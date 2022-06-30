@@ -511,6 +511,8 @@ where
         let (past, contents) =
             get_one_checkpoint(net.clone(), seq, true, &available_authorities).await?;
 
+        //execute_all_certs_in_checkpoint(net.clone(), past, contents).await?;
+
         if let Err(err) =
             checkpoint_db
                 .lock()
