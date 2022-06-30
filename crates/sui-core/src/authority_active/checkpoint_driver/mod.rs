@@ -11,7 +11,7 @@ use std::{
 use parking_lot::Mutex;
 use sui_types::{
     base_types::{AuthorityName, ExecutionDigests, TransactionDigest},
-    error::SuiError,
+    error::{SuiError, SuiResult},
     messages::{CertifiedTransaction, ConfirmationTransaction, TransactionInfoRequest},
     messages_checkpoint::{
         AuthenticatedCheckpoint, AuthorityCheckpointInfo, CertifiedCheckpointSummary,
@@ -511,7 +511,7 @@ where
         let (past, contents) =
             get_one_checkpoint(net.clone(), seq, true, &available_authorities).await?;
 
-        //execute_all_certs_in_checkpoint(net.clone(), past, contents).await?;
+        sync_checkpoint_certs(net.clone(), past, contents).await?;
 
         if let Err(err) =
             checkpoint_db
@@ -523,6 +523,17 @@ where
     }
 
     Ok(())
+}
+
+/// Fetch and execute all certificates in the checkpoint.
+async fn sync_checkpoint_certs<A>(
+    net: Arc<AuthorityAggregator<A>>,
+    sequence_number: CheckpointSequenceNumber,
+    available_authorities: &BTreeSet<AuthorityName>,
+) -> Result<(CertifiedCheckpointSummary, CheckpointContents), SuiError>
+where
+    A: AuthorityAPI + Send + Sync + 'static + Clone,
+{
 }
 
 pub async fn get_one_checkpoint_with_contents<A>(
