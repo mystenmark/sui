@@ -25,9 +25,9 @@ use crate::{
     authority_aggregator::{AuthorityAggregator, ReduceOutput},
     authority_client::AuthorityAPI,
     checkpoints::{proposal::CheckpointProposal, CheckpointStore},
+    node_sync::NodeSyncState,
 };
 use sui_types::committee::{Committee, StakeUnit};
-use sui_types::error::SuiResult;
 use tracing::{debug, info, warn};
 
 #[cfg(test)]
@@ -447,7 +447,7 @@ where
                 .collect();
             if let Ok((_, contents)) = get_one_checkpoint_with_contents(
                 net.clone(),
-                &checkpoint.summary,
+                *checkpoint.summary.sequence_number(),
                 &available_authorities,
             )
             .await
@@ -509,15 +509,15 @@ where
     for seq in full_sync_start..latest_known_checkpoint.summary.sequence_number {
         debug!("Full Sync ({name:?}): {seq:?}");
         let (past, contents) =
-            get_one_checkpoint(net.clone(), seq, true, &available_authorities).await?;
+            get_one_checkpoint_with_contents(net.clone(), seq, &available_authorities).await?;
 
-        sync_checkpoint_certs(net.clone(), past, contents).await?;
+        sync_checkpoint_certs(net.clone(), &past.summary, &contents).await?;
 
-        if let Err(err) =
-            checkpoint_db
-                .lock()
-                .process_checkpoint_certificate(&past, &contents, &net.committee)
-        {
+        if let Err(err) = checkpoint_db.lock().process_checkpoint_certificate(
+            &past,
+            &Some(contents),
+            &net.committee,
+        ) {
             warn!("Sync Err: {err:?}");
         }
     }
@@ -527,24 +527,27 @@ where
 
 /// Fetch and execute all certificates in the checkpoint.
 async fn sync_checkpoint_certs<A>(
+    state: Arc<AuthorityState>,
     net: Arc<AuthorityAggregator<A>>,
-    sequence_number: CheckpointSequenceNumber,
-    available_authorities: &BTreeSet<AuthorityName>,
-) -> Result<(CertifiedCheckpointSummary, CheckpointContents), SuiError>
+    summary: &CheckpointSummary,
+    contents: &CheckpointContents,
+) -> SuiResult
 where
     A: AuthorityAPI + Send + Sync + 'static + Clone,
 {
+    let sync = NodeSyncState::new(state, net, store);
+    sync.sync_checkpoint(contents).await
 }
 
 pub async fn get_one_checkpoint_with_contents<A>(
     net: Arc<AuthorityAggregator<A>>,
-    summary: &CheckpointSummary,
+    seq: CheckpointSequenceNumber,
     available_authorities: &BTreeSet<AuthorityName>,
 ) -> Result<(CertifiedCheckpointSummary, CheckpointContents), SuiError>
 where
     A: AuthorityAPI + Send + Sync + 'static + Clone,
 {
-    get_one_checkpoint(net, *summary.sequence_number(), true, available_authorities)
+    get_one_checkpoint(net, seq, true, available_authorities)
         .await
         // unwrap ok because of true param above.
         .map(|ok| (ok.0, ok.1.unwrap()))
