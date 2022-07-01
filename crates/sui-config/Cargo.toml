@@ -20,8 +20,8 @@ once_cell = "1.11.0"
 debug-ignore = { version = "1.0.2", features = ["serde"] }
 tracing = "0.1.34"
 
-narwhal-config = { git = "https://github.com/MystenLabs/narwhal", rev = "3cf68183b22acfe014118ef2713d5094159f2f4d", package = "config" }
-narwhal-crypto = { git = "https://github.com/MystenLabs/narwhal", rev = "3cf68183b22acfe014118ef2713d5094159f2f4d", package = "crypto" }
+narwhal-config = { git = "https://github.com/MystenLabs/narwhal", rev = "e7261b48c2af15aa36253ffa42b14a95298614b7", package = "config" }
+narwhal-crypto = { git = "https://github.com/MystenLabs/narwhal", rev = "e7261b48c2af15aa36253ffa42b14a95298614b7", package = "crypto" }
 move-binary-format = { git = "https://github.com/move-language/move", rev = "ae62d5f1955a9b92c3ddd31d3cc4467f9aff76ae" }
 move-package = { git = "https://github.com/move-language/move", rev = "ae62d5f1955a9b92c3ddd31d3cc4467f9aff76ae" }
 
