@@ -29,7 +29,7 @@ use tokio::time::Instant;
 use crate::{
     authority_aggregator::{AuthorityAggregator, ReduceOutput},
     authority_client::AuthorityAPI,
-    checkpoints::{proposal::CheckpointProposal, CheckpointStore},
+    checkpoints::CheckpointStore,
     node_sync::NodeSyncState,
 };
 
