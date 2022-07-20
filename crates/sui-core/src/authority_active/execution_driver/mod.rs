@@ -80,6 +80,19 @@ where
 
     let sync_handle = active_authority.node_sync_handle();
 
+    let mut futures = sync_handle
+        .handle_execution_request(pending_transactions.iter().map(|(_, digest)| *digest));
+
+    let mut executed = Vec::new();
+    let mut pending_iter = pending_transactions.iter();
+    while let Some(result) = futures.next().await {
+        let (seq, _) = pending_iter.next().unwrap();
+        if result.is_ok() {
+            executed.push(*seq);
+        }
+    }
+
+    /*
     // Send them for execution
     let executed = sync_handle
         // map to extract digest
@@ -92,6 +105,7 @@ where
         .filter_map(|(result, seq)| async move { result.ok().map(|_| seq) })
         .collect()
         .await;
+    */
 
     // Now update the pending store.
     active_authority
