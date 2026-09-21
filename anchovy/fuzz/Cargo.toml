@@ -1,0 +1,23 @@
+[package]
+name = "anchovy-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Built with a nightly toolchain and sanitizers, so kept out of the main workspace.
+[workspace]
+
+[dependencies]
+anchovy-types = { path = "../crates/anchovy-types" }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "parse"
+path = "fuzz_targets/parse.rs"
+test = false
+doc = false
+bench = false
