@@ -2,7 +2,6 @@
 
 Plan: `IMPLEMENTATION_PLAN_PHASE1.md`. All work is under this directory,
 its own cargo workspace; run cargo from here.
-workspace; run cargo from there.
 
 ## Status: plan complete and reviewed
 
