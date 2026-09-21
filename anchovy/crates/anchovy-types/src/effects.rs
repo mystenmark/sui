@@ -489,12 +489,15 @@ pub struct Event<'a> {
 pub struct TransactionEvents<'a> {
     /// The exact encoding, which is what gets hashed.
     pub bytes: &'a [u8],
-    /// Computed once, from `bytes`, while parsing.
-    pub digest: TransactionEventsDigest,
     pub data: &'a [Event<'a>],
 }
 
 impl<'a> TransactionEvents<'a> {
+    /// Hashed on demand: the reference does not treat events as a message.
+    pub fn digest(&self) -> TransactionEventsDigest {
+        Digest::of("TransactionEvents", self.bytes)
+    }
+
     pub fn parse<A: Alloc<'a>>(r: &mut Reader<'a>, a: &mut A) -> Result<TransactionEvents<'a>> {
         let start = r.pos();
         r.enter()?;
@@ -513,14 +516,8 @@ impl<'a> TransactionEvents<'a> {
             r.leave();
         }
         r.leave();
-        let bytes = r.span(start);
         Ok(TransactionEvents {
-            bytes,
-            digest: if A::BUILD {
-                Digest::of("TransactionEvents", bytes)
-            } else {
-                Digest::ZERO
-            },
+            bytes: r.span(start),
             data: data.finish(),
         })
     }

@@ -222,12 +222,16 @@ pub enum VersionedCheckpointContents<'a> {
 pub struct CheckpointContents<'a> {
     /// The exact encoding, which is what gets hashed.
     pub bytes: &'a [u8],
-    /// Computed once, from `bytes`, while parsing.
-    pub digest: CheckpointContentsDigest,
     pub version: VersionedCheckpointContents<'a>,
 }
 
 impl<'a> CheckpointContents<'a> {
+    /// Hashed on demand: the reference does not treat the contents as a
+    /// message, only the summary that commits to them.
+    pub fn digest(&self) -> CheckpointContentsDigest {
+        Digest::of("CheckpointContents", self.bytes)
+    }
+
     pub fn parse<A: Alloc<'a>>(r: &mut Reader<'a>, a: &mut A) -> Result<CheckpointContents<'a>> {
         let start = r.pos();
         let version = match r.variant()? {
@@ -268,14 +272,8 @@ impl<'a> CheckpointContents<'a> {
                 });
             }
         };
-        let bytes = r.span(start);
         Ok(CheckpointContents {
-            bytes,
-            digest: if A::BUILD {
-                Digest::of("CheckpointContents", bytes)
-            } else {
-                Digest::ZERO
-            },
+            bytes: r.span(start),
             version,
         })
     }

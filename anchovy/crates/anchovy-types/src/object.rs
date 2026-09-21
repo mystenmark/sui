@@ -244,8 +244,6 @@ impl<'a> Data<'a> {
 pub struct Object<'a> {
     /// The exact encoding, which is what gets hashed.
     pub bytes: &'a [u8],
-    /// Computed once, from `bytes`, while parsing.
-    pub digest: ObjectDigest,
     pub data: Data<'a>,
     pub owner: Owner<'a>,
     pub previous_transaction: &'a TransactionDigest,
@@ -265,19 +263,19 @@ impl<'a> Object<'a> {
         let previous_transaction = TransactionDigest::parse(r)?;
         let storage_rebate = r.u64()?;
         r.leave();
-        let bytes = r.span(start);
         Ok(Object {
-            bytes,
-            digest: if A::BUILD {
-                Digest::of("Object", bytes)
-            } else {
-                Digest::ZERO
-            },
+            bytes: r.span(start),
             data,
             owner,
             previous_transaction,
             storage_rebate,
         })
+    }
+
+    /// Hashed on demand: the reference does not treat an object as a
+    /// message, and most objects in a checkpoint never need it.
+    pub fn digest(&self) -> ObjectDigest {
+        Digest::of("Object", self.bytes)
     }
 
     pub fn parse_vec<A: Alloc<'a>>(r: &mut Reader<'a>, a: &mut A) -> Result<&'a [Object<'a>]> {

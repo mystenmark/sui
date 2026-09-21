@@ -40,7 +40,7 @@ fn check(path: &Path, counts: &mut Counts) {
     // Digests computed while parsing must be the ones the checkpoint records.
     let view = checkpoint.get();
     assert_eq!(
-        view.checkpoint_contents.digest,
+        view.checkpoint_contents.digest(),
         *view.checkpoint_summary.data.content_digest
     );
     let VersionedCheckpointContents::V2(contents) = &view.checkpoint_contents.version else {
@@ -57,12 +57,13 @@ fn check(path: &Path, counts: &mut Counts) {
             VersionedEffects::V1(v1) => (v1.transaction_digest, v1.events_digest),
         };
         assert_eq!(*transaction_digest, tx.transaction.data.digest);
-        assert_eq!(events_digest.copied(), tx.events.map(|e| e.digest));
+        assert_eq!(events_digest.copied(), tx.events.map(|e| e.digest()));
         for object in tx.output_objects {
+            let digest = object.digest();
             let written = match &tx.effects.version {
                 VersionedEffects::V2(v2) => v2.changed_objects.iter().any(|c| {
-                    matches!(c.output_state, ObjectOut::ObjectWrite(d, _) if *d == object.digest)
-                        || matches!(c.output_state, ObjectOut::PackageWrite(_, d) if *d == object.digest)
+                    matches!(c.output_state, ObjectOut::ObjectWrite(d, _) if *d == digest)
+                        || matches!(c.output_state, ObjectOut::PackageWrite(_, d) if *d == digest)
                 }),
                 VersionedEffects::V1(_) => true,
             };
