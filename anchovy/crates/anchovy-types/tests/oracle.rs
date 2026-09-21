@@ -21,8 +21,16 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Renders a checkpoint's transactions the way the oracle does.
+// One line per oracle line, in the oracle's order.
+#[allow(clippy::too_many_lines)]
 fn render(checkpoint: &CheckpointData<'_>) -> String {
     let mut out = String::new();
+    writeln!(
+        out,
+        "summary {}",
+        hex(&checkpoint.checkpoint_summary.data.digest.bytes)
+    )
+    .unwrap();
     for (i, tx) in checkpoint.transactions.iter().enumerate() {
         let data = &tx.transaction.data;
         let index = &data.index;

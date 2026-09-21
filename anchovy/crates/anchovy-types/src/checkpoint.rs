@@ -77,6 +77,8 @@ pub struct EndOfEpochData<'a> {
 pub struct CheckpointSummary<'a> {
     /// The exact encoding, which is what gets hashed and signed.
     pub bytes: &'a [u8],
+    /// Computed once, from `bytes`, while parsing.
+    pub digest: CheckpointDigest,
     pub epoch: u64,
     pub sequence_number: u64,
     pub network_total_transactions: u64,
@@ -118,8 +120,12 @@ impl<'a> CheckpointSummary<'a> {
             None
         };
         let version_specific_data = r.byte_vec()?;
+        // Hashed in whichever pass runs: this parser has no arena parameter
+        // to tell them apart, and a summary is rarely parsed twice.
+        let bytes = r.span(start);
         Ok(CheckpointSummary {
-            bytes: r.span(start),
+            bytes,
+            digest: Digest::of("CheckpointSummary", bytes),
             epoch,
             sequence_number,
             network_total_transactions,
@@ -216,6 +222,8 @@ pub enum VersionedCheckpointContents<'a> {
 pub struct CheckpointContents<'a> {
     /// The exact encoding, which is what gets hashed.
     pub bytes: &'a [u8],
+    /// Computed once, from `bytes`, while parsing.
+    pub digest: CheckpointContentsDigest,
     pub version: VersionedCheckpointContents<'a>,
 }
 
@@ -260,8 +268,14 @@ impl<'a> CheckpointContents<'a> {
                 });
             }
         };
+        let bytes = r.span(start);
         Ok(CheckpointContents {
-            bytes: r.span(start),
+            bytes,
+            digest: if A::BUILD {
+                Digest::of("CheckpointContents", bytes)
+            } else {
+                Digest::ZERO
+            },
             version,
         })
     }

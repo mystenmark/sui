@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::arena::{Alloc, Ref};
-use crate::base::{ChainIdentifier, ObjectId, ObjectRef, SequenceNumber, SuiAddress, U32Le, U64Le};
+use crate::base::{
+    ChainIdentifier, Digest, ObjectId, ObjectRef, SequenceNumber, SuiAddress, TransactionDigest,
+    U32Le, U64Le,
+};
 use crate::error::{ParseError, Result};
 use crate::object::GenesisObject;
 use crate::reader::{Reader, WireRecord};
@@ -546,6 +549,8 @@ impl<'a> TransactionExpiration<'a> {
 pub struct TransactionData<'a> {
     /// The exact encoding, which is what gets hashed and signed.
     pub bytes: &'a [u8],
+    /// Computed once, from `bytes`, while parsing.
+    pub digest: TransactionDigest,
     pub kind: TransactionKind<'a>,
     pub sender: &'a SuiAddress,
     pub gas_data: GasData<'a>,
@@ -590,8 +595,14 @@ impl<'a> TransactionData<'a> {
         r.leave();
         r.leave();
         let index = TransactionIndex::build(&kind, &gas_data, counts, a)?;
+        let bytes = r.span(start);
         Ok(TransactionData {
-            bytes: r.span(start),
+            bytes,
+            digest: if A::BUILD {
+                Digest::of("TransactionData", bytes)
+            } else {
+                Digest::ZERO
+            },
             kind,
             sender,
             gas_data,
@@ -643,6 +654,11 @@ pub struct SenderSignedData<'a> {
 }
 
 impl<'a> SenderSignedData<'a> {
+    /// The transaction digest: that of the `TransactionData`.
+    pub fn digest(&self) -> &TransactionDigest {
+        &self.data.digest
+    }
+
     /// A length, an intent, a `TransactionData` (a version, an empty
     /// `EndOfEpochTransaction`, a sender, gas data with no payment, no
     /// expiration) and a length.

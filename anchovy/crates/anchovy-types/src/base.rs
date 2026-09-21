@@ -166,6 +166,20 @@ impl Digest {
         Digest { len: 32, bytes }
     }
 
+    pub const ZERO: Digest = Digest::new([0; 32]);
+
+    /// The reference's digest of a hashed type: Blake2b-256 over the type's
+    /// serde name, `::`, and its BCS bytes.
+    pub fn of(type_name: &str, bcs_bytes: &[u8]) -> Digest {
+        use blake2::digest::consts::U32;
+        use blake2::{Blake2b, Digest as _};
+        let mut hasher = Blake2b::<U32>::new();
+        hasher.update(type_name.as_bytes());
+        hasher.update(b"::");
+        hasher.update(bcs_bytes);
+        Digest::new(hasher.finalize().into())
+    }
+
     pub fn parse<'a>(r: &mut Reader<'a>) -> Result<&'a Digest> {
         let d: &Digest = r.record()?;
         d.check()?;

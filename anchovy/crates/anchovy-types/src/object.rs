@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::arena::{Alloc, Ref};
-use crate::base::{ObjectId, SequenceNumber, SuiAddress, TransactionDigest, U64Le};
+use crate::base::{
+    Digest, ObjectDigest, ObjectId, SequenceNumber, SuiAddress, TransactionDigest, U64Le,
+};
 use crate::error::{ParseError, Result};
 use crate::reader::{Reader, WireRecord};
 use crate::type_tag::{StructTag, TypeTag};
@@ -242,6 +244,8 @@ impl<'a> Data<'a> {
 pub struct Object<'a> {
     /// The exact encoding, which is what gets hashed.
     pub bytes: &'a [u8],
+    /// Computed once, from `bytes`, while parsing.
+    pub digest: ObjectDigest,
     pub data: Data<'a>,
     pub owner: Owner<'a>,
     pub previous_transaction: &'a TransactionDigest,
@@ -261,8 +265,14 @@ impl<'a> Object<'a> {
         let previous_transaction = TransactionDigest::parse(r)?;
         let storage_rebate = r.u64()?;
         r.leave();
+        let bytes = r.span(start);
         Ok(Object {
-            bytes: r.span(start),
+            bytes,
+            digest: if A::BUILD {
+                Digest::of("Object", bytes)
+            } else {
+                Digest::ZERO
+            },
             data,
             owner,
             previous_transaction,

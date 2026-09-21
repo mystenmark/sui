@@ -7,8 +7,10 @@
 use std::path::{Path, PathBuf};
 
 use anchovy_types::Message;
-use anchovy_types::checkpoint::CheckpointData;
-use anchovy_types::effects::{ChangeKind, TransactionEffects, TransactionEvents, VersionedEffects};
+use anchovy_types::checkpoint::{CheckpointData, VersionedCheckpointContents};
+use anchovy_types::effects::{
+    ChangeKind, ObjectOut, TransactionEffects, TransactionEvents, VersionedEffects,
+};
 use anchovy_types::object::{Data, Object};
 use anchovy_types::transaction::TransactionData;
 
@@ -35,8 +37,41 @@ fn check(path: &Path, counts: &mut Counts) {
     counts.wire += checkpoint.wire_bytes().len();
     counts.arena += checkpoint.arena_size();
 
-    for tx in checkpoint.get().transactions {
+    // Digests computed while parsing must be the ones the checkpoint records.
+    let view = checkpoint.get();
+    assert_eq!(
+        view.checkpoint_contents.digest,
+        *view.checkpoint_summary.data.content_digest
+    );
+    let VersionedCheckpointContents::V2(contents) = &view.checkpoint_contents.version else {
+        panic!("{}: mainnet checkpoints have V2 contents", path.display())
+    };
+    assert_eq!(contents.len(), view.transactions.len());
+
+    for (i, tx) in view.transactions.iter().enumerate() {
         counts.transactions += 1;
+        assert_eq!(contents[i].digest.transaction, *tx.transaction.digest());
+        assert_eq!(contents[i].digest.effects, tx.effects.digest);
+        let (transaction_digest, events_digest) = match &tx.effects.version {
+            VersionedEffects::V2(v2) => (v2.transaction_digest, v2.events_digest),
+            VersionedEffects::V1(v1) => (v1.transaction_digest, v1.events_digest),
+        };
+        assert_eq!(*transaction_digest, tx.transaction.data.digest);
+        assert_eq!(events_digest.copied(), tx.events.map(|e| e.digest));
+        for object in tx.output_objects {
+            let written = match &tx.effects.version {
+                VersionedEffects::V2(v2) => v2.changed_objects.iter().any(|c| {
+                    matches!(c.output_state, ObjectOut::ObjectWrite(d, _) if *d == object.digest)
+                        || matches!(c.output_state, ObjectOut::PackageWrite(_, d) if *d == object.digest)
+                }),
+                VersionedEffects::V1(_) => true,
+            };
+            assert!(
+                written,
+                "{}: output object digest not in effects",
+                path.display()
+            );
+        }
 
         let data =
             Message::<TransactionData<'static>>::parse(tx.transaction.data.bytes.to_vec()).unwrap();

@@ -5,7 +5,8 @@
 //! checkpoint, as text, for anchovy's tests to compare against. Usage:
 //! `sui-oracle FILE.chk...` writes `FILE.oracle` next to each input.
 //!
-//! One record per transaction, in checkpoint order:
+//! A `summary <checkpoint digest>` line, then one record per transaction,
+//! in checkpoint order:
 //!
 //! ```text
 //! tx <index>
@@ -40,6 +41,12 @@ fn main() {
         let checkpoint: CheckpointData = bcs::from_bytes(&bytes).unwrap();
 
         let mut out = String::new();
+        writeln!(
+            out,
+            "summary {}",
+            hex(checkpoint.checkpoint_summary.digest().inner())
+        )
+        .unwrap();
         for (i, tx) in checkpoint.transactions.iter().enumerate() {
             let data = tx.transaction.transaction_data();
             writeln!(out, "tx {i}").unwrap();

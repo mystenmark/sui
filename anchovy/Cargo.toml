@@ -10,6 +10,8 @@ license = "Apache-2.0"
 [workspace.dependencies]
 # Pinned to the version in sui's Cargo.lock: accept/reject behaviour must match.
 bcs = "=0.1.6"
+# The crate behind fastcrypto's Blake2b256, at the version sui's lockfile has.
+blake2 = "=0.10.6"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde-reflection = "0.5.0"

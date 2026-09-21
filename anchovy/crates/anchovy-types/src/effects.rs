@@ -4,7 +4,7 @@
 use crate::arena::{Alloc, Ref};
 use crate::base::{
     Digest, EffectsAuxDataDigest, ObjectDigest, ObjectId, ObjectKey, ObjectRef, SequenceNumber,
-    SuiAddress, TransactionDigest, TransactionEventsDigest, U64Le,
+    SuiAddress, TransactionDigest, TransactionEffectsDigest, TransactionEventsDigest, U64Le,
 };
 use crate::error::{ParseError, Result};
 use crate::execution_status::ExecutionStatus;
@@ -436,6 +436,8 @@ pub enum VersionedEffects<'a> {
 pub struct TransactionEffects<'a> {
     /// The exact encoding, which is what gets hashed.
     pub bytes: &'a [u8],
+    /// Computed once, from `bytes`, while parsing.
+    pub digest: TransactionEffectsDigest,
     pub version: VersionedEffects<'a>,
 }
 
@@ -460,8 +462,14 @@ impl<'a> TransactionEffects<'a> {
             }
         };
         r.leave();
+        let bytes = r.span(start);
         Ok(TransactionEffects {
-            bytes: r.span(start),
+            bytes,
+            digest: if A::BUILD {
+                Digest::of("TransactionEffects", bytes)
+            } else {
+                Digest::ZERO
+            },
             version,
         })
     }
@@ -481,6 +489,8 @@ pub struct Event<'a> {
 pub struct TransactionEvents<'a> {
     /// The exact encoding, which is what gets hashed.
     pub bytes: &'a [u8],
+    /// Computed once, from `bytes`, while parsing.
+    pub digest: TransactionEventsDigest,
     pub data: &'a [Event<'a>],
 }
 
@@ -503,8 +513,14 @@ impl<'a> TransactionEvents<'a> {
             r.leave();
         }
         r.leave();
+        let bytes = r.span(start);
         Ok(TransactionEvents {
-            bytes: r.span(start),
+            bytes,
+            digest: if A::BUILD {
+                Digest::of("TransactionEvents", bytes)
+            } else {
+                Digest::ZERO
+            },
             data: data.finish(),
         })
     }
