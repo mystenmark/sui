@@ -14,10 +14,20 @@ cargo-fuzz = true
 [dependencies]
 anchovy-types = { path = "../crates/anchovy-types" }
 libfuzzer-sys = "0.4"
+# The version sui pins: the differential target compares against its rules.
+bcs = "=0.1.6"
+serde = "1"
 
 [[bin]]
 name = "parse"
 path = "fuzz_targets/parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "differential"
+path = "fuzz_targets/differential.rs"
 test = false
 doc = false
 bench = false

@@ -7,7 +7,9 @@ name = "anchovy-fuzz"
 version = "0.0.0"
 dependencies = [
  "anchovy-types",
+ "bcs",
  "libfuzzer-sys",
+ "serde",
 ]
 
 [[package]]
