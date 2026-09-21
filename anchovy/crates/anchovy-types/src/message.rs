@@ -18,6 +18,8 @@ use crate::reader::Reader;
 /// # Safety
 /// `shrink` must be implemented as `v`, which the compiler accepts only if
 /// `View` is covariant in its lifetime. [`Message`] relies on that.
+/// Everything `parse` puts in the arena must have an alignment of at most
+/// `ARENA_ALIGN`; `Alloc::slice` refuses larger ones at compile time.
 pub unsafe trait Wire: 'static {
     type View<'a>: Copy + 'a;
 
@@ -96,11 +98,11 @@ pub struct Message<T: Wire> {
 
 /// The smallest single-pass guess, so that tiny messages with a fixed
 /// overhead do not fall back.
-const MIN_ARENA_GUESS: usize = 256;
+pub const MIN_ARENA_GUESS: usize = 256;
 
 // SAFETY: a `Message` is immutable after construction and owns what `view`
 // points to, so it is as thread-safe as the view's contents.
-unsafe impl<T: Wire> Send for Message<T> where for<'a> T::View<'a>: Sync {}
+unsafe impl<T: Wire> Send for Message<T> where for<'a> T::View<'a>: Send {}
 // SAFETY: as above.
 unsafe impl<T: Wire> Sync for Message<T> where for<'a> T::View<'a>: Sync {}
 
@@ -114,7 +116,7 @@ impl<T: Wire> Message<T> {
         let wire = wire.into();
         let guess = match T::ARENA_GUESS_SIXTEENTHS {
             0 => 0,
-            n => (wire.len * n / 16).max(MIN_ARENA_GUESS),
+            n => (wire.len.saturating_mul(n) / 16).max(MIN_ARENA_GUESS),
         };
         let result = match Self::parse_guessed(&wire, guess) {
             Err(ParseError::ArenaFull) => Self::parse_measured(&wire),

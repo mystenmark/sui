@@ -257,8 +257,24 @@ pub struct ObjectKey {
 // SAFETY: `repr(C)` over wire records: alignment 1, no padding.
 unsafe impl WireRecord for ObjectKey {}
 
-const _: () = {
-    assert!(size_of::<Digest>() == 33 && align_of::<Digest>() == 1);
-    assert!(size_of::<ObjectRef>() == 73 && align_of::<ObjectRef>() == 1);
-    assert!(size_of::<ObjectKey>() == 40 && align_of::<ObjectKey>() == 1);
-};
+/// Asserts at compile time that a wire record's layout is its wire layout.
+macro_rules! assert_wire_layout {
+    ($($ty:ty = $size:expr),* $(,)?) => {
+        const _: () = { $(
+            assert!(size_of::<$ty>() == $size && align_of::<$ty>() == 1);
+        )* };
+    };
+}
+pub(crate) use assert_wire_layout;
+
+assert_wire_layout!(
+    AccountAddress = 32,
+    SuiAddress = 32,
+    ObjectId = 32,
+    U32Le = 4,
+    U64Le = 8,
+    Digest = 33,
+    AuthorityName = 97,
+    ObjectRef = 73,
+    ObjectKey = 40,
+);

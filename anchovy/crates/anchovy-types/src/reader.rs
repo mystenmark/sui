@@ -255,6 +255,7 @@ impl<'a> Reader<'a> {
         // Nearly every string is a short ASCII identifier, for which the
         // general validator's setup costs more than the check.
         if self.strs_validated || bytes.is_ascii() {
+            debug_assert!(std::str::from_utf8(bytes).is_ok());
             // SAFETY: ASCII is UTF-8; otherwise see `revisit`.
             return Ok(unsafe { std::str::from_utf8_unchecked(bytes) });
         }

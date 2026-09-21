@@ -166,6 +166,7 @@ impl<'a> Alloc<'a> for Measure {
     const BUILD: bool = false;
 
     fn slice<T: Copy + 'a>(&mut self, n: usize) -> Result<SliceWriter<'a, T>> {
+        const { assert!(align_of::<T>() <= ARENA_ALIGN) }
         let layout = Layout::array::<T>(n).map_err(|_| ParseError::WireTooLarge)?;
         bump(&mut self.off, layout)?;
         Ok(SliceWriter {
@@ -200,9 +201,9 @@ impl Arena {
             Layout::from_size_align(size, ARENA_ALIGN).map_err(|_| ParseError::WireTooLarge)?;
         // SAFETY: `layout` has non-zero size.
         let ptr = unsafe { alloc::alloc(layout) };
-        let Some(ptr) = NonNull::new(ptr) else {
-            alloc::handle_alloc_error(layout)
-        };
+        // A hostile message can ask for many times its own size; that is an
+        // error to report, not a reason to abort the process.
+        let ptr = NonNull::new(ptr).ok_or(ParseError::OutOfMemory)?;
         Ok(Arena { ptr, size })
     }
 
@@ -251,6 +252,7 @@ impl<'a> Alloc<'a> for Build<'a> {
     const BUILD: bool = true;
 
     fn slice<T: Copy + 'a>(&mut self, n: usize) -> Result<SliceWriter<'a, T>> {
+        const { assert!(align_of::<T>() <= ARENA_ALIGN) }
         let layout = Layout::array::<T>(n).map_err(|_| ParseError::WireTooLarge)?;
         let mut off = self.off;
         let start = bump(&mut off, layout)?;

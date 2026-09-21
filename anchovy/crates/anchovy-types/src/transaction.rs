@@ -700,3 +700,5 @@ impl<'a> SenderSignedData<'a> {
 // Mainnet p99 of arena over wire size: 2.16 and 2.09.
 crate::impl_wire!(TransactionData, guess = 35);
 crate::impl_wire!(SenderSignedData, guess = 34);
+
+crate::base::assert_wire_layout!(SharedObjectArg = 41, Intent = 3);

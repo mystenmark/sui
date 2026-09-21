@@ -15,14 +15,13 @@ use anchovy_types::checkpoint::{
     CertifiedCheckpointSummary, CheckpointContents, CheckpointData, FullCheckpointContents,
 };
 use anchovy_types::effects::{TransactionEffects, TransactionEvents};
+use anchovy_types::message::MIN_ARENA_GUESS;
 use anchovy_types::object::Object;
 use anchovy_types::transaction::{SenderSignedData, TransactionData};
 use anchovy_types::{Message, Wire};
 use libfuzzer_sys::fuzz_target;
 
 const MAX_ARENA_PER_WIRE_BYTE: usize = 32;
-/// Must match `message::MIN_ARENA_GUESS`.
-const MIN_ARENA_GUESS: usize = 256;
 
 struct Counting;
 

@@ -477,3 +477,5 @@ impl<'a> EndOfEpochTransactionKind<'a> {
         Ok(kind)
     }
 }
+
+crate::base::assert_wire_layout!(ConsensusObjectVersion = 48, AuthorityObservation = 109);

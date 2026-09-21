@@ -320,3 +320,5 @@ impl<'a> GenesisObject<'a> {
 // Mainnet p99 of arena over wire size: 0.77.
 crate::impl_wire!(Object, guess = 13);
 crate::impl_wire!(Owner);
+
+crate::base::assert_wire_layout!(PartyMember = 40, Linkage = 72);

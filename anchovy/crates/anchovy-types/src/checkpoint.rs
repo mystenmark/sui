@@ -387,3 +387,9 @@ crate::impl_wire!(CertifiedCheckpointSummary, no_arena);
 crate::impl_wire!(CheckpointContents, guess = 6);
 crate::impl_wire!(FullCheckpointContents, guess = 24);
 crate::impl_wire!(CheckpointData, guess = 13);
+
+crate::base::assert_wire_layout!(
+    CheckpointCommitment = 34,
+    CommitteeMember = 105,
+    ExecutionDigests = 66,
+);

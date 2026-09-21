@@ -34,6 +34,8 @@ pub enum ParseError {
     /// `SenderSignedData` with other than one transaction.
     NotOneTransaction,
     WireTooLarge,
+    /// The arena could not be allocated.
+    OutOfMemory,
     /// A single-pass build outgrew its guessed arena; the caller retries
     /// with a measured one. Never returned from `Message::parse`.
     ArenaFull,
