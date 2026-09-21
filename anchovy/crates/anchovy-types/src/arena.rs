@@ -31,6 +31,11 @@ fn bump(off: &mut usize, layout: Layout) -> Result<usize> {
 }
 
 pub trait Alloc<'a> {
+    /// Whether values are kept. Code that reads back what it parsed, which
+    /// the measure pass cannot do, runs only when this is true; it must
+    /// still make the same reservations in both passes.
+    const BUILD: bool;
+
     /// Reserves room for `n` values, to be filled in order.
     fn slice<T: Copy + 'a>(&mut self, n: usize) -> Result<SliceWriter<'a, T>>;
 
@@ -95,6 +100,29 @@ impl<'a, T: Copy + 'a> SliceWriter<'a, T> {
         self.len += 1;
     }
 
+    /// Sorts what has been pushed and drops repeats. The reservation keeps
+    /// its size, so the space the repeats took is left unused.
+    pub fn sort_dedup(&mut self)
+    where
+        T: Ord,
+    {
+        if self.ptr.is_null() {
+            return;
+        }
+        // SAFETY: the first `len` slots are initialized and `self` is the
+        // only handle to them until `finish`.
+        let filled = unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) };
+        filled.sort_unstable();
+        let mut kept = 0;
+        for i in 0..filled.len() {
+            if kept == 0 || filled[kept - 1] != filled[i] {
+                filled[kept] = filled[i];
+                kept += 1;
+            }
+        }
+        self.len = kept;
+    }
+
     /// The filled prefix. Empty in the measure pass.
     pub fn finish(self) -> &'a [T] {
         if self.ptr.is_null() {
@@ -118,6 +146,8 @@ impl Measure {
 }
 
 impl<'a> Alloc<'a> for Measure {
+    const BUILD: bool = false;
+
     fn slice<T: Copy + 'a>(&mut self, n: usize) -> Result<SliceWriter<'a, T>> {
         let layout = Layout::array::<T>(n).map_err(|_| ParseError::WireTooLarge)?;
         bump(&mut self.off, layout)?;
@@ -201,6 +231,8 @@ impl<'a> Build<'a> {
 }
 
 impl<'a> Alloc<'a> for Build<'a> {
+    const BUILD: bool = true;
+
     fn slice<T: Copy + 'a>(&mut self, n: usize) -> Result<SliceWriter<'a, T>> {
         let layout = Layout::array::<T>(n).map_err(|_| ParseError::WireTooLarge)?;
         let mut off = self.off;

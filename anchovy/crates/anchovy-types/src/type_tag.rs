@@ -78,6 +78,7 @@ impl<'a> TypeTag<'a> {
 impl<'a> StructTag<'a> {
     pub fn parse<A: Alloc<'a>>(r: &mut Reader<'a>, a: &mut A) -> Result<StructTag<'a>> {
         r.enter()?;
+        r.count_struct_tag();
         // The address is the one leaf container that type nesting can push
         // past the depth limit, so it is the one leaf that is counted.
         r.enter()?;

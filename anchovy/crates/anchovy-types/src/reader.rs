@@ -22,6 +22,7 @@ pub struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
     depth: u32,
+    struct_tags: usize,
 }
 
 impl<'a> Reader<'a> {
@@ -30,6 +31,7 @@ impl<'a> Reader<'a> {
             buf,
             pos: 0,
             depth: 0,
+            struct_tags: 0,
         }
     }
 
@@ -70,6 +72,16 @@ impl<'a> Reader<'a> {
 
     pub fn leave(&mut self) {
         self.depth -= 1;
+    }
+
+    /// How many struct tags have been read. Known in both passes, unlike the
+    /// parsed tags, so the transaction index sizes its package list from it.
+    pub fn struct_tags(&self) -> usize {
+        self.struct_tags
+    }
+
+    pub(crate) fn count_struct_tag(&mut self) {
+        self.struct_tags += 1;
     }
 
     pub fn bytes(&mut self, n: usize) -> Result<&'a [u8]> {

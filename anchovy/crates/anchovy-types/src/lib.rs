@@ -20,6 +20,7 @@ pub mod object;
 pub mod reader;
 pub mod system_transaction;
 pub mod transaction;
+pub mod tx_index;
 pub mod type_tag;
 
 pub use error::{ParseError, Result};

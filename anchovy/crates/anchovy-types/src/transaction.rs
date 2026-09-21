@@ -11,6 +11,7 @@ use crate::system_transaction::{
     ConsensusCommitPrologueV3, ConsensusCommitPrologueV4, EndOfEpochTransactionKind,
     RandomnessStateUpdate,
 };
+use crate::tx_index::{IndexCounts, TransactionIndex};
 use crate::type_tag::{TypeInput, TypeTag};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -336,23 +337,29 @@ pub struct ProgrammableTransaction<'a> {
 }
 
 impl<'a> ProgrammableTransaction<'a> {
-    pub fn parse<A: Alloc<'a>>(
+    pub(crate) fn parse<A: Alloc<'a>>(
         r: &mut Reader<'a>,
         a: &mut A,
+        counts: &mut IndexCounts,
     ) -> Result<ProgrammableTransaction<'a>> {
         r.enter()?;
 
         let n = r.seq_len(CallArg::MIN_WIRE_SIZE)?;
         let mut inputs = a.slice(n)?;
         for _ in 0..n {
-            inputs.push(CallArg::parse(r, a)?);
+            let input = CallArg::parse(r, a)?;
+            counts.count_input(&input);
+            inputs.push(input);
         }
         let inputs = inputs.finish();
 
         let n = r.seq_len(Command::MIN_WIRE_SIZE)?;
         let mut commands = a.slice(n)?;
         for _ in 0..n {
-            commands.push(Command::parse(r, a)?);
+            let struct_tags = r.struct_tags();
+            let command = Command::parse(r, a)?;
+            counts.count_command(&command, r.struct_tags() - struct_tags);
+            commands.push(command);
         }
         let commands = commands.finish();
 
@@ -377,10 +384,16 @@ pub enum TransactionKind<'a> {
 }
 
 impl<'a> TransactionKind<'a> {
-    pub fn parse<A: Alloc<'a>>(r: &mut Reader<'a>, a: &mut A) -> Result<TransactionKind<'a>> {
+    pub(crate) fn parse<A: Alloc<'a>>(
+        r: &mut Reader<'a>,
+        a: &mut A,
+        counts: &mut IndexCounts,
+    ) -> Result<TransactionKind<'a>> {
         r.enter()?;
         let kind = match r.variant()? {
-            0 => TransactionKind::ProgrammableTransaction(ProgrammableTransaction::parse(r, a)?),
+            0 => TransactionKind::ProgrammableTransaction(ProgrammableTransaction::parse(
+                r, a, counts,
+            )?),
             1 => {
                 let v = ChangeEpoch::parse(r, a)?;
                 TransactionKind::ChangeEpoch(a.value(v)?)
@@ -404,7 +417,9 @@ impl<'a> TransactionKind<'a> {
                 let n = r.seq_len(EndOfEpochTransactionKind::MIN_WIRE_SIZE)?;
                 let mut kinds = a.slice(n)?;
                 for _ in 0..n {
-                    kinds.push(EndOfEpochTransactionKind::parse(r, a)?);
+                    let kind = EndOfEpochTransactionKind::parse(r, a)?;
+                    counts.count_end_of_epoch(&kind);
+                    kinds.push(kind);
                 }
                 TransactionKind::EndOfEpochTransaction(kinds.finish())
             }
@@ -422,7 +437,7 @@ impl<'a> TransactionKind<'a> {
                 TransactionKind::ConsensusCommitPrologueV4(a.value(v)?)
             }
             10 => TransactionKind::ProgrammableSystemTransaction(ProgrammableTransaction::parse(
-                r, a,
+                r, a, counts,
             )?),
             tag => {
                 return Err(ParseError::UnknownVariant {
@@ -541,9 +556,25 @@ pub struct TransactionData<'a> {
     pub sender: &'a SuiAddress,
     pub gas_data: GasData<'a>,
     pub expiration: TransactionExpiration<'a>,
+    /// Derived from the fields above while parsing.
+    pub index: TransactionIndex<'a>,
 }
 
 impl<'a> TransactionData<'a> {
+    /// The `MoveCall` commands of a user transaction, with their positions.
+    pub fn move_calls(&self) -> impl Iterator<Item = (usize, &ProgrammableMoveCall<'a>)> {
+        let commands = match &self.kind {
+            TransactionKind::ProgrammableTransaction(pt) => pt.commands,
+            _ => &[],
+        };
+        self.index.move_calls.iter().map(move |&i| {
+            let Command::MoveCall(call) = &commands[i as usize] else {
+                unreachable!("the index lists only MoveCall commands")
+            };
+            (i as usize, call)
+        })
+    }
+
     pub fn parse<A: Alloc<'a>>(r: &mut Reader<'a>, a: &mut A) -> Result<TransactionData<'a>> {
         let start = r.pos();
         r.enter()?;
@@ -557,18 +588,21 @@ impl<'a> TransactionData<'a> {
             }
         }
         r.enter()?;
-        let kind = TransactionKind::parse(r, a)?;
+        let mut counts = IndexCounts::default();
+        let kind = TransactionKind::parse(r, a, &mut counts)?;
         let sender = SuiAddress::parse(r)?;
         let gas_data = GasData::parse(r)?;
         let expiration = TransactionExpiration::parse(r)?;
         r.leave();
         r.leave();
+        let index = TransactionIndex::build(&kind, &gas_data, counts, a)?;
         Ok(TransactionData {
             bytes: r.span(start),
             kind,
             sender,
             gas_data,
             expiration,
+            index,
         })
     }
 }
