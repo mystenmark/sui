@@ -1,12 +1,12 @@
-# Anchovy Phase 1: wire format types
+# Phase 1: wire format types
 
 Requirements are in `PRD.md`. This plan covers Phase 1 only.
 
 ## Overview
 
-A new crate, `anchovy-types`, that parses and builds every type named in
+A new crate, `messages`, that parses and builds every type named in
 sui's `format__sui.yaml.snap` (a copy is checked in under
-`crates/anchovy-types/tests/data/`). Parsing is zero-copy: a parsed message
+`crates/messages/tests/data/`). Parsing is zero-copy: a parsed message
 owns the wire buffer and one arena, and everything else is a reference into
 one of the two.
 
@@ -132,7 +132,7 @@ each in `docs/REFERENCE_STRICTNESS.md`:
 
 ### Builders and the in-tree oracle
 
-`anchovy_types::build` has owned mirror types deriving `serde::Serialize`
+`messages::build` has owned mirror types deriving `serde::Serialize`
 and `Deserialize`, serialized with the `bcs` crate. They serve three
 purposes:
 

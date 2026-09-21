@@ -8,12 +8,12 @@
 use std::fmt::Debug;
 use std::path::Path;
 
-use anchovy_types::checkpoint::CheckpointData;
-use anchovy_types::effects::{TransactionEffects, TransactionEvents};
-use anchovy_types::object::Object;
-use anchovy_types::signature::MultiSig;
-use anchovy_types::transaction::TransactionData;
-use anchovy_types::{Message, Wire, build};
+use messages::checkpoint::CheckpointData;
+use messages::effects::{TransactionEffects, TransactionEvents};
+use messages::object::Object;
+use messages::signature::MultiSig;
+use messages::transaction::TransactionData;
+use messages::{Message, Wire, build};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 

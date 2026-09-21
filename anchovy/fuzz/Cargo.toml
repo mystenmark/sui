@@ -1,5 +1,5 @@
 [package]
-name = "anchovy-fuzz"
+name = "fuzz"
 version = "0.0.0"
 edition = "2024"
 license = "Apache-2.0"
@@ -12,7 +12,7 @@ cargo-fuzz = true
 [workspace]
 
 [dependencies]
-anchovy-types = { path = "../crates/anchovy-types" }
+messages = { path = "../crates/messages" }
 libfuzzer-sys = "0.4"
 # The version sui pins: the differential target compares against its rules.
 bcs = "=0.1.6"

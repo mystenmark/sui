@@ -13,10 +13,10 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use anchovy_types::Message;
-use anchovy_types::build;
-use anchovy_types::checkpoint::{CheckpointContents, CheckpointData, CheckpointSummary};
-use anchovy_types::transaction::SenderSignedData;
+use messages::Message;
+use messages::build;
+use messages::checkpoint::{CheckpointContents, CheckpointData, CheckpointSummary};
+use messages::transaction::SenderSignedData;
 
 struct Counting;
 
@@ -130,7 +130,7 @@ fn measure<T>(inputs: &[Vec<u8>], rounds: usize, f: impl Fn(Vec<u8>) -> T) -> Me
 fn header() {
     println!(
         "{:<28} {:>6} {:>6} | {:<32} | {:<32} | {:>8}",
-        "", "items", "bytes", "anchovy", "bcs + owned types", "speed-up"
+        "", "items", "bytes", "messages", "bcs + owned types", "speed-up"
     );
     let columns = format!(
         "{:>8} {:>8} {:>8} {:>6}",
@@ -152,16 +152,16 @@ fn cell(m: &Measurement) -> String {
     )
 }
 
-/// One row: anchovy against the baseline on the same inputs. The last
-/// column is the baseline's parse-and-drop time over anchovy's.
+/// One row: the messages crate against the baseline on the same inputs. The last
+/// column is the baseline's parse-and-drop time over the crate's.
 fn compare<A, B>(
     name: &str,
     inputs: &[Vec<u8>],
     rounds: usize,
-    anchovy: impl Fn(Vec<u8>) -> A,
+    parse: impl Fn(Vec<u8>) -> A,
     baseline: impl Fn(Vec<u8>) -> B,
 ) {
-    let a = measure(inputs, rounds, anchovy);
+    let a = measure(inputs, rounds, parse);
     let b = measure(inputs, rounds, baseline);
     let speed_up = (b.parse + b.drop).as_secs_f64() / (a.parse + a.drop).as_secs_f64();
     let mean_len = inputs.iter().map(Vec::len).sum::<usize>() / inputs.len();
@@ -176,7 +176,7 @@ fn compare<A, B>(
 
 /// The baseline keeps its input buffer, so that both drops free it. It
 /// does not hash: the reference computes digests on demand, not while
-/// deserializing, so anchovy's parse does more than the baseline's.
+/// deserializing, so the crate's parse does more than the baseline's.
 fn baseline<T: serde::de::DeserializeOwned>(b: Vec<u8>) -> (T, Vec<u8>) {
     (bcs::from_bytes::<T>(&b).unwrap(), b)
 }

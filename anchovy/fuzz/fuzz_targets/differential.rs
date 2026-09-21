@@ -8,15 +8,15 @@
 
 #![no_main]
 
-use anchovy_types::build;
-use anchovy_types::checkpoint::{
+use messages::build;
+use messages::checkpoint::{
     CertifiedCheckpointSummary, CheckpointContents, CheckpointData, FullCheckpointContents,
 };
-use anchovy_types::effects::{TransactionEffects, TransactionEvents};
-use anchovy_types::object::Object;
-use anchovy_types::signature::{CompressedSignature, MultiSig, PublicKey};
-use anchovy_types::transaction::{SenderSignedData, TransactionData};
-use anchovy_types::{Message, Wire};
+use messages::effects::{TransactionEffects, TransactionEvents};
+use messages::object::Object;
+use messages::signature::{CompressedSignature, MultiSig, PublicKey};
+use messages::transaction::{SenderSignedData, TransactionData};
+use messages::{Message, Wire};
 use libfuzzer_sys::fuzz_target;
 use serde::Serialize;
 use serde::de::DeserializeOwned;

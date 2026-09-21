@@ -8,10 +8,10 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use anchovy_types::Message;
-use anchovy_types::checkpoint::CheckpointData;
-use anchovy_types::effects::{ChangeKind, VersionedEffects};
-use anchovy_types::transaction::TransactionKind;
+use messages::Message;
+use messages::checkpoint::CheckpointData;
+use messages::effects::{ChangeKind, VersionedEffects};
+use messages::transaction::TransactionKind;
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().fold(String::new(), |mut s, b| {
@@ -181,7 +181,7 @@ fn render_effects(effects: &VersionedEffects<'_>, out: &mut String) {
     }
 }
 
-fn gas_count(data: &anchovy_types::transaction::TransactionData<'_>) -> usize {
+fn gas_count(data: &messages::transaction::TransactionData<'_>) -> usize {
     match data.kind {
         TransactionKind::ProgrammableTransaction(_) => data
             .gas_data
@@ -229,7 +229,7 @@ fn index_matches_sui() {
                     .join("\n")
             };
             panic!(
-                "{}: first difference at line {}\n--- anchovy\n{}\n--- sui\n{}",
+                "{}: first difference at line {}\n--- messages\n{}\n--- sui\n{}",
                 path.display(),
                 mismatch + 1,
                 context(&actual),

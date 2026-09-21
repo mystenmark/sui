@@ -1,7 +1,7 @@
-# Anchovy Phase 1 progress
+# Phase 1 progress
 
-Plan: `IMPLEMENTATION_PLAN_PHASE1.md`. Branch `mlogan-anchovy`, worktree
-`~/projects/mlogan-anchovy`. All work is under `anchovy/`, its own cargo
+Plan: `IMPLEMENTATION_PLAN_PHASE1.md`. All work is under this directory,
+its own cargo workspace; run cargo from here.
 workspace; run cargo from there.
 
 ## Status: plan complete and reviewed
@@ -38,7 +38,7 @@ Every step of the implementation order is done and three review passes
     `tests/min_wire_size.rs`: every `MIN_WIRE_SIZE` equals the encoded size
     of the smallest value.
 11. Fuzzing. `tests/mutate.rs` is a deterministic mutation fuzzer run as a
-    test (`ANCHOVY_MUTATE_ITERATIONS` to run longer; 3M per test clean).
+    test (`MUTATE_ITERATIONS` to run longer; 3M per test clean).
     `fuzz/` has two cargo-fuzz targets: `parse` asserts at most one
     allocation per parse and at most 32 arena bytes per input byte (20M runs
     under ASan, clean); `differential` holds the parsers to `bcs` on the
@@ -49,7 +49,7 @@ Every step of the implementation order is done and three review passes
     missing; one row per type, last column the speed-up of the
     deserialize-and-drop round trip), fat LTO:
 
-    | | anchovy: parse + drop | `bcs` into owned types: parse + drop |
+    | | messages: parse + drop | `bcs` into owned types: parse + drop |
     |---|---|---|
     | `SenderSignedData`, mean 1,047 bytes | 490 ns + 32 ns, 1.01 allocs | 1.9 µs + 477 ns, 43 allocs |
     | `CheckpointData`, mean 417 KB | 52 µs + 0.7 µs, 1.02 allocs | 289 µs + 57 µs, 5,184 allocs |
@@ -59,7 +59,7 @@ Every step of the implementation order is done and three review passes
 
     With digests (below), parse + drop against the unhashed baseline:
 
-    | | anchovy, digests included | `bcs` into owned types, no digests | speed-up |
+    | | messages, digests included | `bcs` into owned types, no digests | speed-up |
     |---|---|---|---|
     | `SenderSignedData`, 1,047 bytes | 1.2 µs + 35 ns | 2.1 µs + 441 ns | 2.0x |
     | `SenderSignedData`, exact two-pass | 1.5 µs + 36 ns | 2.0 µs + 430 ns | 1.6x |
@@ -72,7 +72,7 @@ Every step of the implementation order is done and three review passes
     the summary and the contents. Blake2b-256 runs at about 1.3 GB/s here,
     so on the 170-byte summary the hash is most of the time. The baseline
     does not hash, as the reference does not at deserialization time
-    either, and the comparison is left unfair to anchovy that way.
+    either, and the comparison is left unfair to the messages crate that way.
 13. Digests. The types the reference implements `Message` for, and only
     those, carry a `digest` computed once from the wire span while parsing,
     in the build pass only, and handed out by reference: `SenderSignedData`

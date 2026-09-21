@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Writes what sui-types derives from each transaction and effects in a
-//! checkpoint, as text, for anchovy's tests to compare against. Usage:
+//! checkpoint, as text, for the messages tests to compare against. Usage:
 //! `sui-oracle FILE.chk...` writes `FILE.oracle` next to each input.
 //!
 //! A `summary <checkpoint digest>` line, then one record per transaction,

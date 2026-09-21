@@ -5,7 +5,7 @@ edition = "2024"
 license = "Apache-2.0"
 publish = false
 
-# Outside the anchovy workspace: this is the one place that links sui-types,
+# Outside the messages workspace: this is the one place that links sui-types,
 # and only to write test vectors.
 [workspace]
 

@@ -4,7 +4,7 @@
 
 # Runs the parse benchmark over the mainnet corpus, fetching the corpus
 # first if it is missing. Each row is one message type; the last column is
-# the speed-up of anchovy's deserialize-and-drop round trip over the
+# the speed-up of the messages crate's deserialize-and-drop round trip over the
 # baseline's. Numbers are the fastest of several rounds, so they are
 # repeatable to a few percent on a quiet machine.
 

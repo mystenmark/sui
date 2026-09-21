@@ -6,35 +6,35 @@
 
 use std::path::Path;
 
-use anchovy_types::build::base::{
+use messages::build::base::{
     AuthorityPublicKeyBytes, Digest, ObjectId, ProtocolVersion, SuiAddress,
 };
-use anchovy_types::build::checkpoint::{
+use messages::build::checkpoint::{
     CertifiedCheckpointSummary, CheckpointCommitment, CheckpointContents, CheckpointData,
     CheckpointSummary, CheckpointTransaction, FullCheckpointContents,
 };
-use anchovy_types::build::effects::{
+use messages::build::effects::{
     AccumulatorOperation, AccumulatorValue, DeleteKind, IdOperation, ObjectIn, ObjectOut,
     TransactionEffects, TransactionEvents, UnchangedConsensusKind,
 };
-use anchovy_types::build::execution_status::{
+use messages::build::execution_status::{
     CommandArgumentError, ExecutionErrorKind, ExecutionStatus, PackageUpgradeError,
     TypeArgumentError,
 };
-use anchovy_types::build::object::{
+use messages::build::object::{
     Data, GenesisObject, MoveObjectType, MoveObjectTypeInner, Object, ObjectInfoRequestKind, Owner,
 };
-use anchovy_types::build::signature::{CompressedSignature, MultiSig, PublicKey};
-use anchovy_types::build::system_transaction::{
+use messages::build::signature::{CompressedSignature, MultiSig, PublicKey};
+use messages::build::system_transaction::{
     ConsensusDeterminedVersionAssignments, EndOfEpochTransactionKind, ExecutionTimeObservationKey,
     StoredExecutionTimeObservations,
 };
-use anchovy_types::build::transaction::{
+use messages::build::transaction::{
     Argument, CallArg, Command, GasData, Intent, IntentMessage, ObjectArg, Reservation,
     SenderSignedData, SenderSignedTransaction, SharedObjectMutability, TransactionData,
     TransactionDataV1, TransactionExpiration, TransactionKind, WithdrawFrom, WithdrawalTypeArg,
 };
-use anchovy_types::build::type_tag::{StructInput, TypeInput, TypeTag};
+use messages::build::type_tag::{StructInput, TypeInput, TypeTag};
 use serde_reflection::{Registry, Samples, Tracer, TracerConfig};
 
 fn sender_signed_data_sample() -> SenderSignedData {

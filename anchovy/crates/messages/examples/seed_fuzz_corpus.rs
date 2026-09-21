@@ -7,8 +7,8 @@
 
 use std::path::Path;
 
-use anchovy_types::Message;
-use anchovy_types::checkpoint::CheckpointData;
+use messages::Message;
+use messages::checkpoint::CheckpointData;
 
 fn main() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));

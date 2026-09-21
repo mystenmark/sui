@@ -5,29 +5,29 @@
 //! sequence that claims more elements than the remaining bytes could hold.
 //! The smallest value of each type is built here and measured.
 
-use anchovy_types::build::base::{
+use messages::build::base::{
     AccountAddress, Digest, ObjectId, SequenceNumber, SuiAddress, TransactionDigest,
 };
-use anchovy_types::build::checkpoint::CheckpointTransaction;
-use anchovy_types::build::effects::{
+use messages::build::checkpoint::CheckpointTransaction;
+use messages::build::effects::{
     EffectsObjectChange, GasCostSummary, IdOperation, ObjectIn, ObjectOut, TransactionEffects,
     TransactionEffectsV2,
 };
-use anchovy_types::build::execution_status::ExecutionStatus;
-use anchovy_types::build::object::{
+use messages::build::execution_status::ExecutionStatus;
+use messages::build::object::{
     Data, GenesisObject, MoveObject, MoveObjectType, MoveObjectTypeInner, Object, Owner,
 };
-use anchovy_types::build::signature::{
+use messages::build::signature::{
     CompressedSignature, EmptySignInfo, GenericSignature, ZkLoginAuthenticatorAsBytes,
 };
-use anchovy_types::build::system_transaction::EndOfEpochTransactionKind;
-use anchovy_types::build::transaction::{
+use messages::build::system_transaction::EndOfEpochTransactionKind;
+use messages::build::transaction::{
     Argument, CallArg, Command, GasData, Intent, IntentMessage, SenderSignedData,
     SenderSignedTransaction, Transaction, TransactionData, TransactionDataV1,
     TransactionExpiration, TransactionKind,
 };
-use anchovy_types::build::type_tag::TypeTag;
-use anchovy_types::{
+use messages::build::type_tag::TypeTag;
+use messages::{
     Message, Wire, checkpoint, effects, object, signature, system_transaction, transaction,
     type_tag,
 };

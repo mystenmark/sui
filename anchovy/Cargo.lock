@@ -3,18 +3,6 @@
 version = 4
 
 [[package]]
-name = "anchovy-types"
-version = "0.1.0"
-dependencies = [
- "bcs",
- "blake2",
- "serde",
- "serde-reflection",
- "serde_bytes",
- "serde_yaml",
-]
-
-[[package]]
 name = "bcs"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -109,6 +97,18 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "messages"
+version = "0.1.0"
+dependencies = [
+ "bcs",
+ "blake2",
+ "serde",
+ "serde-reflection",
+ "serde_bytes",
+ "serde_yaml",
+]
 
 [[package]]
 name = "once_cell"

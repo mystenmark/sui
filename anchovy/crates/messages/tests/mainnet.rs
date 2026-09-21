@@ -6,13 +6,13 @@
 
 use std::path::{Path, PathBuf};
 
-use anchovy_types::Message;
-use anchovy_types::checkpoint::{CheckpointData, VersionedCheckpointContents};
-use anchovy_types::effects::{
+use messages::Message;
+use messages::checkpoint::{CheckpointData, VersionedCheckpointContents};
+use messages::effects::{
     ChangeKind, ObjectOut, TransactionEffects, TransactionEvents, VersionedEffects,
 };
-use anchovy_types::object::{Data, Object};
-use anchovy_types::transaction::TransactionData;
+use messages::object::{Data, Object};
+use messages::transaction::TransactionData;
 
 /// The bytes of a `.chk` file after its one-byte encoding tag.
 fn read_chk(path: &Path) -> Vec<u8> {

@@ -8,12 +8,12 @@
 
 use std::path::Path;
 
-use anchovy_types::checkpoint::{CertifiedCheckpointSummary, CheckpointContents, CheckpointData};
-use anchovy_types::effects::{TransactionEffects, TransactionEvents};
-use anchovy_types::message::{MAX_ARENA_PER_WIRE_BYTE, MIN_ARENA_GUESS};
-use anchovy_types::object::Object;
-use anchovy_types::transaction::TransactionData;
-use anchovy_types::{Message, Wire};
+use messages::checkpoint::{CertifiedCheckpointSummary, CheckpointContents, CheckpointData};
+use messages::effects::{TransactionEffects, TransactionEvents};
+use messages::message::{MAX_ARENA_PER_WIRE_BYTE, MIN_ARENA_GUESS};
+use messages::object::Object;
+use messages::transaction::TransactionData;
+use messages::{Message, Wire};
 
 struct Rng(u64);
 
@@ -111,7 +111,7 @@ fn seeds() -> Seeds {
 }
 
 fn iterations() -> usize {
-    std::env::var("ANCHOVY_MUTATE_ITERATIONS")
+    std::env::var("MUTATE_ITERATIONS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(20_000)

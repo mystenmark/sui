@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/anchovy-types"]
+members = ["crates/messages"]
 exclude = ["tools/sui-oracle"]
 
 [workspace.package]
