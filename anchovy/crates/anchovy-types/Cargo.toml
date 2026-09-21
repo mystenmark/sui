@@ -14,5 +14,9 @@ serde_bytes.workspace = true
 serde-reflection.workspace = true
 serde_yaml.workspace = true
 
+[[bench]]
+name = "parse"
+harness = false
+
 [lints]
 workspace = true

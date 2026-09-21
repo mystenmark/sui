@@ -104,6 +104,15 @@ impl<T: Wire> Message<T> {
         }
     }
 
+    /// The arena size parsing `bytes` would need, without allocating it.
+    pub fn measure(bytes: &[u8]) -> Result<usize> {
+        let mut measure = Measure::default();
+        let mut r = Reader::new(bytes);
+        T::parse(&mut r, &mut measure)?;
+        r.finish()?;
+        Ok(measure.size())
+    }
+
     fn parse_inner(wire: &WireBuf) -> Result<(T::View<'static>, Arena)> {
         // SAFETY: the bytes live on the heap until the `WireBuf` is dropped,
         // which is after every use of the view: `get` ties the view's
@@ -125,7 +134,8 @@ impl<T: Wire> Message<T> {
         // SAFETY: the arena is returned alongside the view and kept in the
         // same `Message`; its allocation does not move when the `Arena` does.
         let mut build = unsafe { Build::<'static>::new(&mut arena) };
-        let mut r = Reader::new(bytes);
+        // SAFETY: step 1 drove `T::parse` to success over these bytes.
+        let mut r = unsafe { Reader::revisit(bytes) };
         let view = T::parse(&mut r, &mut build)?;
         r.finish()?;
         if build.used() != arena.size() {

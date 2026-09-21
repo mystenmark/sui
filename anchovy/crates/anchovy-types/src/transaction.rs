@@ -25,22 +25,18 @@ pub enum Argument {
 impl Argument {
     pub const MIN_WIRE_SIZE: usize = 1;
 
+    #[inline]
     pub fn parse(r: &mut Reader<'_>) -> Result<Argument> {
-        r.enter()?;
-        let arg = match r.variant()? {
-            0 => Argument::GasCoin,
-            1 => Argument::Input(r.u16()?),
-            2 => Argument::Result(r.u16()?),
-            3 => Argument::NestedResult(r.u16()?, r.u16()?),
-            tag => {
-                return Err(ParseError::UnknownVariant {
-                    ty: "Argument",
-                    tag,
-                });
-            }
-        };
-        r.leave();
-        Ok(arg)
+        match r.variant()? {
+            0 => Ok(Argument::GasCoin),
+            1 => Ok(Argument::Input(r.u16()?)),
+            2 => Ok(Argument::Result(r.u16()?)),
+            3 => Ok(Argument::NestedResult(r.u16()?, r.u16()?)),
+            tag => Err(ParseError::UnknownVariant {
+                ty: "Argument",
+                tag,
+            }),
+        }
     }
 
     pub fn parse_vec<'a, A: Alloc<'a>>(r: &mut Reader<'a>, a: &mut A) -> Result<&'a [Argument]> {
@@ -116,21 +112,17 @@ pub enum ObjectArg<'a> {
 }
 
 impl<'a> ObjectArg<'a> {
+    #[inline]
     pub fn parse(r: &mut Reader<'a>) -> Result<ObjectArg<'a>> {
-        r.enter()?;
-        let arg = match r.variant()? {
-            0 => ObjectArg::ImmOrOwnedObject(ObjectRef::parse(r)?),
-            1 => ObjectArg::SharedObject(SharedObjectArg::parse(r)?),
-            2 => ObjectArg::Receiving(ObjectRef::parse(r)?),
-            tag => {
-                return Err(ParseError::UnknownVariant {
-                    ty: "ObjectArg",
-                    tag,
-                });
-            }
-        };
-        r.leave();
-        Ok(arg)
+        match r.variant()? {
+            0 => Ok(ObjectArg::ImmOrOwnedObject(ObjectRef::parse(r)?)),
+            1 => Ok(ObjectArg::SharedObject(SharedObjectArg::parse(r)?)),
+            2 => Ok(ObjectArg::Receiving(ObjectRef::parse(r)?)),
+            tag => Err(ParseError::UnknownVariant {
+                ty: "ObjectArg",
+                tag,
+            }),
+        }
     }
 }
 

@@ -90,6 +90,7 @@ pub struct SliceWriter<'a, T> {
 }
 
 impl<'a, T: Copy + 'a> SliceWriter<'a, T> {
+    #[inline]
     pub fn push(&mut self, v: T) {
         if self.ptr.is_null() {
             return;
@@ -98,6 +99,22 @@ impl<'a, T: Copy + 'a> SliceWriter<'a, T> {
         // SAFETY: `ptr` is valid for `cap` writes of `T` and `len < cap`.
         unsafe { self.ptr.add(self.len).write(v) };
         self.len += 1;
+    }
+
+    /// Pushes `v` unless it equals the value pushed last. Cheap relief for
+    /// `sort_dedup` when repeats tend to be adjacent.
+    #[inline]
+    pub fn push_unless_repeat(&mut self, v: T)
+    where
+        T: PartialEq,
+    {
+        if !self.ptr.is_null() && self.len > 0 {
+            // SAFETY: slot `len - 1` was written by `push`.
+            if unsafe { *self.ptr.add(self.len - 1) } == v {
+                return;
+            }
+        }
+        self.push(v);
     }
 
     /// Sorts what has been pushed and drops repeats. The reservation keeps

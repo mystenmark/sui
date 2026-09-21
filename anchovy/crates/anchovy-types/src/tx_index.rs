@@ -169,7 +169,7 @@ fn push_type_packages(ty: &TypeInput<'_>, packages: &mut SliceWriter<'_, ObjectI
     match ty {
         TypeInput::Vector(inner) => push_type_packages(inner, packages),
         TypeInput::Struct(s) => {
-            packages.push(ObjectId(s.address.0));
+            packages.push_unless_repeat(ObjectId(s.address.0));
             for param in s.type_params {
                 push_type_packages(param, packages);
             }
@@ -181,7 +181,7 @@ fn push_type_packages(ty: &TypeInput<'_>, packages: &mut SliceWriter<'_, ObjectI
 fn push_command_packages(command: &Command<'_>, packages: &mut SliceWriter<'_, ObjectId>) {
     match command {
         Command::MoveCall(call) => {
-            packages.push(*call.package);
+            packages.push_unless_repeat(*call.package);
             for ty in call.type_arguments {
                 push_type_packages(ty, packages);
             }
