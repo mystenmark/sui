@@ -54,6 +54,25 @@ under "Open" below.
     Drop frees the input buffer on both sides; the exact two-pass parse of
     a signed transaction is 795 ns + 33 ns.
 
+    With digests (below) the parse of a signed transaction is 1.2 µs and of
+    a checkpoint 364 µs, since a checkpoint hashes nearly all of its bytes
+    (every object, effects and events) and Blake2b-256 runs at about
+    1.3 GB/s here. The baseline rows hash their input buffer once.
+14. Digests. Every hashed view (`TransactionData`, `TransactionEffects`,
+    `TransactionEvents`, `Object`, `CheckpointSummary`,
+    `CheckpointContents`) carries a `digest` computed once from its wire
+    span while parsing, in the build pass only, and handed out by reference
+    (`SenderSignedData::digest()` is its transaction's). The reference's
+    digest is Blake2b-256 over `"<serde name>::"` then the BCS bytes
+    (`default_hash` via `Signable::write` in `crypto.rs`); intents are a
+    separate layer that only applies to what is signed. Confirmed on all
+    64 corpus checkpoints: transaction and effects digests equal those in
+    the checkpoint contents, events digests those in effects, contents
+    digests the summary's `content_digest`, object digests those in
+    effects, and the summary digest that of sui-types via the oracle.
+    Hashing uses the `blake2` crate at sui's version, the same crate behind
+    fastcrypto's `Blake2b256`, without fastcrypto's dependency tree.
+
     `Message::parse` is single-pass: it reserves an arena guessed from the
     wire size (`Wire::ARENA_GUESS_SIXTEENTHS`, set per type to the mainnet
     p99 of arena over wire, floor 256 bytes) and falls back to the exact
