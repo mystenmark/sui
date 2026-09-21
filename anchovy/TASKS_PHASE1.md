@@ -46,10 +46,13 @@ under "Open" below.
     `cd fuzz && cargo +nightly fuzz run <target>`.
 12. `benches/parse.rs` (`cargo bench`), over the corpus, fat LTO:
 
-    | | anchovy | `bcs` into owned types |
+    | | anchovy: parse + drop | `bcs` into owned types: parse + drop |
     |---|---|---|
-    | `SenderSignedData`, mean 1,047 bytes | 490 ns, 1.01 allocs | 2.0 µs, 43 allocs |
-    | `CheckpointData`, mean 417 KB | 54 µs, 1.02 allocs | 290 µs, 5,184 allocs |
+    | `SenderSignedData`, mean 1,047 bytes | 490 ns + 32 ns, 1.01 allocs | 1.9 µs + 477 ns, 43 allocs |
+    | `CheckpointData`, mean 417 KB | 52 µs + 0.7 µs, 1.02 allocs | 289 µs + 57 µs, 5,184 allocs |
+
+    Drop frees the input buffer on both sides; the exact two-pass parse of
+    a signed transaction is 795 ns + 33 ns.
 
     `Message::parse` is single-pass: it reserves an arena guessed from the
     wire size (`Wire::ARENA_GUESS_SIXTEENTHS`, set per type to the mainnet
