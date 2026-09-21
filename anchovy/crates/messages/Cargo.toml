@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+containers.workspace = true
 bcs.workspace = true
 blake2.workspace = true
 serde.workspace = true
@@ -21,3 +22,7 @@ harness = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "build"
+harness = false

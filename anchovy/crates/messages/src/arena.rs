@@ -57,6 +57,11 @@ pub trait Alloc<'a> {
 pub struct Ref<'a, T>(Option<&'a T>);
 
 impl<'a, T> Ref<'a, T> {
+    /// A handle to a value that lives elsewhere, for building views by hand.
+    pub fn new(value: &'a T) -> Ref<'a, T> {
+        Ref(Some(value))
+    }
+
     /// The value, for the arena's whole lifetime rather than this handle's.
     pub fn get(self) -> &'a T {
         self.0.expect("measure-pass value dereferenced")

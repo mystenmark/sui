@@ -45,27 +45,35 @@ impl Drop for Chunk {
 /// never fails, at the cost of a second free; [`Bump::chunks`] reports how
 /// many there are so callers that promised one allocation can check.
 pub struct Bump {
-    // The chunk being bumped, then the full ones. Never empty.
-    chunks: RefCell<Vec<Chunk>>,
+    /// The chunk being bumped: its base and size.
+    current: Cell<(NonNull<u8>, usize)>,
     used: Cell<usize>,
     /// Every allocation ever made, chunk changes included.
     allocated: Cell<usize>,
+    // Only ever read through `current`; held so that it is freed with the arena.
+    _first: Chunk,
+    /// Chunks after the first, oldest first. An empty `Vec` allocates
+    /// nothing, so an arena that never overflows is one allocation.
+    extra: RefCell<Vec<Chunk>>,
 }
 
 impl Bump {
     /// An arena with `capacity` bytes in its first chunk.
     pub fn with_capacity(capacity: usize) -> Bump {
+        let first = Chunk::new(capacity.max(CHUNK_ALIGN));
         Bump {
-            chunks: RefCell::new(vec![Chunk::new(capacity.max(CHUNK_ALIGN))]),
+            current: Cell::new((first.ptr, first.size)),
             used: Cell::new(0),
             allocated: Cell::new(0),
+            _first: first,
+            extra: RefCell::new(Vec::new()),
         }
     }
 
     /// How many chunks have been allocated. One means the initial capacity
     /// was enough.
     pub fn chunks(&self) -> usize {
-        self.chunks.borrow().len()
+        1 + self.extra.borrow().len()
     }
 
     /// Bytes handed out so far, alignment padding included, across chunks.
@@ -83,26 +91,26 @@ impl Bump {
         assert!(layout.align() <= CHUNK_ALIGN, "over-aligned arena value");
         let start = self.used.get().next_multiple_of(layout.align());
         let end = start.saturating_add(layout.size());
-        let chunk_size = self.chunks.borrow().last().expect("a chunk").size;
-        if end > chunk_size {
+        let (base, size) = self.current.get();
+        if end > size {
             return self.alloc_slow(layout);
         }
         self.used.set(end);
         self.allocated.set(self.allocated.get() + (end - start));
-        let base = self.chunks.borrow().last().expect("a chunk").ptr;
-        // SAFETY: `start + size <= chunk_size`, so the range is inside the
+        // SAFETY: `start + size <= chunk size`, so the range is inside the
         // chunk; the chunk outlives every allocation, being freed with `self`.
         let ptr = unsafe { NonNull::new_unchecked(base.as_ptr().add(start)) };
         NonNull::slice_from_raw_parts(ptr, layout.size())
     }
 
-    /// A new chunk at least as large as the last and as the request.
+    /// A new chunk at least twice the last and large enough for the request.
     #[cold]
     fn alloc_slow(&self, layout: Layout) -> NonNull<[u8]> {
-        let last = self.chunks.borrow().last().expect("a chunk").size;
-        let size = last.max(layout.size()).saturating_mul(2);
-        self.chunks.borrow_mut().push(Chunk::new(size));
+        let (_, last) = self.current.get();
+        let chunk = Chunk::new(last.max(layout.size()).saturating_mul(2));
+        self.current.set((chunk.ptr, chunk.size));
         self.used.set(0);
+        self.extra.borrow_mut().push(chunk);
         self.alloc(layout)
     }
 }

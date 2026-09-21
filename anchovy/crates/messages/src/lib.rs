@@ -16,6 +16,7 @@ pub mod checkpoint;
 pub mod effects;
 pub mod error;
 pub mod execution_status;
+pub mod fast;
 pub mod message;
 pub mod object;
 pub mod reader;

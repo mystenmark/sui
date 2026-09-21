@@ -154,6 +154,7 @@ version = "0.1.0"
 dependencies = [
  "bcs",
  "blake2",
+ "containers",
  "serde",
  "serde-reflection",
  "serde_bytes",
