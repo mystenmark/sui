@@ -6,8 +6,13 @@ license.workspace = true
 publish = false
 
 [dependencies]
+bcs.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
 
 [dev-dependencies]
+serde-reflection.workspace = true
+serde_yaml.workspace = true
 
 [lints]
 workspace = true

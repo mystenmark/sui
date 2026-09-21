@@ -11,6 +11,7 @@
 
 pub mod arena;
 pub mod base;
+pub mod build;
 pub mod checkpoint;
 pub mod effects;
 pub mod error;
@@ -18,6 +19,7 @@ pub mod execution_status;
 pub mod message;
 pub mod object;
 pub mod reader;
+pub mod signature;
 pub mod system_transaction;
 pub mod transaction;
 pub mod tx_index;
