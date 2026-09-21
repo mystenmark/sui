@@ -14,7 +14,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anchovy_types::Message;
-use anchovy_types::base::Digest;
 use anchovy_types::build;
 use anchovy_types::checkpoint::CheckpointData;
 use anchovy_types::transaction::SenderSignedData;
@@ -165,12 +164,12 @@ fn main() {
         &corpus.transactions,
         &m,
     );
-    // The baseline keeps its input buffer too, so that both drops free it,
-    // and hashes the buffer, since anchovy's parse includes the digest.
+    // The baseline keeps its input buffer too, so that both drops free it.
+    // It does not hash: the reference computes digests separately, on
+    // demand, so anchovy's parse is doing more than the baseline's.
     let m = measure(&corpus.transactions, 30, |b| {
         (
             bcs::from_bytes::<build::transaction::SenderSignedData>(&b).unwrap(),
-            black_box(Digest::of("TransactionData", &b)),
             b,
         )
     });
@@ -184,12 +183,9 @@ fn main() {
         Message::<CheckpointData<'static>>::parse(b).unwrap()
     });
     report("CheckpointData    anchovy", &corpus.checkpoints, &m);
-    // Anchovy hashes each transaction, effects, events and object, which is
-    // nearly the whole buffer; the baseline hashes the buffer once.
     let m = measure(&corpus.checkpoints, 10, |b| {
         (
             bcs::from_bytes::<build::checkpoint::CheckpointData>(&b).unwrap(),
-            black_box(Digest::of("CheckpointData", &b)),
             b,
         )
     });
