@@ -1,0 +1,33 @@
+[package]
+name = "fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Built with a nightly toolchain and sanitizers, so kept out of the main workspace.
+[workspace]
+
+[dependencies]
+messages = { path = "../crates/messages" }
+libfuzzer-sys = "0.4"
+# The version sui pins: the differential target compares against its rules.
+bcs = "=0.1.6"
+serde = "1"
+
+[[bin]]
+name = "parse"
+path = "fuzz_targets/parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "differential"
+path = "fuzz_targets/differential.rs"
+test = false
+doc = false
+bench = false

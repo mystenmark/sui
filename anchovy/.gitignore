@@ -1,0 +1,3 @@
+/corpus/
+# The repo root ignores every `build`, meaning Move output.
+!/crates/messages/src/build
