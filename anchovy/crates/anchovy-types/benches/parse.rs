@@ -146,90 +146,96 @@ fn measure<T>(inputs: &[Vec<u8>], rounds: usize, f: impl Fn(Vec<u8>) -> T) -> Me
     }
 }
 
-fn report(name: &str, inputs: &[Vec<u8>], m: &Measurement) {
-    let bytes: usize = inputs.iter().map(Vec::len).sum();
-    let mean_len = bytes / inputs.len();
-    let total = m.parse + m.drop;
-    let mb_per_s = mean_len as f64 / total.as_secs_f64() / 1e6;
+fn header() {
     println!(
-        "{name:<44} parse {:>9.1?}  drop {:>9.1?}  total {:>9.1?} {:>7.0} MB/s {:>8.2} allocs  ({} items, mean {} bytes)",
+        "{:<28} {:>6} {:>6} | {:<32} | {:<32} | {:>8}",
+        "", "items", "bytes", "anchovy", "bcs + owned types", "speed-up"
+    );
+    let columns = format!(
+        "{:>8} {:>8} {:>8} {:>6}",
+        "parse", "drop", "total", "allocs"
+    );
+    println!(
+        "{:<28} {:>6} {:>6} | {columns} | {columns} | {:>8}",
+        "", "", "mean", "total"
+    );
+}
+
+fn cell(m: &Measurement) -> String {
+    format!(
+        "{:>8.1?} {:>8.1?} {:>8.1?} {:>6.1}",
         m.parse,
         m.drop,
-        total,
-        mb_per_s,
-        m.allocations,
+        m.parse + m.drop,
+        m.allocations
+    )
+}
+
+/// One row: anchovy against the baseline on the same inputs. The last
+/// column is the baseline's parse-and-drop time over anchovy's.
+fn compare<A, B>(
+    name: &str,
+    inputs: &[Vec<u8>],
+    rounds: usize,
+    anchovy: impl Fn(Vec<u8>) -> A,
+    baseline: impl Fn(Vec<u8>) -> B,
+) {
+    let a = measure(inputs, rounds, anchovy);
+    let b = measure(inputs, rounds, baseline);
+    let speed_up = (b.parse + b.drop).as_secs_f64() / (a.parse + a.drop).as_secs_f64();
+    let mean_len = inputs.iter().map(Vec::len).sum::<usize>() / inputs.len();
+    println!(
+        "{name:<28} {:>6} {:>6} | {} | {} | {speed_up:>7.2}x",
         inputs.len(),
-        mean_len
+        mean_len,
+        cell(&a),
+        cell(&b)
     );
+}
+
+/// The baseline keeps its input buffer, so that both drops free it. It
+/// does not hash: the reference computes digests on demand, not while
+/// deserializing, so anchovy's parse does more than the baseline's.
+fn baseline<T: serde::de::DeserializeOwned>(b: Vec<u8>) -> (T, Vec<u8>) {
+    (bcs::from_bytes::<T>(&b).unwrap(), b)
 }
 
 fn main() {
     let corpus = load();
-
-    let m = measure(&corpus.transactions, 30, |b| {
-        Message::<SenderSignedData<'static>>::parse(b).unwrap()
-    });
-    report("SenderSignedData  anchovy", &corpus.transactions, &m);
-    let m = measure(&corpus.transactions, 30, |b| {
-        Message::<SenderSignedData<'static>>::parse_exact(b).unwrap()
-    });
-    report(
-        "SenderSignedData  anchovy, exact two-pass",
+    header();
+    compare(
+        "SenderSignedData",
         &corpus.transactions,
-        &m,
+        30,
+        |b| Message::<SenderSignedData<'static>>::parse(b).unwrap(),
+        baseline::<build::transaction::SenderSignedData>,
     );
-    // The baseline keeps its input buffer too, so that both drops free it.
-    // It does not hash: the reference computes digests separately, on
-    // demand, so anchovy's parse is doing more than the baseline's.
-    let m = measure(&corpus.transactions, 30, |b| {
-        (
-            bcs::from_bytes::<build::transaction::SenderSignedData>(&b).unwrap(),
-            b,
-        )
-    });
-    report(
-        "SenderSignedData  bcs + owned types",
+    compare(
+        "SenderSignedData, exact",
         &corpus.transactions,
-        &m,
+        30,
+        |b| Message::<SenderSignedData<'static>>::parse_exact(b).unwrap(),
+        baseline::<build::transaction::SenderSignedData>,
     );
-
-    let m = measure(&corpus.summaries, 30, |b| {
-        Message::<CheckpointSummary<'static>>::parse(b).unwrap()
-    });
-    report("CheckpointSummary anchovy", &corpus.summaries, &m);
-    let m = measure(&corpus.summaries, 30, |b| {
-        (
-            bcs::from_bytes::<build::checkpoint::CheckpointSummary>(&b).unwrap(),
-            b,
-        )
-    });
-    report("CheckpointSummary bcs + owned types", &corpus.summaries, &m);
-
-    let m = measure(&corpus.contents, 30, |b| {
-        Message::<CheckpointContents<'static>>::parse(b).unwrap()
-    });
-    report("CheckpointContents anchovy", &corpus.contents, &m);
-    let m = measure(&corpus.contents, 30, |b| {
-        (
-            bcs::from_bytes::<build::checkpoint::CheckpointContents>(&b).unwrap(),
-            b,
-        )
-    });
-    report("CheckpointContents bcs + owned types", &corpus.contents, &m);
-
-    let m = measure(&corpus.checkpoint_data, 10, |b| {
-        Message::<CheckpointData<'static>>::parse(b).unwrap()
-    });
-    report("CheckpointData    anchovy", &corpus.checkpoint_data, &m);
-    let m = measure(&corpus.checkpoint_data, 10, |b| {
-        (
-            bcs::from_bytes::<build::checkpoint::CheckpointData>(&b).unwrap(),
-            b,
-        )
-    });
-    report(
-        "CheckpointData    bcs + owned types",
+    compare(
+        "CheckpointSummary",
+        &corpus.summaries,
+        30,
+        |b| Message::<CheckpointSummary<'static>>::parse(b).unwrap(),
+        baseline::<build::checkpoint::CheckpointSummary>,
+    );
+    compare(
+        "CheckpointContents",
+        &corpus.contents,
+        30,
+        |b| Message::<CheckpointContents<'static>>::parse(b).unwrap(),
+        baseline::<build::checkpoint::CheckpointContents>,
+    );
+    compare(
+        "CheckpointData",
         &corpus.checkpoint_data,
-        &m,
+        10,
+        |b| Message::<CheckpointData<'static>>::parse(b).unwrap(),
+        baseline::<build::checkpoint::CheckpointData>,
     );
 }
