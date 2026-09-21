@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = ["crates/messages"]
+exclude = ["tools/sui-oracle"]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# Pinned to the version in sui's Cargo.lock: accept/reject behaviour must match.
+bcs = "=0.1.6"
+# The crate behind fastcrypto's Blake2b256, at the version sui's lockfile has.
+blake2 = "=0.10.6"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+serde-reflection = "0.5.0"
+serde_yaml = "0.9"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+
+[profile.release]
+debug = true
+
+[profile.bench]
+debug = true
+lto = "fat"
+codegen-units = 1
