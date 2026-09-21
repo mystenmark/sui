@@ -29,11 +29,17 @@ pub use error::{ParseError, Result};
 pub use message::{Message, Wire, WireBuf};
 
 /// Implements [`Wire`] for a view type with an inherent `parse(r, a)`.
+/// `guess = N` sets the single-pass arena guess to `N / 16` of the wire size.
 macro_rules! impl_wire {
     ($ty:ident) => {
+        $crate::impl_wire!($ty, guess = 16);
+    };
+    ($ty:ident, guess = $sixteenths:expr) => {
         // SAFETY: `shrink` is the identity, so `$ty` is covariant.
         unsafe impl $crate::message::Wire for $ty<'static> {
             type View<'a> = $ty<'a>;
+
+            const ARENA_GUESS_SIXTEENTHS: usize = $sixteenths;
 
             fn parse<'a, A: $crate::arena::Alloc<'a>>(
                 r: &mut $crate::reader::Reader<'a>,
@@ -52,6 +58,8 @@ macro_rules! impl_wire {
         // SAFETY: `shrink` is the identity, so `$ty` is covariant.
         unsafe impl $crate::message::Wire for $ty<'static> {
             type View<'a> = $ty<'a>;
+
+            const ARENA_GUESS_SIXTEENTHS: usize = 0;
 
             fn parse<'a, A: $crate::arena::Alloc<'a>>(
                 r: &mut $crate::reader::Reader<'a>,

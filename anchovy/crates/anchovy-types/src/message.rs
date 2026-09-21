@@ -21,6 +21,11 @@ use crate::reader::Reader;
 pub unsafe trait Wire: 'static {
     type View<'a>: Copy + 'a;
 
+    /// How much arena a single-pass parse reserves, in sixteenths of the
+    /// wire size. Picked per type from mainnet data so that about 99% of
+    /// messages fit; the rest are parsed again with a measured arena.
+    const ARENA_GUESS_SIXTEENTHS: usize;
+
     fn parse<'a, A: Alloc<'a>>(r: &mut Reader<'a>, a: &mut A) -> Result<Self::View<'a>>;
 
     fn shrink<'l, 's: 'l>(v: &'l Self::View<'s>) -> &'l Self::View<'l>;
@@ -86,7 +91,12 @@ pub struct Message<T: Wire> {
     view: T::View<'static>,
     wire: WireBuf,
     arena: Arena,
+    arena_used: usize,
 }
+
+/// The smallest single-pass guess, so that tiny messages with a fixed
+/// overhead do not fall back.
+const MIN_ARENA_GUESS: usize = 256;
 
 // SAFETY: a `Message` is immutable after construction and owns what `view`
 // points to, so it is as thread-safe as the view's contents.
@@ -96,12 +106,60 @@ unsafe impl<T: Wire> Sync for Message<T> where for<'a> T::View<'a>: Sync {}
 
 impl<T: Wire> Message<T> {
     /// Parses `wire` as exactly one `T`. On failure the buffer is handed back.
+    ///
+    /// One pass into an arena guessed from the wire size; if the guess is
+    /// too small, the exact two-pass parse runs instead. The arena may
+    /// therefore be larger than what is used.
     pub fn parse(wire: impl Into<WireBuf>) -> std::result::Result<Self, (ParseError, WireBuf)> {
         let wire = wire.into();
-        match Self::parse_inner(&wire) {
-            Ok((view, arena)) => Ok(Message { view, wire, arena }),
+        let guess = match T::ARENA_GUESS_SIXTEENTHS {
+            0 => 0,
+            n => (wire.len * n / 16).max(MIN_ARENA_GUESS),
+        };
+        let result = match Self::parse_guessed(&wire, guess) {
+            Err(ParseError::ArenaFull) => Self::parse_measured(&wire),
+            result => result,
+        };
+        match result {
+            Ok((view, arena, arena_used)) => Ok(Message {
+                view,
+                wire,
+                arena,
+                arena_used,
+            }),
             Err(e) => Err((e, wire)),
         }
+    }
+
+    /// Like `parse`, but always two passes and an arena of exactly the size
+    /// used. For messages that will be held for a long time.
+    pub fn parse_exact(
+        wire: impl Into<WireBuf>,
+    ) -> std::result::Result<Self, (ParseError, WireBuf)> {
+        let wire = wire.into();
+        match Self::parse_measured(&wire) {
+            Ok((view, arena, arena_used)) => Ok(Message {
+                view,
+                wire,
+                arena,
+                arena_used,
+            }),
+            Err(e) => Err((e, wire)),
+        }
+    }
+
+    /// One validating pass into an arena of `size` bytes.
+    fn parse_guessed(wire: &WireBuf, size: usize) -> Result<(T::View<'static>, Arena, usize)> {
+        // SAFETY: as in `parse_measured`.
+        let bytes: &'static [u8] =
+            unsafe { std::slice::from_raw_parts(wire.ptr.as_ptr(), wire.len) };
+        let mut arena = Arena::new(size)?;
+        // SAFETY: as in `parse_measured`.
+        let mut build = unsafe { Build::<'static>::new(&mut arena) };
+        let mut r = Reader::new(bytes);
+        let view = T::parse(&mut r, &mut build)?;
+        r.finish()?;
+        Ok((view, arena, build.used()))
     }
 
     /// The arena size parsing `bytes` would need, without allocating it.
@@ -113,7 +171,7 @@ impl<T: Wire> Message<T> {
         Ok(measure.size())
     }
 
-    fn parse_inner(wire: &WireBuf) -> Result<(T::View<'static>, Arena)> {
+    fn parse_measured(wire: &WireBuf) -> Result<(T::View<'static>, Arena, usize)> {
         // SAFETY: the bytes live on the heap until the `WireBuf` is dropped,
         // which is after every use of the view: `get` ties the view's
         // lifetime to a borrow of the `Message` that owns the buffer, and on
@@ -141,7 +199,7 @@ impl<T: Wire> Message<T> {
         if build.used() != arena.size() {
             return Err(ParseError::ArenaMismatch);
         }
-        Ok((view, arena))
+        Ok((view, arena, build.used()))
     }
 
     pub fn get(&self) -> &T::View<'_> {
@@ -152,8 +210,14 @@ impl<T: Wire> Message<T> {
         self.wire.as_slice()
     }
 
+    /// The arena allocation. After `parse` it may exceed `arena_used`.
     pub fn arena_size(&self) -> usize {
         self.arena.size()
+    }
+
+    /// The arena bytes the view points into.
+    pub fn arena_used(&self) -> usize {
+        self.arena_used
     }
 }
 

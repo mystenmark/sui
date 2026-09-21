@@ -510,5 +510,6 @@ impl<'a> TransactionEvents<'a> {
     }
 }
 
-crate::impl_wire!(TransactionEffects);
-crate::impl_wire!(TransactionEvents);
+// Mainnet p99 of arena over wire size: 0.61 and 0.88.
+crate::impl_wire!(TransactionEffects, guess = 10);
+crate::impl_wire!(TransactionEvents, guess = 15);

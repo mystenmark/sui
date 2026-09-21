@@ -128,14 +128,16 @@ mod tests {
         };
         assert_eq!(**inner, TypeTag::U8);
         // A StructTag, one type parameter, and the vector's element.
-        assert_eq!(m.arena_size(), 56 + 16 + 16);
+        assert_eq!(m.arena_used(), 56 + 16 + 16);
     }
 
     #[test]
     fn primitive_needs_no_arena() {
         let m = Message::<TypeTag<'static>>::parse(vec![2]).unwrap();
         assert_eq!(*m.get(), TypeTag::U64);
-        assert_eq!(m.arena_size(), 0);
+        assert_eq!(m.arena_used(), 0);
+        let exact = Message::<TypeTag<'static>>::parse_exact(vec![2]).unwrap();
+        assert_eq!(exact.arena_size(), 0);
     }
 
     #[test]

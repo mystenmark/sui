@@ -63,7 +63,10 @@ fn parse_checked<T: Wire>(bytes: Vec<u8>) -> Option<Message<T>> {
     let len = bytes.len();
     match Message::<T>::parse(bytes) {
         Ok(m) => {
-            assert!(m.arena_size() <= len * MAX_ARENA_PER_WIRE_BYTE);
+            assert!(m.arena_used() <= len * MAX_ARENA_PER_WIRE_BYTE);
+            // The single-pass guess is a small multiple of the input, with a
+            // floor; a fallback arena is exactly what is used.
+            assert!(m.arena_size() <= (len * 3).max(256).max(m.arena_used()));
             Some(m)
         }
         Err((_, returned)) => {

@@ -255,7 +255,7 @@ impl<'a> Alloc<'a> for Build<'a> {
         let mut off = self.off;
         let start = bump(&mut off, layout)?;
         if off > self.size {
-            return Err(ParseError::ArenaMismatch);
+            return Err(ParseError::ArenaFull);
         }
         self.off = off;
         let ptr = if layout.size() == 0 {

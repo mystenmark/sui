@@ -34,6 +34,9 @@ pub enum ParseError {
     /// `SenderSignedData` with other than one transaction.
     NotOneTransaction,
     WireTooLarge,
+    /// A single-pass build outgrew its guessed arena; the caller retries
+    /// with a measured one. Never returned from `Message::parse`.
+    ArenaFull,
     /// The build pass did not allocate what the measure pass counted. Always a bug.
     ArenaMismatch,
 }

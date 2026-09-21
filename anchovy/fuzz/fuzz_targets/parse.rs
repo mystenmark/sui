@@ -21,6 +21,8 @@ use anchovy_types::{Message, Wire};
 use libfuzzer_sys::fuzz_target;
 
 const MAX_ARENA_PER_WIRE_BYTE: usize = 32;
+/// Must match `message::MIN_ARENA_GUESS`.
+const MIN_ARENA_GUESS: usize = 256;
 
 struct Counting;
 
@@ -53,14 +55,17 @@ fn parse<T: Wire>(bytes: &[u8]) {
     let allocations = ALLOCATIONS.load(Ordering::Relaxed) - allocations;
     let allocated = ALLOCATED_BYTES.load(Ordering::Relaxed) - allocated;
 
-    assert!(allocations <= 1, "{allocations} allocations");
+    // A guessed arena, and a measured one if the guess fell short.
+    assert!(allocations <= 2, "{allocations} allocations");
     assert!(
-        allocated <= bytes.len() * MAX_ARENA_PER_WIRE_BYTE,
+        allocated <= (bytes.len() + MIN_ARENA_GUESS) * (MAX_ARENA_PER_WIRE_BYTE + 3),
         "{allocated} bytes allocated for {} of input",
         bytes.len()
     );
     if let Ok(m) = result {
-        assert_eq!(m.arena_size(), allocated);
+        assert!(m.arena_used() <= m.arena_size());
+        assert!(m.arena_size() <= allocated);
+        assert!(m.arena_used() <= bytes.len() * MAX_ARENA_PER_WIRE_BYTE);
     }
 }
 

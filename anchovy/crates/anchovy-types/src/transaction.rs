@@ -265,6 +265,8 @@ impl<'a> ProgrammableMoveCall<'a> {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Command<'a> {
+    /// Inline, though it makes every `Command` 80 bytes: nearly all commands
+    /// are calls, so boxing would add a pointer and padding to each.
     MoveCall(ProgrammableMoveCall<'a>),
     TransferObjects(&'a [Argument], Argument),
     SplitCoins(Argument, &'a [Argument]),
@@ -679,5 +681,6 @@ impl<'a> SenderSignedData<'a> {
     }
 }
 
-crate::impl_wire!(TransactionData);
-crate::impl_wire!(SenderSignedData);
+// Mainnet p99 of arena over wire size: 2.16 and 2.09.
+crate::impl_wire!(TransactionData, guess = 35);
+crate::impl_wire!(SenderSignedData, guess = 34);

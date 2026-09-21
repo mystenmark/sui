@@ -370,6 +370,8 @@ impl<'a> CheckpointData<'a> {
 
 crate::impl_wire!(CheckpointSummary, no_arena);
 crate::impl_wire!(CertifiedCheckpointSummary, no_arena);
-crate::impl_wire!(CheckpointContents);
-crate::impl_wire!(FullCheckpointContents);
-crate::impl_wire!(CheckpointData);
+// Mainnet p99 of arena over wire size: 0.34 and 0.76. Full contents are
+// not served on mainnet; the guess is a blend of transactions and effects.
+crate::impl_wire!(CheckpointContents, guess = 6);
+crate::impl_wire!(FullCheckpointContents, guess = 24);
+crate::impl_wire!(CheckpointData, guess = 13);
