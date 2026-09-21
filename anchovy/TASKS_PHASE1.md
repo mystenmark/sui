@@ -54,17 +54,28 @@ under "Open" below.
     Drop frees the input buffer on both sides; the exact two-pass parse of
     a signed transaction is 795 ns + 33 ns.
 
-    With digests (below) the parse of a signed transaction is 1.1 µs and of
-    a checkpoint 365 µs, since a checkpoint hashes nearly all of its bytes
-    (every object, effects and events) and Blake2b-256 runs at about
-    1.3 GB/s here. The baseline does not hash, as the reference does not
-    at deserialization time either; the comparison is deliberately unfair
-    to anchovy in that respect.
-14. Digests. Every hashed view (`TransactionData`, `TransactionEffects`,
-    `TransactionEvents`, `Object`, `CheckpointSummary`,
-    `CheckpointContents`) carries a `digest` computed once from its wire
-    span while parsing, in the build pass only, and handed out by reference
-    (`SenderSignedData::digest()` is its transaction's). The reference's
+    With digests (below), parse + drop against the unhashed baseline:
+
+    | | anchovy, digests included | `bcs` into owned types, no digests |
+    |---|---|---|
+    | `SenderSignedData`, 1,047 bytes | 1.2 µs + 32 ns | 1.9 µs + 409 ns |
+    | `CheckpointSummary`, 170 bytes | 207 ns + 5 ns | 83 ns + 21 ns |
+    | `CheckpointContents`, 6.4 KB | 183 ns + 21 ns | 3.0 µs + 716 ns |
+    | `CheckpointData`, 417 KB | 113 µs + 0.7 µs | 280 µs + 56 µs |
+
+    `CheckpointData` is the full download format, a checkpoint plus every
+    transaction with effects, events and objects. A checkpoint proper is
+    the summary and the contents. Blake2b-256 runs at about 1.3 GB/s here,
+    so on the 170-byte summary the hash is most of the time. The baseline
+    does not hash, as the reference does not at deserialization time
+    either, and the comparison is left unfair to anchovy that way.
+14. Digests. The types the reference implements `Message` for, and only
+    those, carry a `digest` computed once from the wire span while parsing,
+    in the build pass only, and handed out by reference: `SenderSignedData`
+    (the field lives on its `TransactionData`), `TransactionEffects` and
+    `CheckpointSummary`. `Object`, `TransactionEvents` and
+    `CheckpointContents` have a `digest()` method that hashes their wire
+    span on demand, as the reference does. The reference's
     digest is Blake2b-256 over `"<serde name>::"` then the BCS bytes
     (`default_hash` via `Signable::write` in `crypto.rs`); intents are a
     separate layer that only applies to what is signed. Confirmed on all
