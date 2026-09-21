@@ -44,7 +44,9 @@ under "Open" below.
     builders for accept/reject, value and re-encoding (7M runs, clean).
     Seed with `cargo run --example seed_fuzz_corpus`; run with
     `cd fuzz && cargo +nightly fuzz run <target>`.
-12. `benches/parse.rs` (`cargo bench`), over the corpus, fat LTO:
+12. `benches/parse.rs`, run with `scripts/bench.sh` (fetches the corpus if
+    missing; one row per type, last column the speed-up of the
+    deserialize-and-drop round trip), fat LTO:
 
     | | anchovy: parse + drop | `bcs` into owned types: parse + drop |
     |---|---|---|
@@ -56,12 +58,13 @@ under "Open" below.
 
     With digests (below), parse + drop against the unhashed baseline:
 
-    | | anchovy, digests included | `bcs` into owned types, no digests |
-    |---|---|---|
-    | `SenderSignedData`, 1,047 bytes | 1.2 µs + 32 ns | 1.9 µs + 409 ns |
-    | `CheckpointSummary`, 170 bytes | 207 ns + 5 ns | 83 ns + 21 ns |
-    | `CheckpointContents`, 6.4 KB | 183 ns + 21 ns | 3.0 µs + 716 ns |
-    | `CheckpointData`, 417 KB | 113 µs + 0.7 µs | 280 µs + 56 µs |
+    | | anchovy, digests included | `bcs` into owned types, no digests | speed-up |
+    |---|---|---|---|
+    | `SenderSignedData`, 1,047 bytes | 1.2 µs + 35 ns | 2.1 µs + 441 ns | 2.0x |
+    | `SenderSignedData`, exact two-pass | 1.5 µs + 36 ns | 2.0 µs + 430 ns | 1.6x |
+    | `CheckpointSummary`, 174 bytes | 205 ns + 11 ns | 82 ns + 29 ns | 0.5x |
+    | `CheckpointContents`, 6.4 KB | 186 ns + 27 ns | 3.0 µs + 828 ns | 17.9x |
+    | `CheckpointData`, 417 KB | 115 µs + 0.7 µs | 311 µs + 57 µs | 3.2x |
 
     `CheckpointData` is the full download format, a checkpoint plus every
     transaction with effects, events and objects. A checkpoint proper is
