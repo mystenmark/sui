@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use anchovy_types::Message;
 use anchovy_types::checkpoint::CheckpointData;
-use anchovy_types::effects::{TransactionEffects, TransactionEvents};
-use anchovy_types::object::Object;
+use anchovy_types::effects::{ChangeKind, TransactionEffects, TransactionEvents, VersionedEffects};
+use anchovy_types::object::{Data, Object};
 use anchovy_types::transaction::TransactionData;
 
 /// The bytes of a `.chk` file after its one-byte encoding tag.
@@ -45,6 +45,31 @@ fn check(path: &Path, counts: &mut Counts) {
         let effects =
             Message::<TransactionEffects<'static>>::parse(tx.effects.bytes.to_vec()).unwrap();
         assert_eq!(*effects.get(), tx.effects);
+
+        // Executed effects only hold changes the reference has a class for,
+        // and gas is paid from an object that existed.
+        if let VersionedEffects::V2(v2) = &tx.effects.version {
+            for change in v2.changed_objects {
+                assert_ne!(change.kind, ChangeKind::Unclassified, "{}", path.display());
+            }
+            if let Some(i) = v2.gas_object_index {
+                let kind = v2.changed_objects[i as usize].kind;
+                assert!(matches!(kind, ChangeKind::Mutated | ChangeKind::Deleted));
+            }
+            let created = v2.changes(ChangeKind::Created).count();
+            let output_created = tx
+                .output_objects
+                .iter()
+                .filter(|o| {
+                    let id = match &o.data {
+                        Data::Move(m) => &m.contents[..32],
+                        Data::Package(p) => &p.id.0[..],
+                    };
+                    v2.changes(ChangeKind::Created).any(|c| c.id.0 == id)
+                })
+                .count();
+            assert_eq!(created, output_created, "{}", path.display());
+        }
 
         if let Some(events) = tx.events {
             let alone =

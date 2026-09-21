@@ -211,6 +211,52 @@ pub enum IdOperation {
     Deleted,
 }
 
+/// What happened to an object, as the reference's `created()`, `mutated()`
+/// and the rest each work out from the three fields of a change. A change
+/// is in at most one class.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ChangeKind {
+    Created,
+    Mutated,
+    Unwrapped,
+    Deleted,
+    UnwrappedThenDeleted,
+    Wrapped,
+    AccumulatorWrite,
+    /// Created and then wrapped or deleted by the same transaction. The
+    /// reference lists these under none of its accessors.
+    Transient,
+    /// A combination the reference puts in no class, such as a package
+    /// written to an id that neither existed nor was created.
+    Unclassified,
+}
+
+impl ChangeKind {
+    fn of(input: &ObjectIn<'_>, output: &ObjectOut<'_>, id_operation: IdOperation) -> ChangeKind {
+        let existed = matches!(input, ObjectIn::Exist { .. });
+        match (existed, output, id_operation) {
+            (_, ObjectOut::AccumulatorWriteV1(_), _) => ChangeKind::AccumulatorWrite,
+            (true, ObjectOut::ObjectWrite(..) | ObjectOut::PackageWrite(..), _) => {
+                ChangeKind::Mutated
+            }
+            (
+                false,
+                ObjectOut::ObjectWrite(..) | ObjectOut::PackageWrite(..),
+                IdOperation::Created,
+            ) => ChangeKind::Created,
+            (false, ObjectOut::ObjectWrite(..), IdOperation::None) => ChangeKind::Unwrapped,
+            (true, ObjectOut::NotExist, IdOperation::Deleted) => ChangeKind::Deleted,
+            (false, ObjectOut::NotExist, IdOperation::Deleted) => ChangeKind::UnwrappedThenDeleted,
+            (true, ObjectOut::NotExist, IdOperation::None) => ChangeKind::Wrapped,
+            (false, ObjectOut::ObjectWrite(..), IdOperation::Deleted)
+            | (false, ObjectOut::PackageWrite(..), IdOperation::None | IdOperation::Deleted)
+            | (true, ObjectOut::NotExist, IdOperation::Created)
+            | (false, ObjectOut::NotExist, IdOperation::None) => ChangeKind::Unclassified,
+            (false, ObjectOut::NotExist, IdOperation::Created) => ChangeKind::Transient,
+        }
+    }
+}
+
 /// A `changed_objects` entry: the id, then `EffectsObjectChange`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ObjectChange<'a> {
@@ -218,6 +264,8 @@ pub struct ObjectChange<'a> {
     pub input_state: ObjectIn<'a>,
     pub output_state: ObjectOut<'a>,
     pub id_operation: IdOperation,
+    /// Derived from the three fields above while parsing.
+    pub kind: ChangeKind,
 }
 
 impl<'a> ObjectChange<'a> {
@@ -279,6 +327,7 @@ impl<'a> ObjectChange<'a> {
             input_state,
             output_state,
             id_operation,
+            kind: ChangeKind::of(&input_state, &output_state, id_operation),
         })
     }
 }
@@ -328,6 +377,11 @@ pub struct TransactionEffectsV2<'a> {
 }
 
 impl<'a> TransactionEffectsV2<'a> {
+    /// The changes of one class, in stored order.
+    pub fn changes(&self, kind: ChangeKind) -> impl Iterator<Item = &'a ObjectChange<'a>> {
+        self.changed_objects.iter().filter(move |c| c.kind == kind)
+    }
+
     pub fn parse<A: Alloc<'a>>(r: &mut Reader<'a>, a: &mut A) -> Result<TransactionEffectsV2<'a>> {
         r.enter()?;
         let status = ExecutionStatus::parse(r)?;
