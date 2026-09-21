@@ -4,17 +4,18 @@ Plan: `IMPLEMENTATION_PLAN_PHASE1.md`. Branch `mlogan-anchovy`, worktree
 `~/projects/mlogan-anchovy`. All work is under `anchovy/`, its own cargo
 workspace; run cargo from there.
 
-## Status: plan complete, pending review
+## Status: plan complete and reviewed
 
-Every step of the implementation order is done. What is not done is listed
-under "Open" below.
+Every step of the implementation order is done and three review passes
+(below) are applied. What is not done is listed under "Open".
 
 ## Done
 
 1. Workspace, lints, `Reader` with `bcs` 0.1.6 encoding rules, errors.
 2. `Arena`, `Alloc` with `Measure` and `Build`, `WireBuf`, `Message`, `Wire`.
    Miri clean on the unit tests and on a full checkpoint parse
-   (`MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test --test tx_index`).
+   (`MIRIFLAGS=-Zmiri-disable-isolation cargo +nightly miri test --test tx_index`),
+   re-run after single-pass mode and the review fixes.
 3. Base types, `TypeTag`/`StructTag` (`TypeInput`/`StructInput` are aliases:
    with identifier checks deferred they are the same wire type).
 4. Transaction types, system transaction kinds, `SenderSignedData`.
@@ -72,7 +73,7 @@ under "Open" below.
     so on the 170-byte summary the hash is most of the time. The baseline
     does not hash, as the reference does not at deserialization time
     either, and the comparison is left unfair to anchovy that way.
-14. Digests. The types the reference implements `Message` for, and only
+13. Digests. The types the reference implements `Message` for, and only
     those, carry a `digest` computed once from the wire span while parsing,
     in the build pass only, and handed out by reference: `SenderSignedData`
     (the field lives on its `TransactionData`), `TransactionEffects` and
@@ -107,7 +108,7 @@ under "Open" below.
     they cannot affect; repeated package ids are not pushed for sorting.
     The baseline is generous to the reference: its own types also parse
     signatures at deserialization time, and frees are not timed.
-13. `tools/sui-oracle`, a crate outside the workspace and the one place that
+14. `tools/sui-oracle`, a crate outside the workspace and the one place that
     links sui-types, writes what the reference derives from each checkpoint
     as text. `tests/oracle.rs` compares the index and change classes with
     it: all 64 corpus checkpoints match on shared inputs, owned inputs and
@@ -119,6 +120,40 @@ under "Open" below.
   objects) parse; each transaction, effects, events and object re-parses
   alone from its recorded span to an equal view. One checkpoint is checked
   in; `scripts/fetch-mainnet.sh` fetches the rest into `corpus/` (ignored).
+
+## Review
+
+Three read-only agents reviewed the crate (unsafe core; parsers against
+the format, `bcs` and the reference; simplification and hygiene). Applied:
+
+- Core: arena alignment is a compile-time check in `Alloc::slice` rather
+  than a debug assertion; `Message: Send` needs `View: Send`, not `Sync`;
+  a failed arena allocation is `ParseError::OutOfMemory` rather than an
+  abort; the guess arithmetic saturates; every wire record's layout is
+  asserted at compile time. Verified under Miri with Stacked and Tree
+  Borrows by the reviewer.
+- Parsers: no accept/reject, order, layout, span or depth difference from
+  `bcs` was found; the reviewer swept type nesting 0 to 520 deep in 19
+  contexts. One rule difference fixed: a coin reservation in the gas
+  payment now counts for every transaction kind, as in the reference. The
+  multisig views are in the differential fuzzer, with the `Passkey`
+  variants the builders lack treated as agreement.
+- Simplification: `WireBuf` is a plain `Vec`; unused API removed;
+  `CheckpointSummary` hashes only in the build pass; `SenderSignedData`
+  and `CertifiedCheckpointSummary` keep their wire spans; `AuthorityName`
+  is `AuthorityPublicKeyBytes`; digest helpers live on `Digest`; the
+  benchmark reports the round with the best parse-and-drop; the mutation
+  fuzzer seeds each checkpoint type from its own bytes;
+  `tests/build_roundtrip.rs` reaches every enum variant through the
+  builders, which the corpus does not.
+
+Not applied, on purpose or deferred: a `seq` helper for the 27 sequence
+loops (the loops read as the spec, per the PRD); distinct digest types
+per use (`TransactionDigest` and the rest are aliases of `Digest`; the
+builders have distinct types); naming the ten inline `seq_len` minimums
+as constants so `tests/min_wire_size.rs` covers them (all were verified
+by hand and by the reviewer); a shared `tests/common` for the corpus
+helpers.
 
 ## Open
 
@@ -142,9 +177,11 @@ under "Open" below.
 - The oracle cannot reach the reference's private gas-payment coin
   reservations, so that part of `coin_reservations` is checked only by
   `tests/tx_index.rs`.
-- The `.chk` files in `corpus/` are from one day of mainnet; older shapes
-  (effects V1, checkpoint contents V1, genesis, prologue V1 to V3) are
-  covered by the builders' round trips and the fuzzers, not by real data.
+- The `.chk` files in `corpus/` are from one day of mainnet; older and
+  rarer shapes (effects V1, checkpoint contents V1, genesis, prologue V1 to
+  V3, publish and upgrade, receiving objects, packages, most error kinds)
+  are covered by `tests/build_roundtrip.rs` and the fuzzers, not by real
+  data.
 
 ## Notes
 

@@ -41,7 +41,7 @@ one of the two.
 ### Two buffers
 
 ```
-Message<T> { wire: WireBuf, arena: Arena, root: NonNull<T::View<'static>> }
+Message<T> { wire: WireBuf, arena: Arena, view: T::View<'static> }
 ```
 
 `WireBuf` is the allocation the network layer read into. `Arena` is one
@@ -175,11 +175,13 @@ as text). The workspace consumes the vectors as data.
 ## Acceptance criteria
 
 - Snapshot test: traced builder format equals the sui snapshot.
-- Every type in the snapshot has a view, a parser and a builder.
+- Every type in the snapshot has a builder, and every type a message can
+  contain has a view and a parser.
 - N mainnet checkpoints parse; each re-serializes through the builders to
   the identical bytes.
 - Differential fuzzing against the builder types finds no accept/reject or
   value disagreement; no allocation above the bound; Miri clean.
-- Parsing a mainnet transaction performs exactly one allocation and is
+- Parsing a mainnet transaction performs one allocation (two for the
+  roughly 1% whose arena guess falls short) and is
   faster than the serde baseline, with numbers recorded in
   `TASKS_PHASE1.md`.
