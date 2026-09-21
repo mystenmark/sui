@@ -100,7 +100,7 @@ struct Measurement {
 /// consumes its buffer, and then times dropping everything `f` returned.
 /// Reports the round with the fastest parse-and-drop.
 fn measure<T>(inputs: &[Vec<u8>], rounds: usize, f: impl Fn(Vec<u8>) -> T) -> Measurement {
-    let mut best = (Duration::MAX, Duration::MAX);
+    let mut best = (Duration::MAX, Duration::ZERO);
     let mut allocations = 0;
     for _ in 0..rounds {
         let owned: Vec<Vec<u8>> = inputs.to_vec();
