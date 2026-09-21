@@ -405,3 +405,15 @@ crate::base::assert_wire_layout!(
     CommitteeMember = 105,
     ExecutionDigests = 66,
 );
+
+impl crate::message::Digested for CheckpointSummary<'_> {
+    fn digest(&self) -> &Digest {
+        &self.digest
+    }
+}
+
+impl crate::message::Digested for CertifiedCheckpointSummary<'_> {
+    fn digest(&self) -> &Digest {
+        &self.data.digest
+    }
+}

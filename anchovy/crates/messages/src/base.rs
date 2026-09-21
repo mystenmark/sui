@@ -150,11 +150,21 @@ pub type SequenceNumber = u64;
 
 /// A 32-byte digest as it sits on the wire: a length byte, always 32, then
 /// the bytes.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(C)]
 pub struct Digest {
     len: u8,
     pub bytes: [u8; 32],
+}
+
+/// The first eight bytes, in one `write_u64`, which is what
+/// `containers::MessageMap` expects and all the hashing a digest needs.
+impl std::hash::Hash for Digest {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(u64::from_le_bytes(
+            self.bytes[..8].try_into().expect("eight bytes"),
+        ));
+    }
 }
 
 // SAFETY: `repr(C)` over byte fields: alignment 1, no padding. `len` is
