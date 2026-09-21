@@ -153,6 +153,10 @@ fn index_matches_walk() {
         &mut programmable,
         &mut system,
     );
+    // Under Miri the checked-in checkpoint is enough, and all there is time for.
+    if cfg!(miri) {
+        return;
+    }
     if let Ok(entries) = std::fs::read_dir(manifest.join("../../corpus/mainnet")) {
         for entry in entries {
             let path = entry.unwrap().path();
