@@ -1,0 +1,16 @@
+[package]
+name = "containers"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+arena.workspace = true
+allocator-api2.workspace = true
+arena-btreemap.workspace = true
+foldhash.workspace = true
+hashbrown.workspace = true
+
+[lints]
+workspace = true
