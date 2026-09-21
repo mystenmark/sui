@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use anchovy_types::Message;
 use anchovy_types::build;
-use anchovy_types::checkpoint::CheckpointData;
+use anchovy_types::checkpoint::{CheckpointContents, CheckpointData, CheckpointSummary};
 use anchovy_types::transaction::SenderSignedData;
 
 struct Counting;
@@ -67,7 +67,12 @@ fn encode(tx: &SenderSignedData<'_>) -> Vec<u8> {
 }
 
 struct Corpus {
-    checkpoints: Vec<Vec<u8>>,
+    /// Full checkpoint downloads: summary, contents, and every transaction
+    /// with its effects, events and objects.
+    checkpoint_data: Vec<Vec<u8>>,
+    /// The checkpoints themselves: a header, and a list of digests.
+    summaries: Vec<Vec<u8>>,
+    contents: Vec<Vec<u8>>,
     transactions: Vec<Vec<u8>>,
 }
 
@@ -80,17 +85,26 @@ fn load() -> Corpus {
         paths.sort();
     }
     let mut corpus = Corpus {
-        checkpoints: Vec::new(),
+        checkpoint_data: Vec::new(),
+        summaries: Vec::new(),
+        contents: Vec::new(),
         transactions: Vec::new(),
     };
     for path in paths {
         let mut bytes = std::fs::read(&path).unwrap();
         bytes.remove(0);
         let checkpoint = Message::<CheckpointData<'static>>::parse(bytes.clone()).unwrap();
-        for tx in checkpoint.get().transactions {
+        let view = checkpoint.get();
+        corpus
+            .summaries
+            .push(view.checkpoint_summary.data.bytes.to_vec());
+        corpus
+            .contents
+            .push(view.checkpoint_contents.bytes.to_vec());
+        for tx in view.transactions {
             corpus.transactions.push(encode(&tx.transaction));
         }
-        corpus.checkpoints.push(bytes);
+        corpus.checkpoint_data.push(bytes);
     }
     corpus
 }
@@ -179,11 +193,35 @@ fn main() {
         &m,
     );
 
-    let m = measure(&corpus.checkpoints, 10, |b| {
+    let m = measure(&corpus.summaries, 30, |b| {
+        Message::<CheckpointSummary<'static>>::parse(b).unwrap()
+    });
+    report("CheckpointSummary anchovy", &corpus.summaries, &m);
+    let m = measure(&corpus.summaries, 30, |b| {
+        (
+            bcs::from_bytes::<build::checkpoint::CheckpointSummary>(&b).unwrap(),
+            b,
+        )
+    });
+    report("CheckpointSummary bcs + owned types", &corpus.summaries, &m);
+
+    let m = measure(&corpus.contents, 30, |b| {
+        Message::<CheckpointContents<'static>>::parse(b).unwrap()
+    });
+    report("CheckpointContents anchovy", &corpus.contents, &m);
+    let m = measure(&corpus.contents, 30, |b| {
+        (
+            bcs::from_bytes::<build::checkpoint::CheckpointContents>(&b).unwrap(),
+            b,
+        )
+    });
+    report("CheckpointContents bcs + owned types", &corpus.contents, &m);
+
+    let m = measure(&corpus.checkpoint_data, 10, |b| {
         Message::<CheckpointData<'static>>::parse(b).unwrap()
     });
-    report("CheckpointData    anchovy", &corpus.checkpoints, &m);
-    let m = measure(&corpus.checkpoints, 10, |b| {
+    report("CheckpointData    anchovy", &corpus.checkpoint_data, &m);
+    let m = measure(&corpus.checkpoint_data, 10, |b| {
         (
             bcs::from_bytes::<build::checkpoint::CheckpointData>(&b).unwrap(),
             b,
@@ -191,7 +229,7 @@ fn main() {
     });
     report(
         "CheckpointData    bcs + owned types",
-        &corpus.checkpoints,
+        &corpus.checkpoint_data,
         &m,
     );
 }
