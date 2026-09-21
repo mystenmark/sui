@@ -31,22 +31,6 @@ impl GasCostSummary {
     }
 }
 
-fn parse_option_digest<'a>(r: &mut Reader<'a>) -> Result<Option<&'a Digest>> {
-    Ok(if r.option()? {
-        Some(Digest::parse(r)?)
-    } else {
-        None
-    })
-}
-
-fn parse_digests<'a>(r: &mut Reader<'a>) -> Result<&'a [Digest]> {
-    let digests: &[Digest] = r.record_vec()?;
-    for d in digests {
-        d.check()?;
-    }
-    Ok(digests)
-}
-
 /// `Vec<(ObjectRef, Owner)>`.
 fn parse_owned_refs<'a, A: Alloc<'a>>(
     r: &mut Reader<'a>,
@@ -96,8 +80,8 @@ impl<'a> TransactionEffectsV1<'a> {
             unwrapped_then_deleted: ObjectRef::parse_vec(r)?,
             wrapped: ObjectRef::parse_vec(r)?,
             gas_object: (ObjectRef::parse(r)?, Owner::parse(r, a)?),
-            events_digest: parse_option_digest(r)?,
-            dependencies: parse_digests(r)?,
+            events_digest: Digest::parse_option(r)?,
+            dependencies: Digest::parse_vec(r)?,
         };
         r.leave();
         Ok(effects)
@@ -315,7 +299,7 @@ impl<'a> ObjectChange<'a> {
             2 => IdOperation::Deleted,
             tag => {
                 return Err(ParseError::UnknownVariant {
-                    ty: "IDOperation",
+                    ty: "IdOperation",
                     tag,
                 });
             }
@@ -389,8 +373,8 @@ impl<'a> TransactionEffectsV2<'a> {
         let gas_used = GasCostSummary::parse(r)?;
         let transaction_digest = TransactionDigest::parse(r)?;
         let gas_object_index = if r.option()? { Some(r.u32()?) } else { None };
-        let events_digest = parse_option_digest(r)?;
-        let dependencies = parse_digests(r)?;
+        let events_digest = Digest::parse_option(r)?;
+        let dependencies = Digest::parse_vec(r)?;
         let lamport_version = r.u64()?;
 
         let n = r.seq_len(ObjectChange::MIN_WIRE_SIZE)?;
@@ -408,7 +392,7 @@ impl<'a> TransactionEffectsV2<'a> {
         }
         let unchanged_consensus_objects = unchanged_consensus_objects.finish();
 
-        let aux_data_digest = parse_option_digest(r)?;
+        let aux_data_digest = Digest::parse_option(r)?;
         r.leave();
         Ok(TransactionEffectsV2 {
             status,

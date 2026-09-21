@@ -103,6 +103,12 @@ fn walk(data: &TransactionData<'_>, out: &mut Walked) -> bool {
         }
         TransactionKind::ProgrammableSystemTransaction(pt) => {
             walk_pt(pt, false, out);
+            // Reservations in the gas payment count for every kind.
+            for o in data.gas_data.payment {
+                if o.is_coin_reservation() {
+                    out.coin_reservations.push(*o);
+                }
+            }
             true
         }
         _ => false,
@@ -112,7 +118,7 @@ fn walk(data: &TransactionData<'_>, out: &mut Walked) -> bool {
 fn check(path: &Path, programmable: &mut usize, system: &mut usize) {
     let mut bytes = std::fs::read(path).unwrap();
     bytes.remove(0);
-    let checkpoint = Message::<CheckpointData<'static>>::parse(bytes).unwrap();
+    let checkpoint = Message::<CheckpointData>::parse(bytes).unwrap();
     for tx in checkpoint.get().transactions {
         let data = &tx.transaction.data;
         let index = &data.index;

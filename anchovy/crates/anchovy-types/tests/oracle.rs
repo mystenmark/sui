@@ -115,12 +115,12 @@ fn render(checkpoint: &CheckpointData<'_>) -> String {
         }
         // The oracle can only reach the reference's reservations among the
         // inputs; those in the gas payment come last in the index.
-        let gas_reservations = match data.kind {
-            TransactionKind::ProgrammableTransaction(_) => {
-                data.gas_data.payment.len() - gas_count(data)
-            }
-            _ => 0,
-        };
+        let gas_reservations = data
+            .gas_data
+            .payment
+            .iter()
+            .filter(|o| o.is_coin_reservation())
+            .count();
         let inputs = index.coin_reservations.len() - gas_reservations;
         for o in &index.coin_reservations[..inputs] {
             writeln!(
@@ -212,7 +212,7 @@ fn index_matches_sui() {
         };
         let mut bytes = std::fs::read(&path).unwrap();
         bytes.remove(0);
-        let checkpoint = Message::<CheckpointData<'static>>::parse(bytes).unwrap();
+        let checkpoint = Message::<CheckpointData>::parse(bytes).unwrap();
         let actual = render(checkpoint.get());
         if actual != expected {
             let expected_lines: Vec<&str> = expected.lines().collect();

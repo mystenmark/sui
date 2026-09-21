@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn struct_tag() {
-        let m = Message::<TypeTag<'static>>::parse(coin_of_bytes()).unwrap();
+        let m = Message::<TypeTag>::parse(coin_of_bytes()).unwrap();
         let TypeTag::Struct(s) = *m.get() else {
             panic!("not a struct")
         };
@@ -133,16 +133,16 @@ mod tests {
 
     #[test]
     fn primitive_needs_no_arena() {
-        let m = Message::<TypeTag<'static>>::parse(vec![2]).unwrap();
+        let m = Message::<TypeTag>::parse(vec![2]).unwrap();
         assert_eq!(*m.get(), TypeTag::U64);
         assert_eq!(m.arena_used(), 0);
-        let exact = Message::<TypeTag<'static>>::parse_exact(vec![2]).unwrap();
+        let exact = Message::<TypeTag>::parse_exact(vec![2]).unwrap();
         assert_eq!(exact.arena_size(), 0);
     }
 
     #[test]
     fn rejects() {
-        let err = |b: Vec<u8>| Message::<TypeTag<'static>>::parse(b).unwrap_err().0;
+        let err = |b: Vec<u8>| Message::<TypeTag>::parse(b).unwrap_err().0;
         assert_eq!(err(vec![]), ParseError::UnexpectedEof);
         assert_eq!(err(vec![2, 0]), ParseError::TrailingBytes);
         assert_eq!(
@@ -162,11 +162,11 @@ mod tests {
         // Each vector is one enum; the innermost u8 is the 500th container.
         let mut ok = vec![6; 499];
         ok.push(1);
-        assert!(Message::<TypeTag<'static>>::parse(ok).is_ok());
+        assert!(Message::<TypeTag>::parse(ok).is_ok());
         let mut deep = vec![6; 500];
         deep.push(1);
         assert_eq!(
-            Message::<TypeTag<'static>>::parse(deep).unwrap_err().0,
+            Message::<TypeTag>::parse(deep).unwrap_err().0,
             ParseError::ContainerDepthExceeded
         );
     }

@@ -648,6 +648,8 @@ impl<'a> GenericSignature<'a> {
 /// The one `SenderSignedTransaction` a `SenderSignedData` holds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SenderSignedData<'a> {
+    /// The exact encoding, as it is stored and sent.
+    pub bytes: &'a [u8],
     pub intent: &'a Intent,
     pub data: TransactionData<'a>,
     pub tx_signatures: &'a [GenericSignature<'a>],
@@ -665,6 +667,7 @@ impl<'a> SenderSignedData<'a> {
     pub const MIN_WIRE_SIZE: usize = 1 + 3 + (1 + 2 + 32 + (1 + 32 + 8 + 8) + 1) + 1;
 
     pub fn parse<A: Alloc<'a>>(r: &mut Reader<'a>, a: &mut A) -> Result<SenderSignedData<'a>> {
+        let start = r.pos();
         r.enter()?;
         if r.length()? != 1 {
             return Err(ParseError::NotOneTransaction);
@@ -678,6 +681,7 @@ impl<'a> SenderSignedData<'a> {
         r.leave();
         r.leave();
         Ok(SenderSignedData {
+            bytes: r.span(start),
             intent,
             data,
             tx_signatures,

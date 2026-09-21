@@ -148,6 +148,7 @@ pub enum ExecutionErrorKind<'a> {
 }
 
 impl<'a> ExecutionErrorKind<'a> {
+    // One arm per variant of a 42-variant enum.
     #[allow(clippy::too_many_lines)]
     pub fn parse(r: &mut Reader<'a>) -> Result<ExecutionErrorKind<'a>> {
         use ExecutionErrorKind as E;

@@ -86,36 +86,44 @@ impl From<&view::StructTag<'_>> for StructTag {
     }
 }
 
-// Keep in step with `TypeTag::from`: the views have one type for both.
+// The views have one type for both, so the walk is done once as `TypeTag`.
 impl From<&view::TypeInput<'_>> for TypeInput {
     fn from(v: &view::TypeInput<'_>) -> Self {
-        match v {
-            view::TypeInput::Bool => TypeInput::Bool,
-            view::TypeInput::U8 => TypeInput::U8,
-            view::TypeInput::U64 => TypeInput::U64,
-            view::TypeInput::U128 => TypeInput::U128,
-            view::TypeInput::Address => TypeInput::Address,
-            view::TypeInput::Signer => TypeInput::Signer,
-            view::TypeInput::Vector(inner) => {
-                TypeInput::Vector(Box::new(TypeInput::from(&**inner)))
-            }
-            view::TypeInput::Struct(inner) => {
-                TypeInput::Struct(Box::new(StructInput::from(&**inner)))
-            }
-            view::TypeInput::U16 => TypeInput::U16,
-            view::TypeInput::U32 => TypeInput::U32,
-            view::TypeInput::U256 => TypeInput::U256,
-        }
+        TypeInput::from(TypeTag::from(v))
     }
 }
 
 impl From<&view::StructInput<'_>> for StructInput {
     fn from(v: &view::StructInput<'_>) -> Self {
+        StructInput::from(StructTag::from(v))
+    }
+}
+
+impl From<TypeTag> for TypeInput {
+    fn from(t: TypeTag) -> Self {
+        match t {
+            TypeTag::Bool => TypeInput::Bool,
+            TypeTag::U8 => TypeInput::U8,
+            TypeTag::U64 => TypeInput::U64,
+            TypeTag::U128 => TypeInput::U128,
+            TypeTag::Address => TypeInput::Address,
+            TypeTag::Signer => TypeInput::Signer,
+            TypeTag::Vector(inner) => TypeInput::Vector(Box::new(TypeInput::from(*inner))),
+            TypeTag::Struct(inner) => TypeInput::Struct(Box::new(StructInput::from(*inner))),
+            TypeTag::U16 => TypeInput::U16,
+            TypeTag::U32 => TypeInput::U32,
+            TypeTag::U256 => TypeInput::U256,
+        }
+    }
+}
+
+impl From<StructTag> for StructInput {
+    fn from(s: StructTag) -> Self {
         StructInput {
-            address: AccountAddress::from(v.address),
-            module: v.module.to_owned(),
-            name: v.name.to_owned(),
-            type_params: v.type_params.iter().map(TypeInput::from).collect(),
+            address: s.address,
+            module: s.module,
+            name: s.name,
+            type_params: s.type_params.into_iter().map(TypeInput::from).collect(),
         }
     }
 }

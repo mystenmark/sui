@@ -32,7 +32,7 @@ struct Counts {
 /// Parses a checkpoint, then parses each hashed part on its own from the
 /// span the checkpoint recorded for it and expects an equal view.
 fn check(path: &Path, counts: &mut Counts) {
-    let checkpoint = Message::<CheckpointData<'static>>::parse(read_chk(path))
+    let checkpoint = Message::<CheckpointData>::parse(read_chk(path))
         .unwrap_or_else(|(e, _)| panic!("{}: {e}", path.display()));
     counts.wire += checkpoint.wire_bytes().len();
     counts.arena += checkpoint.arena_size();
@@ -74,12 +74,10 @@ fn check(path: &Path, counts: &mut Counts) {
             );
         }
 
-        let data =
-            Message::<TransactionData<'static>>::parse(tx.transaction.data.bytes.to_vec()).unwrap();
+        let data = Message::<TransactionData>::parse(tx.transaction.data.bytes.to_vec()).unwrap();
         assert_eq!(*data.get(), tx.transaction.data);
 
-        let effects =
-            Message::<TransactionEffects<'static>>::parse(tx.effects.bytes.to_vec()).unwrap();
+        let effects = Message::<TransactionEffects>::parse(tx.effects.bytes.to_vec()).unwrap();
         assert_eq!(*effects.get(), tx.effects);
 
         // Executed effects only hold changes the reference has a class for,
@@ -108,14 +106,13 @@ fn check(path: &Path, counts: &mut Counts) {
         }
 
         if let Some(events) = tx.events {
-            let alone =
-                Message::<TransactionEvents<'static>>::parse(events.bytes.to_vec()).unwrap();
+            let alone = Message::<TransactionEvents>::parse(events.bytes.to_vec()).unwrap();
             assert_eq!(*alone.get(), events);
         }
 
         for object in tx.input_objects.iter().chain(tx.output_objects) {
             counts.objects += 1;
-            let alone = Message::<Object<'static>>::parse(object.bytes.to_vec()).unwrap();
+            let alone = Message::<Object>::parse(object.bytes.to_vec()).unwrap();
             assert_eq!(*alone.get(), *object);
         }
     }

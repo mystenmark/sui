@@ -14,11 +14,16 @@ fn main() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut checkpoint = std::fs::read(manifest.join("tests/data/mainnet-325300367.chk")).unwrap();
     checkpoint.remove(0);
-    let parsed = Message::<CheckpointData<'static>>::parse(checkpoint.clone()).unwrap();
+    let parsed = Message::<CheckpointData>::parse(checkpoint.clone()).unwrap();
     let view = parsed.get();
 
-    let mut seeds: Vec<(u8, &[u8])> = vec![(5, view.checkpoint_contents.bytes), (8, &checkpoint)];
+    let mut seeds: Vec<(u8, &[u8])> = vec![
+        (5, view.checkpoint_contents.bytes),
+        (6, view.checkpoint_summary.bytes),
+        (8, &checkpoint),
+    ];
     for tx in view.transactions {
+        seeds.push((0, tx.transaction.bytes));
         seeds.push((1, tx.transaction.data.bytes));
         seeds.push((2, tx.effects.bytes));
         if let Some(events) = &tx.events {

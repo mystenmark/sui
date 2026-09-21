@@ -45,27 +45,6 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
-fn push_uleb128(out: &mut Vec<u8>, mut v: usize) {
-    while v >= 0x80 {
-        out.push((v & 0x7f) as u8 | 0x80);
-        v >>= 7;
-    }
-    out.push(v as u8);
-}
-
-/// Re-encodes a parsed transaction. The view keeps the span of the
-/// `TransactionData` but not of what surrounds it.
-fn encode(tx: &SenderSignedData<'_>) -> Vec<u8> {
-    let mut out = vec![1, tx.intent.scope, tx.intent.version, tx.intent.app_id];
-    out.extend_from_slice(tx.data.bytes);
-    push_uleb128(&mut out, tx.tx_signatures.len());
-    for sig in tx.tx_signatures {
-        push_uleb128(&mut out, sig.0.len());
-        out.extend_from_slice(sig.0);
-    }
-    out
-}
-
 struct Corpus {
     /// Full checkpoint downloads: summary, contents, and every transaction
     /// with its effects, events and objects.
@@ -93,7 +72,7 @@ fn load() -> Corpus {
     for path in paths {
         let mut bytes = std::fs::read(&path).unwrap();
         bytes.remove(0);
-        let checkpoint = Message::<CheckpointData<'static>>::parse(bytes.clone()).unwrap();
+        let checkpoint = Message::<CheckpointData>::parse(bytes.clone()).unwrap();
         let view = checkpoint.get();
         corpus
             .summaries
@@ -102,7 +81,7 @@ fn load() -> Corpus {
             .contents
             .push(view.checkpoint_contents.bytes.to_vec());
         for tx in view.transactions {
-            corpus.transactions.push(encode(&tx.transaction));
+            corpus.transactions.push(tx.transaction.bytes.to_vec());
         }
         corpus.checkpoint_data.push(bytes);
     }
@@ -119,10 +98,9 @@ struct Measurement {
 
 /// Times `f` over every input, the inputs cloned beforehand since parsing
 /// consumes its buffer, and then times dropping everything `f` returned.
-/// Reports the fastest of `rounds` for each.
+/// Reports the round with the fastest parse-and-drop.
 fn measure<T>(inputs: &[Vec<u8>], rounds: usize, f: impl Fn(Vec<u8>) -> T) -> Measurement {
-    let mut best_parse = Duration::MAX;
-    let mut best_drop = Duration::MAX;
+    let mut best = (Duration::MAX, Duration::MAX);
     let mut allocations = 0;
     for _ in 0..rounds {
         let owned: Vec<Vec<u8>> = inputs.to_vec();
@@ -132,16 +110,19 @@ fn measure<T>(inputs: &[Vec<u8>], rounds: usize, f: impl Fn(Vec<u8>) -> T) -> Me
         for input in owned {
             outputs.push(black_box(f(input)));
         }
-        best_parse = best_parse.min(start.elapsed());
+        let parse = start.elapsed();
         allocations = ALLOCATIONS.load(Ordering::Relaxed) - before;
 
         let start = Instant::now();
         drop(outputs);
-        best_drop = best_drop.min(start.elapsed());
+        let drop = start.elapsed();
+        if parse + drop < best.0 + best.1 {
+            best = (parse, drop);
+        }
     }
     Measurement {
-        parse: best_parse / inputs.len() as u32,
-        drop: best_drop / inputs.len() as u32,
+        parse: best.0 / inputs.len() as u32,
+        drop: best.1 / inputs.len() as u32,
         allocations: allocations as f64 / inputs.len() as f64,
     }
 }
@@ -207,35 +188,35 @@ fn main() {
         "SenderSignedData",
         &corpus.transactions,
         30,
-        |b| Message::<SenderSignedData<'static>>::parse(b).unwrap(),
+        |b| Message::<SenderSignedData>::parse(b).unwrap(),
         baseline::<build::transaction::SenderSignedData>,
     );
     compare(
         "SenderSignedData, exact",
         &corpus.transactions,
         30,
-        |b| Message::<SenderSignedData<'static>>::parse_exact(b).unwrap(),
+        |b| Message::<SenderSignedData>::parse_exact(b).unwrap(),
         baseline::<build::transaction::SenderSignedData>,
     );
     compare(
         "CheckpointSummary",
         &corpus.summaries,
         30,
-        |b| Message::<CheckpointSummary<'static>>::parse(b).unwrap(),
+        |b| Message::<CheckpointSummary>::parse(b).unwrap(),
         baseline::<build::checkpoint::CheckpointSummary>,
     );
     compare(
         "CheckpointContents",
         &corpus.contents,
         30,
-        |b| Message::<CheckpointContents<'static>>::parse(b).unwrap(),
+        |b| Message::<CheckpointContents>::parse(b).unwrap(),
         baseline::<build::checkpoint::CheckpointContents>,
     );
     compare(
         "CheckpointData",
         &corpus.checkpoint_data,
         10,
-        |b| Message::<CheckpointData<'static>>::parse(b).unwrap(),
+        |b| Message::<CheckpointData>::parse(b).unwrap(),
         baseline::<build::checkpoint::CheckpointData>,
     );
 }

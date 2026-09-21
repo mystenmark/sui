@@ -73,14 +73,14 @@ fuzz_target!(|input: &[u8]| {
         return;
     };
     match selector % 9 {
-        0 => parse::<SenderSignedData<'static>>(bytes),
-        1 => parse::<TransactionData<'static>>(bytes),
-        2 => parse::<TransactionEffects<'static>>(bytes),
-        3 => parse::<TransactionEvents<'static>>(bytes),
-        4 => parse::<Object<'static>>(bytes),
-        5 => parse::<CheckpointContents<'static>>(bytes),
-        6 => parse::<CertifiedCheckpointSummary<'static>>(bytes),
-        7 => parse::<FullCheckpointContents<'static>>(bytes),
-        _ => parse::<CheckpointData<'static>>(bytes),
+        0 => parse::<SenderSignedData>(bytes),
+        1 => parse::<TransactionData>(bytes),
+        2 => parse::<TransactionEffects>(bytes),
+        3 => parse::<TransactionEvents>(bytes),
+        4 => parse::<Object>(bytes),
+        5 => parse::<CheckpointContents>(bytes),
+        6 => parse::<CertifiedCheckpointSummary>(bytes),
+        7 => parse::<FullCheckpointContents>(bytes),
+        _ => parse::<CheckpointData>(bytes),
     }
 });

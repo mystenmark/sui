@@ -81,7 +81,9 @@ impl<'a> Reader<'a> {
     /// A failed parse is abandoned, so error paths need not call `leave`.
     ///
     /// Only type tags recurse, so the count matters only on a path from a
-    /// root to a `TypeTag`. Parsers of types that cannot contain one skip it.
+    /// root to a `TypeTag`, and every container on such a path is counted.
+    /// Elsewhere it makes no difference; the hot leaves `Argument` and
+    /// `ObjectArg` skip it, other parsers count where `bcs` would.
     #[inline]
     pub fn enter(&mut self) -> Result<()> {
         if self.depth == MAX_CONTAINER_DEPTH {
@@ -234,19 +236,6 @@ impl<'a> Reader<'a> {
     pub fn byte_vec(&mut self) -> Result<&'a [u8]> {
         let len = self.length()?;
         self.bytes(len)
-    }
-
-    /// A length-prefixed byte string that must be `N` bytes long.
-    pub fn byte_vec_exact<const N: usize>(&mut self, ty: &'static str) -> Result<&'a [u8; N]> {
-        let len = self.length()?;
-        if len != N {
-            return Err(ParseError::WrongLength {
-                ty,
-                expected: N as u32,
-                actual: len as u32,
-            });
-        }
-        self.array()
     }
 
     #[inline]

@@ -51,7 +51,7 @@ fn check_checkpoint(path: &Path, counts: &mut Counts) {
     check::<CheckpointData<'static>, build::checkpoint::CheckpointData>(&bytes);
     counts.checkpoints += 1;
 
-    let checkpoint = Message::<CheckpointData<'static>>::parse(bytes).unwrap();
+    let checkpoint = Message::<CheckpointData>::parse(bytes).unwrap();
     for tx in checkpoint.get().transactions {
         counts.transactions += 1;
         check::<TransactionData<'static>, build::transaction::TransactionData>(
@@ -136,7 +136,7 @@ fn multisig() {
         built
     );
 
-    let message = Message::<MultiSig<'static>>::parse(bytes).unwrap();
+    let message = Message::<MultiSig>::parse(bytes).unwrap();
     assert_eq!(
         build::signature::MultiSig::try_from(message.get()),
         Ok(built)
@@ -150,7 +150,7 @@ fn multisig_with_passkey() {
     let bytes = vec![1, 4, 0, 0, 0, 0, 0, 0];
     assert!(bcs::from_bytes::<build::signature::MultiSig>(&bytes).is_err());
 
-    let message = Message::<MultiSig<'static>>::parse(bytes).unwrap();
+    let message = Message::<MultiSig>::parse(bytes).unwrap();
     assert_eq!(
         build::signature::MultiSig::try_from(message.get()),
         Err(build::signature::PasskeyUnsupported)

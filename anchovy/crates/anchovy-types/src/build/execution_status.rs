@@ -212,6 +212,7 @@ impl From<&view::MoveLocation<'_>> for MoveLocation {
 }
 
 impl From<&view::ExecutionErrorKind<'_>> for ExecutionErrorKind {
+    // One arm per variant of a 42-variant enum.
     #[allow(clippy::too_many_lines)]
     fn from(v: &view::ExecutionErrorKind<'_>) -> Self {
         use ExecutionErrorKind as B;

@@ -14,6 +14,7 @@ use anchovy_types::checkpoint::{
 };
 use anchovy_types::effects::{TransactionEffects, TransactionEvents};
 use anchovy_types::object::Object;
+use anchovy_types::signature::{CompressedSignature, MultiSig, PublicKey};
 use anchovy_types::transaction::{SenderSignedData, TransactionData};
 use anchovy_types::{Message, Wire};
 use libfuzzer_sys::fuzz_target;
@@ -39,24 +40,53 @@ where
     }
 }
 
+/// The builders mirror the format snapshot, which lacks the `Passkey`
+/// variants the view accepts; an input the view accepts because of one is
+/// not a disagreement.
+fn compare_multisig(bytes: &[u8]) {
+    let view = Message::<MultiSig>::parse(bytes.to_vec());
+    let owned = bcs::from_bytes::<build::signature::MultiSig>(bytes);
+    match (view, owned) {
+        (Ok(view), Ok(owned)) => {
+            assert_eq!(
+                build::signature::MultiSig::try_from(view.get()).unwrap(),
+                owned
+            );
+            assert_eq!(bcs::to_bytes(&owned).unwrap(), bytes);
+        }
+        (Err(_), Err(_)) => {}
+        (Ok(view), Err(e)) => {
+            let v = view.get();
+            let passkey = v
+                .sigs
+                .iter()
+                .any(|s| matches!(s, CompressedSignature::Passkey(_)))
+                || v.multisig_pk
+                    .pk_map
+                    .iter()
+                    .any(|(k, _)| matches!(k, PublicKey::Passkey(_)));
+            assert!(passkey, "only the view parser accepts: bcs says {e}");
+        }
+        (Err((e, _)), Ok(_)) => panic!("only bcs accepts: the view parser says {e}"),
+    }
+}
+
 fuzz_target!(|input: &[u8]| {
     let Some((&selector, bytes)) = input.split_first() else {
         return;
     };
-    match selector % 9 {
-        0 => compare::<SenderSignedData<'static>, build::transaction::SenderSignedData>(bytes),
-        1 => compare::<TransactionData<'static>, build::transaction::TransactionData>(bytes),
-        2 => compare::<TransactionEffects<'static>, build::effects::TransactionEffects>(bytes),
-        3 => compare::<TransactionEvents<'static>, build::effects::TransactionEvents>(bytes),
-        4 => compare::<Object<'static>, build::object::Object>(bytes),
-        5 => compare::<CheckpointContents<'static>, build::checkpoint::CheckpointContents>(bytes),
-        6 => compare::<
-            CertifiedCheckpointSummary<'static>,
-            build::checkpoint::CertifiedCheckpointSummary,
-        >(bytes),
-        7 => compare::<FullCheckpointContents<'static>, build::checkpoint::FullCheckpointContents>(
+    match selector % 10 {
+        0 => compare::<SenderSignedData, build::transaction::SenderSignedData>(bytes),
+        1 => compare::<TransactionData, build::transaction::TransactionData>(bytes),
+        2 => compare::<TransactionEffects, build::effects::TransactionEffects>(bytes),
+        3 => compare::<TransactionEvents, build::effects::TransactionEvents>(bytes),
+        4 => compare::<Object, build::object::Object>(bytes),
+        5 => compare::<CheckpointContents, build::checkpoint::CheckpointContents>(bytes),
+        6 => compare::<CertifiedCheckpointSummary, build::checkpoint::CertifiedCheckpointSummary>(
             bytes,
         ),
-        _ => compare::<CheckpointData<'static>, build::checkpoint::CheckpointData>(bytes),
+        7 => compare::<FullCheckpointContents, build::checkpoint::FullCheckpointContents>(bytes),
+        8 => compare::<CheckpointData, build::checkpoint::CheckpointData>(bytes),
+        _ => compare_multisig(bytes),
     }
 });

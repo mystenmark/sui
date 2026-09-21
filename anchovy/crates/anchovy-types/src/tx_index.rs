@@ -33,14 +33,6 @@ const SUI_SYSTEM_STATE: SharedObjectArg = SharedObjectArg::new(
 const SUI_CLOCK: SharedObjectArg =
     SharedObjectArg::new(SUI_CLOCK_OBJECT_ID, 1, SharedObjectMutability::Mutable);
 
-impl ObjectRef {
-    /// Whether this names an address balance reservation rather than an
-    /// object: the digest's last twenty bytes are all `0xac`.
-    pub fn is_coin_reservation(&self) -> bool {
-        self.digest.bytes[12..] == [0xac; 20]
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TransactionIndex<'a> {
     /// Every shared object input in input order, repeats included. System
@@ -52,12 +44,13 @@ pub struct TransactionIndex<'a> {
     /// Every package a command calls into, names in a type argument, or
     /// depends on, in increasing order without repeats.
     pub packages: &'a [ObjectId],
-    /// The rest are empty unless the kind is `ProgrammableTransaction`.
+    /// The next three are empty unless the kind is `ProgrammableTransaction`.
     pub receiving: &'a [ObjectRef],
     /// Indices into `commands` of the `MoveCall`s.
     pub move_calls: &'a [u32],
     pub funds_withdrawals: &'a [Ref<'a, FundsWithdrawalArg<'a>>],
-    /// Coin reservations among the inputs, then among the gas payment.
+    /// Coin reservations among the inputs of a `ProgrammableTransaction`,
+    /// then among the gas payment of any kind.
     pub coin_reservations: &'a [ObjectRef],
 }
 
@@ -215,24 +208,25 @@ impl<'a> TransactionIndex<'a> {
         a: &mut A,
     ) -> Result<TransactionIndex<'a>> {
         // Step 1: settle the counts that depend on the kind. Only a user
-        // transaction pays gas with objects or reports the last four slices.
+        // transaction pays gas with objects or reports receiving objects,
+        // move calls, withdrawals and input reservations; a reservation in
+        // the gas payment counts for every kind, as in the reference.
         let user_pt: Option<&ProgrammableTransaction<'a>> = match kind {
             TransactionKind::ProgrammableTransaction(pt) => Some(pt),
             _ => None,
         };
-        if user_pt.is_some() {
-            for o in gas_data.payment {
-                if o.is_coin_reservation() {
-                    counts.coin_reservations += 1;
-                } else {
-                    counts.owned += 1;
-                }
-            }
-        } else {
+        if user_pt.is_none() {
             counts.receiving = 0;
             counts.move_calls = 0;
             counts.funds_withdrawals = 0;
             counts.coin_reservations = 0;
+        }
+        for o in gas_data.payment {
+            if o.is_coin_reservation() {
+                counts.coin_reservations += 1;
+            } else if user_pt.is_some() {
+                counts.owned += 1;
+            }
         }
         counts.shared += match kind {
             TransactionKind::ChangeEpoch(_)
@@ -319,13 +313,11 @@ impl<'a> TransactionIndex<'a> {
                     }
                 }
             }
-            if user_pt.is_some() {
-                for o in gas_data.payment {
-                    if o.is_coin_reservation() {
-                        coin_reservations.push(*o);
-                    } else {
-                        owned.push(*o);
-                    }
+            for o in gas_data.payment {
+                if o.is_coin_reservation() {
+                    coin_reservations.push(*o);
+                } else if user_pt.is_some() {
+                    owned.push(*o);
                 }
             }
         }

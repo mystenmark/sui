@@ -112,18 +112,18 @@ impl fmt::Debug for U32Le {
 /// 96, then a compressed BLS12-381 G2 point that is not checked here.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(C)]
-pub struct AuthorityName {
+pub struct AuthorityPublicKeyBytes {
     len: u8,
     pub bytes: [u8; 96],
 }
 
 // SAFETY: `repr(C)` over byte fields: alignment 1, no padding. `len` is
 // checked wherever a reference is produced but no value of it is invalid.
-unsafe impl WireRecord for AuthorityName {}
+unsafe impl WireRecord for AuthorityPublicKeyBytes {}
 
-impl AuthorityName {
-    pub const fn new(bytes: [u8; 96]) -> AuthorityName {
-        AuthorityName { len: 96, bytes }
+impl AuthorityPublicKeyBytes {
+    pub const fn new(bytes: [u8; 96]) -> AuthorityPublicKeyBytes {
+        AuthorityPublicKeyBytes { len: 96, bytes }
     }
 
     pub(crate) fn check(&self) -> Result<()> {
@@ -139,7 +139,7 @@ impl AuthorityName {
     }
 }
 
-impl fmt::Debug for AuthorityName {
+impl fmt::Debug for AuthorityPublicKeyBytes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt_hex(&self.bytes, f)
     }
@@ -184,6 +184,22 @@ impl Digest {
         let d: &Digest = r.record()?;
         d.check()?;
         Ok(d)
+    }
+
+    pub fn parse_option<'a>(r: &mut Reader<'a>) -> Result<Option<&'a Digest>> {
+        Ok(if r.option()? {
+            Some(Digest::parse(r)?)
+        } else {
+            None
+        })
+    }
+
+    pub fn parse_vec<'a>(r: &mut Reader<'a>) -> Result<&'a [Digest]> {
+        let digests: &[Digest] = r.record_vec()?;
+        for d in digests {
+            d.check()?;
+        }
+        Ok(digests)
     }
 
     pub(crate) fn check(&self) -> Result<()> {
@@ -231,6 +247,12 @@ pub struct ObjectRef {
 unsafe impl WireRecord for ObjectRef {}
 
 impl ObjectRef {
+    /// Whether this names an address balance reservation rather than an
+    /// object: the digest's last twenty bytes are all `0xac`.
+    pub fn is_coin_reservation(&self) -> bool {
+        self.digest.bytes[12..] == [0xac; 20]
+    }
+
     pub fn parse<'a>(r: &mut Reader<'a>) -> Result<&'a ObjectRef> {
         let o: &ObjectRef = r.record()?;
         o.digest.check()?;
@@ -274,7 +296,7 @@ assert_wire_layout!(
     U32Le = 4,
     U64Le = 8,
     Digest = 33,
-    AuthorityName = 97,
+    AuthorityPublicKeyBytes = 97,
     ObjectRef = 73,
     ObjectKey = 40,
 );

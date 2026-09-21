@@ -4,11 +4,13 @@
 //! The single allocation that holds everything a parsed message does not
 //! borrow from its wire bytes.
 //!
-//! Parsers are generic over [`Alloc`] and run twice: once with [`Measure`],
-//! which only adds up sizes, and once with [`Build`], which writes into an
-//! [`Arena`] of exactly the measured size. Both compute offsets with
-//! [`bump`], so they agree as long as the parser makes the same calls, which
-//! it does because it is the same code reading the same bytes.
+//! Parsers are generic over [`Alloc`]. An exact parse runs them twice: once
+//! with [`Measure`], which only adds up sizes, and once with [`Build`],
+//! which writes into an [`Arena`] of exactly the measured size. Both compute
+//! offsets with [`bump`], so they agree as long as the parser makes the same
+//! calls, which it does because it is the same code reading the same bytes.
+//! A guessed parse runs [`Build`] alone over an arena sized from the wire
+//! length and reports [`ParseError::ArenaFull`] if that was not enough.
 
 use std::alloc::{self, Layout};
 use std::marker::PhantomData;
@@ -52,8 +54,20 @@ pub trait Alloc<'a> {
 /// The measure pass has nowhere to put the value, so there it holds nothing
 /// and dereferencing panics. Parsers never read back what they built, and
 /// only build-pass output leaves the crate.
-#[derive(Debug)]
 pub struct Ref<'a, T>(Option<&'a T>);
+
+impl<'a, T> Ref<'a, T> {
+    /// The value, for the arena's whole lifetime rather than this handle's.
+    pub fn get(self) -> &'a T {
+        self.0.expect("measure-pass value dereferenced")
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for Ref<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
 
 impl<T> Clone for Ref<'_, T> {
     fn clone(&self) -> Self {

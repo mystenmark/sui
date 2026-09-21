@@ -5,8 +5,8 @@
 
 use crate::arena::{Alloc, Ref};
 use crate::base::{
-    AdditionalConsensusStateDigest, AuthorityName, ChainIdentifier, ConsensusCommitDigest,
-    ObjectId, ObjectKey, SequenceNumber, TransactionDigest, U32Le, U64Le,
+    AdditionalConsensusStateDigest, AuthorityPublicKeyBytes, ChainIdentifier,
+    ConsensusCommitDigest, ObjectId, ObjectKey, SequenceNumber, TransactionDigest, U32Le, U64Le,
 };
 use crate::error::{ParseError, Result};
 use crate::reader::{Reader, WireRecord};
@@ -365,7 +365,7 @@ impl<'a> ExecutionTimeObservationKey<'a> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(C)]
 pub struct AuthorityObservation {
-    pub authority: AuthorityName,
+    pub authority: AuthorityPublicKeyBytes,
     pub secs: U64Le,
     pub nanos: U32Le,
 }

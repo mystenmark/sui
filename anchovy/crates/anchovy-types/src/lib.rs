@@ -53,25 +53,5 @@ macro_rules! impl_wire {
             }
         }
     };
-    // For a view whose `parse(r)` allocates nothing.
-    ($ty:ident, no_arena) => {
-        // SAFETY: `shrink` is the identity, so `$ty` is covariant.
-        unsafe impl $crate::message::Wire for $ty<'static> {
-            type View<'a> = $ty<'a>;
-
-            const ARENA_GUESS_SIXTEENTHS: usize = 0;
-
-            fn parse<'a, A: $crate::arena::Alloc<'a>>(
-                r: &mut $crate::reader::Reader<'a>,
-                _: &mut A,
-            ) -> $crate::error::Result<$ty<'a>> {
-                $ty::parse(r)
-            }
-
-            fn shrink<'l, 's: 'l>(v: &'l $ty<'s>) -> &'l $ty<'l> {
-                v
-            }
-        }
-    };
 }
 pub(crate) use impl_wire;

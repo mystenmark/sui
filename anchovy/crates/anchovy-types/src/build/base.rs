@@ -97,8 +97,8 @@ pub struct EcmhLiveObjectSetDigest {
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuthorityPublicKeyBytes(#[serde(with = "super::fixed_bytes")] pub [u8; 96]);
 
-impl From<&view::AuthorityName> for AuthorityPublicKeyBytes {
-    fn from(v: &view::AuthorityName) -> Self {
+impl From<&view::AuthorityPublicKeyBytes> for AuthorityPublicKeyBytes {
+    fn from(v: &view::AuthorityPublicKeyBytes) -> Self {
         AuthorityPublicKeyBytes(v.bytes)
     }
 }

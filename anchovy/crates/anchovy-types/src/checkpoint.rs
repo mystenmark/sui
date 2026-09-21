@@ -3,7 +3,7 @@
 
 use crate::arena::Alloc;
 use crate::base::{
-    AuthorityName, CheckpointContentsDigest, CheckpointDigest, Digest, TransactionDigest,
+    AuthorityPublicKeyBytes, CheckpointContentsDigest, CheckpointDigest, Digest, TransactionDigest,
     TransactionEffectsDigest, U64Le,
 };
 use crate::effects::{GasCostSummary, TransactionEffects, TransactionEvents};
@@ -59,7 +59,7 @@ impl CheckpointCommitment {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(C)]
 pub struct CommitteeMember {
-    pub authority: AuthorityName,
+    pub authority: AuthorityPublicKeyBytes,
     pub stake: U64Le,
 }
 
@@ -92,7 +92,8 @@ pub struct CheckpointSummary<'a> {
 }
 
 impl<'a> CheckpointSummary<'a> {
-    pub fn parse(r: &mut Reader<'a>) -> Result<CheckpointSummary<'a>> {
+    /// Allocates nothing; the arena parameter only tells the passes apart.
+    pub fn parse<A: Alloc<'a>>(r: &mut Reader<'a>, _: &mut A) -> Result<CheckpointSummary<'a>> {
         let start = r.pos();
         let epoch = r.u64()?;
         let sequence_number = r.u64()?;
@@ -120,12 +121,14 @@ impl<'a> CheckpointSummary<'a> {
             None
         };
         let version_specific_data = r.byte_vec()?;
-        // Hashed in whichever pass runs: this parser has no arena parameter
-        // to tell them apart, and a summary is rarely parsed twice.
         let bytes = r.span(start);
         Ok(CheckpointSummary {
             bytes,
-            digest: Digest::of("CheckpointSummary", bytes),
+            digest: if A::BUILD {
+                Digest::of("CheckpointSummary", bytes)
+            } else {
+                Digest::ZERO
+            },
             epoch,
             sequence_number,
             network_total_transactions,
@@ -153,19 +156,28 @@ pub struct AuthorityQuorumSignInfo<'a> {
 /// `Envelope<CheckpointSummary, AuthorityQuorumSignInfo>`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct CertifiedCheckpointSummary<'a> {
+    /// The exact encoding, as it is stored and sent.
+    pub bytes: &'a [u8],
     pub data: CheckpointSummary<'a>,
     pub auth_signature: AuthorityQuorumSignInfo<'a>,
 }
 
 impl<'a> CertifiedCheckpointSummary<'a> {
-    pub fn parse(r: &mut Reader<'a>) -> Result<CertifiedCheckpointSummary<'a>> {
+    pub fn parse<A: Alloc<'a>>(
+        r: &mut Reader<'a>,
+        a: &mut A,
+    ) -> Result<CertifiedCheckpointSummary<'a>> {
+        let start = r.pos();
+        let data = CheckpointSummary::parse(r, a)?;
+        let auth_signature = AuthorityQuorumSignInfo {
+            epoch: r.u64()?,
+            signature: r.array()?,
+            signers_map: r.byte_vec()?,
+        };
         Ok(CertifiedCheckpointSummary {
-            data: CheckpointSummary::parse(r)?,
-            auth_signature: AuthorityQuorumSignInfo {
-                epoch: r.u64()?,
-                signature: r.array()?,
-                signers_map: r.byte_vec()?,
-            },
+            bytes: r.span(start),
+            data,
+            auth_signature,
         })
     }
 }
@@ -364,7 +376,7 @@ pub struct CheckpointData<'a> {
 impl<'a> CheckpointData<'a> {
     pub fn parse<A: Alloc<'a>>(r: &mut Reader<'a>, a: &mut A) -> Result<CheckpointData<'a>> {
         r.enter()?;
-        let checkpoint_summary = CertifiedCheckpointSummary::parse(r)?;
+        let checkpoint_summary = CertifiedCheckpointSummary::parse(r, a)?;
         let checkpoint_contents = CheckpointContents::parse(r, a)?;
         let n = r.seq_len(CheckpointTransaction::MIN_WIRE_SIZE)?;
         let mut transactions = a.slice(n)?;
@@ -380,8 +392,8 @@ impl<'a> CheckpointData<'a> {
     }
 }
 
-crate::impl_wire!(CheckpointSummary, no_arena);
-crate::impl_wire!(CertifiedCheckpointSummary, no_arena);
+crate::impl_wire!(CheckpointSummary, guess = 0);
+crate::impl_wire!(CertifiedCheckpointSummary, guess = 0);
 // Mainnet p99 of arena over wire size: 0.34 and 0.76. Full contents are
 // not served on mainnet; the guess is a blend of transactions and effects.
 crate::impl_wire!(CheckpointContents, guess = 6);

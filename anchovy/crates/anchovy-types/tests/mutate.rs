@@ -10,13 +10,10 @@ use std::path::Path;
 
 use anchovy_types::checkpoint::{CertifiedCheckpointSummary, CheckpointContents, CheckpointData};
 use anchovy_types::effects::{TransactionEffects, TransactionEvents};
+use anchovy_types::message::{MAX_ARENA_PER_WIRE_BYTE, MIN_ARENA_GUESS};
 use anchovy_types::object::Object;
 use anchovy_types::transaction::TransactionData;
 use anchovy_types::{Message, Wire};
-
-/// The most arena bytes any one wire byte can cost: a three-byte
-/// `MakeMoveVec(None, [])` becomes an 80-byte `Command`.
-const MAX_ARENA_PER_WIRE_BYTE: usize = 32;
 
 struct Rng(u64);
 
@@ -64,9 +61,9 @@ fn parse_checked<T: Wire>(bytes: Vec<u8>) -> Option<Message<T>> {
     match Message::<T>::parse(bytes) {
         Ok(m) => {
             assert!(m.arena_used() <= len * MAX_ARENA_PER_WIRE_BYTE);
-            // The single-pass guess is a small multiple of the input, with a
-            // floor; a fallback arena is exactly what is used.
-            assert!(m.arena_size() <= (len * 3).max(256).max(m.arena_used()));
+            // A guessed arena, or a fallback arena of exactly what is used.
+            let guess = (len * T::ARENA_GUESS_SIXTEENTHS / 16).max(MIN_ARENA_GUESS);
+            assert!(m.arena_size() == guess || m.arena_size() == m.arena_used());
             Some(m)
         }
         Err((_, returned)) => {
@@ -78,6 +75,8 @@ fn parse_checked<T: Wire>(bytes: Vec<u8>) -> Option<Message<T>> {
 
 struct Seeds {
     checkpoint: Vec<u8>,
+    summary: Vec<u8>,
+    contents: Vec<u8>,
     transactions: Vec<Vec<u8>>,
     effects: Vec<Vec<u8>>,
     events: Vec<Vec<u8>>,
@@ -88,9 +87,11 @@ fn seeds() -> Seeds {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/mainnet-325300367.chk");
     let mut checkpoint = std::fs::read(path).unwrap();
     checkpoint.remove(0);
-    let parsed = Message::<CheckpointData<'static>>::parse(checkpoint.clone()).unwrap();
+    let parsed = Message::<CheckpointData>::parse(checkpoint.clone()).unwrap();
     let mut seeds = Seeds {
         checkpoint,
+        summary: parsed.get().checkpoint_summary.bytes.to_vec(),
+        contents: parsed.get().checkpoint_contents.bytes.to_vec(),
         transactions: Vec::new(),
         effects: Vec::new(),
         events: Vec::new(),
@@ -123,7 +124,7 @@ fn transactions() {
     let mut accepted = 0;
     for _ in 0..iterations() {
         let seed = &seeds.transactions[rng.below(seeds.transactions.len())];
-        let Some(m) = parse_checked::<TransactionData<'static>>(mutate(seed, &mut rng)) else {
+        let Some(m) = parse_checked::<TransactionData>(mutate(seed, &mut rng)) else {
             continue;
         };
         accepted += 1;
@@ -141,15 +142,15 @@ fn effects_events_objects() {
     let mut rng = Rng(0x2545_f491_4f6c_dd1d);
     for _ in 0..iterations() {
         let seed = &seeds.effects[rng.below(seeds.effects.len())];
-        if let Some(m) = parse_checked::<TransactionEffects<'static>>(mutate(seed, &mut rng)) {
+        if let Some(m) = parse_checked::<TransactionEffects>(mutate(seed, &mut rng)) {
             assert_eq!(m.get().bytes, m.wire_bytes());
         }
         let seed = &seeds.events[rng.below(seeds.events.len())];
-        if let Some(m) = parse_checked::<TransactionEvents<'static>>(mutate(seed, &mut rng)) {
+        if let Some(m) = parse_checked::<TransactionEvents>(mutate(seed, &mut rng)) {
             assert_eq!(m.get().bytes, m.wire_bytes());
         }
         let seed = &seeds.objects[rng.below(seeds.objects.len())];
-        if let Some(m) = parse_checked::<Object<'static>>(mutate(seed, &mut rng)) {
+        if let Some(m) = parse_checked::<Object>(mutate(seed, &mut rng)) {
             assert_eq!(m.get().bytes, m.wire_bytes());
         }
     }
@@ -159,20 +160,25 @@ fn effects_events_objects() {
 fn checkpoints() {
     let seeds = seeds();
     let mut rng = Rng(0xda94_2042_e4dd_58b5);
+    let mut accepted = 0;
     for _ in 0..iterations() / 100 {
-        let mutated = mutate(&seeds.checkpoint, &mut rng);
-        parse_checked::<CheckpointContents<'static>>(mutated.clone());
-        parse_checked::<CertifiedCheckpointSummary<'static>>(mutated.clone());
-        let Some(m) = parse_checked::<CheckpointData<'static>>(mutated) else {
+        if parse_checked::<CheckpointContents>(mutate(&seeds.contents, &mut rng)).is_some() {
+            accepted += 1;
+        }
+        if parse_checked::<CertifiedCheckpointSummary>(mutate(&seeds.summary, &mut rng)).is_some() {
+            accepted += 1;
+        }
+        let Some(m) = parse_checked::<CheckpointData>(mutate(&seeds.checkpoint, &mut rng)) else {
             continue;
         };
+        accepted += 1;
         for tx in m.get().transactions {
-            let alone =
-                parse_checked::<TransactionData<'static>>(tx.transaction.data.bytes.to_vec())
-                    .expect("a span the checkpoint parser accepted");
+            let alone = parse_checked::<TransactionData>(tx.transaction.data.bytes.to_vec())
+                .expect("a span the checkpoint parser accepted");
             assert_eq!(*alone.get(), tx.transaction.data);
         }
     }
+    assert!(accepted > 0);
 }
 
 /// Any byte string at all, as every root type.
@@ -190,10 +196,10 @@ fn noise() {
                 }
             })
             .collect();
-        parse_checked::<TransactionData<'static>>(bytes.clone());
-        parse_checked::<TransactionEffects<'static>>(bytes.clone());
-        parse_checked::<TransactionEvents<'static>>(bytes.clone());
-        parse_checked::<Object<'static>>(bytes.clone());
-        parse_checked::<CheckpointData<'static>>(bytes);
+        parse_checked::<TransactionData>(bytes.clone());
+        parse_checked::<TransactionEffects>(bytes.clone());
+        parse_checked::<TransactionEvents>(bytes.clone());
+        parse_checked::<Object>(bytes.clone());
+        parse_checked::<CheckpointData>(bytes);
     }
 }
