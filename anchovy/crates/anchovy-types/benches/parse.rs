@@ -95,15 +95,20 @@ fn load() -> Corpus {
     corpus
 }
 
+/// Per item.
 struct Measurement {
-    per_item: Duration,
-    allocations_per_item: f64,
+    parse: Duration,
+    /// Dropping the parsed value, its input buffer included.
+    drop: Duration,
+    allocations: f64,
 }
 
 /// Times `f` over every input, the inputs cloned beforehand since parsing
-/// consumes its buffer. Reports the fastest of `rounds`.
+/// consumes its buffer, and then times dropping everything `f` returned.
+/// Reports the fastest of `rounds` for each.
 fn measure<T>(inputs: &[Vec<u8>], rounds: usize, f: impl Fn(Vec<u8>) -> T) -> Measurement {
-    let mut best = Duration::MAX;
+    let mut best_parse = Duration::MAX;
+    let mut best_drop = Duration::MAX;
     let mut allocations = 0;
     for _ in 0..rounds {
         let owned: Vec<Vec<u8>> = inputs.to_vec();
@@ -113,26 +118,32 @@ fn measure<T>(inputs: &[Vec<u8>], rounds: usize, f: impl Fn(Vec<u8>) -> T) -> Me
         for input in owned {
             outputs.push(black_box(f(input)));
         }
-        let elapsed = start.elapsed();
+        best_parse = best_parse.min(start.elapsed());
         allocations = ALLOCATIONS.load(Ordering::Relaxed) - before;
-        best = best.min(elapsed);
+
+        let start = Instant::now();
         drop(outputs);
+        best_drop = best_drop.min(start.elapsed());
     }
     Measurement {
-        per_item: best / inputs.len() as u32,
-        allocations_per_item: allocations as f64 / inputs.len() as f64,
+        parse: best_parse / inputs.len() as u32,
+        drop: best_drop / inputs.len() as u32,
+        allocations: allocations as f64 / inputs.len() as f64,
     }
 }
 
 fn report(name: &str, inputs: &[Vec<u8>], m: &Measurement) {
     let bytes: usize = inputs.iter().map(Vec::len).sum();
     let mean_len = bytes / inputs.len();
-    let mb_per_s = mean_len as f64 / m.per_item.as_secs_f64() / 1e6;
+    let total = m.parse + m.drop;
+    let mb_per_s = mean_len as f64 / total.as_secs_f64() / 1e6;
     println!(
-        "{name:<44} {:>10.1?}/item {:>8.0} MB/s {:>8.2} allocs/item  ({} items, mean {} bytes)",
-        m.per_item,
+        "{name:<44} parse {:>9.1?}  drop {:>9.1?}  total {:>9.1?} {:>7.0} MB/s {:>8.2} allocs  ({} items, mean {} bytes)",
+        m.parse,
+        m.drop,
+        total,
         mb_per_s,
-        m.allocations_per_item,
+        m.allocations,
         inputs.len(),
         mean_len
     );
@@ -146,15 +157,19 @@ fn main() {
     });
     report("SenderSignedData  anchovy", &corpus.transactions, &m);
     let m = measure(&corpus.transactions, 30, |b| {
-        Message::<SenderSignedData<'static>>::measure(&b).unwrap()
+        Message::<SenderSignedData<'static>>::parse_exact(b).unwrap()
     });
     report(
-        "SenderSignedData  anchovy, measure pass only",
+        "SenderSignedData  anchovy, exact two-pass",
         &corpus.transactions,
         &m,
     );
+    // The baseline keeps its input buffer too, so that both drops free it.
     let m = measure(&corpus.transactions, 30, |b| {
-        bcs::from_bytes::<build::transaction::SenderSignedData>(&b).unwrap()
+        (
+            bcs::from_bytes::<build::transaction::SenderSignedData>(&b).unwrap(),
+            b,
+        )
     });
     report(
         "SenderSignedData  bcs + owned types",
@@ -167,7 +182,10 @@ fn main() {
     });
     report("CheckpointData    anchovy", &corpus.checkpoints, &m);
     let m = measure(&corpus.checkpoints, 10, |b| {
-        bcs::from_bytes::<build::checkpoint::CheckpointData>(&b).unwrap()
+        (
+            bcs::from_bytes::<build::checkpoint::CheckpointData>(&b).unwrap(),
+            b,
+        )
     });
     report(
         "CheckpointData    bcs + owned types",
