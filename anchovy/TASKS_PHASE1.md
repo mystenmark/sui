@@ -54,10 +54,12 @@ under "Open" below.
     Drop frees the input buffer on both sides; the exact two-pass parse of
     a signed transaction is 795 ns + 33 ns.
 
-    With digests (below) the parse of a signed transaction is 1.2 µs and of
-    a checkpoint 364 µs, since a checkpoint hashes nearly all of its bytes
+    With digests (below) the parse of a signed transaction is 1.1 µs and of
+    a checkpoint 365 µs, since a checkpoint hashes nearly all of its bytes
     (every object, effects and events) and Blake2b-256 runs at about
-    1.3 GB/s here. The baseline rows hash their input buffer once.
+    1.3 GB/s here. The baseline does not hash, as the reference does not
+    at deserialization time either; the comparison is deliberately unfair
+    to anchovy in that respect.
 14. Digests. Every hashed view (`TransactionData`, `TransactionEffects`,
     `TransactionEvents`, `Object`, `CheckpointSummary`,
     `CheckpointContents`) carries a `digest` computed once from its wire
