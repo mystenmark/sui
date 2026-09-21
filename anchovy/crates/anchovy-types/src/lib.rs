@@ -11,9 +11,15 @@
 
 pub mod arena;
 pub mod base;
+pub mod checkpoint;
+pub mod effects;
 pub mod error;
+pub mod execution_status;
 pub mod message;
+pub mod object;
 pub mod reader;
+pub mod system_transaction;
+pub mod transaction;
 pub mod type_tag;
 
 pub use error::{ParseError, Result};
@@ -31,6 +37,24 @@ macro_rules! impl_wire {
                 a: &mut A,
             ) -> $crate::error::Result<$ty<'a>> {
                 $ty::parse(r, a)
+            }
+
+            fn shrink<'l, 's: 'l>(v: &'l $ty<'s>) -> &'l $ty<'l> {
+                v
+            }
+        }
+    };
+    // For a view whose `parse(r)` allocates nothing.
+    ($ty:ident, no_arena) => {
+        // SAFETY: `shrink` is the identity, so `$ty` is covariant.
+        unsafe impl $crate::message::Wire for $ty<'static> {
+            type View<'a> = $ty<'a>;
+
+            fn parse<'a, A: $crate::arena::Alloc<'a>>(
+                r: &mut $crate::reader::Reader<'a>,
+                _: &mut A,
+            ) -> $crate::error::Result<$ty<'a>> {
+                $ty::parse(r)
             }
 
             fn shrink<'l, 's: 'l>(v: &'l $ty<'s>) -> &'l $ty<'l> {

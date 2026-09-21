@@ -84,6 +84,67 @@ impl fmt::Debug for U64Le {
     }
 }
 
+/// A little-endian `u32` with alignment 1.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct U32Le(pub [u8; 4]);
+
+// SAFETY: a transparent wrapper of a byte array.
+unsafe impl WireRecord for U32Le {}
+
+impl U32Le {
+    pub const fn new(v: u32) -> U32Le {
+        U32Le(v.to_le_bytes())
+    }
+
+    pub const fn get(self) -> u32 {
+        u32::from_le_bytes(self.0)
+    }
+}
+
+impl fmt::Debug for U32Le {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.get().fmt(f)
+    }
+}
+
+/// `AuthorityPublicKeyBytes` as it sits on the wire: a length byte, always
+/// 96, then a compressed BLS12-381 G2 point that is not checked here.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(C)]
+pub struct AuthorityName {
+    len: u8,
+    pub bytes: [u8; 96],
+}
+
+// SAFETY: `repr(C)` over byte fields: alignment 1, no padding. `len` is
+// checked wherever a reference is produced but no value of it is invalid.
+unsafe impl WireRecord for AuthorityName {}
+
+impl AuthorityName {
+    pub const fn new(bytes: [u8; 96]) -> AuthorityName {
+        AuthorityName { len: 96, bytes }
+    }
+
+    pub(crate) fn check(&self) -> Result<()> {
+        if self.len == 96 {
+            Ok(())
+        } else {
+            Err(ParseError::WrongLength {
+                ty: "AuthorityPublicKeyBytes",
+                expected: 96,
+                actual: u32::from(self.len),
+            })
+        }
+    }
+}
+
+impl fmt::Debug for AuthorityName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt_hex(&self.bytes, f)
+    }
+}
+
 /// An object version.
 pub type SequenceNumber = u64;
 
@@ -111,7 +172,7 @@ impl Digest {
         Ok(d)
     }
 
-    fn check(&self) -> Result<()> {
+    pub(crate) fn check(&self) -> Result<()> {
         if self.len == 32 {
             Ok(())
         } else {

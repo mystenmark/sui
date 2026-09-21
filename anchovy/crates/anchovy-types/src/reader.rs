@@ -57,6 +57,9 @@ impl<'a> Reader<'a> {
     /// `bcs` counts every struct, newtype struct, tuple struct and enum
     /// toward the depth limit; tuples, sequences, maps and options are free.
     /// A failed parse is abandoned, so error paths need not call `leave`.
+    ///
+    /// Only type tags recurse, so the count matters only on a path from a
+    /// root to a `TypeTag`. Parsers of types that cannot contain one skip it.
     pub fn enter(&mut self) -> Result<()> {
         if self.depth == MAX_CONTAINER_DEPTH {
             return Err(ParseError::ContainerDepthExceeded);
