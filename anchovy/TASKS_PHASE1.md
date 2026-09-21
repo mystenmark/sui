@@ -48,15 +48,25 @@ under "Open" below.
 
     | | anchovy | `bcs` into owned types |
     |---|---|---|
-    | `SenderSignedData`, mean 1,047 bytes | 788 ns, 1 alloc | 2.0 µs, 43 allocs |
-    | `CheckpointData`, mean 417 KB | 95 µs, 1 alloc | 290 µs, 5,184 allocs |
+    | `SenderSignedData`, mean 1,047 bytes | 490 ns, 1.01 allocs | 2.0 µs, 43 allocs |
+    | `CheckpointData`, mean 417 KB | 54 µs, 1.02 allocs | 290 µs, 5,184 allocs |
 
-    The measure pass is 334 ns of the 788. A profile showed a quarter of
-    the time in `core::str::from_utf8` on short identifiers; strings now
-    take an ASCII fast path and the build pass skips validation the
-    measure pass did. Inlining the one-byte uleb128 case and the small
-    reader methods, dropping depth accounting from `Argument` and
-    `ObjectArg`, and not pushing repeated package ids took it from 1.1 µs.
+    `Message::parse` is single-pass: it reserves an arena guessed from the
+    wire size (`Wire::ARENA_GUESS_SIXTEENTHS`, set per type to the mainnet
+    p99 of arena over wire, floor 256 bytes) and falls back to the exact
+    two-pass parse (`Message::parse_exact`) when the guess is short.
+    Fallback rates on the corpus: transactions 0.5%, effects 0.9%,
+    checkpoints 1.6%, events and objects 0%. The guess over-allocates by
+    37% (transaction data) to 48% (signed transactions) of what is used;
+    for objects parsed alone the floor makes it 7x, which only matters if
+    something parses objects one at a time.
+    Before single-pass mode the same parse took 788 ns, of which the
+    measure pass was 334; before that 1.1 µs. A profile had shown a quarter
+    of the time in `core::str::from_utf8` on short identifiers, so strings
+    take an ASCII fast path and an exact build pass skips validation the
+    measure pass did; the one-byte uleb128 case and the small reader
+    methods are inlined; `Argument` and `ObjectArg` skip depth accounting
+    they cannot affect; repeated package ids are not pushed for sorting.
     The baseline is generous to the reference: its own types also parse
     signatures at deserialization time, and frees are not timed.
 13. `tools/sui-oracle`, a crate outside the workspace and the one place that
@@ -74,15 +84,17 @@ under "Open" below.
 
 ## Open
 
-- Arena size per transaction is 1.4x the wire size at the median (p99
-  2.2x): `Command` is 80 bytes, `CallArg` 24, and the index copies owned
-  refs (73 bytes each). Boxing `MoveCall` would halve `Command` at the cost
-  of an indirection on the most common command. Decide whether memory or
-  the extra hop matters more once there is a consumer.
-- A single-pass mode (guess the arena from the wire length, fall back to
-  measure-then-build) would save up to the 334 ns measure pass, but a
-  guess big enough for p99 wastes about a wire-length of memory per
-  transaction. Not done; the two-pass design is exact.
+- Arena used per transaction is 1.4x the wire size at the median (p99
+  2.2x). Per programmable transaction (1,094 wire bytes, 2,006 arena):
+  type tags 434 (`StructTag` is 56 bytes, mostly two `&str`), index copies
+  393 (owned refs are 73 bytes each), `MoveCall` bodies 327, `CallArg`s
+  261 (24 each), commands 234, arguments 117. Boxing `MoveCall` was tried
+  and made it worse (p50 1.40 to 1.51): 4.6 of the 4.9 commands per
+  transaction are calls, so a box adds a pointer and padding to nearly
+  every command and saves 40 bytes on almost none. The levers that would
+  help are storing index owned refs as 8-byte references instead of
+  73-byte copies, and packing `StructTag` strings; both trade an
+  indirection for memory.
 - The builders mirror the snapshot, so they reject the `Passkey` variants
   of `CompressedSignature` and `PublicKey` that sui and `signature.rs`
   accept (`multisig_with_passkey` in `tests/roundtrip.rs`).
