@@ -15,7 +15,7 @@ Top level rules / design principles:
     - minimize allocations / frees.
     - minimize indirection / pointer chasing
     - prefer processing memory sequentially whenever possible
-    - Temporary data (vectors etc) should always be allocated from an arena that can be dropped in one free. That is, anything that would be a stacked variable, except for the fact that it requires dynamic storage, should use an arena.
+    - Temporary data (vectors etc) should always be allocated from an arena that can be dropped in one free. That is, anything that would be a stack variable, except for the fact that it requires dynamic storage, should use an arena.
   - correctness tools:
     - use types to "force" correctness when possible
       - an example of this is the use of VerifiedTransaction in the existing sui implementation, which prevents an unverified transaction from being executed.
@@ -46,6 +46,14 @@ Phase 2: containers
     - MessageMap: this maps a digest->message, e.g. TransactionDigest->Transaction. Because messages already have cryptographic hashes, and they are stored in the message struct, hashing is as simple as returning the first 64 bits of the digest. (collisions are of course mineable in ~2^32 steps but at very high cost to an attacker)
   - BTreeMap: vanilla BTreeMap (+ allocator support) is probably okay.
 - note there are some optimizations we can do for Message: equality and ordering can be done simply by looking at the digest, which all message types have.
+
+Phase 3: Server skeleton + validation
+- build a binary that provides the validator grpc API.
+- most handlers should be left with a todo!() impl for now.
+- use tokio + tonic
+
+Phase 4: Transaction validation
+- implement and test transaction validity checking (i.e. static checks)
 
 ---
 
