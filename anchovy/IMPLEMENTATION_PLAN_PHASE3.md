@@ -20,8 +20,10 @@ gRPC API with tokio and tonic, most handlers `todo!()`.
 2. Requests are decoded into this repo's wire types, not sui-types: BCS
    requests with `messages`' parser, protobuf requests with `prost` structs
    declared here with the reference's field tags.
-3. `ValidatorHealth` and the ping forms of `SubmitTransaction` and
-   `WaitForEffects` answer; every other handler is `todo!()`.
+3. `ValidatorHealth` answers; every other handler is `todo!()`. Pings are
+   `todo!()` too: the reference answers a submit ping with a real
+   consensus position and a wait-for-effects ping when that position
+   commits, neither of which exists without consensus.
 4. TLS as validators speak it: a self-signed certificate over the
    validator's Ed25519 network key, server name `sui`, so a stock sui
    client that pins the key connects.
@@ -30,7 +32,7 @@ gRPC API with tokio and tonic, most handlers `todo!()`.
 
 - Validity checks on submitted transactions (Phase 4). Decoding only
   builds the in-memory representation, per the PRD clarification.
-- Any real handler behaviour beyond pings and health: no consensus, no
+- Any real handler behaviour beyond health: no consensus, no
   storage, no execution.
 - Response types beyond what the implemented handlers return. The
   `todo!()` handlers return pre-encoded bytes, so their response types can
@@ -46,8 +48,8 @@ gRPC frame (no compression).
 
 | Route                  | Codec    | Request                   | Skeleton        |
 |------------------------|----------|---------------------------|-----------------|
-| `SubmitTransaction`    | protobuf | `RawSubmitTxRequest`      | ping answers    |
-| `WaitForEffects`       | protobuf | `RawWaitForEffectsRequest`| ping answers    |
+| `SubmitTransaction`    | protobuf | `RawSubmitTxRequest`      | `todo!()`       |
+| `WaitForEffects`       | protobuf | `RawWaitForEffectsRequest`| `todo!()`       |
 | `ObjectInfo`           | BCS      | `ObjectInfoRequest`       | `todo!()`       |
 | `TransactionInfo`      | BCS      | `TransactionInfoRequest`  | `todo!()`       |
 | `Checkpoint`           | BCS      | `CheckpointRequest`       | `todo!()`       |
@@ -82,11 +84,11 @@ at this crate:
 
 ### Handlers
 
-One struct, `Validator`, implements the generated trait. Pings return
-empty results; health returns zeros for fields the skeleton cannot know.
-`todo!()` panics unwind into the connection task (the release profile does
-not set `panic = "abort"`), which resets that stream; the server keeps
-serving.
+One struct, `Validator`, implements the generated trait. Health leaves
+every field absent (all are optional in the reference).
+`todo!()` panics unwind the task tonic spawns for that h2 stream (the
+release profile does not set `panic = "abort"`), which resets the stream;
+the connection and server keep serving.
 
 ### Binary
 
@@ -106,13 +108,13 @@ key rather than a chain. We do the same with `rustls`, `tokio-rustls` and
 - `messages::grpc`: each request parses the oracle's vectors and writes
   them back byte-for-byte; truncated and trailing-byte inputs fail.
 - In-crate: a tonic client over our own codecs calls every route on an
-  in-process server; pings and health answer, `todo!()` routes fail
-  without taking down the server.
+  in-process server; health answers, `todo!()` routes fail without taking
+  down the server, malformed BCS is `invalid_argument` before a handler.
 - Conformance: `tools/validator-client`, outside the workspace like
   `sui-oracle`, links `sui-network` and `sui-tls` and runs the reference
   client against a running `anchovy-validator`: TLS handshake with the
-  pinned key, ping and health answered, each `todo!()` route reached (seen
-  as a reset stream, not `unimplemented`).
+  pinned key, health answered, each `todo!()` route reached (seen as a
+  reset stream, not `unimplemented`).
 
 ## Steps
 
