@@ -5,13 +5,28 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[[bin]]
+name = "anchovy-validator"
+path = "src/main.rs"
+
 [dependencies]
+base64.workspace = true
 bytes.workspace = true
+clap.workspace = true
 messages.workspace = true
 prost.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-stream.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+hyper-util.workspace = true
+tower.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true
