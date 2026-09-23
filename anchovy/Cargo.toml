@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/arena", "crates/containers", "crates/messages", "crates/validator"]
+members = [
+    "crates/arena",
+    "crates/containers",
+    "crates/messages",
+    "crates/protocol-config",
+    "crates/protocol-config-macros",
+    "crates/validator",
+]
 exclude = ["tools/sui-oracle", "tools/validator-client"]
 
 [workspace.package]
@@ -15,6 +22,8 @@ blake2 = "=0.10.6"
 arena = { path = "crates/arena" }
 containers = { path = "crates/containers" }
 messages = { path = "crates/messages" }
+protocol-config = { path = "crates/protocol-config" }
+protocol-config-macros = { path = "crates/protocol-config-macros" }
 # Two versions of the allocator trait: hashbrown and its Vec use 0.2,
 # arena-btreemap uses 0.4. The arena implements both.
 allocator-api2 = { version = "0.2", default-features = false, features = ["alloc"] }
@@ -26,6 +35,15 @@ serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde-reflection = "0.5.0"
 serde_yaml = "0.9"
+serde_json = "1"
+serde_with = { version = "3", default-features = false, features = ["macros"] }
+tracing = "0.1"
+bs58 = "0.5"
+insta = { version = "1", features = ["yaml"] }
+proc-macro2 = "1"
+quote = "1"
+# sui-protocol-config-macros is written against syn 1.
+syn = { version = "1.0.104", features = ["full", "derive", "extra-traits"] }
 # The gRPC stack, at the versions in sui's lockfile.
 bytes = "1.11"
 prost = "0.14.1"
