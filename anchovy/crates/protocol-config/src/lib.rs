@@ -1,6 +1,9 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+// The field-walking macros in `macros.rs` recurse once per field.
+#![recursion_limit = "1024"]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
@@ -11,13 +14,11 @@ use std::{
 
 use std::sync::Mutex;
 
-use protocol_config_macros::{
-    ProtocolConfigAccessors, ProtocolConfigFeatureFlagsGetters, ProtocolConfigOverride,
-};
 use serde::{Deserialize, Serialize};
-use serde_with::skip_serializing_none;
 use tracing::{info, warn};
 
+#[macro_use]
+mod macros;
 mod shims;
 pub use shims::AccountAddress;
 use shims::{Base58, Hex, in_integration_test};
@@ -476,9 +477,10 @@ impl Chain {
 pub struct Error(pub String);
 
 // TODO: There are quite a few non boolean values in the feature flags. We should move them out.
+feature_flags! {
 /// Records on/off feature flags that may vary at each protocol version.
-#[derive(Default, Clone, Serialize, Deserialize, Debug, ProtocolConfigFeatureFlagsGetters)]
-struct FeatureFlags {
+#[derive(Default, Clone, Serialize, Deserialize, Debug)]
+pub struct FeatureFlags {
     // Add feature flags here, e.g.:
     // new_protocol_feature: bool,
     #[serde(skip_serializing_if = "is_false")]
@@ -1282,6 +1284,7 @@ struct FeatureFlags {
     #[serde(skip_serializing_if = "is_false")]
     disable_effects_tx_dependencies: bool,
 }
+}
 
 fn is_false(b: &bool) -> bool {
     !b
@@ -1396,6 +1399,7 @@ impl ConsensusNetwork {
     }
 }
 
+protocol_config! {
 /// Constants that change the behavior of the protocol.
 ///
 /// The value of each constant here must be fixed for a given protocol version. To change the value
@@ -1408,27 +1412,12 @@ impl ConsensusNetwork {
 /// - Add the field as a private `Option<T>` to the struct.
 /// - Initialize the field to `None` in prior protocol versions.
 /// - Initialize the field to `Some(val)` for your new protocol version.
-/// - Add a public getter that simply unwraps the field.
-/// - Two public getters of the form `field(&self) -> field_type`
-///     and `field_as_option(&self) -> Option<field_type>` will be automatically generated for you.
-/// Example for a field: `new_constant: Option<u64>`
-/// ```rust,ignore
-///      pub fn new_constant(&self) -> u64 {
-///         self.new_constant.expect(Self::CONSTANT_ERR_MSG)
-///     }
-///      pub fn new_constant_as_option(&self) -> Option<u64> {
-///         self.new_constant.expect(Self::CONSTANT_ERR_MSG)
-///     }
-/// ```
-/// With `pub fn new_constant(&self) -> u64`, if the constant is accessed in a protocol version
-/// in which it is not defined, the validator will crash. (Crashing is necessary because
-/// this type of error would almost always result in forking if not prevented here).
-/// If you don't want the validator to crash, you can use the
-/// `pub fn new_constant_as_option(&self) -> Option<u64>` getter, which will
-/// return `None` if the field is not defined at that version.
+/// - For an `Option<u16 | u32 | u64 | bool>` field, `protocol_config!` generates
+///   `field(&self) -> T`, which panics if the constant is accessed in a protocol version in which
+///   it is not defined. (Crashing is necessary because this type of error would almost always
+///   result in forking if not prevented here.) Read the field itself to get `None` instead.
 /// - If you want a customized getter, you can add a method in the impl.
-#[skip_serializing_none]
-#[derive(Clone, Serialize, Debug, ProtocolConfigAccessors, ProtocolConfigOverride)]
+#[derive(Clone, Serialize, Debug)]
 pub struct ProtocolConfig {
     pub version: ProtocolVersion,
 
@@ -2069,8 +2058,7 @@ pub struct ProtocolConfig {
     // The cutoff value for the MED outlier detection
     // scoring_decision_cutoff_value: Option<f64>,
     /// === Execution Version ===
-    // custom_setter: see `set_execution_version_for_testing`, which forbids downgrades.
-    #[custom_setter]
+    // Tests should set this with `set_execution_version_for_testing`, which forbids downgrades.
     execution_version: Option<u64>,
 
     // Dictates the threshold (percentage of stake) that is used to calculate the "bad" nodes to be
@@ -2217,6 +2205,7 @@ pub struct ProtocolConfig {
     gasless_max_computation_units: Option<u64>,
 
     /// Allowed token types for gasless transactions, with minimum transfer sizes per token.
+    #[serde(skip_serializing_if = "Option::is_none")]
     gasless_allowed_token_types: Option<Vec<(String, u64)>>,
 
     /// Maximum number of unused Pure inputs allowed in a gasless transaction.
@@ -2232,7 +2221,6 @@ pub struct ProtocolConfig {
     gasless_max_tps: Option<u64>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[skip_accessor]
     include_special_package_amendments: Option<Arc<Amendments>>,
 
     /// Maximum serialized size in bytes of a gasless transaction (SenderSignedData).
@@ -2254,6 +2242,28 @@ pub struct ProtocolConfig {
     /// The maximum number of references returned over the course of the transaction. Only used
     /// when `allow_references_in_ptbs` is enabled.
     max_ptb_total_returned_references: Option<u64>,
+}
+}
+
+/// A scalar config value, by type.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Serialize, Debug, PartialEq, Deserialize)]
+pub enum ProtocolConfigValue {
+    u16(u16),
+    u32(u32),
+    u64(u64),
+    bool(bool),
+}
+
+impl std::fmt::Display for ProtocolConfigValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProtocolConfigValue::u16(x) => write!(f, "{x}"),
+            ProtocolConfigValue::u32(x) => write!(f, "{x}"),
+            ProtocolConfigValue::u64(x) => write!(f, "{x}"),
+            ProtocolConfigValue::bool(x) => write!(f, "{x}"),
+        }
+    }
 }
 
 /// An aliased address.
@@ -4803,7 +4813,7 @@ impl ProtocolConfig {
 // This is only needed for feature_flags. Please suffix each setter with `_for_testing`.
 // Non-feature_flags should already have test setters defined through macros.
 impl ProtocolConfig {
-    // Hand-written (the field is marked #[custom_setter]) to forbid downgrades: an executor
+    // Hand-written to forbid downgrades: an executor
     // older than the config's protocol version can't link the frameworks of later versions —
     // its natives tables are frozen. Upgrades are allowed for replay's executor override.
     pub fn set_execution_version_for_testing(&mut self, val: u64) {
@@ -5066,24 +5076,18 @@ mod test {
     fn test_getters() {
         let prot: ProtocolConfig =
             ProtocolConfig::get_for_version(ProtocolVersion::new(1), Chain::Unknown);
-        assert_eq!(
-            prot.max_arguments(),
-            prot.max_arguments_as_option().unwrap()
-        );
+        assert_eq!(prot.max_arguments(), prot.max_arguments.unwrap());
     }
 
     #[test]
     fn test_setters() {
         let mut prot: ProtocolConfig =
             ProtocolConfig::get_for_version(ProtocolVersion::new(1), Chain::Unknown);
-        prot.set_max_arguments_for_testing(123);
+        prot.max_arguments = Some(123);
         assert_eq!(prot.max_arguments(), 123);
 
-        prot.set_max_arguments_from_str_for_testing("321".to_string());
-        assert_eq!(prot.max_arguments(), 321);
-
-        prot.disable_max_arguments_for_testing();
-        assert_eq!(prot.max_arguments_as_option(), None);
+        prot.max_arguments = None;
+        assert_eq!(prot.lookup_attr("max_arguments".to_string()), None);
 
         prot.set_attr_for_testing("max_arguments".to_string(), "456".to_string());
         assert_eq!(prot.max_arguments(), 456);

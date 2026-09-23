@@ -6,16 +6,15 @@ license.workspace = true
 publish = false
 
 # A copy of sui's `sui-protocol-config` with its Move, fastcrypto, clap,
-# Antithesis and RPC-rendering dependencies stripped; see `src/shims.rs`.
+# Antithesis and RPC-rendering dependencies stripped (`src/shims.rs`), and its
+# derive macros replaced by `macro_rules!` (`src/macros.rs`).
 # `src/snapshots` are the reference's, renamed for this crate, and must not
 # be updated, only added to.
 
 [dependencies]
 bs58.workspace = true
-protocol-config-macros.workspace = true
 serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
-serde_with.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
