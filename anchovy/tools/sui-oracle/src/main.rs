@@ -23,6 +23,9 @@
 //! ```
 //!
 //! Hex has no prefix. Lines within a record keep the reference's order.
+//!
+//! `sui-oracle --grpc-requests FILE` instead writes sample validator gRPC
+//! requests, one `<type> <bcs hex>` line each.
 
 use std::fmt::Write as _;
 
@@ -34,8 +37,73 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn grpc_requests() -> String {
+    use sui_types::base_types::{ObjectID, SequenceNumber};
+    use sui_types::digests::TransactionDigest;
+    use sui_types::messages_checkpoint::{CheckpointRequest, CheckpointRequestV2};
+    use sui_types::messages_grpc::{
+        LayoutGenerationOption, ObjectInfoRequest, ObjectInfoRequestKind, SystemStateRequest,
+        TransactionInfoRequest,
+    };
+
+    let id = ObjectID::new(std::array::from_fn(|i| i as u8));
+    let mut out = String::new();
+    let mut line = |ty: &str, bytes: Vec<u8>| writeln!(out, "{ty} {}", hex(&bytes)).unwrap();
+    for (generate_layout, request_kind) in [
+        (
+            LayoutGenerationOption::Generate,
+            ObjectInfoRequestKind::LatestObjectInfo,
+        ),
+        (
+            LayoutGenerationOption::None,
+            ObjectInfoRequestKind::PastObjectInfoDebug(SequenceNumber::from_u64(u64::MAX - 1)),
+        ),
+    ] {
+        let request = ObjectInfoRequest {
+            object_id: id,
+            generate_layout,
+            request_kind,
+        };
+        line("ObjectInfoRequest", bcs::to_bytes(&request).unwrap());
+    }
+    let request = TransactionInfoRequest {
+        transaction_digest: TransactionDigest::new([0xab; 32]),
+    };
+    line("TransactionInfoRequest", bcs::to_bytes(&request).unwrap());
+    for sequence_number in [None, Some(0), Some(325_300_367)] {
+        for request_content in [false, true] {
+            let v1 = CheckpointRequest {
+                sequence_number,
+                request_content,
+            };
+            line("CheckpointRequest", bcs::to_bytes(&v1).unwrap());
+            for certified in [false, true] {
+                let v2 = CheckpointRequestV2 {
+                    sequence_number,
+                    request_content,
+                    certified,
+                };
+                line("CheckpointRequestV2", bcs::to_bytes(&v2).unwrap());
+            }
+        }
+    }
+    for unused in [false, true] {
+        let request = SystemStateRequest { _unused: unused };
+        line("SystemStateRequest", bcs::to_bytes(&request).unwrap());
+    }
+    out
+}
+
 fn main() {
-    for path in std::env::args().skip(1) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let [flag, path] = args.as_slice()
+        && flag == "--grpc-requests"
+    {
+        std::fs::write(path, grpc_requests()).unwrap();
+        println!("{path}");
+        return;
+    }
+    for path in args {
         let mut bytes = std::fs::read(&path).unwrap();
         assert_eq!(bytes.remove(0), 1, "{path}: not a BCS blob");
         let checkpoint: CheckpointData = bcs::from_bytes(&bytes).unwrap();
