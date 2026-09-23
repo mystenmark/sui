@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/arena", "crates/containers", "crates/messages", "crates/validator"]
-exclude = ["tools/sui-oracle"]
+exclude = ["tools/sui-oracle", "tools/validator-client"]
 
 [workspace.package]
 edition = "2024"

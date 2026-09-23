@@ -1,0 +1,23 @@
+[package]
+name = "validator-client"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Outside the anchovy workspace: links sui's own validator client, to check
+# anchovy-validator against it. Cargo.lock starts from sui's.
+[workspace]
+
+[dependencies]
+sui-network = { path = "../../../crates/sui-network" }
+mysten-network = { path = "../../../crates/mysten-network" }
+sui-tls = { path = "../../../crates/sui-tls" }
+sui-types = { path = "../../../crates/sui-types" }
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "076bf5ad8cea140dc7cf5c5861c24a36acdf64ce" }
+anyhow = "1.0.71"
+bcs = "0.1.6"
+bytes = "1"
+rand = "0.8.5"
+tokio = { version = "1", features = ["full"] }
+tonic = "0.14.6"
