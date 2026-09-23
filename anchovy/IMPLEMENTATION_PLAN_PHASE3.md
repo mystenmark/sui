@@ -101,7 +101,9 @@ shutdown on ctrl-c. Argument parsing with `clap` (derive).
 `sui-tls` makes a self-signed certificate for the network key with
 `rcgen`, server name `sui`, and clients verify the certificate's public
 key rather than a chain. We do the same with `rustls`, `tokio-rustls` and
-`rcgen` (all in sui's lockfile), and `fastcrypto` for the key.
+`rcgen` (all in sui's lockfile). The secret reaches ring as PKCS#8 v1,
+which for Ed25519 is a fixed prefix and the 32 bytes, so no key crate is
+needed.
 
 ## Testing
 

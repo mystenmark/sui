@@ -3,7 +3,7 @@
 Plan: `IMPLEMENTATION_PLAN_PHASE3.md`. Branch `mlogan-phase3`, to be merged
 into `anchovy-main`.
 
-## Status: steps 1 and 2 done, step 3 next
+## Status: steps 1 to 4 done, step 5 (conformance) next
 
 ## Done
 
@@ -22,6 +22,18 @@ into `anchovy-main`.
    else is `todo!()`. In-process test: every route reached through the
    generated client, server survives the panics, malformed BCS rejected
    before the handler.
+3. `anchovy-validator --listen <addr> --network-key <file>`: reads sui's
+   key file format (base64 of flag 0 and the 32-byte secret), serves until
+   ctrl-c, exits 0. `validator::serve` is the shared entry point.
+4. TLS (`tls.rs`), done with step 3 rather than after a plaintext binary:
+   `sui-tls`'s server config (ring, TLS 1.3 only, ALPN `h2`, no client
+   auth) and certificate (`rcgen` defaults, SAN `sui`, self-signed over
+   the network key). The key goes to ring as a fixed-prefix PKCS#8 v1, so
+   no `fastcrypto`, `ed25519` or `pkcs8` crates. Handshakes run in their
+   own tasks with a 10 s timeout and feed tonic through a channel.
+   Tests: a client configured as sui's (TLS 1.3, pinned key) is served; a
+   client pinning another key is refused; key files parse, and the wrong
+   scheme or length is rejected.
 
 ## Findings
 
@@ -33,6 +45,5 @@ into `anchovy-main`.
 
 ## Remaining
 
-3. `anchovy-validator` binary, plaintext.
-4. TLS matching `sui-tls`.
-5. `tools/validator-client` conformance run.
+5. `tools/validator-client` conformance run: sui's own client and
+   `sui-tls` verifier against `anchovy-validator`.
