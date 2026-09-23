@@ -28,7 +28,14 @@ pub fn hash_set<K>(bump: &Bump, capacity: usize) -> HashSet<'_, K> {
 }
 
 /// A map keyed by message digest. Digests are uniformly distributed
-/// already, so the hash is their first eight bytes and nothing is hashed.
+/// already, so the hash is their first eight bytes put through one
+/// multiply with a per-map secret seed.
+///
+/// The seed is what stops hash flooding: a transaction's digest can be
+/// ground cheaply until its low bits pick a chosen bucket, which is all a
+/// flood needs. Seeding each map separately also avoids the quadratic
+/// clustering of inserting one map's keys, in its iteration order, into
+/// another. Iteration order is therefore random and must not reach output.
 ///
 /// The key's `Hash` impl must call `write_u64` once with those bytes and
 /// nothing else; `messages::base::Digest` does.
@@ -36,41 +43,78 @@ pub type MessageMap<'a, K, V> = hashbrown::HashMap<K, V, DigestHasher, &'a Bump>
 pub type MessageSet<'a, K> = hashbrown::HashSet<K, DigestHasher, &'a Bump>;
 
 pub fn message_map<K, V>(bump: &Bump, capacity: usize) -> MessageMap<'_, K, V> {
-    MessageMap::with_capacity_and_hasher_in(capacity, DigestHasher, bump)
+    MessageMap::with_capacity_and_hasher_in(capacity, DigestHasher::new(), bump)
 }
 
 pub fn message_set<K>(bump: &Bump, capacity: usize) -> MessageSet<'_, K> {
-    MessageSet::with_capacity_and_hasher_in(capacity, DigestHasher, bump)
+    MessageSet::with_capacity_and_hasher_in(capacity, DigestHasher::new(), bump)
 }
 
-#[derive(Clone, Copy, Default, Debug)]
-pub struct DigestHasher;
+#[derive(Clone, Copy)]
+pub struct DigestHasher {
+    seed: u64,
+    multiplier: u64,
+}
+
+impl DigestHasher {
+    /// Fresh secrets for one map. std's `RandomState` is keyed from the OS
+    /// and distinct per instance; foldhash's is not meant to resist
+    /// flooding.
+    pub fn new() -> DigestHasher {
+        let keys = std::hash::RandomState::new();
+        DigestHasher {
+            seed: keys.hash_one(0u64),
+            multiplier: keys.hash_one(1u64),
+        }
+    }
+}
+
+impl Default for DigestHasher {
+    fn default() -> DigestHasher {
+        DigestHasher::new()
+    }
+}
+
+impl std::fmt::Debug for DigestHasher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DigestHasher").finish_non_exhaustive()
+    }
+}
 
 impl BuildHasher for DigestHasher {
     type Hasher = DigestHasher64;
 
+    #[inline]
     fn build_hasher(&self) -> DigestHasher64 {
-        DigestHasher64(0)
+        DigestHasher64 {
+            value: 0,
+            keys: *self,
+        }
     }
 }
 
-#[derive(Default)]
-pub struct DigestHasher64(u64);
+pub struct DigestHasher64 {
+    value: u64,
+    keys: DigestHasher,
+}
 
 impl Hasher for DigestHasher64 {
     #[inline]
     fn write_u64(&mut self, v: u64) {
-        debug_assert_eq!(self.0, 0, "a digest key hashes exactly once");
-        self.0 = v;
+        debug_assert_eq!(self.value, 0, "a digest key hashes exactly once");
+        self.value = v;
     }
 
     fn write(&mut self, _: &[u8]) {
         unreachable!("digest keys hash by write_u64 only")
     }
 
+    /// foldhash's mix: the two halves of a 128-bit product, xored, spread
+    /// every input bit over the low bits hashbrown picks buckets with.
     #[inline]
     fn finish(&self) -> u64 {
-        self.0
+        let product = u128::from(self.value ^ self.keys.seed) * u128::from(self.keys.multiplier);
+        (product as u64) ^ ((product >> 64) as u64)
     }
 }
 
@@ -228,5 +272,14 @@ mod tests {
         assert_eq!(*boxed, 42);
         assert_eq!(bump.chunks(), 1);
         assert!(bump.allocated() > 0);
+    }
+
+    #[test]
+    fn message_maps_are_seeded_apart() {
+        let key = Key([7; 32]);
+        let a = DigestHasher::new();
+        let b = DigestHasher::new();
+        assert_ne!(a.hash_one(key), b.hash_one(key));
+        assert_ne!(a.hash_one(key), u64::from_le_bytes([7; 8]));
     }
 }
