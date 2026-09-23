@@ -1,0 +1,13 @@
+[package]
+name = "arena"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+allocator-api2.workspace = true
+allocator-api2-04.workspace = true
+
+[lints]
+workspace = true

@@ -8,6 +8,7 @@
 use std::fmt;
 
 use crate::arena::{Alloc, Arena, Build, Measure};
+use crate::base::Digest;
 use crate::error::{ParseError, Result};
 use crate::reader::Reader;
 
@@ -192,5 +193,59 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.get().fmt(f)
+    }
+}
+
+/// A view whose identity is a digest computed while parsing: the types the
+/// reference implements `Message` for.
+pub trait Digested {
+    fn digest(&self) -> &Digest;
+}
+
+impl<T: Wire> Message<T>
+where
+    for<'a> T::View<'a>: Digested,
+{
+    pub fn digest(&self) -> &Digest {
+        self.get().digest()
+    }
+}
+
+// Equality, order and hash of a digested message are those of its digest.
+impl<T: Wire> PartialEq for Message<T>
+where
+    for<'a> T::View<'a>: Digested,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.digest() == other.digest()
+    }
+}
+
+impl<T: Wire> Eq for Message<T> where for<'a> T::View<'a>: Digested {}
+
+impl<T: Wire> PartialOrd for Message<T>
+where
+    for<'a> T::View<'a>: Digested,
+{
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<T: Wire> Ord for Message<T>
+where
+    for<'a> T::View<'a>: Digested,
+{
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.digest().cmp(other.digest())
+    }
+}
+
+impl<T: Wire> std::hash::Hash for Message<T>
+where
+    for<'a> T::View<'a>: Digested,
+{
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.digest().hash(state);
     }
 }
