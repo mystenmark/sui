@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/messages"]
+members = ["crates/arena", "crates/containers", "crates/messages"]
 exclude = ["tools/sui-oracle"]
 
 [workspace.package]
@@ -12,6 +12,15 @@ license = "Apache-2.0"
 bcs = "=0.1.6"
 # The crate behind fastcrypto's Blake2b256, at the version sui's lockfile has.
 blake2 = "=0.10.6"
+arena = { path = "crates/arena" }
+containers = { path = "crates/containers" }
+# Two versions of the allocator trait: hashbrown and its Vec use 0.2,
+# arena-btreemap uses 0.4. The arena implements both.
+allocator-api2 = { version = "0.2", default-features = false, features = ["alloc"] }
+allocator-api2-04 = { package = "allocator-api2", version = "0.4", default-features = false, features = ["alloc"] }
+hashbrown = { version = "0.17", default-features = false, features = ["allocator-api2", "default-hasher", "inline-more"] }
+foldhash = { version = "0.2", default-features = false }
+arena-btreemap = "0.1.2"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde-reflection = "0.5.0"

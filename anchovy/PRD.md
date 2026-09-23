@@ -15,6 +15,7 @@ Top level rules / design principles:
     - minimize allocations / frees.
     - minimize indirection / pointer chasing
     - prefer processing memory sequentially whenever possible
+    - Temporary data (vectors etc) should always be allocated from an arena that can be dropped in one free. That is, anything that would be a stacked variable, except for the fact that it requires dynamic storage, should use an arena.
   - correctness tools:
     - use types to "force" correctness when possible
       - an example of this is the use of VerifiedTransaction in the existing sui implementation, which prevents an unverified transaction from being executed.
@@ -31,6 +32,20 @@ Phase 1: re-implement wire format types from sui-types.
 - we will need separate "builder" structs to build messages, since the primary type will only be constructible from an already serialized bcs buffer.
 - build a fuzzer to test the deser. look for potential OOMs
 - benchmark the deser path against real transactions pulled from mainnet, and optimize it.
+
+Phase 1a: fast builders
+- TransactionEffects and Checkpoints are constructed by validators. so these need fast, low-allocation builders. probably the simplest way is to have the builder own an arena, and allocate all intermediate structures in that arena. this work may have to be sequenced after the container work below.
+  - examine sui repo for how we construct these types in practice, optimize for those cases.
+  - build a benchmark and take a pass at optimizing code.
+  - should be possible to roundtrip a builder with only one malloc() + one free(). assuming initial capacity is chosen well. don't worry about an initial capacity heuristic yet, we just want to make this possible mechanically.
+
+Phase 2: containers
+- we need basic containers for use throughout the code. all containers must support arenas (there is a crate that offers most stdlib types with allocator support). we need the following types:
+  - sorted map, aka Vec<(key, value)>. this can be used whenever an associative container is built once and then read many times, and not inserted to or deleted from later. lookups can be done with binary search (or linear search when the container is small). HashMap may be faster in some cases.
+  - hash map: find the fastest available hash map for rust and use it. it will be used in general cases, as well as the building block for some special cases:
+    - MessageMap: this maps a digest->message, e.g. TransactionDigest->Transaction. Because messages already have cryptographic hashes, and they are stored in the message struct, hashing is as simple as returning the first 64 bits of the digest. (collisions are of course mineable in ~2^32 steps but at very high cost to an attacker)
+  - BTreeMap: vanilla BTreeMap (+ allocator support) is probably okay.
+- note there are some optimizations we can do for Message: equality and ordering can be done simply by looking at the digest, which all message types have.
 
 ---
 

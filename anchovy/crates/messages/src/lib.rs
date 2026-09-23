@@ -16,6 +16,7 @@ pub mod checkpoint;
 pub mod effects;
 pub mod error;
 pub mod execution_status;
+pub mod fast;
 pub mod message;
 pub mod object;
 pub mod reader;
@@ -55,3 +56,46 @@ macro_rules! impl_wire {
     };
 }
 pub(crate) use impl_wire;
+
+#[cfg(test)]
+mod message_identity {
+    use std::collections::BTreeSet;
+
+    use crate::Message;
+    use crate::checkpoint::CheckpointData;
+    use crate::transaction::SenderSignedData;
+
+    #[test]
+    fn messages_compare_and_hash_by_digest() {
+        let mut bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/mainnet-325300367.chk"
+        ))
+        .unwrap();
+        bytes.remove(0);
+        let checkpoint = Message::<CheckpointData>::parse(bytes).unwrap();
+        let parsed: Vec<Message<SenderSignedData>> = checkpoint
+            .get()
+            .transactions
+            .iter()
+            .map(|tx| Message::<SenderSignedData>::parse(tx.transaction.bytes.to_vec()).unwrap())
+            .collect();
+        let again = Message::<SenderSignedData>::parse(parsed[0].wire_bytes().to_vec()).unwrap();
+        assert_eq!(parsed[0], again);
+        assert_ne!(parsed[0], parsed[1]);
+        let sorted: BTreeSet<&Message<SenderSignedData>> = parsed.iter().collect();
+        assert_eq!(sorted.len(), parsed.len());
+        let mut hashes: Vec<u64> = parsed
+            .iter()
+            .map(|m| {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::hash::DefaultHasher::new();
+                m.hash(&mut h);
+                h.finish()
+            })
+            .collect();
+        hashes.sort_unstable();
+        hashes.dedup();
+        assert_eq!(hashes.len(), parsed.len());
+    }
+}

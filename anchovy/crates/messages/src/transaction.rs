@@ -706,3 +706,15 @@ crate::impl_wire!(TransactionData, guess = 35);
 crate::impl_wire!(SenderSignedData, guess = 34);
 
 crate::base::assert_wire_layout!(SharedObjectArg = 41, Intent = 3);
+
+impl crate::message::Digested for TransactionData<'_> {
+    fn digest(&self) -> &Digest {
+        &self.digest
+    }
+}
+
+impl crate::message::Digested for SenderSignedData<'_> {
+    fn digest(&self) -> &Digest {
+        &self.data.digest
+    }
+}

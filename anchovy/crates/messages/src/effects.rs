@@ -512,3 +512,9 @@ crate::impl_wire!(TransactionEffects, guess = 10);
 crate::impl_wire!(TransactionEvents, guess = 15);
 
 crate::base::assert_wire_layout!(EventCommitment = 41);
+
+impl crate::message::Digested for TransactionEffects<'_> {
+    fn digest(&self) -> &Digest {
+        &self.digest
+    }
+}

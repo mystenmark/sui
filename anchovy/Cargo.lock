@@ -3,6 +3,35 @@
 version = 4
 
 [[package]]
+name = "allocator-api2"
+version = "0.2.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
+
+[[package]]
+name = "allocator-api2"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c880a97d28a3681c0267bd29cff89621202715b065127cd445fa0f0fe0aa2880"
+
+[[package]]
+name = "arena"
+version = "0.1.0"
+dependencies = [
+ "allocator-api2 0.2.21",
+ "allocator-api2 0.4.0",
+]
+
+[[package]]
+name = "arena-btreemap"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58eed693eb0b42c7631f70044924736fbf77c6698bc843b8c20b3136826ed42c"
+dependencies = [
+ "allocator-api2 0.4.0",
+]
+
+[[package]]
 name = "bcs"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -28,6 +57,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "containers"
+version = "0.1.0"
+dependencies = [
+ "allocator-api2 0.2.21",
+ "arena",
+ "arena-btreemap",
+ "foldhash",
+ "hashbrown",
 ]
 
 [[package]]
@@ -67,6 +107,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -81,6 +127,10 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "allocator-api2 0.2.21",
+ "foldhash",
+]
 
 [[package]]
 name = "indexmap"
@@ -104,6 +154,7 @@ version = "0.1.0"
 dependencies = [
  "bcs",
  "blake2",
+ "containers",
  "serde",
  "serde-reflection",
  "serde_bytes",
