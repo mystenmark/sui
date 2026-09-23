@@ -3,7 +3,7 @@
 Plan: `IMPLEMENTATION_PLAN_PHASE3.md`. Branch `mlogan-phase3`, to be merged
 into `anchovy-main`.
 
-## Status: steps 1 to 4 done, step 5 (conformance) next
+## Status: complete
 
 ## Done
 
@@ -34,6 +34,16 @@ into `anchovy-main`.
    Tests: a client configured as sui's (TLS 1.3, pinned key) is served; a
    client pinning another key is refused; key files parse, and the wrong
    scheme or length is rejected.
+5. `tools/validator-client` (outside the workspace, lockfile pruned from
+   sui's): generates a key with sui-types, writes it with sui's
+   `encode_base64`, starts `anchovy-validator`, and connects exactly as
+   `NetworkAuthorityClient::connect` does (`sui_tls` client config pinning
+   the key, `mysten_network::client::connect`). Health answers; each of
+   the seven other routes, sent with sui-types' own requests and codecs,
+   reaches its handler (the server's `todo!()` message for that handler
+   appears on stderr); the server keeps serving; a client pinning another
+   key is refused. Run: `cargo run --manifest-path
+   tools/validator-client/Cargo.toml -- target/debug/anchovy-validator`.
 
 ## Findings
 
@@ -42,8 +52,6 @@ into `anchovy-main`.
   `todo!()` like the rest; plan updated.
 - A `todo!()` panic resets only its h2 stream; the connection and server
   keep going (tonic spawns a task per stream).
-
-## Remaining
-
-5. `tools/validator-client` conformance run: sui's own client and
-   `sui-tls` verifier against `anchovy-validator`.
+- `mysten_network::client::connect` is https-only: an `/http` multiaddr
+  becomes an `http://` URI that its connector refuses, so the conformance
+  tool addresses the server as `/ip4/.../tcp/.../https`.
