@@ -98,6 +98,24 @@ the fetched corpus when present (2,332 transactions in 64 checkpoints:
 1,683 pass everything, 660 system transactions, 2 `InvalidArgumentIndex`
 under the latest config, 1 zkLogin without its JWK; all agree).
 
+Mutation testing (after review: the corpus is valid transactions and the
+crafted vectors mostly break one check at a time):
+`sui-oracle --mutation-vectors` takes valid seeds (the crafted shapes and
+the checked-in mainnet checkpoint's transactions, re-sent from our keys),
+applies one to three random field-aware changes (gas, sender, expiration,
+inputs, commands, argument indices, type arguments, identifiers, publish
+counts, randomness, system kinds) and sometimes breaks the signatures,
+then records the reference's verdict on everything static a validator
+checks on submission (`full`: decoding, `validity_check`, signature
+verification) over every tenth and the last nine protocol versions on
+each chain. 3,000 transactions, seeded and reproducible, gzipped
+(`mutations.vectors.gz`). `validation::check` is that same sequence on our
+side. All agree; neither side panics. `tests/coverage.rs` fails if an
+`ErrorKind` has no vector, except `IncorrectSigner` and `InvalidAddress`,
+which cannot be reached end to end (listed with reasons). The mutator is
+meant to grow with the stateful layer, whose rejections it will check the
+same way.
+
 ## Deferred to the stateful layer
 
 Checks on the reference's signing path that need object state, so are
@@ -109,6 +127,41 @@ not in `validation`; each must land with object state:
   (`InvalidExpiration`). Telling address-owned from immutable inputs needs
   the objects. With `relax_valid_during_for_owned_inputs` this is the only
   replay check for address-balance gas.
+
+An audit of the rest of the signing path (`handle_submit_transaction`,
+`handle_vote_transaction`, sui-transaction-checks, the consensus vote)
+found more checks outside the functions we mirrored. Static, or always
+rejecting whatever the state (only the error depends on it):
+
+- `ObjectInputArityViolation` (`check_objects`): no input objects at all,
+  when coin reservations are off and gas comes from the address balance.
+- `GasBalanceTooLow` (`check_gas_data`): gas paid only with coin
+  reservations whose amounts sum below the budget.
+- A gas object repeated in `payment`, or also a PTB input: always
+  rejected (`MutableObjectUsedMoreThanOnce` or a state-dependent error);
+  the gas refs are not in validity_check's duplicate check.
+- A receiving object that is also an input or repeated
+  (`DuplicateObjectRefInput`, unless already received at that version);
+  receiving or owned versions at or above `SequenceNumber::MAX`.
+- `SenderAllowance` whose allowance object is not among the inputs, and
+  withdrawal sums per account overflowing u64 (`InvalidWithdrawReservation`).
+- Shared system objects: Clock, Random and the accumulator root only
+  immutable; other system ids only the listed ones
+  (`ImmutableParameterExpectedError`, after loading).
+- Gasless transactions with shared system-object inputs (`Unsupported`).
+- Package metering and the `<SELF>` identifier at publish
+  (`PackageVerificationTimeout`; limits from node config).
+
+Request- and node-level, for the Phase 5 handler: submit type, ping and
+empty requests, batch size, `RepeatedTransactions`, soft-bundle
+`GasPriceMismatchError`, `TotalTransactionSizeTooLargeInBatch`,
+`check_self_allowed_proposer` (`ProposerNotAllowed`), and on the
+consensus side the alias-claim and immutable-object-claim checks.
+
+Stateful: deny lists and node deny config, object existence, versions,
+digests and ownership, locks, balances and allowances, coin deny lists,
+aliases (which also make `SignerSignatureAbsent` stateful), overload and
+in-flight state, executed-transaction lookups.
 
 ## Findings
 
