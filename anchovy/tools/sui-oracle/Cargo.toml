@@ -20,6 +20,7 @@ shared-crypto = { path = "../../../crates/shared-crypto" }
 base64ct = { version = "=1.8.0", features = ["alloc"] }
 rand = "0.8.5"
 bs58 = "0.5"
+flate2 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 move-core-types = { path = "../../../external-crates/move/crates/move-core-types" }
@@ -34,3 +35,8 @@ overflow-checks = false
 # debug assertions (multisig signatures and bitmap out of step).
 [profile.dev.package.mysten-common]
 debug-assertions = false
+
+# sui-types and everything under it optimized: the vectors run the
+# reference millions of times.
+[profile.dev.package."*"]
+opt-level = 2

@@ -30,9 +30,12 @@
 //! `sui-oracle --validity-vectors FILE` writes validity-check vectors; see
 //! `validity.rs`. `sui-oracle --validity-corpus FILE.chk...` writes the
 //! validity verdicts of real transactions; see `validity_corpus.rs`.
+//! `sui-oracle --mutation-vectors FILE.gz` writes randomly mutated
+//! transactions with the reference's verdicts; see `mutations.rs`.
 
 use std::fmt::Write as _;
 
+mod mutations;
 mod signatures;
 mod validity;
 mod validity_corpus;
@@ -119,6 +122,13 @@ fn main() {
             println!("{path}");
             return;
         }
+    }
+    if let [flag, path] = args.as_slice()
+        && flag == "--mutation-vectors"
+    {
+        std::fs::write(path, mutations::vectors()).unwrap();
+        println!("{path}");
+        return;
     }
     if args.first().map(String::as_str) == Some("--validity-corpus") {
         for path in &args[1..] {

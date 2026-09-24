@@ -330,5 +330,18 @@ pub(crate) fn cases() -> Vec<(String, Vec<u8>)> {
         &from(address(&ed)),
         &[&zk_sig(&data, &eph, 10)],
     );
+    // The ephemeral key is only parsed when the ephemeral signature is
+    // checked: a key fastcrypto rejects gets there.
+    let bad_ephemeral = {
+        let msg = IntentMessage::new(Intent::sui_transaction(), &data);
+        // A Secp256k1 signature whose key has the invalid SEC1 tag 5.
+        let mut s = vec![1];
+        s.extend_from_slice(&Signature::new_secure(&msg, &eph).as_ref()[1..65]);
+        s.extend_from_slice(&[5; 33]);
+        let mut b = vec![5];
+        b.extend(bcs::to_bytes(&(inputs.clone(), 10u64, s)).unwrap());
+        b
+    };
+    add("zklogin_bad_ephemeral_key", &data, &[&bad_ephemeral]);
     cases
 }
