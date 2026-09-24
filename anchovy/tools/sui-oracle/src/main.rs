@@ -28,12 +28,14 @@
 //! requests, one `<type> <bcs hex>` line each.
 //!
 //! `sui-oracle --validity-vectors FILE` writes validity-check vectors; see
-//! `validity.rs`.
+//! `validity.rs`. `sui-oracle --validity-corpus FILE.chk...` writes the
+//! validity verdicts of real transactions; see `validity_corpus.rs`.
 
 use std::fmt::Write as _;
 
 mod signatures;
 mod validity;
+mod validity_corpus;
 mod validity_kind;
 mod validity_signed;
 mod validity_verify;
@@ -117,6 +119,17 @@ fn main() {
             println!("{path}");
             return;
         }
+    }
+    if args.first().map(String::as_str) == Some("--validity-corpus") {
+        for path in &args[1..] {
+            let mut bytes = std::fs::read(path).unwrap();
+            assert_eq!(bytes.remove(0), 1, "{path}: not a BCS blob");
+            let checkpoint: CheckpointData = bcs::from_bytes(&bytes).unwrap();
+            let out_path = path.replace(".chk", ".validity");
+            std::fs::write(&out_path, validity_corpus::verdicts(&checkpoint)).unwrap();
+            println!("{out_path}");
+        }
+        return;
     }
     for path in args {
         let mut bytes = std::fs::read(&path).unwrap();

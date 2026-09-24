@@ -71,8 +71,17 @@ pub(crate) fn verdict(bytes: &[u8], config: &ProtocolConfig, chain: Chain, epoch
     let Ok(tx) = bcs::from_bytes::<SenderSignedData>(bytes) else {
         return "TransactionDeserializationError".to_owned();
     };
+    verify(&tx, config, chain, epoch)
+}
+
+pub(crate) fn verify(
+    tx: &SenderSignedData,
+    config: &ProtocolConfig,
+    chain: Chain,
+    epoch: u64,
+) -> String {
     match verify_sender_signed_data_message_signatures(
-        &tx,
+        tx,
         epoch,
         &params(config, chain),
         Arc::new(VerifiedDigestCache::new_empty()),

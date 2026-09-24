@@ -5166,6 +5166,7 @@ version = "0.1.0"
 dependencies = [
  "base64ct",
  "bcs",
+ "bs58 0.5.1",
  "fastcrypto",
  "fastcrypto-zkp",
  "move-core-types",
