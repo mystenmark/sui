@@ -2749,6 +2749,8 @@ dependencies = [
  "messages",
  "protocol-config",
  "roaring",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

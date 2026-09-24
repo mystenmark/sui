@@ -38,7 +38,21 @@ pub enum ParsedSignature<'a> {
         serialized_len: usize,
     },
     ZkLogin(&'a [u8]),
-    Passkey(&'a [u8]),
+    Passkey(Passkey<'a>),
+}
+
+/// A passkey (`WebAuthn`) assertion over a transaction: the authenticator signed
+/// `authenticator_data || sha256(client_data_json)`, and the client data's
+/// challenge is the transaction's signing digest.
+#[derive(Clone, Copy, Debug)]
+pub struct Passkey<'a> {
+    pub authenticator_data: &'a [u8],
+    pub client_data_json: &'a str,
+    pub challenge: [u8; 32],
+    /// A Secp256r1 signature, `r || s`, both in range.
+    pub signature: &'a [u8; 64],
+    /// A valid compressed Secp256r1 point.
+    pub public_key: &'a [u8; 33],
 }
 
 impl ParsedSignature<'_> {
@@ -75,7 +89,9 @@ pub fn parse<'a>(bytes: &'a [u8], bump: &'a Bump) -> Result<(ParsedSignature<'a>
             None => legacy_multisig(&bytes[1..], bump)?,
         },
         5 => ParsedSignature::ZkLogin(bytes),
-        6 => ParsedSignature::Passkey(bytes),
+        6 => ParsedSignature::Passkey(
+            passkey(&bytes[1..]).ok_or_else(|| malformed("invalid passkey"))?,
+        ),
         _ => return Err(malformed("unknown signature scheme")),
     };
     let len = match parsed {
@@ -110,6 +126,76 @@ fn multisig_pk_valid(pk: &MultiSigPublicKey<'_>) -> bool {
             .iter()
             .enumerate()
             .all(|(i, (k, _))| map[i + 1..].iter().all(|(other, _)| other != k))
+}
+
+/// The fields of the client data the reference reads, with its serde
+/// attributes (`passkey_types::webauthn::CollectedClientData`), so that the
+/// same JSON is accepted.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+struct CollectedClientData {
+    #[serde(rename = "type")]
+    ty: ClientDataType,
+    challenge: String,
+    origin: String,
+    #[serde(default)]
+    cross_origin: Option<bool>,
+    #[serde(flatten)]
+    extra_data: (),
+    #[serde(flatten)]
+    unknown_keys: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(serde::Deserialize, PartialEq)]
+enum ClientDataType {
+    #[serde(rename = "webauthn.create")]
+    Create,
+    #[serde(rename = "webauthn.get")]
+    Get,
+    #[serde(rename = "payment.get")]
+    PaymentGet,
+}
+
+/// `PasskeyAuthenticator`'s deserialization: authenticator data, client
+/// data JSON, and a Secp256r1 signature whose key and signature fastcrypto
+/// accepts.
+fn passkey(body: &[u8]) -> Option<Passkey<'_>> {
+    let mut r = Reader::new(body);
+    let authenticator_data = r.byte_vec().ok()?;
+    let client_data_json = r.str().ok()?;
+    let user_signature = r.byte_vec().ok()?;
+    r.finish().ok()?;
+
+    let client_data: CollectedClientData = serde_json::from_str(client_data_json).ok()?;
+    if client_data.ty != ClientDataType::Get {
+        return None;
+    }
+    let challenge = {
+        use base64ct::Encoding as _;
+        let mut buf = [0u8; 32];
+        let decoded = base64ct::Base64UrlUnpadded::decode(&client_data.challenge, &mut buf).ok()?;
+        if decoded.len() != 32 {
+            return None;
+        }
+        buf
+    };
+
+    // `Signature::from_bytes`, which must be Secp256r1: flag, signature, key.
+    if user_signature.len() != SECP256_SIGNATURE_LEN || user_signature[0] != 2 {
+        return None;
+    }
+    let signature: &[u8; 64] = user_signature[1..65].try_into().ok()?;
+    let public_key: &[u8; 33] = user_signature[65..].try_into().ok()?;
+    fastcrypto::secp256r1::Secp256r1PublicKey::from_bytes(public_key).ok()?;
+    fastcrypto::secp256r1::Secp256r1Signature::from_bytes(signature).ok()?;
+    Some(Passkey {
+        authenticator_data,
+        client_data_json,
+        challenge,
+        signature,
+        public_key,
+    })
 }
 
 /// `MultiSigLegacy::from_bytes`: the same signatures, a roaring bitmap as

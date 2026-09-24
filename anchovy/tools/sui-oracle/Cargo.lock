@@ -668,9 +668,9 @@ checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "base64ct"
-version = "1.8.3"
+version = "1.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
+checksum = "55248b47b0caf0546f7988906588779981c43bb1bc9d0c44087278f80cdb44ba"
 
 [[package]]
 name = "bcs"
@@ -5164,6 +5164,7 @@ dependencies = [
 name = "sui-oracle"
 version = "0.1.0"
 dependencies = [
+ "base64ct",
  "bcs",
  "fastcrypto",
  "move-core-types",
