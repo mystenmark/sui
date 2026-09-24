@@ -53,9 +53,10 @@ into `anchovy-main`.
   recorded as `panic` verdicts: `SuiGasStatus::new_with_budget` asserts a
   non-zero gas price (a zero reference gas price lets price 0 through),
   and overflows on a huge price under gas models without a price cap.
-- `SuiCostTable::new` multiplies `base_tx_cost_fixed * price` unchecked;
-  sui's release profile wraps, so ours uses `wrapping_mul`. Only reachable
-  where no price cap applies.
+- `SuiCostTable::new` multiplies `base_tx_cost_fixed * price` under
+  `#[with_checked_arithmetic]`, so an overflow panics in every build. It
+  cannot happen: the multiplier exists only from v18, where the price cap
+  is checked first. Ours saturates.
 - `get_gasless_allowed_token_types` caches by protocol version only, not
   chain: a process that validates for several chains can get another
   chain's list. The oracle's loop order changes version on every call, so
