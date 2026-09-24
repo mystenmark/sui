@@ -9,7 +9,7 @@ use containers::Bump;
 use messages::Message;
 use messages::transaction::Transaction;
 use tokio::sync::oneshot;
-use workqueue::Processor;
+use workqueue::{Pool, Processor, Queue};
 
 use crate::epoch::EpochState;
 
@@ -47,5 +47,30 @@ impl Processor<ValidateTransaction> for TransactionValidator {
             validation::transaction_data::validity_check(data, &self.epoch.context(), &self.bump);
         // The handler may have given up; nothing to do then.
         let _ = item.reply.send(result);
+    }
+}
+
+/// The processor pools, and the queues that feed them.
+pub struct Processors {
+    pub transactions: Queue<ValidateTransaction>,
+    // Dropped last: stops and joins the threads.
+    _validation: Pool,
+}
+
+/// Queued transactions beyond which submissions are refused.
+const VALIDATION_QUEUE: usize = 4096;
+
+impl Processors {
+    pub fn start(epoch: &Arc<EpochState>, validation_threads: usize) -> Processors {
+        let make = {
+            let epoch = epoch.clone();
+            move || TransactionValidator::new(epoch.clone())
+        };
+        let (transactions, validation) =
+            Pool::spawn("validate", validation_threads, VALIDATION_QUEUE, make);
+        Processors {
+            transactions,
+            _validation: validation,
+        }
     }
 }

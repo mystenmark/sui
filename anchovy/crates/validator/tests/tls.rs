@@ -95,7 +95,15 @@ async fn serve(key: NetworkKey) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        validator::serve(listener, &key, std::future::pending())
+        let epoch = std::sync::Arc::new(validator::epoch::EpochState::new(
+            protocol_config::Chain::Unknown,
+            protocol_config::ProtocolVersion::MAX.as_u64(),
+            0,
+            messages::base::Digest::new([0; 32]),
+            1000,
+            1,
+        ));
+        validator::serve(listener, &key, epoch, 1, std::future::pending())
             .await
             .unwrap();
     });

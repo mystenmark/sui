@@ -18,14 +18,22 @@ pub mod service {
     include!(concat!(env!("OUT_DIR"), "/sui.validator.Validator.rs"));
 }
 
-/// Serves the API over TLS on `listener` until `shutdown` completes.
+/// Serves the API over TLS on `listener` until `shutdown` completes, with
+/// `validation_threads` threads validating transactions. They stop once the
+/// server has.
 pub async fn serve(
     listener: tokio::net::TcpListener,
     key: &tls::NetworkKey,
+    epoch: std::sync::Arc<epoch::EpochState>,
+    validation_threads: usize,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
-    tonic::transport::Server::builder()
-        .add_service(Validator::default().into_service())
+    let processors = processors::Processors::start(&epoch, validation_threads);
+    let validator = Validator::new(epoch, processors.transactions.clone());
+    let served = tonic::transport::Server::builder()
+        .add_service(validator.into_service())
         .serve_with_incoming_shutdown(tls::incoming(listener, tls::server_config(key)), shutdown)
-        .await
+        .await;
+    drop(processors);
+    served
 }
