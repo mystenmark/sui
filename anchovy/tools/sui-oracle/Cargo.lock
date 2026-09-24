@@ -5165,6 +5165,7 @@ name = "sui-oracle"
 version = "0.1.0"
 dependencies = [
  "bcs",
+ "move-core-types",
  "nonempty",
  "sui-protocol-config",
  "sui-types",

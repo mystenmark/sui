@@ -33,6 +33,7 @@
 use std::fmt::Write as _;
 
 mod validity;
+mod validity_kind;
 
 use sui_types::effects::TransactionEffectsAPI;
 use sui_types::full_checkpoint_content::CheckpointData;

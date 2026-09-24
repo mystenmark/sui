@@ -40,9 +40,9 @@ use sui_types::transaction::{
 
 use crate::hex;
 
-const CHAIN_ID: [u8; 32] = [0x11; 32];
+pub(crate) const CHAIN_ID: [u8; 32] = [0x11; 32];
 const OTHER_CHAIN_ID: [u8; 32] = [0x22; 32];
-const EPOCH: u64 = 5;
+pub(crate) const EPOCH: u64 = 5;
 
 struct Context {
     epoch: u64,
@@ -72,7 +72,7 @@ const CONTEXTS: [Context; 3] = [
     },
 ];
 
-fn chain_identifier(id: [u8; 32]) -> ChainIdentifier {
+pub(crate) fn chain_identifier(id: [u8; 32]) -> ChainIdentifier {
     ChainIdentifier::from(CheckpointDigest::new(id))
 }
 
@@ -111,7 +111,7 @@ fn base(expiration: TransactionExpiration, price: u64) -> TransactionData {
     })
 }
 
-fn valid_during(min: Option<u64>, max: Option<u64>) -> TransactionExpiration {
+pub(crate) fn valid_during(min: Option<u64>, max: Option<u64>) -> TransactionExpiration {
     TransactionExpiration::ValidDuring {
         min_epoch: min,
         max_epoch: max,
@@ -218,15 +218,15 @@ fn expiration_cases() -> Vec<(String, TransactionData)> {
     cases
 }
 
-fn sender() -> SuiAddress {
+pub(crate) fn sender() -> SuiAddress {
     SuiAddress::from(ObjectID::new([0xa1; 32]))
 }
 
-fn recipient() -> SuiAddress {
+pub(crate) fn recipient() -> SuiAddress {
     SuiAddress::from(ObjectID::new([0xb2; 32]))
 }
 
-fn object(n: u8) -> ObjectRef {
+pub(crate) fn object(n: u8) -> ObjectRef {
     (
         ObjectID::new([n; 32]),
         SequenceNumber::from_u64(7),
@@ -246,18 +246,18 @@ fn sui_balance(owner: SuiAddress) -> ObjectID {
         .inner()
 }
 
-struct Spec {
-    kind: TransactionKind,
-    payment: Vec<ObjectRef>,
-    owner: SuiAddress,
-    price: u64,
-    budget: u64,
-    expiration: TransactionExpiration,
+pub(crate) struct Spec {
+    pub(crate) kind: TransactionKind,
+    pub(crate) payment: Vec<ObjectRef>,
+    pub(crate) owner: SuiAddress,
+    pub(crate) price: u64,
+    pub(crate) budget: u64,
+    pub(crate) expiration: TransactionExpiration,
 }
 
 impl Spec {
     /// A transfer of the gas coin, one gas object, price 1000.
-    fn new() -> Spec {
+    pub(crate) fn new() -> Spec {
         let mut builder = ProgrammableTransactionBuilder::new();
         builder.transfer_arg(recipient(), Argument::GasCoin);
         Spec {
@@ -271,7 +271,7 @@ impl Spec {
     }
 
     /// A transfer of an owned object, so the gas coin is not an argument.
-    fn transfer_object() -> Spec {
+    pub(crate) fn transfer_object() -> Spec {
         let mut builder = ProgrammableTransactionBuilder::new();
         let owned = builder
             .obj(ObjectArg::ImmOrOwnedObject(object(0xe5)))
@@ -284,7 +284,7 @@ impl Spec {
     }
 
     /// Address-balance gas: no gas objects, a two-epoch window.
-    fn address_balance() -> Spec {
+    pub(crate) fn address_balance() -> Spec {
         Spec {
             payment: vec![],
             expiration: valid_during(Some(EPOCH), Some(EPOCH + 1)),
@@ -292,7 +292,7 @@ impl Spec {
         }
     }
 
-    fn with_inputs(inputs: Vec<CallArg>) -> Spec {
+    pub(crate) fn with_inputs(inputs: Vec<CallArg>) -> Spec {
         let mut builder = ProgrammableTransactionBuilder::new();
         for input in inputs {
             builder.input(input).unwrap();
@@ -307,7 +307,7 @@ impl Spec {
         }
     }
 
-    fn build(self) -> TransactionData {
+    pub(crate) fn build(self) -> TransactionData {
         TransactionData::V1(TransactionDataV1 {
             kind: self.kind,
             sender: sender(),
@@ -322,7 +322,7 @@ impl Spec {
     }
 }
 
-fn withdrawal(amount: u64, from: WithdrawFrom) -> CallArg {
+pub(crate) fn withdrawal(amount: u64, from: WithdrawFrom) -> CallArg {
     CallArg::FundsWithdrawal(FundsWithdrawalArg {
         reservation: Reservation::MaxAmountU64(amount),
         type_arg: WithdrawalTypeArg::Balance(GAS::type_tag()),
@@ -331,7 +331,7 @@ fn withdrawal(amount: u64, from: WithdrawFrom) -> CallArg {
 }
 
 /// Just under, at and over every value `limit` takes across versions.
-fn boundaries(
+pub(crate) fn boundaries(
     configs: &[&ProtocolConfig],
     limit: impl Fn(&ProtocolConfig) -> Option<u64>,
 ) -> Vec<u64> {
@@ -633,7 +633,9 @@ pub fn vectors() -> String {
         .chain(gas_cases(&all))
         .chain(address_balance_cases())
         .chain(withdrawal_cases())
-        .chain(sponsorship_cases());
+        .chain(sponsorship_cases())
+        .chain(crate::validity_kind::kind_cases(&all))
+        .chain(crate::validity_kind::gasless_cases());
     for (label, tx) in tx_data {
         cases.push(("tx_data", label, tx));
     }
@@ -652,7 +654,7 @@ pub fn vectors() -> String {
         )
         .unwrap();
         for context in &CONTEXTS {
-            for (chain, configs) in chains.iter().zip(&configs) {
+            for (chain, configs) in chains.iter().enumerate().map(|(i, c)| (c, &configs[i])) {
                 let verdicts: Vec<String> = configs
                     .iter()
                     .map(|config| {
