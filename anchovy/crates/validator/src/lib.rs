@@ -28,7 +28,8 @@ pub async fn serve(
     validation_threads: usize,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
-    let processors = processors::Processors::start(&epoch, validation_threads);
+    let processors =
+        processors::Processors::start(&epoch, validation_threads, processors::VALIDATION_QUEUE);
     let validator = Validator::new(epoch, processors.transactions.clone());
     let served = tonic::transport::Server::builder()
         .add_service(validator.into_service())

@@ -37,7 +37,7 @@ async fn serve() -> SocketAddr {
         1000,
         4,
     ));
-    let processors = Processors::start(&epoch, 2);
+    let processors = Processors::start(&epoch, 2, 64);
     let service = Validator::new(epoch, processors.transactions.clone()).into_service();
     tokio::spawn(async move {
         // The pool lives as long as the server.
