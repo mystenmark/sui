@@ -51,21 +51,23 @@ impl<W> Queue<W> {
 /// Threads running processors over one queue. Dropping it stops them:
 /// each finishes the item in hand, items still queued are dropped (with
 /// whatever reply channel they carry), and the threads are joined.
-pub struct Pool {
+pub struct Pool<W> {
     shutdown: Option<Sender<()>>,
     threads: Vec<JoinHandle<()>>,
+    /// Keeps the queue open for the pool's lifetime, even with no threads.
+    _work: Receiver<W>,
 }
 
-impl Pool {
+impl<W> Pool<W> {
     /// Starts `threads` threads named `name-0`, `name-1`, …, each building
     /// its processor with `make` and taking items from a queue of
     /// `capacity`.
-    pub fn spawn<W, P>(
+    pub fn spawn<P>(
         name: &str,
         threads: usize,
         capacity: usize,
         make: impl Fn() -> P + Send + Sync + Clone + 'static,
-    ) -> (Queue<W>, Pool)
+    ) -> (Queue<W>, Pool<W>)
     where
         W: Send + 'static,
         P: Processor<W>,
@@ -86,6 +88,7 @@ impl Pool {
             Pool {
                 shutdown: Some(shutdown),
                 threads,
+                _work: work,
             },
         )
     }
@@ -108,7 +111,7 @@ fn run<W, P: Processor<W>>(work: &Receiver<W>, stop: &Receiver<()>, mut processo
     }
 }
 
-impl Drop for Pool {
+impl<W> Drop for Pool<W> {
     fn drop(&mut self) {
         drop(self.shutdown.take());
         for thread in self.threads.drain(..) {
@@ -189,5 +192,15 @@ mod tests {
         assert!(matches!(queue.try_push(()), Err(PushError::Full(()))));
         drop(open);
         drop(pool);
+    }
+
+    #[test]
+    fn a_pool_without_threads_holds_its_queue_open() {
+        let (queue, pool) = Pool::spawn("idle", 0, 1, || Echo { seen: 0 });
+        let item = || (0, mpsc::channel().0);
+        queue.try_push(item()).unwrap();
+        assert!(matches!(queue.try_push(item()), Err(PushError::Full(_))));
+        drop(pool);
+        assert!(matches!(queue.try_push(item()), Err(PushError::Closed(_))));
     }
 }
