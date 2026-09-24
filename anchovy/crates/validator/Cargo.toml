@@ -13,7 +13,9 @@ path = "src/main.rs"
 base64.workspace = true
 bytes.workspace = true
 clap.workspace = true
+containers.workspace = true
 messages.workspace = true
+protocol-config.workspace = true
 prost.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
@@ -22,6 +24,8 @@ tokio-rustls.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
+validation.workspace = true
+workqueue.workspace = true
 
 [dev-dependencies]
 base64.workspace = true

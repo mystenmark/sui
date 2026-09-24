@@ -4,6 +4,8 @@
 //! The validator's gRPC service, `sui.validator.Validator`.
 
 pub mod codec;
+pub mod epoch;
+pub mod processors;
 pub mod proto;
 pub mod server;
 pub mod tls;

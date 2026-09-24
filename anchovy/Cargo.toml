@@ -24,6 +24,7 @@ arena = { path = "crates/arena" }
 containers = { path = "crates/containers" }
 messages = { path = "crates/messages" }
 protocol-config = { path = "crates/protocol-config" }
+validation = { path = "crates/validation" }
 workqueue = { path = "crates/workqueue" }
 # Two versions of the allocator trait: hashbrown and its Vec use 0.2,
 # arena-btreemap uses 0.4. The arena implements both.

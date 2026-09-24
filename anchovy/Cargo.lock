@@ -3658,9 +3658,11 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "clap",
+ "containers",
  "hyper-util",
  "messages",
  "prost",
+ "protocol-config",
  "rcgen",
  "rustls",
  "tokio",
@@ -3670,6 +3672,8 @@ dependencies = [
  "tonic-build",
  "tonic-prost",
  "tower",
+ "validation",
+ "workqueue",
 ]
 
 [[package]]
