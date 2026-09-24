@@ -26,8 +26,13 @@
 //!
 //! `sui-oracle --grpc-requests FILE` instead writes sample validator gRPC
 //! requests, one `<type> <bcs hex>` line each.
+//!
+//! `sui-oracle --validity-vectors FILE` writes validity-check vectors; see
+//! `validity.rs`.
 
 use std::fmt::Write as _;
+
+mod validity;
 
 use sui_types::effects::TransactionEffectsAPI;
 use sui_types::full_checkpoint_content::CheckpointData;
@@ -96,12 +101,17 @@ fn grpc_requests() -> String {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let [flag, path] = args.as_slice()
-        && flag == "--grpc-requests"
-    {
-        std::fs::write(path, grpc_requests()).unwrap();
-        println!("{path}");
-        return;
+    if let [flag, path] = args.as_slice() {
+        let out = match flag.as_str() {
+            "--grpc-requests" => Some(grpc_requests()),
+            "--validity-vectors" => Some(validity::vectors()),
+            _ => None,
+        };
+        if let Some(out) = out {
+            std::fs::write(path, out).unwrap();
+            println!("{path}");
+            return;
+        }
     }
     for path in args {
         let mut bytes = std::fs::read(&path).unwrap();

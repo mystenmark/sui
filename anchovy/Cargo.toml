@@ -5,6 +5,7 @@ members = [
     "crates/containers",
     "crates/messages",
     "crates/protocol-config",
+    "crates/validation",
     "crates/validator",
 ]
 exclude = ["tools/sui-oracle", "tools/validator-client"]

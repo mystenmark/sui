@@ -1,0 +1,13 @@
+[package]
+name = "validation"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+messages.workspace = true
+protocol-config.workspace = true
+
+[lints]
+workspace = true

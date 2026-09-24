@@ -11,4 +11,6 @@ publish = false
 
 [dependencies]
 sui-types = { path = "../../../crates/sui-types" }
+sui-protocol-config = { path = "../../../crates/sui-protocol-config" }
+nonempty = "0.9"
 bcs = "0.1.6"
