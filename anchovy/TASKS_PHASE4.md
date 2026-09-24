@@ -98,6 +98,18 @@ the fetched corpus when present (2,332 transactions in 64 checkpoints:
 1,683 pass everything, 660 system transactions, 2 `InvalidArgumentIndex`
 under the latest config, 1 zkLogin without its JWK; all agree).
 
+## Deferred to the stateful layer
+
+Checks on the reference's signing path that need object state, so are
+not in `validation`; each must land with object state:
+
+- `check_replay_protection` (sui-transaction-checks, run at signing for
+  every version): without a one- or two-epoch window and without gas
+  objects, a transaction needs an address-owned or coin-reservation input
+  (`InvalidExpiration`). Telling address-owned from immutable inputs needs
+  the objects. With `relax_valid_during_for_owned_inputs` this is the only
+  replay check for address-balance gas.
+
 ## Findings
 
 - The reference panics in two places after its static checks pass,
