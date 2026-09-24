@@ -168,14 +168,15 @@ fn split_struct_tag(s: &str) -> Option<([u8; 32], &str, &str)> {
     if parts.next().is_some() || name.contains('<') {
         return None;
     }
-    let hex = address.strip_prefix("0x")?;
+    let hex = address.strip_prefix("0x")?.as_bytes();
     if hex.is_empty() || hex.len() > 64 {
         return None;
     }
-    let mut bytes = [0; 32];
-    let padded = format!("{hex:0>64}");
-    for (i, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&padded[2 * i..2 * i + 2], 16).ok()?;
+    // Right-aligned: the last digit is the low nibble of the last byte.
+    let mut bytes = [0u8; 32];
+    for (i, digit) in hex.iter().rev().enumerate() {
+        let nibble = char::from(*digit).to_digit(16)? as u8;
+        bytes[31 - i / 2] |= nibble << (4 * (i % 2));
     }
     Some((bytes, module, name))
 }
