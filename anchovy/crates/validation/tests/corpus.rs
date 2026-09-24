@@ -50,14 +50,15 @@ fn check(chk: &Path, verdicts: &Path, mismatches: &mut Vec<String>) -> usize {
     let expected = std::fs::read_to_string(verdicts).unwrap();
     let expected: Vec<&str> = expected.lines().collect();
     assert_eq!(expected.len(), checkpoint.transactions.len());
-    for (i, (tx, line)) in checkpoint.transactions.iter().zip(expected).enumerate() {
+    for (i, tx) in checkpoint.transactions.iter().enumerate() {
+        let line = expected[i];
         let bump = Bump::with_capacity(1 << 16);
         let signed = &tx.transaction;
         let validity = match validation::sender_signed::validity_check(signed, &ctx, &bump) {
             Ok(checked) => format!("ok:{}", checked.tx_size),
             Err(e) => format!("{:?}", e.kind),
         };
-        let verified = validation::sender_signed::deserialization_checks(signed, &bump)
+        let verification = validation::sender_signed::deserialization_checks(signed, &bump)
             .and_then(|(signatures, _)| {
                 validation::verify::verify_signatures(
                     signed,
@@ -69,7 +70,7 @@ fn check(chk: &Path, verdicts: &Path, mismatches: &mut Vec<String>) -> usize {
                 )
             })
             .map_or_else(|e| format!("{:?}", e.kind), |()| "ok".to_owned());
-        let ours = format!("{i} {validity} {verified}");
+        let ours = format!("{i} {validity} {verification}");
         if ours != line {
             mismatches.push(format!(
                 "{} tx {i}: reference {line}, ours {ours}",
