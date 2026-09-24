@@ -3,7 +3,7 @@
 Plan: `IMPLEMENTATION_PLAN_PHASE4.md`. Branch `mlogan-phase4`, to be merged
 into `anchovy-main`.
 
-## Status: step 0 done, step 1 next
+## Status: steps 0 to 2 done, step 3 next
 
 ## Done
 
@@ -22,6 +22,48 @@ into `anchovy-main`.
    Dependencies: `serde`, `serde_json`, `tracing` (no default features),
    `bs58`. The reference's 414 snapshots (every version on Unknown, Mainnet
    and Testnet), renamed for the crate, pass unchanged.
+
+1. `crates/validation`: `Context` (the reference's
+   `TxValidityCheckContext`), `Error` carrying the reference's error
+   variant name, and `tests/reference.rs`, which replays
+   `tests/data/validity.vectors` (written by `sui-oracle
+   --validity-vectors`) against our checks. Each vector is a transaction
+   plus a context; the oracle runs the reference under every protocol
+   version on Unknown, Mainnet and Testnet and records the verdict, with
+   runs of equal verdicts compressed into version ranges. 300,564 cases.
+2. `TransactionData::validity_check`, in the reference's order:
+   expiration and allowed proposers; funds withdrawals and coin
+   reservations; address-balance gas; gas object count; coin reservations
+   as gas (the SUI balance id derived as the reference's dynamic field id,
+   in `accumulator.rs`); price cap and budget bounds; `kind.rs` (system
+   kind flags, PTB command/input/package/receiving limits, duplicate
+   inputs, pure size, accumulator type nodes, publish limits, per-command
+   checks, type arguments in the reference's stack order, identifiers,
+   argument indices, randomness); `gasless.rs`; sponsorship. Plus
+   `check_gas_price`, the static part of `SuiGasStatus::new`.
+   `validity_check` takes a `&Bump` for its temporaries.
+
+   Crafted vectors come from limits read off every version's config
+   (just under, at, over each distinct value), so they follow the table.
+   Planted bugs (an off-by-one; reversed type-argument order) are caught.
+
+## Findings
+
+- The reference panics in two places after its static checks pass,
+  recorded as `panic` verdicts: `SuiGasStatus::new_with_budget` asserts a
+  non-zero gas price (a zero reference gas price lets price 0 through),
+  and overflows on a huge price under gas models without a price cap.
+- `SuiCostTable::new` multiplies `base_tx_cost_fixed * price` unchecked;
+  sui's release profile wraps, so ours uses `wrapping_mul`. Only reachable
+  where no price cap applies.
+- `get_gasless_allowed_token_types` caches by protocol version only, not
+  chain: a process that validates for several chains can get another
+  chain's list. The oracle's loop order changes version on every call, so
+  it never hits a stale entry.
+- An empty `AllowedProposers.proposers` is rejected by the reference at
+  deserialization; our parser accepts it, so step 4 must check it.
+- The vector file is 1.3 MB, mostly limit-boundary transactions (2,049
+  package dependencies, 1,025 commands, 16 KB pure arguments).
 
 ## Reference survey (checklist)
 
@@ -60,8 +102,6 @@ gas_data_tests, move_package_publish_tests, transfer_to_object_tests}.rs`.
 
 ## Remaining
 
-1. `validation` crate: `Context`, `Error`, vector format, runner.
-2. `TransactionData::validity_check` and the RGP floor, with crafted vectors.
 3. `SenderSignedData::validity_check`, with corpus vectors.
 4. Deferred signature parsing and `Identifier` grammar.
 5. Signature verification, with signed vectors.
