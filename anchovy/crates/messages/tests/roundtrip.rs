@@ -156,3 +156,43 @@ fn multisig_with_passkey() {
         Err(build::signature::PasskeyUnsupported)
     );
 }
+
+/// A submitted `Transaction` is its `SenderSignedData`'s bytes, one
+/// container deeper.
+#[test]
+fn transaction_envelope() {
+    use messages::transaction::{SenderSignedData, Transaction};
+    let mut bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/mainnet-325300367.chk"
+    ))
+    .unwrap();
+    bytes.remove(0);
+    let checkpoint = Message::<messages::checkpoint::CheckpointData>::parse(bytes).unwrap();
+    for tx in checkpoint.get().transactions {
+        let wire = tx.transaction.bytes.to_vec();
+        let envelope = Message::<Transaction>::parse(wire.clone()).unwrap();
+        let bare = Message::<SenderSignedData>::parse(wire).unwrap();
+        assert_eq!(envelope.get().0, *bare.get());
+    }
+}
+
+/// The envelope's extra container level, at the depth limit, against the
+/// reference (`sui-oracle --depth-vectors`).
+#[test]
+fn transaction_envelope_depth() {
+    use messages::transaction::{SenderSignedData, Transaction};
+    for line in include_str!("data/depth.txt").lines() {
+        let [label, hex, bare, envelope] = line.split(' ').collect::<Vec<_>>()[..] else {
+            panic!("bad line {line}");
+        };
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let verdict = |ok: bool| if ok { "ok" } else { "error" };
+        let ours_bare = verdict(Message::<SenderSignedData>::parse(bytes.clone()).is_ok());
+        let ours_envelope = verdict(Message::<Transaction>::parse(bytes).is_ok());
+        assert_eq!((ours_bare, ours_envelope), (bare, envelope), "{label}");
+    }
+}

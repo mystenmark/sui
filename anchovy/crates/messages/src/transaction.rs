@@ -701,9 +701,22 @@ impl<'a> SenderSignedData<'a> {
     }
 }
 
+/// The reference's `Transaction`, `Envelope<SenderSignedData, EmptySignInfo>`:
+/// what the submit RPC carries. The same bytes as `SenderSignedData`, but
+/// the envelope counts toward the container depth limit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Transaction<'a>(pub SenderSignedData<'a>);
+
+impl<'a> Transaction<'a> {
+    pub fn parse<A: Alloc<'a>>(r: &mut Reader<'a>, a: &mut A) -> Result<Transaction<'a>> {
+        Ok(Transaction(SenderSignedData::parse_envelope(r, a)?))
+    }
+}
+
 // Mainnet p99 of arena over wire size: 2.16 and 2.09.
 crate::impl_wire!(TransactionData, guess = 35);
 crate::impl_wire!(SenderSignedData, guess = 34);
+crate::impl_wire!(Transaction, guess = 34);
 
 crate::base::assert_wire_layout!(SharedObjectArg = 41, Intent = 3);
 
