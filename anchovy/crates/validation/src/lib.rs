@@ -30,3 +30,18 @@ pub struct Context<'a> {
     /// Validators in the epoch's committee, which bounds committee indices.
     pub committee_size: u32,
 }
+
+/// Everything static a validator checks on a submitted transaction, in the
+/// reference's order: what decoding checks, `validity_check`, then the
+/// signatures. `aliases` are as for [`verify::verify_signatures`].
+pub fn check<'a>(
+    tx: &messages::transaction::SenderSignedData<'a>,
+    ctx: &Context<'_>,
+    verifier: &verify::Verifier,
+    aliases: &[(messages::base::SuiAddress, &[messages::base::SuiAddress])],
+    bump: &'a containers::Bump,
+) -> Result<sender_signed::Checked<'a>, Error> {
+    let checked = sender_signed::validity_check(tx, ctx, bump)?;
+    verify::verify_signatures(tx, checked.signatures, ctx.epoch, verifier, aliases, bump)?;
+    Ok(checked)
+}

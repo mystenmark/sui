@@ -38,6 +38,71 @@ pub enum ErrorKind {
     KeyConversionError,
 }
 
+impl ErrorKind {
+    /// Every kind, for coverage checks.
+    pub const ALL: &[ErrorKind] = &[
+        ErrorKind::TransactionExpired,
+        ErrorKind::Unsupported,
+        ErrorKind::InvalidExpiration,
+        ErrorKind::InvalidChainId,
+        ErrorKind::MissingGasPayment,
+        ErrorKind::InvalidWithdrawReservation,
+        ErrorKind::GasPriceUnderRGP,
+        ErrorKind::SizeLimitExceeded,
+        ErrorKind::GasObjectNotOwnedObject,
+        ErrorKind::GasPriceTooHigh,
+        ErrorKind::GasBudgetTooHigh,
+        ErrorKind::GasBudgetTooLow,
+        ErrorKind::UnsupportedSponsoredTransactionKind,
+        ErrorKind::DuplicateObjectRefInput,
+        ErrorKind::MaxPublishCountExceeded,
+        ErrorKind::EmptyCommandInput,
+        ErrorKind::InvalidIdentifier,
+        ErrorKind::InvalidArgumentIndex,
+        ErrorKind::PostRandomCommandRestrictions,
+        ErrorKind::TransactionDeserializationError,
+        ErrorKind::SignerSignatureNumberMismatch,
+        ErrorKind::SignerSignatureAbsent,
+        ErrorKind::InvalidSignature,
+        ErrorKind::IncorrectSigner,
+        ErrorKind::InvalidAddress,
+        ErrorKind::KeyConversionError,
+    ];
+
+    // Adding a kind breaks this match until `ALL` lists it too.
+    #[allow(dead_code)]
+    fn listed_in_all(self) {
+        match self {
+            ErrorKind::TransactionExpired
+            | ErrorKind::Unsupported
+            | ErrorKind::InvalidExpiration
+            | ErrorKind::InvalidChainId
+            | ErrorKind::MissingGasPayment
+            | ErrorKind::InvalidWithdrawReservation
+            | ErrorKind::GasPriceUnderRGP
+            | ErrorKind::SizeLimitExceeded
+            | ErrorKind::GasObjectNotOwnedObject
+            | ErrorKind::GasPriceTooHigh
+            | ErrorKind::GasBudgetTooHigh
+            | ErrorKind::GasBudgetTooLow
+            | ErrorKind::UnsupportedSponsoredTransactionKind
+            | ErrorKind::DuplicateObjectRefInput
+            | ErrorKind::MaxPublishCountExceeded
+            | ErrorKind::EmptyCommandInput
+            | ErrorKind::InvalidIdentifier
+            | ErrorKind::InvalidArgumentIndex
+            | ErrorKind::PostRandomCommandRestrictions
+            | ErrorKind::TransactionDeserializationError
+            | ErrorKind::SignerSignatureNumberMismatch
+            | ErrorKind::SignerSignatureAbsent
+            | ErrorKind::InvalidSignature
+            | ErrorKind::IncorrectSigner
+            | ErrorKind::InvalidAddress
+            | ErrorKind::KeyConversionError => {}
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Error {
     pub kind: ErrorKind,

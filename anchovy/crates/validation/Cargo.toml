@@ -20,6 +20,7 @@ messages.workspace = true
 protocol-config.workspace = true
 
 [dev-dependencies]
+flate2 = "1"
 serde_json.workspace = true
 containers.workspace = true
 
