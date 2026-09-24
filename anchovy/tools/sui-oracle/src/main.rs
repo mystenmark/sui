@@ -26,8 +26,22 @@
 //!
 //! `sui-oracle --grpc-requests FILE` instead writes sample validator gRPC
 //! requests, one `<type> <bcs hex>` line each.
+//!
+//! `sui-oracle --validity-vectors FILE` writes validity-check vectors; see
+//! `validity.rs`. `sui-oracle --validity-corpus FILE.chk...` writes the
+//! validity verdicts of real transactions; see `validity_corpus.rs`.
+//! `sui-oracle --mutation-vectors FILE.gz` writes randomly mutated
+//! transactions with the reference's verdicts; see `mutations.rs`.
 
 use std::fmt::Write as _;
+
+mod mutations;
+mod signatures;
+mod validity;
+mod validity_corpus;
+mod validity_kind;
+mod validity_signed;
+mod validity_verify;
 
 use sui_types::effects::TransactionEffectsAPI;
 use sui_types::full_checkpoint_content::CheckpointData;
@@ -96,11 +110,35 @@ fn grpc_requests() -> String {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let [flag, path] = args.as_slice() {
+        let out = match flag.as_str() {
+            "--grpc-requests" => Some(grpc_requests()),
+            "--validity-vectors" => Some(validity::vectors()),
+            "--signature-vectors" => Some(signatures::vectors()),
+            _ => None,
+        };
+        if let Some(out) = out {
+            std::fs::write(path, out).unwrap();
+            println!("{path}");
+            return;
+        }
+    }
     if let [flag, path] = args.as_slice()
-        && flag == "--grpc-requests"
+        && flag == "--mutation-vectors"
     {
-        std::fs::write(path, grpc_requests()).unwrap();
+        std::fs::write(path, mutations::vectors()).unwrap();
         println!("{path}");
+        return;
+    }
+    if args.first().map(String::as_str) == Some("--validity-corpus") {
+        for path in &args[1..] {
+            let mut bytes = std::fs::read(path).unwrap();
+            assert_eq!(bytes.remove(0), 1, "{path}: not a BCS blob");
+            let checkpoint: CheckpointData = bcs::from_bytes(&bytes).unwrap();
+            let out_path = path.replace(".chk", ".validity");
+            std::fs::write(&out_path, validity_corpus::verdicts(&checkpoint)).unwrap();
+            println!("{out_path}");
+        }
         return;
     }
     for path in args {
