@@ -3,7 +3,7 @@
 Plan: `IMPLEMENTATION_PLAN_PHASE4.md`. Branch `mlogan-phase4`, to be merged
 into `anchovy-main`.
 
-## Status: steps 0 to 4 done, step 5 (signature verification) next
+## Status: steps 0 to 5 done
 
 ## Done
 
@@ -71,6 +71,24 @@ into `anchovy-main`.
    variant and re-serialized length) and `sender_signed` cases in
    `validity.vectors` (verdict `ok:<size>` compares sizes too).
 
+5. `verify.rs`: `Verifier` (the epoch's JWKs and the protocol's
+   verification settings, as sui's `SignatureVerifier`) and
+   `verify_signatures`: one signature per required signer, signer map by
+   address (later wins, walked in address order), required signers or
+   caller-supplied aliases present, then each scheme's check: single keys
+   (address over fastcrypto's re-encoded key, then the signature), multisig
+   (both formats; members paired with the bitmap's bits and truncated as
+   the reference does in release; nested zkLogin and passkey), zkLogin
+   (epoch bounds, unpadded or legacy padded address, provider, ephemeral
+   signature, `verify_zk_login` with no proof cache), passkey (address,
+   challenge = transaction digest, Secp256r1 over authenticator data and
+   the client data's SHA-256).
+   Vectors: `verify` cases in `validity.vectors` (transactions signed with
+   every scheme, then broken; zkLogin from sui's test proof and JWK, which
+   the file carries on its `jwks` line), at epochs 4, 10 and 11.
+   Dependencies build with `opt-level = 2` in dev and test: arkworks is
+   otherwise too slow for the proof checks.
+
 ## Findings
 
 - The reference panics in two places after its static checks pass,
@@ -101,6 +119,15 @@ into `anchovy-main`.
 - System kinds carry deserialization rules we do not check (genesis
   objects, durations); a user-submitted one is rejected as a system
   transaction, where the reference reports a deserialization error.
+- The reference pairs multisig signatures with the bitmap's bits via
+  `zip_debug_eq`: in release it stops at the shorter, so signatures past
+  the bits are never checked (garbage is accepted) and extra bits are
+  ignored; in debug it panics (`debug_fatal`), so a user transaction can
+  crash a debug-built validator. We truncate, as release does. The oracle
+  builds mysten-common without debug assertions to see release behavior.
+- An Ed25519 signature whose key fastcrypto accepts but that is not the
+  signer's derives a different address: the reference reports a missing
+  signer, not a bad signature.
 - The vector file is 1.3 MB, mostly limit-boundary transactions (2,049
   package dependencies, 1,025 commands, 16 KB pure arguments).
 
