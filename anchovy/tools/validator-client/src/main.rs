@@ -7,9 +7,11 @@
 //! Generates a network key with sui-types, writes it in sui's key file
 //! format, starts the server with it, and connects as
 //! `NetworkAuthorityClient::connect` does (`sui-tls` pinning the key,
-//! `mysten-network`'s channel). Then: health must answer; every other
-//! route must reach its handler, which the server's `todo!()` message on
-//! stderr shows; a client pinning another key must be refused.
+//! `mysten-network`'s channel). Then: health must answer; a signed
+//! transaction must validate (and stop at consensus submission) and one
+//! with too low a gas budget must not; every other route must
+//! reach its handler, which the server's `todo!()` message on stderr
+//! shows; a client pinning another key must be refused.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
@@ -21,10 +23,10 @@ use mysten_network::Multiaddr;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use sui_network::api::ValidatorClient;
-use sui_types::base_types::{ObjectID, SequenceNumber};
+use sui_types::base_types::{ObjectDigest, ObjectID, SequenceNumber, SuiAddress};
 use sui_types::crypto::{
-    EncodeDecodeBase64, KeypairTraits, NetworkKeyPair, NetworkPublicKey, SuiKeyPair,
-    get_key_pair_from_rng,
+    AccountKeyPair, EncodeDecodeBase64, KeypairTraits, NetworkKeyPair, NetworkPublicKey,
+    SuiKeyPair, get_key_pair_from_rng,
 };
 use sui_types::digests::TransactionDigest;
 use sui_types::messages_checkpoint::{CheckpointRequest, CheckpointRequestV2};
@@ -33,6 +35,7 @@ use sui_types::messages_grpc::{
     RawValidatorHealthRequest, RawWaitForEffectsRequest, SubmitTxType, SystemStateRequest,
     TransactionInfoRequest,
 };
+use sui_types::transaction::{Transaction, TransactionData};
 use tonic::Code;
 use tonic::transport::Channel;
 
@@ -118,6 +121,40 @@ async fn connect(address: &Multiaddr, key: NetworkPublicKey) -> Result<Validator
     Ok(ValidatorClient::new(channel))
 }
 
+/// A SUI transfer signed by its sender, in the form `SubmitTransaction`
+/// carries: the BCS of sui's `Transaction`.
+fn transfer(gas_budget: u64) -> Result<Bytes> {
+    let (sender, key): (SuiAddress, AccountKeyPair) =
+        get_key_pair_from_rng(&mut StdRng::from_seed([9; 32]));
+    let gas = (
+        ObjectID::new([3; 32]),
+        SequenceNumber::from_u64(1),
+        ObjectDigest::new([4; 32]),
+    );
+    let data = TransactionData::new_transfer_sui(
+        SuiAddress::from(ObjectID::new([5; 32])),
+        sender,
+        Some(1),
+        gas,
+        gas_budget,
+        // The server's reference gas price, by default.
+        1000,
+    );
+    let transaction = Transaction::from_data_and_signer(data, vec![&key]);
+    Ok(bcs::to_bytes(&transaction)?.into())
+}
+
+async fn submit(client: &mut ValidatorClient<Channel>, transaction: Bytes) -> tonic::Status {
+    let request = RawSubmitTxRequest {
+        transactions: vec![transaction],
+        submit_type: SubmitTxType::Default as i32,
+    };
+    match client.submit_transaction(request).await {
+        Ok(response) => tonic::Status::ok(format!("{:?}", response.into_inner())),
+        Err(status) => status,
+    }
+}
+
 /// A route that decoded its request and reached a `todo!()` handler.
 async fn expect_todo<T>(
     server: &Server,
@@ -161,12 +198,28 @@ async fn main() -> Result<()> {
     );
     println!("ok  validator_health answered");
 
+    let status = submit(&mut client, transfer(50_000_000)?).await;
+    ensure!(
+        status.code() == Code::Unimplemented && status.message() == "consensus submission",
+        "valid transaction: {status:?}"
+    );
+    println!("ok  a signed transaction validated, stopping at consensus submission");
+    let status = submit(&mut client, transfer(1)?).await;
+    ensure!(
+        status.code() == Code::InvalidArgument && status.message().starts_with("GasBudgetTooLow"),
+        "transaction with too low a budget: {status:?}"
+    );
+    println!(
+        "ok  a transaction with too low a budget refused: {}",
+        status.message()
+    );
+
     let ping = RawSubmitTxRequest {
         transactions: vec![],
         submit_type: SubmitTxType::Ping as i32,
     };
     let result = client.submit_transaction(ping).await;
-    expect_todo(&server, "submit_transaction", result).await?;
+    expect_todo(&server, "ping", result).await?;
 
     let wait = RawWaitForEffectsRequest {
         transaction_digest: None,
