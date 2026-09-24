@@ -6,7 +6,10 @@
 //! reference function and applies its checks in the same order, so that the
 //! first failure, and so the error, is the same.
 
+pub mod accumulator;
 pub mod error;
+pub mod gasless;
+pub mod kind;
 pub mod transaction_data;
 
 use messages::base::ChainIdentifier;

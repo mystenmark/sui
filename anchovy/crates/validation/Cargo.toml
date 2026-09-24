@@ -6,8 +6,13 @@ license.workspace = true
 publish = false
 
 [dependencies]
+blake2.workspace = true
+containers.workspace = true
 messages.workspace = true
 protocol-config.workspace = true
+
+[dev-dependencies]
+containers.workspace = true
 
 [lints]
 workspace = true

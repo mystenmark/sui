@@ -12,6 +12,21 @@ pub enum ErrorKind {
     Unsupported,
     InvalidExpiration,
     InvalidChainId,
+    MissingGasPayment,
+    InvalidWithdrawReservation,
+    GasPriceUnderRGP,
+    SizeLimitExceeded,
+    GasObjectNotOwnedObject,
+    GasPriceTooHigh,
+    GasBudgetTooHigh,
+    GasBudgetTooLow,
+    UnsupportedSponsoredTransactionKind,
+    DuplicateObjectRefInput,
+    MaxPublishCountExceeded,
+    EmptyCommandInput,
+    InvalidIdentifier,
+    InvalidArgumentIndex,
+    PostRandomCommandRestrictions,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

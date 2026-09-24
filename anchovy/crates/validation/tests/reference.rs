@@ -41,7 +41,14 @@ fn run(tx: &Tx, ctx: &Context<'_>) -> String {
             let message = Message::<TransactionData>::parse(tx.bytes.clone())
                 .map_err(|(e, _)| e)
                 .unwrap();
-            validation::transaction_data::validity_check(message.get(), ctx)
+            let bump = containers::Bump::with_capacity(4096);
+            validation::transaction_data::validity_check(message.get(), ctx, &bump)
+        }
+        "gas_price" => {
+            let message = Message::<TransactionData>::parse(tx.bytes.clone())
+                .map_err(|(e, _)| e)
+                .unwrap();
+            validation::transaction_data::check_gas_price(message.get().gas_data.price, ctx)
         }
         check => panic!("unknown check {check}"),
     };
@@ -100,10 +107,12 @@ fn matches_the_reference() {
                         committee_size: committee.parse().unwrap(),
                     };
                     let ours = run(tx, &ctx);
-                    if ours != *verdict {
+                    // The reference's checks passed; what follows them panicked.
+                    let expected = if *verdict == "panic" { "ok" } else { verdict };
+                    if ours != expected {
                         mismatches.push(format!(
-                            "{} {} v{version} {chain_name} rgp {rgp} committee {committee}: \
-                             reference {verdict}, ours {ours}",
+                            "{} {}: reference {verdict}, ours {ours} \
+                             (v{version} {chain_name} rgp {rgp} committee {committee})",
                             tx.check, tx.label
                         ));
                     }
@@ -114,10 +123,23 @@ fn matches_the_reference() {
         }
     }
     assert!(cases > 0);
+    // One line per transaction and verdict pair, with its first case.
+    let mut first_of_each: Vec<&String> = vec![];
+    let mut seen = std::collections::HashSet::new();
+    for m in &mismatches {
+        if seen.insert(m.split(" (").next().unwrap()) {
+            first_of_each.push(m);
+        }
+    }
     assert!(
         mismatches.is_empty(),
-        "{} of {cases} cases differ:\n{}",
+        "{} of {cases} cases differ, {} distinct:\n{}",
         mismatches.len(),
-        mismatches[..mismatches.len().min(30)].join("\n")
+        first_of_each.len(),
+        first_of_each
+            .iter()
+            .map(|m| m.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
