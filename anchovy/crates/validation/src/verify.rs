@@ -4,6 +4,10 @@
 //! Signature verification: `verify_sender_signed_data_message_signatures`
 //! and each scheme's `verify_authenticator`. Signatures are the ones
 //! `sender_signed::validity_check` parsed.
+//!
+//! TODO: optimize. Secp256r1 (and so passkey) verification allocates inside
+//! fastcrypto; zkLogin re-parses its inputs for each use and has no cache
+//! of verified proofs; passkey client data goes through `serde_json`.
 
 use blake2::Blake2b;
 use blake2::digest::consts::U32;

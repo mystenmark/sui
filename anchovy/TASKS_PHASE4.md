@@ -116,6 +116,13 @@ which cannot be reached end to end (listed with reasons). The mutator is
 meant to grow with the stateful layer, whose rejections it will check the
 same way.
 
+## TODO
+
+- Optimize signature verification (see the TODO in `verify.rs`): heap use
+  in fastcrypto's Secp256r1 verification (and so passkey), zkLogin
+  re-parsing and no proof cache, serde_json for passkey client data.
+  Accepting other transactions allocates nothing (`tests/allocations.rs`).
+
 ## Deferred to the stateful layer
 
 Checks on the reference's signing path that need object state, so are
