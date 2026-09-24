@@ -10,6 +10,7 @@ base64ct.workspace = true
 bcs.workspace = true
 fastcrypto.workspace = true
 fastcrypto-zkp.workspace = true
+imbl.workspace = true
 roaring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -19,6 +20,7 @@ messages.workspace = true
 protocol-config.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 containers.workspace = true
 
 [lints]

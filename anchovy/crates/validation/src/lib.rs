@@ -13,6 +13,7 @@ pub mod kind;
 pub mod sender_signed;
 pub mod signature;
 pub mod transaction_data;
+pub mod verify;
 
 use messages::base::ChainIdentifier;
 use protocol_config::ProtocolConfig;

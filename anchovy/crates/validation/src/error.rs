@@ -30,6 +30,12 @@ pub enum ErrorKind {
     /// The reference fails the whole request while deserializing: our
     /// parser defers these checks to validation.
     TransactionDeserializationError,
+    SignerSignatureNumberMismatch,
+    SignerSignatureAbsent,
+    InvalidSignature,
+    IncorrectSigner,
+    InvalidAddress,
+    KeyConversionError,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

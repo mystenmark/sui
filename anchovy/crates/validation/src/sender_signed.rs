@@ -90,7 +90,7 @@ pub fn validity_check<'a>(
 /// System kinds carry more deserialization rules (genesis objects,
 /// durations) that are not checked here; such a transaction is rejected as
 /// a system transaction instead, with a different error.
-fn deserialization_checks<'a>(
+pub fn deserialization_checks<'a>(
     tx: &SenderSignedData<'a>,
     bump: &'a Bump,
 ) -> Result<(&'a [ParsedSignature<'a>], usize), Error> {

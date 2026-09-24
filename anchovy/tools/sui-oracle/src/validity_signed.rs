@@ -16,7 +16,7 @@ use crate::validity::{CHAIN_ID, EPOCH, Spec, chain_identifier, verdict_of};
 
 /// `SenderSignedData` built by hand, so the intent and the signature bytes
 /// can be anything.
-fn signed(intent: [u8; 3], tx: &TransactionData, signatures: &[&[u8]]) -> Vec<u8> {
+pub(crate) fn signed(intent: [u8; 3], tx: &TransactionData, signatures: &[&[u8]]) -> Vec<u8> {
     let mut out = vec![1];
     out.extend_from_slice(&intent);
     out.extend(bcs::to_bytes(tx).unwrap());

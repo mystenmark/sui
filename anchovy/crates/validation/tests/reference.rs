@@ -7,11 +7,13 @@
 
 use std::collections::HashMap;
 
+use fastcrypto_zkp::bn254::zk_login::{JWK, JwkId};
 use messages::Message;
 use messages::base::Digest;
 use messages::transaction::{SenderSignedData, TransactionData};
 use protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
 use validation::Context;
+use validation::verify::Verifier;
 
 fn unhex(s: &str) -> Vec<u8> {
     (0..s.len())
@@ -35,7 +37,7 @@ struct Tx {
     bytes: Vec<u8>,
 }
 
-fn run(tx: &Tx, ctx: &Context<'_>) -> String {
+fn run(tx: &Tx, ctx: &Context<'_>, verifier: &Verifier) -> String {
     let result = match tx.check.as_str() {
         "tx_data" => {
             let message = Message::<TransactionData>::parse(tx.bytes.clone())
@@ -60,6 +62,23 @@ fn run(tx: &Tx, ctx: &Context<'_>) -> String {
                 Err(e) => format!("{:?}", e.kind),
             };
         }
+        "verify" => {
+            let Ok(message) = Message::<SenderSignedData>::parse(tx.bytes.clone()) else {
+                return "TransactionDeserializationError".to_owned();
+            };
+            let bump = containers::Bump::with_capacity(4096);
+            let signed = message.get();
+            let (signatures, _) = validation::sender_signed::deserialization_checks(signed, &bump)
+                .expect("verification vectors decode");
+            validation::verify::verify_signatures(
+                signed,
+                signatures,
+                ctx.epoch,
+                verifier,
+                &[],
+                &bump,
+            )
+        }
         check => panic!("unknown check {check}"),
     };
     match result {
@@ -71,12 +90,17 @@ fn run(tx: &Tx, ctx: &Context<'_>) -> String {
 #[test]
 fn matches_the_reference() {
     let mut configs: HashMap<(String, u64), ProtocolConfig> = HashMap::new();
+    let mut jwks: Vec<(JwkId, JWK)> = vec![];
     let mut txs: HashMap<String, Tx> = HashMap::new();
     let mut cases = 0;
     let mut mismatches = Vec::new();
 
     for line in include_str!("data/validity.vectors").lines() {
         let fields: Vec<&str> = line.split(' ').collect();
+        if let Some(json) = line.strip_prefix("jwks ") {
+            jwks = serde_json::from_str(json).unwrap();
+            continue;
+        }
         match fields.as_slice() {
             ["tx", id, check, label, hex] => {
                 let tx = Tx {
@@ -116,7 +140,8 @@ fn matches_the_reference() {
                         reference_gas_price: rgp.parse().unwrap(),
                         committee_size: committee.parse().unwrap(),
                     };
-                    let ours = run(tx, &ctx);
+                    let verifier = Verifier::new(config, chain(chain_name), jwks.clone());
+                    let ours = run(tx, &ctx, &verifier);
                     // The reference's checks passed; what follows them panicked.
                     let expected = if *verdict == "panic" { "ok" } else { verdict };
                     if ours != expected {

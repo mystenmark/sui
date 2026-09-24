@@ -36,6 +36,7 @@ mod signatures;
 mod validity;
 mod validity_kind;
 mod validity_signed;
+mod validity_verify;
 
 use sui_types::effects::TransactionEffectsAPI;
 use sui_types::full_checkpoint_content::CheckpointData;

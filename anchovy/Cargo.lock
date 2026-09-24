@@ -3585,6 +3585,7 @@ dependencies = [
  "containers",
  "fastcrypto",
  "fastcrypto-zkp",
+ "imbl",
  "messages",
  "protocol-config",
  "roaring",

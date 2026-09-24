@@ -13,7 +13,9 @@
 //! `check` names the reference function: `tx_data` is
 //! `TransactionData::validity_check` on BCS `TransactionData`, `gas_price`
 //! the price checks of `SuiGasStatus::new`, `sender_signed` decoding
-//! `SenderSignedData` and its `validity_check` (see `validity_signed.rs`). A `case` covers a run of consecutive
+//! `SenderSignedData` and its `validity_check` (see `validity_signed.rs`),
+//! `verify` its signatures (see `validity_verify.rs`). A first line
+//! `jwks <json>` holds the JWKs verification runs with. A `case` covers a run of consecutive
 //! versions with the same verdict: `ok`, the error's variant name
 //! (`UserInputError`'s inner variant when it is one), or `panic` when the
 //! reference passed its checks and then panicked in what follows them.
@@ -253,6 +255,7 @@ fn sui_balance(owner: SuiAddress) -> ObjectID {
 }
 
 pub(crate) struct Spec {
+    pub(crate) sender: SuiAddress,
     pub(crate) kind: TransactionKind,
     pub(crate) payment: Vec<ObjectRef>,
     pub(crate) owner: SuiAddress,
@@ -267,6 +270,7 @@ impl Spec {
         let mut builder = ProgrammableTransactionBuilder::new();
         builder.transfer_arg(recipient(), Argument::GasCoin);
         Spec {
+            sender: sender(),
             kind: TransactionKind::ProgrammableTransaction(builder.finish()),
             payment: vec![object(0xc3)],
             owner: sender(),
@@ -316,7 +320,7 @@ impl Spec {
     pub(crate) fn build(self) -> TransactionData {
         TransactionData::V1(TransactionDataV1 {
             kind: self.kind,
-            sender: sender(),
+            sender: self.sender,
             gas_data: GasData {
                 payment: self.payment,
                 owner: self.owner,
@@ -611,16 +615,18 @@ fn gas_status(
     ctx: &TxValidityCheckContext<'_>,
 ) -> Option<Result<(), SuiError>> {
     let gas = tx.gas_data();
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    // The expected panic is a verdict, not printed; other panics still are.
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         SuiGasStatus::new(gas.budget, gas.price, ctx.reference_gas_price, ctx.config).map(|_| ())
-    }))
-    .ok()
+    }));
+    std::panic::set_hook(hook);
+    result.ok()
 }
 
 /// Every case, run under every context, chain and protocol version.
 pub fn vectors() -> String {
-    // Expected panics are recorded as verdicts, not printed.
-    std::panic::set_hook(Box::new(|_| {}));
     let chains = [Chain::Unknown, Chain::Mainnet, Chain::Testnet];
     let max = ProtocolVersion::MAX.as_u64();
     let configs: Vec<Vec<ProtocolConfig>> = chains
@@ -638,6 +644,13 @@ pub fn vectors() -> String {
         TxData(Box<TransactionData>),
         Signed(Vec<u8>),
     }
+    // Verification runs at, before and after a zkLogin proof's max epoch.
+    let verify_contexts = [4, 10, 11].map(|epoch| Context {
+        epoch,
+        chain_id: CHAIN_ID,
+        rgp: 1000,
+        committee_size: 4,
+    });
     let mut cases: Vec<(&str, String, Subject)> = vec![];
     let tx_data = expiration_cases()
         .into_iter()
@@ -658,15 +671,23 @@ pub fn vectors() -> String {
     for (label, bytes) in crate::validity_signed::cases() {
         cases.push(("sender_signed", label, Subject::Signed(bytes)));
     }
+    for (label, bytes) in crate::validity_verify::cases() {
+        cases.push(("verify", label, Subject::Signed(bytes)));
+    }
 
-    let mut out = String::new();
+    let mut out = format!("jwks {}\n", crate::validity_verify::jwks_json());
     for (id, (check, label, subject)) in cases.into_iter().enumerate() {
         let bytes = match &subject {
             Subject::TxData(tx) => bcs::to_bytes(tx).unwrap(),
             Subject::Signed(bytes) => bytes.clone(),
         };
         writeln!(out, "tx {id} {check} {label} {}", hex(&bytes)).unwrap();
-        for context in &CONTEXTS {
+        let contexts: &[Context] = if check == "verify" {
+            &verify_contexts
+        } else {
+            &CONTEXTS
+        };
+        for context in contexts {
             for (chain, configs) in chains.iter().enumerate().map(|(i, c)| (c, &configs[i])) {
                 let verdicts: Vec<String> = configs
                     .iter()
@@ -686,6 +707,12 @@ pub fn vectors() -> String {
                             ("sender_signed", Subject::Signed(bytes)) => {
                                 crate::validity_signed::verdict(bytes, &ctx)
                             }
+                            ("verify", Subject::Signed(bytes)) => crate::validity_verify::verdict(
+                                bytes,
+                                config,
+                                *chain,
+                                context.epoch,
+                            ),
                             _ => unreachable!(),
                         }
                     })

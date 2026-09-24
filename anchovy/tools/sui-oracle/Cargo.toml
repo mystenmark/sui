@@ -15,6 +15,8 @@ sui-protocol-config = { path = "../../../crates/sui-protocol-config" }
 nonempty = "0.9"
 fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "076bf5ad8cea140dc7cf5c5861c24a36acdf64ce" }
 roaring = "=0.11.4"
+fastcrypto-zkp = { git = "https://github.com/MystenLabs/fastcrypto", rev = "076bf5ad8cea140dc7cf5c5861c24a36acdf64ce", package = "fastcrypto-zkp" }
+shared-crypto = { path = "../../../crates/shared-crypto" }
 base64ct = { version = "=1.8.0", features = ["alloc"] }
 rand = "0.8.5"
 serde = { version = "1", features = ["derive"] }
@@ -26,3 +28,8 @@ bcs = "0.1.6"
 # release and panics with overflow checks.
 [profile.dev.package.fastcrypto-zkp]
 overflow-checks = false
+
+# As validators run it: `zip_debug_eq` truncates in release and panics with
+# debug assertions (multisig signatures and bitmap out of step).
+[profile.dev.package.mysten-common]
+debug-assertions = false

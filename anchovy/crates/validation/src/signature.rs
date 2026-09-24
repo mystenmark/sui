@@ -200,7 +200,7 @@ enum ClientDataType {
 /// `PasskeyAuthenticator`'s deserialization: authenticator data, client
 /// data JSON, and a Secp256r1 signature whose key and signature fastcrypto
 /// accepts.
-fn passkey(body: &[u8]) -> Option<Passkey<'_>> {
+pub(crate) fn passkey(body: &[u8]) -> Option<Passkey<'_>> {
     let mut r = Reader::new(body);
     let authenticator_data = r.byte_vec().ok()?;
     let client_data_json = r.str().ok()?;
@@ -316,15 +316,28 @@ fn decode_legacy_key<'a>(encoded: &str, bump: &'a Bump) -> Option<PublicKey<'a>>
     let mut buf = [0u8; 34];
     let bytes = base64ct::Base64::decode(encoded, &mut buf).ok()?;
     let (&flag, key) = bytes.split_first()?;
-    let valid = match flag {
-        0 => fastcrypto::ed25519::Ed25519PublicKey::from_bytes(key).is_ok(),
-        1 => fastcrypto::secp256k1::Secp256k1PublicKey::from_bytes(key).is_ok(),
-        2 | 6 => fastcrypto::secp256r1::Secp256r1PublicKey::from_bytes(key).is_ok(),
-        _ => false,
+    // The reference keeps the key as fastcrypto re-encodes it, which is
+    // what the multisig's address hashes: a Secp256r1 key in SEC1's compact
+    // form comes back compressed.
+    let mut canonical = [0u8; 33];
+    let key: &[u8] = match flag {
+        0 => {
+            let k = fastcrypto::ed25519::Ed25519PublicKey::from_bytes(key).ok()?;
+            canonical[..32].copy_from_slice(k.as_bytes());
+            &canonical[..32]
+        }
+        1 => {
+            let k = fastcrypto::secp256k1::Secp256k1PublicKey::from_bytes(key).ok()?;
+            canonical.copy_from_slice(k.as_bytes());
+            &canonical
+        }
+        2 | 6 => {
+            let k = fastcrypto::secp256r1::Secp256r1PublicKey::from_bytes(key).ok()?;
+            canonical.copy_from_slice(k.as_bytes());
+            &canonical
+        }
+        _ => return None,
     };
-    if !valid {
-        return None;
-    }
     let copy = |key: &[u8]| -> &'a [u8] {
         let mut v = containers::Vec::with_capacity_in(key.len(), bump);
         v.extend_from_slice(key);
