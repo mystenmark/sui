@@ -89,6 +89,15 @@ into `anchovy-main`.
    Dependencies build with `opt-level = 2` in dev and test: arkworks is
    otherwise too slow for the proof checks.
 
+Corpus: `sui-oracle --validity-corpus` records the reference's
+`validity_check` and verification verdicts for every transaction of a
+mainnet checkpoint under a fixed context (the checkpoint's epoch,
+mainnet's chain id and latest config, RGP 1, no JWKs).
+`tests/corpus.rs` compares ours: the checked-in checkpoint always, and
+the fetched corpus when present (2,332 transactions in 64 checkpoints:
+1,683 pass everything, 660 system transactions, 2 `InvalidArgumentIndex`
+under the latest config, 1 zkLogin without its JWK; all agree).
+
 ## Findings
 
 - The reference panics in two places after its static checks pass,
