@@ -170,6 +170,29 @@ impl<'a, T: Copy + 'a> SliceWriter<'a, T> {
     }
 }
 
+/// Builds into a caller's [`containers::Bump`], for views that live as long
+/// as that arena rather than as a [`crate::Message`]'s.
+pub struct BumpAlloc<'a>(pub &'a containers::Bump);
+
+impl<'a> Alloc<'a> for BumpAlloc<'a> {
+    const BUILD: bool = true;
+
+    fn slice<T: Copy + 'a>(&mut self, n: usize) -> Result<SliceWriter<'a, T>> {
+        Layout::array::<T>(n).map_err(|_| ParseError::WireTooLarge)?;
+        let mut v = containers::Vec::<T>::with_capacity_in(n, self.0);
+        let ptr = v.as_mut_ptr();
+        // The arena owns the memory and frees it with the rest; `T` is
+        // `Copy`, so nothing needs dropping.
+        std::mem::forget(v);
+        Ok(SliceWriter {
+            ptr,
+            len: 0,
+            cap: n,
+            _arena: PhantomData,
+        })
+    }
+}
+
 #[derive(Default)]
 pub struct Measure {
     off: usize,

@@ -55,6 +55,11 @@ Phase 3: Server skeleton + validation
 Phase 4: Transaction validation
 - implement and test transaction validity checking (i.e. static checks)
 
+Phase 5: System architecture
+- architecture is based around work queues and processors, (similar to a component entity system).
+- tokio runtime will be responsible ONLY for RPCs. handlers will deserialize messages and put them into a work queue. processors running on dedicated threads will handle the work items. results will eventually be sent back to rpc handler via tokio::sync::oneshot.
+- for now, implement a transaction validation processor. this will encompass *only* the work currently done by TransactionData::validity_check
+
 ---
 
 Clarifications (added after the original prompt, in the user's words):
