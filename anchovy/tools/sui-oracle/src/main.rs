@@ -32,8 +32,10 @@
 
 use std::fmt::Write as _;
 
+mod signatures;
 mod validity;
 mod validity_kind;
+mod validity_signed;
 
 use sui_types::effects::TransactionEffectsAPI;
 use sui_types::full_checkpoint_content::CheckpointData;
@@ -106,6 +108,7 @@ fn main() {
         let out = match flag.as_str() {
             "--grpc-requests" => Some(grpc_requests()),
             "--validity-vectors" => Some(validity::vectors()),
+            "--signature-vectors" => Some(signatures::vectors()),
             _ => None,
         };
         if let Some(out) = out {

@@ -6,6 +6,9 @@ license.workspace = true
 publish = false
 
 [dependencies]
+base64ct.workspace = true
+fastcrypto.workspace = true
+roaring.workspace = true
 blake2.workspace = true
 containers.workspace = true
 messages.workspace = true

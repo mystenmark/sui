@@ -11,8 +11,9 @@
 //! ```
 //!
 //! `check` names the reference function: `tx_data` is
-//! `TransactionData::validity_check`, `gas_price` the price checks of
-//! `SuiGasStatus::new`. A `case` covers a run of consecutive
+//! `TransactionData::validity_check` on BCS `TransactionData`, `gas_price`
+//! the price checks of `SuiGasStatus::new`, `sender_signed` decoding
+//! `SenderSignedData` and its `validity_check` (see `validity_signed.rs`). A `case` covers a run of consecutive
 //! versions with the same verdict: `ok`, the error's variant name
 //! (`UserInputError`'s inner variant when it is one), or `panic` when the
 //! reference passed its checks and then panicked in what follows them.
@@ -79,10 +80,15 @@ pub(crate) fn chain_identifier(id: [u8; 32]) -> ChainIdentifier {
 fn verdict(result: Result<(), SuiError>) -> String {
     match result {
         Ok(()) => "ok".to_owned(),
-        Err(e) => match e.as_inner() {
-            SuiErrorKind::UserInputError { error } => error.as_ref().to_owned(),
-            kind => kind.as_ref().to_owned(),
-        },
+        Err(e) => verdict_of(e),
+    }
+}
+
+/// An error's variant name: `UserInputError`'s inner one when it is one.
+pub(crate) fn verdict_of(e: SuiError) -> String {
+    match e.as_inner() {
+        SuiErrorKind::UserInputError { error } => error.as_ref().to_owned(),
+        kind => kind.as_ref().to_owned(),
     }
 }
 
@@ -627,7 +633,12 @@ pub fn vectors() -> String {
         .collect();
 
     let all: Vec<&ProtocolConfig> = configs.iter().flatten().collect();
-    let mut cases: Vec<(&str, String, TransactionData)> = vec![];
+    // What each vector runs: the transaction data, or signed bytes.
+    enum Subject {
+        TxData(TransactionData),
+        Signed(Vec<u8>),
+    }
+    let mut cases: Vec<(&str, String, Subject)> = vec![];
     let tx_data = expiration_cases()
         .into_iter()
         .chain(gas_cases(&all))
@@ -637,22 +648,24 @@ pub fn vectors() -> String {
         .chain(crate::validity_kind::kind_cases(&all))
         .chain(crate::validity_kind::gasless_cases());
     for (label, tx) in tx_data {
-        cases.push(("tx_data", label, tx));
+        cases.push(("tx_data", label, Subject::TxData(tx)));
     }
     for (label, tx) in gas_cases(&all) {
         if label.starts_with("price_") {
-            cases.push(("gas_price", label, tx));
+            cases.push(("gas_price", label, Subject::TxData(tx)));
         }
+    }
+    for (label, bytes) in crate::validity_signed::cases() {
+        cases.push(("sender_signed", label, Subject::Signed(bytes)));
     }
 
     let mut out = String::new();
-    for (id, (check, label, tx)) in cases.into_iter().enumerate() {
-        writeln!(
-            out,
-            "tx {id} {check} {label} {}",
-            hex(&bcs::to_bytes(&tx).unwrap())
-        )
-        .unwrap();
+    for (id, (check, label, subject)) in cases.into_iter().enumerate() {
+        let bytes = match &subject {
+            Subject::TxData(tx) => bcs::to_bytes(tx).unwrap(),
+            Subject::Signed(bytes) => bytes.clone(),
+        };
+        writeln!(out, "tx {id} {check} {label} {}", hex(&bytes)).unwrap();
         for context in &CONTEXTS {
             for (chain, configs) in chains.iter().enumerate().map(|(i, c)| (c, &configs[i])) {
                 let verdicts: Vec<String> = configs
@@ -665,10 +678,13 @@ pub fn vectors() -> String {
                             reference_gas_price: context.rgp,
                             committee_size: context.committee_size,
                         };
-                        match check {
-                            "tx_data" => verdict(tx.validity_check(&ctx)),
-                            "gas_price" => {
-                                gas_status(&tx, &ctx).map_or_else(|| "panic".to_owned(), verdict)
+                        match (check, &subject) {
+                            ("tx_data", Subject::TxData(tx)) => verdict(tx.validity_check(&ctx)),
+                            ("gas_price", Subject::TxData(tx)) => {
+                                gas_status(tx, &ctx).map_or_else(|| "panic".to_owned(), verdict)
+                            }
+                            ("sender_signed", Subject::Signed(bytes)) => {
+                                crate::validity_signed::verdict(bytes, &ctx)
                             }
                             _ => unreachable!(),
                         }

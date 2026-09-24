@@ -10,6 +10,8 @@ pub mod accumulator;
 pub mod error;
 pub mod gasless;
 pub mod kind;
+pub mod sender_signed;
+pub mod signature;
 pub mod transaction_data;
 
 use messages::base::ChainIdentifier;

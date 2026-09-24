@@ -83,7 +83,7 @@ fn is_gas_paid_from_address_balance(tx: &TransactionData<'_>) -> bool {
     tx.gas_data.payment.is_empty() && matches!(tx.kind, TransactionKind::ProgrammableTransaction(_))
 }
 
-fn is_gasless(tx: &TransactionData<'_>, ctx: &Context<'_>) -> bool {
+pub(crate) fn is_gasless(tx: &TransactionData<'_>, ctx: &Context<'_>) -> bool {
     ctx.config.enable_gasless() && is_gas_paid_from_address_balance(tx) && tx.gas_data.price == 0
 }
 

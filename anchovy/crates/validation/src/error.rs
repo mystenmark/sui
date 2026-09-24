@@ -27,6 +27,9 @@ pub enum ErrorKind {
     InvalidIdentifier,
     InvalidArgumentIndex,
     PostRandomCommandRestrictions,
+    /// The reference fails the whole request while deserializing: our
+    /// parser defers these checks to validation.
+    TransactionDeserializationError,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

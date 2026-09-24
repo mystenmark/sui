@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use messages::Message;
 use messages::base::Digest;
-use messages::transaction::TransactionData;
+use messages::transaction::{SenderSignedData, TransactionData};
 use protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
 use validation::Context;
 
@@ -49,6 +49,16 @@ fn run(tx: &Tx, ctx: &Context<'_>) -> String {
                 .map_err(|(e, _)| e)
                 .unwrap();
             validation::transaction_data::check_gas_price(message.get().gas_data.price, ctx)
+        }
+        "sender_signed" => {
+            let Ok(message) = Message::<SenderSignedData>::parse(tx.bytes.clone()) else {
+                return "TransactionDeserializationError".to_owned();
+            };
+            let bump = containers::Bump::with_capacity(4096);
+            return match validation::sender_signed::validity_check(message.get(), ctx, &bump) {
+                Ok(checked) => format!("ok:{}", checked.tx_size),
+                Err(e) => format!("{:?}", e.kind),
+            };
         }
         check => panic!("unknown check {check}"),
     };
