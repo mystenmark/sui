@@ -5171,6 +5171,8 @@ dependencies = [
  "nonempty",
  "rand 0.8.8",
  "roaring",
+ "serde",
+ "serde_json",
  "sui-protocol-config",
  "sui-types",
 ]

@@ -82,6 +82,11 @@ pub(crate) fn cases() -> Vec<(String, Vec<u8>)> {
         "legacy_index_10",
         "simple_0_96",
         "empty",
+        "passkey_ok",
+        "passkey_json_create",
+        "zklogin_vector_0",
+        "zklogin_seed_over_modulus",
+        "zklogin_header_hs256",
     ] {
         add(label, signed([0, 0, 0], &tx, &[&signature(label)]));
     }

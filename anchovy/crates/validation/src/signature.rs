@@ -37,6 +37,8 @@ pub enum ParsedSignature<'a> {
         /// counts can differ from the wire length.
         serialized_len: usize,
     },
+    /// Checked, but kept as bytes: the parsed inputs own heap strings, so
+    /// verification parses them again.
     ZkLogin(&'a [u8]),
     Passkey(Passkey<'a>),
 }
@@ -88,7 +90,11 @@ pub fn parse<'a>(bytes: &'a [u8], bump: &'a Bump) -> Result<(ParsedSignature<'a>
             Some(m) => ParsedSignature::MultiSig(m),
             None => legacy_multisig(&bytes[1..], bump)?,
         },
-        5 => ParsedSignature::ZkLogin(bytes),
+        5 => {
+            let len =
+                zklogin_serialized_len(&bytes[1..]).ok_or_else(|| malformed("invalid zklogin"))?;
+            return Ok((ParsedSignature::ZkLogin(bytes), 1 + len));
+        }
         6 => ParsedSignature::Passkey(
             passkey(&bytes[1..]).ok_or_else(|| malformed("invalid passkey"))?,
         ),
@@ -126,6 +132,40 @@ fn multisig_pk_valid(pk: &MultiSigPublicKey<'_>) -> bool {
             .iter()
             .enumerate()
             .all(|(i, (k, _))| map[i + 1..].iter().all(|(other, _)| other != k))
+}
+
+/// A zkLogin authenticator, decoded with fastcrypto-zkp's own types so that
+/// field elements and JWT details are accepted exactly as the reference
+/// does.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct ZkLoginAuthenticator {
+    pub inputs: fastcrypto_zkp::bn254::zk_login::ZkLoginInputs,
+    pub max_epoch: u64,
+    /// `flag || signature || key` of the ephemeral key.
+    pub user_signature: Vec<u8>,
+}
+
+/// Decodes a zkLogin body (after the flag) as the reference does: BCS,
+/// the ephemeral signature's length, then `ZkLoginInputs::init`.
+pub(crate) fn zklogin(body: &[u8]) -> Option<ZkLoginAuthenticator> {
+    let mut zk: ZkLoginAuthenticator = bcs::from_bytes(body).ok()?;
+    let sig_len_ok = match zk.user_signature.first() {
+        Some(0) => zk.user_signature.len() == ED25519_SIGNATURE_LEN,
+        Some(1 | 2) => zk.user_signature.len() == SECP256_SIGNATURE_LEN,
+        _ => false,
+    };
+    if !sig_len_ok {
+        return None;
+    }
+    zk.inputs.init().ok()?;
+    Some(zk)
+}
+
+/// The length the reference re-serializes a zkLogin body to: field elements
+/// are reduced and printed canonically, so it can differ from the wire.
+fn zklogin_serialized_len(body: &[u8]) -> Option<usize> {
+    let zk = zklogin(body)?;
+    bcs::serialized_size(&zk).ok()
 }
 
 /// The fields of the client data the reference reads, with its serde

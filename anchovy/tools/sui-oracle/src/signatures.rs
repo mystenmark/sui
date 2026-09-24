@@ -535,6 +535,209 @@ pub fn vectors() -> String {
     trailing.push(0);
     add("passkey_trailing", trailing);
 
+    // zkLogin: sui's test vectors, then variations. The mirror carries every
+    // field as the strings BCS has, so any of them can be broken.
+    #[derive(serde::Serialize, serde::Deserialize, Clone)]
+    #[serde(rename_all = "camelCase")]
+    struct Proof {
+        a: Vec<String>,
+        b: Vec<Vec<String>>,
+        c: Vec<String>,
+    }
+    #[derive(serde::Serialize, serde::Deserialize, Clone)]
+    #[serde(rename_all = "camelCase")]
+    struct Claim {
+        value: String,
+        index_mod_4: u8,
+    }
+    #[derive(serde::Serialize, serde::Deserialize, Clone)]
+    #[serde(rename_all = "camelCase")]
+    struct Inputs {
+        proof_points: Proof,
+        iss_base64_details: Claim,
+        header_base64: String,
+        #[serde(default)]
+        address_seed: String,
+    }
+    #[derive(serde::Serialize)]
+    struct Authenticator {
+        inputs: Inputs,
+        max_epoch: u64,
+        user_signature: Vec<u8>,
+    }
+    let zk = |inputs: &Inputs, sig: &[u8]| {
+        let mut b = vec![5];
+        b.extend(
+            bcs::to_bytes(&Authenticator {
+                inputs: inputs.clone(),
+                max_epoch: 10,
+                user_signature: sig.to_vec(),
+            })
+            .unwrap(),
+        );
+        b
+    };
+    let vectors: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+        "../../../../crates/sui-types/src/unit_tests/zklogin_test_vectors.json"
+    ))
+    .unwrap();
+    let simple_sig = {
+        let (_, k): (_, fastcrypto::ed25519::Ed25519KeyPair) = get_key_pair_from_rng(&mut rng);
+        sui_types::crypto::Signature::new_hashed(&[0; 32], &SuiKeyPair::Ed25519(k))
+            .as_ref()
+            .to_vec()
+    };
+    let mut base: Option<Inputs> = None;
+    for (i, v) in vectors.iter().enumerate() {
+        let mut inputs: Inputs =
+            serde_json::from_str(v["zklogin_inputs"].as_str().unwrap()).unwrap();
+        inputs.address_seed = v["address_seed"].as_str().unwrap().to_owned();
+        add(&format!("zklogin_vector_{i}"), zk(&inputs, &simple_sig));
+        base.get_or_insert(inputs);
+    }
+    let base = base.unwrap();
+    let with = |f: &dyn Fn(&mut Inputs)| {
+        let mut i = base.clone();
+        f(&mut i);
+        i
+    };
+    let b64url =
+        |s: &str| <base64ct::Base64UrlUnpadded as base64ct::Encoding>::encode_string(s.as_bytes());
+    for (label, inputs) in [
+        ("seed_zero", with(&|i| i.address_seed = "0".to_owned())),
+        (
+            "seed_leading_zero",
+            with(&|i| i.address_seed = format!("0{}", i.address_seed)),
+        ),
+        ("seed_empty", with(&|i| i.address_seed = String::new())),
+        (
+            "seed_over_modulus",
+            with(&|i| i.address_seed = "9".repeat(90)),
+        ),
+        (
+            "seed_not_digits",
+            with(&|i| i.address_seed = "12a4".to_owned()),
+        ),
+        ("seed_plus", with(&|i| i.address_seed = "+12".to_owned())),
+        (
+            "proof_over_modulus",
+            with(&|i| i.proof_points.a[0] = "9".repeat(100)),
+        ),
+        (
+            "proof_short",
+            with(&|i| {
+                i.proof_points.a.pop();
+            }),
+        ),
+        ("proof_bad", with(&|i| i.proof_points.c[1] = "x".to_owned())),
+        (
+            "header_hs256",
+            with(&|i| i.header_base64 = b64url(r#"{"alg":"HS256","typ":"JWT","kid":"1"}"#)),
+        ),
+        (
+            "header_no_kid",
+            with(&|i| i.header_base64 = b64url(r#"{"alg":"RS256","typ":"JWT"}"#)),
+        ),
+        (
+            "header_no_typ",
+            with(&|i| i.header_base64 = b64url(r#"{"alg":"RS256","kid":"1"}"#)),
+        ),
+        (
+            "header_extra",
+            with(&|i| i.header_base64 = b64url(r#"{"alg":"RS256","kid":"1","x":{"y":[1]}}"#)),
+        ),
+        (
+            "header_duplicate_alg",
+            with(&|i| i.header_base64 = b64url(r#"{"alg":"RS256","alg":"RS256","kid":"1"}"#)),
+        ),
+        (
+            "header_trailing",
+            with(&|i| i.header_base64 = b64url(r#"{"alg":"RS256","kid":"1"} x"#)),
+        ),
+        (
+            "header_padded",
+            with(&|i| i.header_base64 = format!("{}=", b64url(r#"{"alg":"RS256","kid":"1"}"#))),
+        ),
+        (
+            "header_not_base64",
+            with(&|i| i.header_base64 = "!!".to_owned()),
+        ),
+        (
+            "claim_index_3",
+            with(&|i| i.iss_base64_details.index_mod_4 = 3),
+        ),
+        (
+            "claim_short",
+            with(&|i| i.iss_base64_details.value = "w".to_owned()),
+        ),
+        (
+            "claim_bad_char",
+            with(&|i| i.iss_base64_details.value.push('!')),
+        ),
+        (
+            "claim_empty",
+            with(&|i| i.iss_base64_details.value = String::new()),
+        ),
+        // `"iss":"a",` whole: offset 0, ends in a comma.
+        (
+            "claim_plain",
+            with(&|i| {
+                i.iss_base64_details.value = b64url(r#""iss":"https://a.b","#);
+                i.iss_base64_details.index_mod_4 = 0;
+            }),
+        ),
+        (
+            "claim_no_terminator",
+            with(&|i| {
+                i.iss_base64_details.value = b64url(r#""iss":"https://a.b"x"#);
+                i.iss_base64_details.index_mod_4 = 0;
+            }),
+        ),
+        (
+            "claim_not_iss",
+            with(&|i| {
+                i.iss_base64_details.value = b64url(r#""sub":"https://a.b","#);
+                i.iss_base64_details.index_mod_4 = 0;
+            }),
+        ),
+        (
+            "claim_iss_number",
+            with(&|i| {
+                i.iss_base64_details.value = b64url(r#""iss":12,"#);
+                i.iss_base64_details.index_mod_4 = 0;
+            }),
+        ),
+        // The claim length wraps in u8 inside fastcrypto: 256 characters.
+        (
+            "claim_len_256",
+            with(&|i| {
+                i.iss_base64_details.value = "A".repeat(256);
+                i.iss_base64_details.index_mod_4 = 0;
+            }),
+        ),
+        (
+            "claim_len_255_index_2",
+            with(&|i| {
+                i.iss_base64_details.value = "A".repeat(255);
+                i.iss_base64_details.index_mod_4 = 2;
+            }),
+        ),
+    ] {
+        add(&format!("zklogin_{label}"), zk(&inputs, &simple_sig));
+    }
+    add("zklogin_sig_short", zk(&base, &simple_sig[..96]));
+    add(
+        "zklogin_sig_passkey_flag",
+        zk(&base, &{
+            let mut s = simple_sig.clone();
+            s[0] = 6;
+            s
+        }),
+    );
+    let mut trailing = zk(&base, &simple_sig);
+    trailing.push(0);
+    add("zklogin_trailing", trailing);
+
     // A real single signature, for the length only.
     let (_, kp): (_, SuiKeyPair) = {
         let (a, k): (_, fastcrypto::ed25519::Ed25519KeyPair) = get_key_pair_from_rng(&mut rng);

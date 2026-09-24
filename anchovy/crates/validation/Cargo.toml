@@ -7,7 +7,9 @@ publish = false
 
 [dependencies]
 base64ct.workspace = true
+bcs.workspace = true
 fastcrypto.workspace = true
+fastcrypto-zkp.workspace = true
 roaring.workspace = true
 serde.workspace = true
 serde_json.workspace = true

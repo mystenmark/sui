@@ -41,6 +41,7 @@ bs58 = "0.5"
 # the versions sui decodes signatures with.
 fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "076bf5ad8cea140dc7cf5c5861c24a36acdf64ce" }
 base64ct = { version = "=1.8.0", features = ["alloc"] }
+fastcrypto-zkp = { git = "https://github.com/MystenLabs/fastcrypto", rev = "076bf5ad8cea140dc7cf5c5861c24a36acdf64ce", package = "fastcrypto-zkp" }
 roaring = "=0.11.4"
 insta = { version = "1", features = ["yaml"] }
 # The gRPC stack, at the versions in sui's lockfile.
@@ -72,6 +73,12 @@ module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
+
+# fastcrypto-zkp adds claim offsets in u8 (`decode_base64_url`), which
+# wraps harmlessly in release but panics with overflow checks on crafted
+# signatures; build it everywhere as release does.
+[profile.dev.package.fastcrypto-zkp]
+overflow-checks = false
 
 [profile.release]
 debug = true
