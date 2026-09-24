@@ -340,10 +340,11 @@ fn check_gas_price_and_budget(tx: &TransactionData<'_>, ctx: &Context<'_>) -> Re
         }
         return Ok(());
     }
-    // The reference's `SuiCostTable::new`. Its multiplication is unchecked,
-    // so it wraps in release builds; reachable only without the price cap.
+    // The reference's `SuiCostTable::new`, whose checked arithmetic panics
+    // on overflow. It cannot overflow: the multiplier exists only in
+    // versions that cap the price above.
     let min_budget = if config.txn_base_cost_as_multiplier() {
-        config.base_tx_cost_fixed().wrapping_mul(gas.price)
+        config.base_tx_cost_fixed().saturating_mul(gas.price)
     } else {
         config.base_tx_cost_fixed()
     };

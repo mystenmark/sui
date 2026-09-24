@@ -635,7 +635,7 @@ pub fn vectors() -> String {
     let all: Vec<&ProtocolConfig> = configs.iter().flatten().collect();
     // What each vector runs: the transaction data, or signed bytes.
     enum Subject {
-        TxData(TransactionData),
+        TxData(Box<TransactionData>),
         Signed(Vec<u8>),
     }
     let mut cases: Vec<(&str, String, Subject)> = vec![];
@@ -648,11 +648,11 @@ pub fn vectors() -> String {
         .chain(crate::validity_kind::kind_cases(&all))
         .chain(crate::validity_kind::gasless_cases());
     for (label, tx) in tx_data {
-        cases.push(("tx_data", label, Subject::TxData(tx)));
+        cases.push(("tx_data", label, Subject::TxData(Box::new(tx))));
     }
     for (label, tx) in gas_cases(&all) {
         if label.starts_with("price_") {
-            cases.push(("gas_price", label, Subject::TxData(tx)));
+            cases.push(("gas_price", label, Subject::TxData(Box::new(tx))));
         }
     }
     for (label, bytes) in crate::validity_signed::cases() {
