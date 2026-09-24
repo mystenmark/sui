@@ -3,7 +3,7 @@
 Plan: `IMPLEMENTATION_PLAN_PHASE4.md`. Branch `mlogan-phase4`, to be merged
 into `anchovy-main`.
 
-## Status: steps 0 to 2 done, step 3 next
+## Status: steps 0 to 4 done, step 5 (signature verification) next
 
 ## Done
 
@@ -47,6 +47,30 @@ into `anchovy-main`.
    (just under, at, over each distinct value), so they follow the table.
    Planted bugs (an off-by-one; reversed type-argument order) are caught.
 
+3. and 4. (done together: the scheme gate needs parsed signatures)
+   `signature.rs` parses `GenericSignature` as the reference's
+   `from_bytes`: exact lengths for single-key schemes; the new multisig
+   (the `messages` view, built into the caller's `Bump` through the new
+   `messages::arena::BumpAlloc`) with `init_and_validate`, falling back to
+   legacy multisig (roaring bitmap via the `roaring` crate, keys strictly
+   base64-decoded into a stack buffer and point-checked by fastcrypto);
+   passkey (client data with `passkey-types`' serde attributes mirrored,
+   base64url challenge, Secp256r1 key and signature by fastcrypto);
+   zkLogin (fastcrypto-zkp's `ZkLoginInputs` through `bcs`, then
+   `init`). Each also yields the length the reference re-serializes it to,
+   which differs from the wire for legacy multisig (canonical bitmap) and
+   zkLogin (field elements reduced mod p).
+   `sender_signed.rs`: the deserialization checks our parser defers
+   (intent `00 00 00`, non-empty allowed proposers, identifiers in
+   withdrawal types, signatures), then `SenderSignedData::validity_check`:
+   scheme gating, no system transactions, size limits on the reference's
+   re-serialized size, `TransactionData::validity_check`. Returns the
+   parsed signatures and that size.
+   Vectors: `signatures.vectors` (`sui-oracle --signature-vectors`, 150
+   signatures incl. sui's zkLogin test vectors, each with the reference's
+   variant and re-serialized length) and `sender_signed` cases in
+   `validity.vectors` (verdict `ok:<size>` compares sizes too).
+
 ## Findings
 
 - The reference panics in two places after its static checks pass,
@@ -63,6 +87,20 @@ into `anchovy-main`.
   it never hits a stale entry.
 - An empty `AllowedProposers.proposers` is rejected by the reference at
   deserialization; our parser accepts it, so step 4 must check it.
+- The reference accepts, when parsing: a legacy bitmap with trailing
+  bytes and an empty legacy bitmap; a passkey key with the SEC1 compact
+  tag `0x05`; high-s passkey signatures; zkLogin field elements of any
+  length at or above the modulus (reduced); JSON with duplicate unknown
+  keys (last wins).
+- fastcrypto-zkp's `decode_base64_url` adds a claim's length in `u8`: a
+  256-character claim panics with overflow checks on (debug and tests)
+  and wraps harmlessly in release. Both workspaces build fastcrypto-zkp
+  without overflow checks, as release does.
+- Legacy multisig and zkLogin parsing allocate on the heap (roaring,
+  serde); both are rare and zkLogin's proof check dominates its cost.
+- System kinds carry deserialization rules we do not check (genesis
+  objects, durations); a user-submitted one is rejected as a system
+  transaction, where the reference reports a deserialization error.
 - The vector file is 1.3 MB, mostly limit-boundary transactions (2,049
   package dependencies, 1,025 commands, 16 KB pure arguments).
 
@@ -103,6 +141,4 @@ gas_data_tests, move_package_publish_tests, transfer_to_object_tests}.rs`.
 
 ## Remaining
 
-3. `SenderSignedData::validity_check`, with corpus vectors.
-4. Deferred signature parsing and `Identifier` grammar.
 5. Signature verification, with signed vectors.
