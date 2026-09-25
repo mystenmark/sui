@@ -32,6 +32,10 @@ base64.workspace = true
 hyper-util.workspace = true
 tower.workspace = true
 
+[[bench]]
+name = "validate"
+harness = false
+
 [build-dependencies]
 tonic-build.workspace = true
 
