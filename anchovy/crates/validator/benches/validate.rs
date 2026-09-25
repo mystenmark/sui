@@ -19,7 +19,7 @@ use containers::Bump;
 use messages::Message;
 use messages::base::Digest;
 use messages::checkpoint::CheckpointData;
-use messages::transaction::Transaction;
+use messages::transaction::{DigestPending, DigestReady, Transaction};
 use protocol_config::{Chain, ProtocolVersion};
 use tokio::sync::oneshot;
 use tonic::transport::Channel;
@@ -103,8 +103,8 @@ fn epoch_state(epoch: u64) -> Arc<EpochState> {
     ))
 }
 
-fn decode(bytes: &Bytes) -> Message<Transaction<'static>> {
-    Message::<Transaction>::parse(bytes.to_vec())
+fn decode(bytes: &Bytes) -> Message<Transaction<'static, DigestPending>> {
+    Message::<Transaction<DigestPending>>::parse(bytes.to_vec())
         .map_err(|(e, _)| e)
         .unwrap()
 }
@@ -170,7 +170,7 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
         }),
     );
     row(
-        "decode (copy + parse + digest), then drop",
+        "decode (copy + parse), then drop",
         per_tx(txs, 50, |txs| {
             for bytes in txs {
                 black_box(decode(bytes));
@@ -186,7 +186,7 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
         }),
     );
     row(
-        "  of which: Blake2b of TransactionData",
+        "Blake2b of TransactionData",
         per_tx(txs, 50, |_| {
             for m in &decoded {
                 black_box(Digest::of("TransactionData", m.get().0.data.bytes));
@@ -194,10 +194,22 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
         }),
     );
     row(
+        "  Message::with_digests over a Vec",
+        with_digest_per_tx(txs, 50, Message::with_digests),
+    );
+    row(
+        "  into_iter().map(Message::with_digest).collect()",
+        with_digest_per_tx(txs, 50, |v| {
+            v.into_iter().map(Message::with_digest).collect()
+        }),
+    );
+    row(
         "decode, two-pass (parse_exact)",
         per_tx(txs, 20, |txs| {
             for bytes in txs {
-                black_box(Message::<Transaction>::parse_exact(bytes.to_vec()).unwrap());
+                black_box(
+                    Message::<Transaction<DigestPending>>::parse_exact(bytes.to_vec()).unwrap(),
+                );
             }
         }),
     );
@@ -213,7 +225,7 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
     );
     let mut validator = TransactionValidator::new(epoch.clone());
     row(
-        "decode + TransactionValidator::process",
+        "decode + TransactionValidator::process (+ digest)",
         per_tx(txs, 50, |txs| {
             for bytes in txs {
                 let (reply, verdict) = oneshot::channel();
@@ -225,6 +237,32 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
             }
         }),
     );
+}
+
+/// Converting the corpus, as one `Vec`, to computed digests with `convert`:
+/// the time and allocations of the conversion alone, decoding excluded.
+fn with_digest_per_tx(
+    txs: &[Bytes],
+    rounds: usize,
+    convert: impl Fn(
+        Vec<Message<Transaction<'static, DigestPending>>>,
+    ) -> Vec<Message<Transaction<'static, DigestReady>>>,
+) -> (Duration, f64) {
+    let mut best = Duration::MAX;
+    let mut allocations = 0;
+    for _ in 0..rounds {
+        let pending: Vec<_> = txs.iter().map(decode).collect();
+        let before = ALLOCATIONS.load(Ordering::Relaxed);
+        let start = Instant::now();
+        let ready = convert(pending);
+        best = best.min(start.elapsed());
+        allocations = ALLOCATIONS.load(Ordering::Relaxed) - before;
+        black_box(ready);
+    }
+    (
+        best / txs.len() as u32,
+        allocations as f64 / txs.len() as f64,
+    )
 }
 
 /// Decodes and validates on the calling thread, in its own arena.
