@@ -13,8 +13,8 @@ into `anchovy-main`.
    owns its queue, so a pool with no threads is paused (full), not closed.
 3. `messages::transaction::Transaction`, depth-checked against the
    reference at the boundary (`--depth-vectors` in the oracle).
-4. `EpochState` and `TransactionValidator` (one reused 64 KiB arena per
-   thread).
+4. `EpochState` and `TransactionValidator` (one reused 64 KiB arena),
+   on a single processor thread; one work item per request.
 5. `SubmitTransaction`: request checks, decode in the handler, enqueue
    (`resource_exhausted` when full), await verdicts; valid transactions
    answer `unimplemented("consensus submission")`. Epoch state from the
@@ -30,6 +30,8 @@ into `anchovy-main`.
      (`GasBudgetTooLow`).
 
 ## Notes
+
+- Performance: `BENCHMARKS_PHASE5.md`.
 
 - Gas price under RGP is not a `validity_check` failure (the reference
   checks it separately), so the processor accepts it, as the PRD scopes it.
