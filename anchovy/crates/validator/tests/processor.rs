@@ -13,7 +13,7 @@ use messages::transaction::Transaction;
 use protocol_config::{Chain, ProtocolVersion};
 use tokio::sync::oneshot;
 use validator::epoch::EpochState;
-use validator::processors::{TransactionValidator, ValidateTransaction};
+use validator::processors::{TransactionValidator, ValidateTransactions};
 use workqueue::Pool;
 
 fn unhex(s: &str) -> Vec<u8> {
@@ -67,7 +67,10 @@ async fn pool_verdicts_match_direct_calls() {
 
         let (reply, verdict) = oneshot::channel();
         queue
-            .try_push(ValidateTransaction { transaction, reply })
+            .try_push(ValidateTransactions {
+                transactions: vec![transaction],
+                reply,
+            })
             .unwrap_or_else(|_| panic!("queue refused"));
         let pooled = verdict.await.unwrap().map_err(|e| e.kind);
         assert_eq!(pooled, direct, "{label}");

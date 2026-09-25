@@ -173,12 +173,15 @@ async fn malformed_requests_are_refused() {
 
 #[tokio::test]
 async fn a_full_queue_refuses_work() {
-    // No threads drain it, so the second transaction finds it full.
-    let mut client = serve(0, 1).await;
+    // No threads drain it: of two requests, one fills it and waits
+    // forever, and the other finds it full.
+    let client = serve(0, 1).await;
     let valid = vectors().into_iter().find(|(_, _, v)| v == "ok").unwrap().1;
-    let status = client
-        .submit_transaction(submit(vec![valid.clone(), valid], SubmitTxType::Default))
-        .await
-        .unwrap_err();
+    let (mut a, mut b) = (client.clone(), client);
+    let status = tokio::select! {
+        r = a.submit_transaction(submit(vec![valid.clone()], SubmitTxType::Default)) => r,
+        r = b.submit_transaction(submit(vec![valid], SubmitTxType::Default)) => r,
+    }
+    .unwrap_err();
     assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
 }

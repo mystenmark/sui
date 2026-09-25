@@ -22,7 +22,7 @@ use tonic::{Request, Response, Status};
 
 use crate::codec::Encoded;
 use crate::epoch::EpochState;
-use crate::processors::ValidateTransaction;
+use crate::processors::ValidateTransactions;
 use crate::proto::{
     RawSubmitTxRequest, RawSubmitTxResponse, RawValidatorHealthRequest, RawValidatorHealthResponse,
     RawWaitForEffectsRequest, RawWaitForEffectsResponse, SubmitTxType,
@@ -31,11 +31,11 @@ use crate::service::validator_server::{self, ValidatorServer};
 
 pub struct Validator {
     epoch: Arc<EpochState>,
-    transactions: Queue<ValidateTransaction>,
+    transactions: Queue<ValidateTransactions>,
 }
 
 impl Validator {
-    pub fn new(epoch: Arc<EpochState>, transactions: Queue<ValidateTransaction>) -> Validator {
+    pub fn new(epoch: Arc<EpochState>, transactions: Queue<ValidateTransactions>) -> Validator {
         Validator {
             epoch,
             transactions,
@@ -73,6 +73,33 @@ impl Validator {
         }
         Ok(submit_type)
     }
+
+    /// Decodes the request's transactions and queues them for validation.
+    /// Not inlined into the handler: holding decoded messages across an
+    /// `await` defeats the future's `Send` inference.
+    fn enqueue(
+        &self,
+        request: &RawSubmitTxRequest,
+    ) -> Result<oneshot::Receiver<Result<(), validation::Error>>, Status> {
+        let mut transactions = Vec::with_capacity(request.transactions.len());
+        for bytes in &request.transactions {
+            let transaction = Message::<Transaction>::parse(bytes.to_vec()).map_err(|(e, _)| {
+                Status::invalid_argument(format!("TransactionDeserializationError: {e:?}"))
+            })?;
+            transactions.push(transaction);
+        }
+        let (reply, verdict) = oneshot::channel();
+        self.transactions
+            .try_push(ValidateTransactions {
+                transactions,
+                reply,
+            })
+            .map_err(|e| match e {
+                PushError::Full(_) => Status::resource_exhausted("validation queue full"),
+                PushError::Closed(_) => Status::unavailable("shutting down"),
+            })?;
+        Ok(verdict)
+    }
 }
 
 fn validation_failure(e: &validation::Error) -> Status {
@@ -81,8 +108,8 @@ fn validation_failure(e: &validation::Error) -> Status {
 
 #[tonic::async_trait]
 impl validator_server::Validator for Validator {
-    /// Decodes each transaction here, validates them all on the processors,
-    /// and fails the request if any is invalid, as the reference does. What
+    /// Decodes each transaction here, validates them on a processor, and
+    /// fails the request if any is invalid, as the reference does. What
     /// passes has no consensus to go to yet.
     async fn submit_transaction(
         &self,
@@ -93,26 +120,10 @@ impl validator_server::Validator for Validator {
             todo!("ping: a consensus position")
         }
 
-        let mut verdicts = Vec::with_capacity(request.transactions.len());
-        for bytes in &request.transactions {
-            let transaction = Message::<Transaction>::parse(bytes.to_vec()).map_err(|(e, _)| {
-                Status::invalid_argument(format!("TransactionDeserializationError: {e:?}"))
-            })?;
-            let (reply, verdict) = oneshot::channel();
-            self.transactions
-                .try_push(ValidateTransaction { transaction, reply })
-                .map_err(|e| match e {
-                    PushError::Full(_) => Status::resource_exhausted("validation queue full"),
-                    PushError::Closed(_) => Status::unavailable("shutting down"),
-                })?;
-            verdicts.push(verdict);
-        }
-        for verdict in verdicts {
-            verdict
-                .await
-                .map_err(|_| Status::internal("validation did not finish"))?
-                .map_err(|e| validation_failure(&e))?;
-        }
+        self.enqueue(&request)?
+            .await
+            .map_err(|_| Status::internal("validation did not finish"))?
+            .map_err(|e| validation_failure(&e))?;
         Err(Status::unimplemented("consensus submission"))
     }
 

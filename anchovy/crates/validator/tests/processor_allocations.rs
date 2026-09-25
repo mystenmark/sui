@@ -14,7 +14,7 @@ use messages::transaction::Transaction;
 use protocol_config::{Chain, ProtocolVersion};
 use tokio::sync::oneshot;
 use validator::epoch::EpochState;
-use validator::processors::{TransactionValidator, ValidateTransaction};
+use validator::processors::{TransactionValidator, ValidateTransactions};
 use workqueue::Processor;
 
 struct Counting;
@@ -60,8 +60,12 @@ fn process(validator: &mut TransactionValidator, transaction: &[u8]) -> (bool, u
         .map_err(|(e, _)| e)
         .unwrap();
     let (reply, verdict) = oneshot::channel();
+    let item = ValidateTransactions {
+        transactions: vec![transaction],
+        reply,
+    };
     let before = ALLOCATIONS.with(Cell::get);
-    validator.process(ValidateTransaction { transaction, reply });
+    validator.process(item);
     let allocations = ALLOCATIONS.with(Cell::get) - before;
     (verdict.blocking_recv().unwrap().is_ok(), allocations)
 }

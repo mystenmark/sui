@@ -13,9 +13,11 @@ use workqueue::{Pool, Processor, Queue};
 
 use crate::epoch::EpochState;
 
-/// A decoded transaction to validate, and where the verdict goes.
-pub struct ValidateTransaction {
-    pub transaction: Message<Transaction<'static>>,
+/// A request's decoded transactions to validate, and where the verdict
+/// goes: the first failure, in order, or success. One item per request, as
+/// the handoff costs far more than validating a transaction does.
+pub struct ValidateTransactions {
+    pub transactions: Vec<Message<Transaction<'static>>>,
     pub reply: oneshot::Sender<Result<(), validation::Error>>,
 }
 
@@ -38,13 +40,18 @@ impl TransactionValidator {
     }
 }
 
-impl Processor<ValidateTransaction> for TransactionValidator {
-    fn process(&mut self, item: ValidateTransaction) {
-        // Reset first, so an item that panicked leaves nothing behind.
-        self.bump.reset();
-        let data = &item.transaction.get().0.data;
-        let result =
-            validation::transaction_data::validity_check(data, &self.epoch.context(), &self.bump);
+impl Processor<ValidateTransactions> for TransactionValidator {
+    fn process(&mut self, item: ValidateTransactions) {
+        let context = self.epoch.context();
+        let result = item.transactions.iter().try_for_each(|transaction| {
+            // Reset first, so an item that panicked leaves nothing behind.
+            self.bump.reset();
+            validation::transaction_data::validity_check(
+                &transaction.get().0.data,
+                &context,
+                &self.bump,
+            )
+        });
         // The handler may have given up; nothing to do then.
         let _ = item.reply.send(result);
     }
@@ -52,12 +59,12 @@ impl Processor<ValidateTransaction> for TransactionValidator {
 
 /// The processor pools, and the queues that feed them.
 pub struct Processors {
-    pub transactions: Queue<ValidateTransaction>,
+    pub transactions: Queue<ValidateTransactions>,
     // Dropped last: stops and joins the threads.
-    _validation: Pool<ValidateTransaction>,
+    _validation: Pool<ValidateTransactions>,
 }
 
-/// Queued transactions beyond which submissions are refused.
+/// Queued requests beyond which submissions are refused.
 pub const VALIDATION_QUEUE: usize = 4096;
 
 impl Processors {
