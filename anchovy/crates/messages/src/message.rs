@@ -55,7 +55,8 @@ impl fmt::Debug for WireBuf {
 }
 
 /// A parsed `T`. Dropping it frees the wire buffer and the arena and nothing
-/// else.
+/// else. `repr(C)`, so that messages whose views lay out alike do too.
+#[repr(C)]
 pub struct Message<T: Wire> {
     // Points into `wire` and `arena`; `'static` stands for "while self lives".
     view: T::View<'static>,
@@ -166,6 +167,13 @@ impl<T: Wire> Message<T> {
             return Err(ParseError::ArenaMismatch);
         }
         Ok((view, arena, build.used()))
+    }
+
+    /// # Safety
+    /// Whatever the caller writes must not borrow from outside the message,
+    /// unless for `'static`: the lifetime is erased.
+    pub(crate) unsafe fn view_mut(&mut self) -> &mut T::View<'static> {
+        &mut self.view
     }
 
     pub fn get(&self) -> &T::View<'_> {

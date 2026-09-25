@@ -161,7 +161,7 @@ fn multisig_with_passkey() {
 /// container deeper.
 #[test]
 fn transaction_envelope() {
-    use messages::transaction::{SenderSignedData, Transaction};
+    use messages::transaction::{DigestReady, SenderSignedData, Transaction};
     let mut bytes = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/data/mainnet-325300367.chk"
@@ -171,9 +171,49 @@ fn transaction_envelope() {
     let checkpoint = Message::<messages::checkpoint::CheckpointData>::parse(bytes).unwrap();
     for tx in checkpoint.get().transactions {
         let wire = tx.transaction.bytes.to_vec();
-        let envelope = Message::<Transaction>::parse(wire.clone()).unwrap();
+        let envelope = Message::<Transaction<DigestReady>>::parse(wire.clone()).unwrap();
         let bare = Message::<SenderSignedData>::parse(wire).unwrap();
         assert_eq!(envelope.get().0, *bare.get());
+    }
+}
+
+/// A transaction parsed without its digest, then hashed, is the one parsed
+/// with it, singly or a batch at a time; a batch keeps its allocation.
+#[test]
+fn transaction_digest_computed_later() {
+    use messages::transaction::{DigestPending, DigestReady, Transaction};
+    let mut bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/mainnet-325300367.chk"
+    ))
+    .unwrap();
+    bytes.remove(0);
+    let checkpoint = Message::<messages::checkpoint::CheckpointData>::parse(bytes).unwrap();
+    let transactions = checkpoint.get().transactions;
+    let pending: Vec<Message<Transaction<DigestPending>>> = transactions
+        .iter()
+        .map(|tx| Message::parse(tx.transaction.bytes.to_vec()).unwrap())
+        .collect();
+    let singly: Vec<Message<Transaction<DigestReady>>> = transactions
+        .iter()
+        .map(|tx| {
+            let pending: Message<Transaction<DigestPending>> =
+                Message::parse(tx.transaction.bytes.to_vec()).unwrap();
+            pending.with_digest()
+        })
+        .collect();
+    let (ptr, capacity) = (pending.as_ptr().cast::<u8>(), pending.capacity());
+    let ready = Message::with_digests(pending);
+    assert_eq!(
+        (ready.as_ptr().cast::<u8>(), ready.capacity()),
+        (ptr, capacity)
+    );
+    assert_eq!(ready.len(), transactions.len());
+    for (i, ready) in ready.iter().enumerate() {
+        let tx = &transactions[i].transaction;
+        assert_eq!(ready.get().0, *tx);
+        assert_eq!(ready.get().0.digest(), tx.digest());
+        assert_eq!(singly[i].get(), ready.get());
     }
 }
 
@@ -181,7 +221,7 @@ fn transaction_envelope() {
 /// reference (`sui-oracle --depth-vectors`).
 #[test]
 fn transaction_envelope_depth() {
-    use messages::transaction::{SenderSignedData, Transaction};
+    use messages::transaction::{DigestPending, SenderSignedData, Transaction};
     for line in include_str!("data/depth.txt").lines() {
         let [label, hex, bare, envelope] = line.split(' ').collect::<Vec<_>>()[..] else {
             panic!("bad line {line}");
@@ -192,7 +232,7 @@ fn transaction_envelope_depth() {
             .collect();
         let verdict = |ok: bool| if ok { "ok" } else { "error" };
         let ours_bare = verdict(Message::<SenderSignedData>::parse(bytes.clone()).is_ok());
-        let ours_envelope = verdict(Message::<Transaction>::parse(bytes).is_ok());
+        let ours_envelope = verdict(Message::<Transaction<DigestPending>>::parse(bytes).is_ok());
         assert_eq!((ours_bare, ours_envelope), (bare, envelope), "{label}");
     }
 }
