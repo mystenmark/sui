@@ -6,6 +6,8 @@
 //! thread. RPC handlers push items and await replies the items carry.
 
 use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
@@ -17,14 +19,20 @@ pub trait Processor<W> {
 }
 
 /// The sending side of a pool's queue. Cheap to clone.
+///
+/// Each pool thread has its own channel: with one channel shared by every
+/// thread, idle threads contend on its waker lock, which costs more than
+/// small items take to process.
 pub struct Queue<W> {
-    items: Sender<W>,
+    shards: Arc<[Sender<W>]>,
+    next: Arc<AtomicUsize>,
 }
 
 impl<W> Clone for Queue<W> {
     fn clone(&self) -> Self {
         Queue {
-            items: self.items.clone(),
+            shards: self.shards.clone(),
+            next: self.next.clone(),
         }
     }
 }
@@ -39,12 +47,18 @@ pub enum PushError<W> {
 }
 
 impl<W> Queue<W> {
-    /// Queues `item`, or returns it at once if the queue is full.
-    pub fn try_push(&self, item: W) -> Result<(), PushError<W>> {
-        self.items.try_send(item).map_err(|e| match e {
-            TrySendError::Full(item) => PushError::Full(item),
-            TrySendError::Disconnected(item) => PushError::Closed(item),
-        })
+    /// Queues `item` on the threads in turn, skipping full ones, or returns
+    /// it at once if every thread's queue is full.
+    pub fn try_push(&self, mut item: W) -> Result<(), PushError<W>> {
+        let first = self.next.fetch_add(1, Ordering::Relaxed);
+        for i in 0..self.shards.len() {
+            match self.shards[(first + i) % self.shards.len()].try_send(item) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(back)) => item = back,
+                Err(TrySendError::Disconnected(back)) => return Err(PushError::Closed(back)),
+            }
+        }
+        Err(PushError::Full(item))
     }
 }
 
@@ -52,16 +66,16 @@ impl<W> Queue<W> {
 /// each finishes the item in hand, items still queued are dropped (with
 /// whatever reply channel they carry), and the threads are joined.
 pub struct Pool<W> {
-    shutdown: Option<Sender<()>>,
+    shutdown: Vec<Sender<()>>,
     threads: Vec<JoinHandle<()>>,
     /// Keeps the queue open for the pool's lifetime, even with no threads.
-    _work: Receiver<W>,
+    _work: Vec<Receiver<W>>,
 }
 
 impl<W> Pool<W> {
     /// Starts `threads` threads named `name-0`, `name-1`, …, each building
-    /// its processor with `make` and taking items from a queue of
-    /// `capacity`.
+    /// its processor with `make` and taking items from its share of a queue
+    /// of `capacity`.
     pub fn spawn<P>(
         name: &str,
         threads: usize,
@@ -72,11 +86,18 @@ impl<W> Pool<W> {
         W: Send + 'static,
         P: Processor<W>,
     {
-        let (items, work) = crossbeam_channel::bounded(capacity);
-        let (shutdown, stop) = crossbeam_channel::bounded(0);
-        let threads = (0..threads)
-            .map(|i| {
-                let (work, stop, make) = (work.clone(), stop.clone(), make.clone());
+        // A pool without threads still has a queue, which fills.
+        let shards = threads.max(1);
+        let (items, work): (Vec<_>, Vec<_>) = (0..shards)
+            .map(|_| crossbeam_channel::bounded(capacity.div_ceil(shards)))
+            .unzip();
+        let (shutdown, stops): (Vec<_>, Vec<_>) =
+            (0..threads).map(|_| crossbeam_channel::bounded(0)).unzip();
+        let threads = stops
+            .into_iter()
+            .enumerate()
+            .map(|(i, stop)| {
+                let (work, make) = (work[i].clone(), make.clone());
                 std::thread::Builder::new()
                     .name(format!("{name}-{i}"))
                     .spawn(move || run(&work, &stop, make()))
@@ -84,9 +105,12 @@ impl<W> Pool<W> {
             })
             .collect();
         (
-            Queue { items },
+            Queue {
+                shards: items.into(),
+                next: Arc::new(AtomicUsize::new(0)),
+            },
             Pool {
-                shutdown: Some(shutdown),
+                shutdown,
                 threads,
                 _work: work,
             },
@@ -113,7 +137,7 @@ fn run<W, P: Processor<W>>(work: &Receiver<W>, stop: &Receiver<()>, mut processo
 
 impl<W> Drop for Pool<W> {
     fn drop(&mut self) {
-        drop(self.shutdown.take());
+        self.shutdown.clear();
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
@@ -191,6 +215,49 @@ mod tests {
         }
         assert!(matches!(queue.try_push(()), Err(PushError::Full(()))));
         drop(open);
+        drop(pool);
+    }
+
+    /// Signals when it starts an item, then blocks until any item may go on.
+    struct Turnstile {
+        started: mpsc::Sender<()>,
+        go: std::sync::Arc<std::sync::Mutex<mpsc::Receiver<()>>>,
+    }
+
+    impl Processor<()> for Turnstile {
+        fn process(&mut self, (): ()) {
+            self.started.send(()).unwrap();
+            let _ = self.go.lock().unwrap().recv();
+        }
+    }
+
+    #[test]
+    fn a_push_skips_full_threads() {
+        let (started, starts) = mpsc::channel();
+        let (go, gone) = mpsc::channel();
+        let gone = std::sync::Arc::new(std::sync::Mutex::new(gone));
+        let (queue, pool) = Pool::spawn("turnstile", 3, 3, move || Turnstile {
+            started: started.clone(),
+            go: gone.clone(),
+        });
+        // One item in each thread's hand, then one queued behind each.
+        for _ in 0..3 {
+            queue.try_push(()).unwrap();
+        }
+        for _ in 0..3 {
+            starts.recv().unwrap();
+        }
+        for _ in 0..3 {
+            queue.try_push(()).unwrap();
+        }
+        assert!(matches!(queue.try_push(()), Err(PushError::Full(()))));
+        // One thread moves on to its queued item; wherever the rotation
+        // points, the push finds that thread's free slot.
+        go.send(()).unwrap();
+        starts.recv().unwrap();
+        queue.try_push(()).unwrap();
+        assert!(matches!(queue.try_push(()), Err(PushError::Full(()))));
+        drop(go);
         drop(pool);
     }
 
