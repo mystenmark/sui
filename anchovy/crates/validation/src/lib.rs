@@ -35,7 +35,7 @@ pub struct Context<'a> {
 /// reference's order: what decoding checks, `validity_check`, then the
 /// signatures. `aliases` are as for [`verify::verify_signatures`].
 pub fn check<'a>(
-    tx: &messages::transaction::SenderSignedData<'a>,
+    tx: &messages::transaction::SenderSignedData<'a, impl messages::transaction::DigestState>,
     ctx: &Context<'_>,
     verifier: &verify::Verifier,
     aliases: &[(messages::base::SuiAddress, &[messages::base::SuiAddress])],
