@@ -55,7 +55,32 @@ one work item per request.
   22 → 10µs; no effect on a sequential gRPC caller (the gap between
   requests outlasts the spin); burns a core while idle.
 
+## Digest on the processor
+
+The handler now parses without the transaction digest (`DigestPending`);
+the processor hashes the transactions that pass validation
+(`Message::with_digests`). Nothing before signature verification needs the
+digest, and signature verification hashes the intent message itself.
+
+| step | before | after |
+|---|---|---|
+| handler decode, per tx | 1,200 ns | 519 ns |
+| processor, per tx | 131 ns | 139 + 690 ns |
+
+Converting a batch is zero-cost beyond the hash: `with_digests` 690 ns/tx
+against 688 ns for Blake2b alone, no allocation. Its loop is the hash call
+and a 33-byte store into the element; the `Vec` is relabelled, which the
+`repr(C)` layouts make sound (Miri passes). The idiomatic
+`into_iter().map(Message::with_digest).collect()` also reuses the
+allocation, but moves each 448-byte message out and back (three `memcpy`s
+per element, more with `#[inline]`): 708 ns/tx.
+
+End to end, one-tx requests gain a little (143–151k req/s, from
+135–148k). 16-tx requests lose (0.77–0.84M tx/s, from 0.96–1.28M): at
+~830 ns of work per transaction the single processor thread is now the
+bottleneck. In process, through the queue: 0.48M tx/s.
+
 ## Open
 
-- Blake2b at ~1.5 GB/s is the largest single cost; a faster implementation,
-  or computing the digest later, would roughly halve decode.
+- Blake2b at ~1.5 GB/s is now the processor's main cost; a faster
+  implementation would raise the single thread's ceiling.

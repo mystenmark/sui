@@ -32,6 +32,8 @@ into `anchovy-main`.
 ## Notes
 
 - Performance: `BENCHMARKS_PHASE5.md`.
+- Transactions are parsed without their digest (`DigestPending`); the
+  processor hashes those that validate.
 
 - Gas price under RGP is not a `validity_check` failure (the reference
   checks it separately), so the processor accepts it, as the PRD scopes it.
