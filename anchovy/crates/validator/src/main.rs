@@ -42,9 +42,6 @@ struct Args {
     reference_gas_price: u64,
     #[arg(long, default_value_t = 1)]
     committee_size: u32,
-    /// Threads validating transactions; half the cores by default.
-    #[arg(long)]
-    validation_threads: Option<usize>,
 }
 
 /// Up to 32 bytes of hex, left-padded.
@@ -81,9 +78,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.reference_gas_price,
         args.committee_size,
     ));
-    let threads = args.validation_threads.unwrap_or_else(|| {
-        std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1))
-    });
 
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     eprintln!("listening on {}", listener.local_addr()?);
@@ -93,6 +87,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::future::pending::<()>().await;
         }
     };
-    validator::serve(listener, &key, epoch, threads, shutdown).await?;
+    validator::serve(listener, &key, epoch, shutdown).await?;
     Ok(())
 }

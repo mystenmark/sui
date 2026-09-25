@@ -103,7 +103,7 @@ async fn serve(key: NetworkKey) -> SocketAddr {
             1000,
             1,
         ));
-        validator::serve(listener, &key, epoch, 1, std::future::pending())
+        validator::serve(listener, &key, epoch, std::future::pending())
             .await
             .unwrap();
     });

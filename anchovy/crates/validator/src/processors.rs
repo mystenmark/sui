@@ -57,10 +57,11 @@ impl Processor<ValidateTransactions> for TransactionValidator {
     }
 }
 
-/// The processor pools, and the queues that feed them.
+/// The processors, and the queues that feed them. Validation runs on one
+/// thread for now.
 pub struct Processors {
     pub transactions: Queue<ValidateTransactions>,
-    // Dropped last: stops and joins the threads.
+    // Dropped last: stops and joins the thread.
     _validation: Pool<ValidateTransactions>,
 }
 
@@ -68,17 +69,12 @@ pub struct Processors {
 pub const VALIDATION_QUEUE: usize = 4096;
 
 impl Processors {
-    pub fn start(
-        epoch: &Arc<EpochState>,
-        validation_threads: usize,
-        validation_queue: usize,
-    ) -> Processors {
+    pub fn start(epoch: &Arc<EpochState>, validation_queue: usize) -> Processors {
         let make = {
             let epoch = epoch.clone();
             move || TransactionValidator::new(epoch.clone())
         };
-        let (transactions, validation) =
-            Pool::spawn("validate", validation_threads, validation_queue, make);
+        let (transactions, validation) = Pool::spawn("validate", 1, validation_queue, make);
         Processors {
             transactions,
             _validation: validation,

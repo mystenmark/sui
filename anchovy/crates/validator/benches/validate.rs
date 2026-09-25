@@ -246,17 +246,17 @@ fn validate_inline(bytes: &Bytes, epoch: &EpochState) -> bool {
 
 /// Tasks on a `workers`-thread runtime, each in a closed loop (decode,
 /// push, await) over its share of `rounds` passes of the corpus, against
-/// `threads` processors, or validating inline with none. Returns transactions per second and the mean
+/// the processor, or validating inline. Returns transactions per second and the mean
 /// round trip.
 fn pool(
     txs: &Arc<Vec<Bytes>>,
     epoch: &Arc<EpochState>,
-    threads: usize,
+    inline: bool,
     workers: usize,
     tasks: usize,
     rounds: usize,
 ) -> (f64, Duration) {
-    let processors = Processors::start(epoch, threads, 1 << 16);
+    let processors = Processors::start(epoch, 1 << 16);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .build()
@@ -272,7 +272,7 @@ fn pool(
                 tokio::spawn(async move {
                     let mut i = t;
                     while i < total {
-                        if threads == 0 {
+                        if inline {
                             black_box(validate_inline(&txs[i % txs.len()], &epoch));
                             i += tasks;
                             // Let other tasks run, as a handler would.
@@ -308,33 +308,31 @@ fn pool(
 
 fn pools(txs: &[Bytes], epoch: &Arc<EpochState>) {
     let txs = Arc::new(txs.to_vec());
+    println!("\nqueue + processor: closed-loop tasks on a 4-worker runtime (decode, push, await):");
     println!(
-        "\nqueue + pool: closed-loop tasks on a 4-worker runtime (decode, push, await; 0 threads: inline):"
-    );
-    println!(
-        "  {:>8} {:>6} {:>11} {:>11}",
-        "threads", "tasks", "tx/s", "round trip"
+        "  {:<10} {:>6} {:>11} {:>11}",
+        "", "tasks", "tx/s", "round trip"
     );
     let mut configs = vec![
-        (0, 1, 5),
-        (0, 64, 40),
-        (1, 1, 5),
-        (1, 64, 20),
-        (2, 64, 20),
-        (4, 64, 40),
-        (8, 64, 40),
-        (8, 256, 40),
-        (12, 64, 40),
-        (12, 256, 40),
+        (true, 1, 5),
+        (true, 64, 40),
+        (false, 1, 5),
+        (false, 64, 20),
+        (false, 256, 20),
     ];
-    // POOL=threads,tasks,rounds runs one configuration, for profiling.
+    // POOL=inline|queue,tasks,rounds runs one configuration, for profiling.
     if let Ok(one) = std::env::var("POOL") {
-        let n: Vec<usize> = one.split(',').map(|n| n.parse().unwrap()).collect();
-        configs = vec![(n[0], n[1], n[2])];
+        let n: Vec<&str> = one.split(',').collect();
+        configs = vec![(
+            n[0] == "inline",
+            n[1].parse().unwrap(),
+            n[2].parse().unwrap(),
+        )];
     }
-    for (threads, tasks, rounds) in configs {
-        let (rate, latency) = pool(&txs, epoch, threads, 4, tasks, rounds);
-        println!("  {threads:>8} {tasks:>6} {rate:>11.0} {latency:>11.1?}");
+    for (inline, tasks, rounds) in configs {
+        let (rate, latency) = pool(&txs, epoch, inline, 4, tasks, rounds);
+        let name = if inline { "inline" } else { "queue" };
+        println!("  {name:<10} {tasks:>6} {rate:>11.0} {latency:>11.1?}");
     }
 }
 
@@ -348,13 +346,13 @@ impl Drop for Guard {
 }
 
 /// An in-process server, plaintext, on its own runtime.
-fn server(epoch: &Arc<EpochState>, threads: usize, workers: usize) -> (SocketAddr, impl Drop) {
+fn server(epoch: &Arc<EpochState>, workers: usize) -> (SocketAddr, impl Drop) {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .enable_all()
         .build()
         .unwrap();
-    let processors = Processors::start(epoch, threads, 1 << 16);
+    let processors = Processors::start(epoch, 1 << 16);
     let service = Validator::new(epoch.clone(), processors.transactions.clone()).into_service();
     let listener = runtime
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
@@ -446,34 +444,30 @@ fn end_to_end(txs: &[Bytes], epoch: &Arc<EpochState>) {
     let duration = Duration::from_secs(3);
     println!("\ngRPC, plaintext, in process (client: CLIENT_WORKERS=6 workers, CONNECTIONS=16):");
     println!(
-        "  {:<16} {:>8} {:>8} {:>6} {:>11} {:>11} {:>11}",
-        "request", "workers", "threads", "tasks", "requests/s", "tx/s", "round trip"
+        "  {:<16} {:>8} {:>6} {:>11} {:>11} {:>11}",
+        "request", "workers", "tasks", "requests/s", "tx/s", "round trip"
     );
     let mut configs = vec![
-        ("health", 4, 1, 256, 0),
-        ("health", 8, 1, 256, 0),
-        ("submit, 1 tx", 4, 1, 1, 1),
-        ("submit, 1 tx", 4, 1, 256, 1),
-        ("submit, 1 tx", 4, 2, 256, 1),
-        ("submit, 1 tx", 4, 4, 256, 1),
-        ("submit, 1 tx", 8, 2, 256, 1),
-        ("submit, 1 tx", 8, 8, 256, 1),
-        ("submit, 16 txs", 4, 2, 64, 16),
-        ("submit, 16 txs", 4, 4, 64, 16),
-        ("submit, 16 txs", 8, 4, 64, 16),
+        ("health", 4, 256, 0),
+        ("health", 8, 256, 0),
+        ("submit, 1 tx", 4, 1, 1),
+        ("submit, 1 tx", 4, 256, 1),
+        ("submit, 1 tx", 8, 256, 1),
+        ("submit, 16 txs", 4, 64, 16),
+        ("submit, 16 txs", 8, 64, 16),
     ];
-    // GRPC=workers,threads,tasks,batch runs one configuration.
+    // GRPC=workers,tasks,batch runs one configuration.
     if let Ok(one) = std::env::var("GRPC") {
         let n: Vec<usize> = one.split(',').map(|n| n.parse().unwrap()).collect();
-        configs = vec![("custom", n[0], n[1], n[2], n[3])];
+        configs = vec![("custom", n[0], n[1], n[2])];
     }
     let connections = std::env::var("CONNECTIONS").map_or(16, |c| c.parse().unwrap());
-    for (name, workers, threads, tasks, batch) in configs {
-        let (addr, guard) = server(epoch, threads, workers);
+    for (name, workers, tasks, batch) in configs {
+        let (addr, guard) = server(epoch, workers);
         let (rate, latency) = grpc(&txs, addr, connections, tasks, batch, duration);
         drop(guard);
         println!(
-            "  {name:<16} {workers:>8} {threads:>8} {tasks:>6} {rate:>11.0} {:>11.0} {latency:>11.1?}",
+            "  {name:<16} {workers:>8} {tasks:>6} {rate:>11.0} {:>11.0} {latency:>11.1?}",
             rate * batch.max(1) as f64
         );
     }

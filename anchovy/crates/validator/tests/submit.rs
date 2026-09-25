@@ -16,9 +16,10 @@ use tonic::transport::Channel;
 use tonic::transport::server::TcpIncoming;
 use validator::Validator;
 use validator::epoch::EpochState;
-use validator::processors::Processors;
+use validator::processors::{Processors, TransactionValidator, ValidateTransactions};
 use validator::proto::{RawSubmitTxRequest, SubmitTxType};
 use validator::service::validator_client::ValidatorClient;
+use workqueue::{Pool, Queue};
 
 /// The context of the validity vectors' first case set.
 fn epoch() -> Arc<EpochState> {
@@ -32,12 +33,23 @@ fn epoch() -> Arc<EpochState> {
     ))
 }
 
-async fn serve(threads: usize, queue: usize) -> ValidatorClient<Channel> {
+async fn serve() -> ValidatorClient<Channel> {
+    let epoch = epoch();
+    let processors = Processors::start(&epoch, 64);
+    let queue = processors.transactions.clone();
+    serve_with(epoch, queue, processors).await
+}
+
+/// Serves with `queue`; `processors` (whatever drains it) live as long as
+/// the server.
+async fn serve_with(
+    epoch: Arc<EpochState>,
+    queue: Queue<ValidateTransactions>,
+    processors: impl Send + 'static,
+) -> ValidatorClient<Channel> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
-    let epoch = epoch();
-    let processors = Processors::start(&epoch, threads, queue);
-    let service = Validator::new(epoch, processors.transactions.clone()).into_service();
+    let service = Validator::new(epoch, queue).into_service();
     tokio::spawn(async move {
         let _processors = processors;
         tonic::transport::Server::builder()
@@ -112,7 +124,7 @@ fn vectors() -> Vec<(String, Bytes, String)> {
 
 #[tokio::test]
 async fn verdicts_come_back_over_grpc() {
-    let mut client = serve(2, 64).await;
+    let mut client = serve().await;
     let cases = vectors();
     assert!(cases.len() > 100);
     for (label, bytes, verdict) in cases {
@@ -134,7 +146,7 @@ async fn verdicts_come_back_over_grpc() {
 
 #[tokio::test]
 async fn malformed_requests_are_refused() {
-    let mut client = serve(1, 64).await;
+    let mut client = serve().await;
     let valid = vectors().into_iter().find(|(_, _, v)| v == "ok").unwrap().1;
     let cases = [
         (
@@ -175,7 +187,9 @@ async fn malformed_requests_are_refused() {
 async fn a_full_queue_refuses_work() {
     // No threads drain it: of two requests, one fills it and waits
     // forever, and the other finds it full.
-    let client = serve(0, 1).await;
+    let make = || -> TransactionValidator { unreachable!() };
+    let (queue, pool) = Pool::spawn("validate", 0, 1, make);
+    let client = serve_with(epoch(), queue, pool).await;
     let valid = vectors().into_iter().find(|(_, _, v)| v == "ok").unwrap().1;
     let (mut a, mut b) = (client.clone(), client);
     let status = tokio::select! {
