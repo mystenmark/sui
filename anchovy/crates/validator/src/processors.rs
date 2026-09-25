@@ -7,22 +7,29 @@ use std::sync::Arc;
 
 use containers::Bump;
 use messages::Message;
-use messages::transaction::Transaction;
+use messages::transaction::{DigestPending, DigestReady, Transaction};
 use tokio::sync::oneshot;
 use workqueue::{Pool, Processor, Queue};
 
 use crate::epoch::EpochState;
 
 /// A request's decoded transactions to validate, and where the verdict
-/// goes: the first failure, in order, or success. One item per request, as
-/// the handoff costs far more than validating a transaction does.
+/// goes: the first failure, in order, or the transactions with their
+/// digests. One item per request, as the handoff costs far more than
+/// validating a transaction does.
 pub struct ValidateTransactions {
-    pub transactions: Vec<Message<Transaction<'static>>>,
-    pub reply: oneshot::Sender<Result<(), validation::Error>>,
+    pub transactions: Vec<Message<Transaction<'static, DigestPending>>>,
+    pub reply: oneshot::Sender<Result<Validated, validation::Error>>,
 }
 
-/// Runs `TransactionData::validity_check`, nothing more for now. Each
-/// thread's arena is reused for every transaction it validates.
+/// Transactions that passed validation, with their digests. A struct, not an
+/// alias: a future holding `Message<Transaction<'static, _>>` across an
+/// `await` fails `Send` inference, which erases the `'static`.
+pub struct Validated(pub Vec<Message<Transaction<'static, DigestReady>>>);
+
+/// Runs `TransactionData::validity_check`, then computes the digests of
+/// the transactions that pass. Each thread's arena is reused for every
+/// transaction it validates.
 pub struct TransactionValidator {
     epoch: Arc<EpochState>,
     bump: Bump,
@@ -43,7 +50,7 @@ impl TransactionValidator {
 impl Processor<ValidateTransactions> for TransactionValidator {
     fn process(&mut self, item: ValidateTransactions) {
         let context = self.epoch.context();
-        let result = item.transactions.iter().try_for_each(|transaction| {
+        let checked = item.transactions.iter().try_for_each(|transaction| {
             // Reset first, so an item that panicked leaves nothing behind.
             self.bump.reset();
             validation::transaction_data::validity_check(
@@ -52,6 +59,9 @@ impl Processor<ValidateTransactions> for TransactionValidator {
                 &self.bump,
             )
         });
+        // Hashing is left until here, off the RPC runtime, and until the
+        // cheap checks have passed.
+        let result = checked.map(|()| Validated(Message::with_digests(item.transactions)));
         // The handler may have given up; nothing to do then.
         let _ = item.reply.send(result);
     }

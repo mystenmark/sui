@@ -9,7 +9,7 @@ use std::sync::Arc;
 use containers::Bump;
 use messages::Message;
 use messages::base::Digest;
-use messages::transaction::Transaction;
+use messages::transaction::{DigestPending, DigestReady, Transaction};
 use protocol_config::{Chain, ProtocolVersion};
 use tokio::sync::oneshot;
 use validator::epoch::EpochState;
@@ -54,7 +54,9 @@ async fn pool_verdicts_match_direct_calls() {
         let ["tx", _, "tx_data", label, hex] = fields[..] else {
             continue;
         };
-        let Ok(transaction) = Message::<Transaction>::parse(as_transaction(&unhex(hex))) else {
+        let Ok(transaction) =
+            Message::<Transaction<DigestPending>>::parse(as_transaction(&unhex(hex)))
+        else {
             continue;
         };
         let bump = Bump::with_capacity(1 << 16);
@@ -65,6 +67,7 @@ async fn pool_verdicts_match_direct_calls() {
         )
         .map_err(|e| e.kind);
 
+        let wire = transaction.wire_bytes().to_vec();
         let (reply, verdict) = oneshot::channel();
         queue
             .try_push(ValidateTransactions {
@@ -73,7 +76,17 @@ async fn pool_verdicts_match_direct_calls() {
             })
             .unwrap_or_else(|_| panic!("queue refused"));
         let pooled = verdict.await.unwrap().map_err(|e| e.kind);
-        assert_eq!(pooled, direct, "{label}");
+        match (pooled, direct) {
+            (Ok(validated), Ok(())) => {
+                // Hashed on the processor, as parsing with the digest would.
+                let parsed = Message::<Transaction<DigestReady>>::parse(wire).unwrap();
+                let [hashed] = &validated.0[..] else {
+                    panic!("{label}: {} transactions back", validated.0.len())
+                };
+                assert_eq!(hashed.get(), parsed.get(), "{label}");
+            }
+            (pooled, direct) => assert_eq!(pooled.map(|_| ()), direct, "{label}"),
+        }
         compared += 1;
     }
     assert!(compared > 100);

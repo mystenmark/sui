@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use messages::Message;
 use messages::base::Digest;
-use messages::transaction::Transaction;
+use messages::transaction::{DigestPending, Transaction};
 use protocol_config::{Chain, ProtocolVersion};
 use tokio::sync::oneshot;
 use validator::epoch::EpochState;
@@ -56,7 +56,7 @@ fn as_transaction(data: &[u8]) -> Vec<u8> {
 /// Validates `transaction`, counting the processor's allocations; the work
 /// item and its reply channel are the handler's, made before counting.
 fn process(validator: &mut TransactionValidator, transaction: &[u8]) -> (bool, usize) {
-    let transaction = Message::<Transaction>::parse(transaction.to_vec())
+    let transaction = Message::<Transaction<DigestPending>>::parse(transaction.to_vec())
         .map_err(|(e, _)| e)
         .unwrap();
     let (reply, verdict) = oneshot::channel();
@@ -89,7 +89,7 @@ fn accepting_allocates_nothing_once_warm() {
                 return None;
             };
             let bytes = as_transaction(&unhex(hex));
-            Message::<Transaction>::parse(bytes.clone()).ok()?;
+            Message::<Transaction<DigestPending>>::parse(bytes.clone()).ok()?;
             Some(bytes)
         })
         .collect();

@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use messages::Message;
-use messages::transaction::Transaction;
+use messages::transaction::{DigestPending, Transaction};
 use tokio::sync::oneshot;
 use workqueue::{PushError, Queue};
 
@@ -22,7 +22,7 @@ use tonic::{Request, Response, Status};
 
 use crate::codec::Encoded;
 use crate::epoch::EpochState;
-use crate::processors::ValidateTransactions;
+use crate::processors::{ValidateTransactions, Validated};
 use crate::proto::{
     RawSubmitTxRequest, RawSubmitTxResponse, RawValidatorHealthRequest, RawValidatorHealthResponse,
     RawWaitForEffectsRequest, RawWaitForEffectsResponse, SubmitTxType,
@@ -80,12 +80,13 @@ impl Validator {
     fn enqueue(
         &self,
         request: &RawSubmitTxRequest,
-    ) -> Result<oneshot::Receiver<Result<(), validation::Error>>, Status> {
+    ) -> Result<oneshot::Receiver<Result<Validated, validation::Error>>, Status> {
         let mut transactions = Vec::with_capacity(request.transactions.len());
         for bytes in &request.transactions {
-            let transaction = Message::<Transaction>::parse(bytes.to_vec()).map_err(|(e, _)| {
-                Status::invalid_argument(format!("TransactionDeserializationError: {e:?}"))
-            })?;
+            let transaction = Message::<Transaction<DigestPending>>::parse(bytes.to_vec())
+                .map_err(|(e, _)| {
+                    Status::invalid_argument(format!("TransactionDeserializationError: {e:?}"))
+                })?;
             transactions.push(transaction);
         }
         let (reply, verdict) = oneshot::channel();
@@ -108,9 +109,9 @@ fn validation_failure(e: &validation::Error) -> Status {
 
 #[tonic::async_trait]
 impl validator_server::Validator for Validator {
-    /// Decodes each transaction here, validates them on a processor, and
-    /// fails the request if any is invalid, as the reference does. What
-    /// passes has no consensus to go to yet.
+    /// Decodes each transaction here, without its digest; validates and
+    /// hashes them on a processor, and fails the request if any is invalid,
+    /// as the reference does. What passes has no consensus to go to yet.
     async fn submit_transaction(
         &self,
         request: Request<RawSubmitTxRequest>,
