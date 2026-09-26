@@ -579,7 +579,11 @@ impl DigestState for DigestReady {
 }
 
 /// `TransactionData::V1`, the only version.
+///
+/// `repr(C)` so that the digest states lay out alike, which
+/// `Message::with_digests` relies on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(C)]
 pub struct TransactionData<'a, D: DigestState = DigestReady> {
     /// The exact encoding, which is what gets hashed and signed.
     pub bytes: &'a [u8],
@@ -688,7 +692,9 @@ impl<'a> GenericSignature<'a> {
 }
 
 /// The one `SenderSignedTransaction` a `SenderSignedData` holds.
+/// `repr(C)`: see `TransactionData`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(C)]
 pub struct SenderSignedData<'a, D: DigestState = DigestReady> {
     /// The exact encoding, as it is stored and sent.
     pub bytes: &'a [u8],
@@ -748,7 +754,9 @@ impl<'a, D: DigestState> SenderSignedData<'a, D> {
 /// The reference's `Transaction`, `Envelope<SenderSignedData, EmptySignInfo>`:
 /// what the submit RPC carries. The same bytes as `SenderSignedData`, but
 /// the envelope counts toward the container depth limit.
+/// `repr(transparent)`: see `TransactionData`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(transparent)]
 pub struct Transaction<'a, D: DigestState>(pub SenderSignedData<'a, D>);
 
 impl<'a, D: DigestState> Transaction<'a, D> {
@@ -767,20 +775,57 @@ impl Message<Transaction<'static, DigestPending>> {
         self.map(AssumeDigested)
     }
 
-    /// Computes the digest of each. No allocation and no copying: the
-    /// digests are written in place first, so that what remains is a
-    /// field-for-field move into the same allocation, which compiles to
-    /// nothing.
+    /// Computes the digest of each, in place: no allocation and no copying.
+    /// (`into_iter().map(..).collect()` would relabel without allocating,
+    /// but whether it copies is up to the optimizer, as `Message` has a
+    /// destructor; it does copy when not inlined into the hashing loop.)
     pub fn with_digests(mut transactions: Vec<Pending>) -> Vec<Ready> {
         for transaction in &mut transactions {
             transaction.update(ComputeDigest);
         }
-        transactions
-            .into_iter()
-            .map(|transaction| transaction.map(AssumeDigested))
-            .collect()
+        let (ptr, len, capacity) = transactions.into_raw_parts();
+        // SAFETY: `Pending` and `Ready` lay out alike, field for field
+        // (checked below at compile time), so the allocation holds `len`
+        // valid `Ready`s and is what a `Vec<Ready>` of `capacity` allocates;
+        // every digest is computed.
+        unsafe { Vec::from_raw_parts(ptr.cast::<Ready>(), len, capacity) }
     }
 }
+
+/// Asserts at compile time that a type parameterized by digest state lays
+/// out alike in both states, field for field.
+macro_rules! assert_same_layout {
+    ($ty:ident { $($field:tt),* $(,)? }) => {
+        const _: () = {
+            type P = $ty<'static, DigestPending>;
+            type R = $ty<'static, DigestReady>;
+            assert!(size_of::<P>() == size_of::<R>() && align_of::<P>() == align_of::<R>());
+            $(assert!(std::mem::offset_of!(P, $field) == std::mem::offset_of!(R, $field));)*
+        };
+    };
+}
+
+assert_same_layout!(TransactionData {
+    bytes,
+    kind,
+    sender,
+    gas_data,
+    expiration,
+    index,
+    digest,
+    state,
+});
+assert_same_layout!(SenderSignedData {
+    bytes,
+    intent,
+    data,
+    tx_signatures
+});
+assert_same_layout!(Transaction { 0 });
+const _: () = assert!(crate::message::same_layout::<
+    Transaction<'static, DigestPending>,
+    Transaction<'static, DigestReady>,
+>());
 
 struct ComputeDigest;
 

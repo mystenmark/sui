@@ -54,6 +54,17 @@ impl fmt::Debug for WireBuf {
     }
 }
 
+/// Whether `Message<T>` and `Message<U>` lay out alike, field for field.
+pub(crate) const fn same_layout<T: Wire, U: Wire>() -> bool {
+    use std::mem::offset_of;
+    size_of::<Message<T>>() == size_of::<Message<U>>()
+        && align_of::<Message<T>>() == align_of::<Message<U>>()
+        && offset_of!(Message<T>, view) == offset_of!(Message<U>, view)
+        && offset_of!(Message<T>, wire) == offset_of!(Message<U>, wire)
+        && offset_of!(Message<T>, arena) == offset_of!(Message<U>, arena)
+        && offset_of!(Message<T>, arena_used) == offset_of!(Message<U>, arena_used)
+}
+
 /// A conversion between views over the same buffers. `apply` works for
 /// every lifetime, so it cannot keep the view's references.
 pub(crate) trait ViewMap<T: Wire, U: Wire> {
@@ -67,7 +78,9 @@ pub(crate) trait ViewUpdate<T: Wire> {
 }
 
 /// A parsed `T`. Dropping it frees the wire buffer and the arena and nothing
-/// else.
+/// else. `repr(C)` so that messages whose views lay out alike do too, which
+/// `Message::with_digests` relies on.
+#[repr(C)]
 pub struct Message<T: Wire> {
     // Points into `wire` and `arena`; `'static` stands for "while self lives".
     view: T::View<'static>,
