@@ -30,6 +30,10 @@ pub struct ValidateTransactions {
 /// are next.
 pub struct VerifySignatures {
     pub transactions: Vec<Message<Transaction<'static, DigestReady>>>,
+    /// Why the transaction after these failed validation, if one did. The
+    /// reference checks each transaction's signatures before validating the
+    /// next, so a bad signature among these is the request's error first.
+    pub then: Option<validation::Error>,
     pub reply: Reply,
 }
 
@@ -78,22 +82,40 @@ impl TransactionValidator {
 
 impl Processor<ValidateTransactions> for TransactionValidator {
     fn process(&mut self, item: ValidateTransactions) {
+        let ValidateTransactions {
+            mut transactions,
+            reply,
+        } = item;
         let context = self.epoch.context();
-        let checked = item.transactions.iter().try_for_each(|transaction| {
-            // Reset first, so an item that panicked leaves nothing behind.
-            self.bump.reset();
-            sender_signed::validity_check(&transaction.get().0, &context, &self.bump).map(|_| ())
-        });
-        if let Err(e) = checked {
-            // The handler may have given up; nothing to do then.
-            let _ = item.reply.send(Err(Rejected::Invalid(e)));
-            return;
-        }
+        let failed = transactions
+            .iter()
+            .enumerate()
+            .find_map(|(i, transaction)| {
+                // Reset first, so an item that panicked leaves nothing behind.
+                self.bump.reset();
+                sender_signed::validity_check(&transaction.get().0, &context, &self.bump)
+                    .err()
+                    .map(|e| (i, e))
+            });
+        let then = match failed {
+            Some((0, e)) => {
+                // The handler may have given up; nothing to do then.
+                let _ = reply.send(Err(Rejected::Invalid(e)));
+                return;
+            }
+            // Those before it go on, for their signatures to be checked first.
+            Some((i, e)) => {
+                transactions.truncate(i);
+                Some(e)
+            }
+            None => None,
+        };
         // Hashing is left until here, off the RPC runtime, and until the
         // cheap checks have passed.
         let next = VerifySignatures {
-            transactions: Message::with_digests(item.transactions),
-            reply: item.reply,
+            transactions: Message::with_digests(transactions),
+            then,
+            reply,
         };
         if let Err(e) = self.signatures.try_push(next) {
             let (next, why) = match e {
@@ -139,9 +161,10 @@ impl Processor<VerifySignatures> for SignatureVerifier {
                 &self.bump,
             )
         });
-        let result = verified
-            .map(|()| Validated(item.transactions))
-            .map_err(Rejected::Invalid);
+        let result = match (verified, item.then) {
+            (Err(e), _) | (Ok(()), Some(e)) => Err(Rejected::Invalid(e)),
+            (Ok(()), None) => Ok(Validated(item.transactions)),
+        };
         let _ = item.reply.send(result);
     }
 }
