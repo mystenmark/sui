@@ -79,6 +79,12 @@ which is differential-tested against the reference.
   (arena reset per transaction), then `Message::with_digests`, then
   `VerifySignatures { transactions: Vec<Message<Transaction<DigestReady>>>, reply }`
   pushed to the verifier's queue. A full queue replies `Overloaded`.
+- Order within a request: the reference validates a transaction and checks
+  its signatures before the next (`handle_submit_transaction_inner`), so a
+  bad signature on the first beats an invalid second. Validation stops at
+  the first invalid transaction and forwards the ones before it with that
+  error (`VerifySignatures::then`); the verifier reports a signature failure
+  among them first, else that error.
 - `SignatureVerifier`: per transaction, `deserialization_checks` (to parse
   the signatures again into its own arena; validation's arena is reset per
   transaction) then `verify::verify_signatures`, and replies.
