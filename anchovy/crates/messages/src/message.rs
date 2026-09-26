@@ -54,8 +54,33 @@ impl fmt::Debug for WireBuf {
     }
 }
 
+/// Whether `Message<T>` and `Message<U>` lay out alike, field for field.
+pub(crate) const fn same_layout<T: Wire, U: Wire>() -> bool {
+    use std::mem::offset_of;
+    size_of::<Message<T>>() == size_of::<Message<U>>()
+        && align_of::<Message<T>>() == align_of::<Message<U>>()
+        && offset_of!(Message<T>, view) == offset_of!(Message<U>, view)
+        && offset_of!(Message<T>, wire) == offset_of!(Message<U>, wire)
+        && offset_of!(Message<T>, arena) == offset_of!(Message<U>, arena)
+        && offset_of!(Message<T>, arena_used) == offset_of!(Message<U>, arena_used)
+}
+
+/// A conversion between views over the same buffers. `apply` works for
+/// every lifetime, so it cannot keep the view's references.
+pub(crate) trait ViewMap<T: Wire, U: Wire> {
+    fn apply(self, view: T::View<'_>) -> U::View<'_>;
+}
+
+/// A change to a view. `apply` works for every lifetime, so it cannot put
+/// in references that do not live as long as the message.
+pub(crate) trait ViewUpdate<T: Wire> {
+    fn apply(self, view: &mut T::View<'_>);
+}
+
 /// A parsed `T`. Dropping it frees the wire buffer and the arena and nothing
-/// else.
+/// else. `repr(C)` so that messages whose views lay out alike do too, which
+/// `Message::with_digests` relies on.
+#[repr(C)]
 pub struct Message<T: Wire> {
     // Points into `wire` and `arena`; `'static` stands for "while self lives".
     view: T::View<'static>,
@@ -166,6 +191,23 @@ impl<T: Wire> Message<T> {
             return Err(ParseError::ArenaMismatch);
         }
         Ok((view, arena, build.used()))
+    }
+
+    /// Converts the view, keeping the buffers it points into.
+    #[inline]
+    pub(crate) fn map<U: Wire>(self, f: impl ViewMap<T, U>) -> Message<U> {
+        Message {
+            view: f.apply(self.view),
+            wire: self.wire,
+            arena: self.arena,
+            arena_used: self.arena_used,
+        }
+    }
+
+    /// Changes the view in place.
+    #[inline]
+    pub(crate) fn update(&mut self, f: impl ViewUpdate<T>) {
+        f.apply(&mut self.view);
     }
 
     pub fn get(&self) -> &T::View<'_> {

@@ -4,6 +4,7 @@
 //! Every route of an in-process server, through tonic's generated client.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use messages::base::{Digest, ObjectId};
@@ -11,11 +12,14 @@ use messages::grpc::{
     CheckpointRequest, CheckpointRequestV2, ObjectInfoRequest, ObjectInfoRequestKind,
     SystemStateRequest, TransactionInfoRequest,
 };
+use protocol_config::{Chain, ProtocolVersion};
 use tonic::Code;
 use tonic::transport::Channel;
 use tonic::transport::server::TcpIncoming;
 use validator::Validator;
 use validator::codec::{BcsCodec, Encoded};
+use validator::epoch::EpochState;
+use validator::processors::Processors;
 use validator::proto::{
     PingType, RawSubmitTxRequest, RawValidatorHealthRequest, RawValidatorHealthResponse,
     RawWaitForEffectsRequest, SubmitTxType,
@@ -25,11 +29,24 @@ use validator::service::validator_client::ValidatorClient;
 async fn serve() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(
+    let epoch = Arc::new(EpochState::new(
+        Chain::Unknown,
+        ProtocolVersion::MAX.as_u64(),
+        5,
+        Digest::new([0x11; 32]),
+        1000,
+        4,
+    ));
+    let processors = Processors::start(&epoch, 64);
+    let service = Validator::new(epoch, processors.transactions.clone()).into_service();
+    tokio::spawn(async move {
+        // The pool lives as long as the server.
+        let _processors = processors;
         tonic::transport::Server::builder()
-            .add_service(Validator::default().into_service())
-            .serve_with_incoming(TcpIncoming::from(listener)),
-    );
+            .add_service(service)
+            .serve_with_incoming(TcpIncoming::from(listener))
+            .await
+    });
     addr
 }
 

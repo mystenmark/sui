@@ -32,9 +32,29 @@ pub use message::{Message, Wire, WireBuf};
 
 /// Implements [`Wire`] for a view type with an inherent `parse(r, a)`.
 /// `guess = N` sets the single-pass arena guess to `N / 16` of the wire size.
+/// `$ty<D>` implements it for every digest state of a transaction type.
 macro_rules! impl_wire {
     ($ty:ident) => {
         $crate::impl_wire!($ty, guess = 16);
+    };
+    ($ty:ident<D>, guess = $sixteenths:expr) => {
+        // SAFETY: `shrink` is the identity, so `$ty` is covariant.
+        unsafe impl<D: $crate::transaction::DigestState> $crate::message::Wire for $ty<'static, D> {
+            type View<'a> = $ty<'a, D>;
+
+            const ARENA_GUESS_SIXTEENTHS: usize = $sixteenths;
+
+            fn parse<'a, A: $crate::arena::Alloc<'a>>(
+                r: &mut $crate::reader::Reader<'a>,
+                a: &mut A,
+            ) -> $crate::error::Result<$ty<'a, D>> {
+                $ty::parse(r, a)
+            }
+
+            fn shrink<'l, 's: 'l>(v: &'l $ty<'s, D>) -> &'l $ty<'l, D> {
+                v
+            }
+        }
     };
     ($ty:ident, guess = $sixteenths:expr) => {
         // SAFETY: `shrink` is the identity, so `$ty` is covariant.

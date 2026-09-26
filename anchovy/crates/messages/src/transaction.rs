@@ -1,6 +1,9 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::marker::PhantomData;
+
+use crate::Message;
 use crate::arena::{Alloc, Ref};
 use crate::base::{
     ChainIdentifier, Digest, ObjectId, ObjectRef, SequenceNumber, SuiAddress, TransactionDigest,
@@ -544,22 +547,64 @@ impl<'a> TransactionExpiration<'a> {
     }
 }
 
-/// `TransactionData::V1`, the only version.
+/// Whether a transaction's digest has been computed, tracked in the type:
+/// the digest is readable only in [`DigestReady`]. Hashing costs more than
+/// parsing, so a transaction can be parsed without it and hashed later.
+pub trait DigestState: Copy + Eq + std::fmt::Debug + 'static {
+    /// Whether parsing computes the digest.
+    const COMPUTED_WHILE_PARSING: bool;
+}
+
+/// The digest is not computed yet; the field holds zeros and has no accessor.
+///
+/// ```compile_fail
+/// # use messages::{Message, transaction::{DigestPending, Transaction}};
+/// fn read(tx: &Message<Transaction<'static, DigestPending>>) {
+///     let _ = tx.get().0.digest();
+/// }
+/// ```
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct TransactionData<'a> {
+pub struct DigestPending;
+
+/// The digest is computed and readable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DigestReady;
+
+impl DigestState for DigestPending {
+    const COMPUTED_WHILE_PARSING: bool = false;
+}
+
+impl DigestState for DigestReady {
+    const COMPUTED_WHILE_PARSING: bool = true;
+}
+
+/// `TransactionData::V1`, the only version.
+///
+/// `repr(C)` so that the digest states lay out alike, which
+/// `Message::with_digests` relies on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(C)]
+pub struct TransactionData<'a, D: DigestState = DigestReady> {
     /// The exact encoding, which is what gets hashed and signed.
     pub bytes: &'a [u8],
-    /// Computed once, from `bytes`, while parsing.
-    pub digest: TransactionDigest,
     pub kind: TransactionKind<'a>,
     pub sender: &'a SuiAddress,
     pub gas_data: GasData<'a>,
     pub expiration: TransactionExpiration<'a>,
     /// Derived from the fields above while parsing.
     pub index: TransactionIndex<'a>,
+    /// Zero until computed; readable only in `DigestReady`.
+    digest: TransactionDigest,
+    state: PhantomData<D>,
 }
 
-impl<'a> TransactionData<'a> {
+impl TransactionData<'_, DigestReady> {
+    pub fn digest(&self) -> &TransactionDigest {
+        &self.digest
+    }
+}
+
+impl<'a, D: DigestState> TransactionData<'a, D> {
     /// The `MoveCall` commands of a user transaction, with their positions.
     pub fn move_calls(&self) -> impl Iterator<Item = (usize, &ProgrammableMoveCall<'a>)> {
         let commands = match &self.kind {
@@ -574,7 +619,7 @@ impl<'a> TransactionData<'a> {
         })
     }
 
-    pub fn parse<A: Alloc<'a>>(r: &mut Reader<'a>, a: &mut A) -> Result<TransactionData<'a>> {
+    pub fn parse<A: Alloc<'a>>(r: &mut Reader<'a>, a: &mut A) -> Result<TransactionData<'a, D>> {
         let start = r.pos();
         r.enter()?;
         match r.variant()? {
@@ -598,7 +643,7 @@ impl<'a> TransactionData<'a> {
         let bytes = r.span(start);
         Ok(TransactionData {
             bytes,
-            digest: if A::BUILD {
+            digest: if A::BUILD && D::COMPUTED_WHILE_PARSING {
                 Digest::of("TransactionData", bytes)
             } else {
                 Digest::ZERO
@@ -608,6 +653,7 @@ impl<'a> TransactionData<'a> {
             gas_data,
             expiration,
             index,
+            state: PhantomData,
         })
     }
 }
@@ -646,27 +692,31 @@ impl<'a> GenericSignature<'a> {
 }
 
 /// The one `SenderSignedTransaction` a `SenderSignedData` holds.
+/// `repr(C)`: see `TransactionData`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct SenderSignedData<'a> {
+#[repr(C)]
+pub struct SenderSignedData<'a, D: DigestState = DigestReady> {
     /// The exact encoding, as it is stored and sent.
     pub bytes: &'a [u8],
     pub intent: &'a Intent,
-    pub data: TransactionData<'a>,
+    pub data: TransactionData<'a, D>,
     pub tx_signatures: &'a [GenericSignature<'a>],
 }
 
-impl<'a> SenderSignedData<'a> {
+impl SenderSignedData<'_, DigestReady> {
     /// The transaction digest: that of the `TransactionData`.
     pub fn digest(&self) -> &TransactionDigest {
         &self.data.digest
     }
+}
 
+impl<'a, D: DigestState> SenderSignedData<'a, D> {
     /// A length, an intent, a `TransactionData` (a version, an empty
     /// `EndOfEpochTransaction`, a sender, gas data with no payment, no
     /// expiration) and a length.
     pub const MIN_WIRE_SIZE: usize = 1 + 3 + (1 + 2 + 32 + (1 + 32 + 8 + 8) + 1) + 1;
 
-    pub fn parse<A: Alloc<'a>>(r: &mut Reader<'a>, a: &mut A) -> Result<SenderSignedData<'a>> {
+    pub fn parse<A: Alloc<'a>>(r: &mut Reader<'a>, a: &mut A) -> Result<SenderSignedData<'a, D>> {
         let start = r.pos();
         r.enter()?;
         if r.length()? != 1 {
@@ -692,7 +742,7 @@ impl<'a> SenderSignedData<'a> {
     pub fn parse_envelope<A: Alloc<'a>>(
         r: &mut Reader<'a>,
         a: &mut A,
-    ) -> Result<SenderSignedData<'a>> {
+    ) -> Result<SenderSignedData<'a, D>> {
         r.enter()?;
         let data = SenderSignedData::parse(r, a)?;
         // `EmptySignInfo` is a struct of no bytes.
@@ -701,19 +751,144 @@ impl<'a> SenderSignedData<'a> {
     }
 }
 
+/// The reference's `Transaction`, `Envelope<SenderSignedData, EmptySignInfo>`:
+/// what the submit RPC carries. The same bytes as `SenderSignedData`, but
+/// the envelope counts toward the container depth limit.
+/// `repr(transparent)`: see `TransactionData`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(transparent)]
+pub struct Transaction<'a, D: DigestState>(pub SenderSignedData<'a, D>);
+
+impl<'a, D: DigestState> Transaction<'a, D> {
+    pub fn parse<A: Alloc<'a>>(r: &mut Reader<'a>, a: &mut A) -> Result<Transaction<'a, D>> {
+        Ok(Transaction(SenderSignedData::parse_envelope(r, a)?))
+    }
+}
+
+type Pending = Message<Transaction<'static, DigestPending>>;
+type Ready = Message<Transaction<'static, DigestReady>>;
+
+impl Message<Transaction<'static, DigestPending>> {
+    /// Computes the digest.
+    pub fn with_digest(mut self) -> Ready {
+        self.update(ComputeDigest);
+        self.map(AssumeDigested)
+    }
+
+    /// Computes the digest of each, in place: no allocation and no copying.
+    /// (`into_iter().map(..).collect()` would relabel without allocating,
+    /// but whether it copies is up to the optimizer, as `Message` has a
+    /// destructor; it does copy when not inlined into the hashing loop.)
+    pub fn with_digests(mut transactions: Vec<Pending>) -> Vec<Ready> {
+        for transaction in &mut transactions {
+            transaction.update(ComputeDigest);
+        }
+        let (ptr, len, capacity) = transactions.into_raw_parts();
+        // SAFETY: `Pending` and `Ready` lay out alike, field for field
+        // (checked below at compile time), so the allocation holds `len`
+        // valid `Ready`s and is what a `Vec<Ready>` of `capacity` allocates;
+        // every digest is computed.
+        unsafe { Vec::from_raw_parts(ptr.cast::<Ready>(), len, capacity) }
+    }
+}
+
+/// Asserts at compile time that a type parameterized by digest state lays
+/// out alike in both states, field for field.
+macro_rules! assert_same_layout {
+    ($ty:ident { $($field:tt),* $(,)? }) => {
+        const _: () = {
+            type P = $ty<'static, DigestPending>;
+            type R = $ty<'static, DigestReady>;
+            assert!(size_of::<P>() == size_of::<R>() && align_of::<P>() == align_of::<R>());
+            $(assert!(std::mem::offset_of!(P, $field) == std::mem::offset_of!(R, $field));)*
+        };
+    };
+}
+
+assert_same_layout!(TransactionData {
+    bytes,
+    kind,
+    sender,
+    gas_data,
+    expiration,
+    index,
+    digest,
+    state,
+});
+assert_same_layout!(SenderSignedData {
+    bytes,
+    intent,
+    data,
+    tx_signatures
+});
+assert_same_layout!(Transaction { 0 });
+const _: () = assert!(crate::message::same_layout::<
+    Transaction<'static, DigestPending>,
+    Transaction<'static, DigestReady>,
+>());
+
+struct ComputeDigest;
+
+impl crate::message::ViewUpdate<Transaction<'static, DigestPending>> for ComputeDigest {
+    #[inline]
+    fn apply(self, view: &mut Transaction<'_, DigestPending>) {
+        let data = &mut view.0.data;
+        data.digest = Digest::of("TransactionData", data.bytes);
+    }
+}
+
+/// Relabels a transaction whose digest is computed. Moves every field
+/// unchanged, so that a relabelling in place is free.
+struct AssumeDigested;
+
+impl crate::message::ViewMap<Transaction<'static, DigestPending>, Transaction<'static, DigestReady>>
+    for AssumeDigested
+{
+    // The bound makes `'x` early-bound, as it is in the trait, where it
+    // appears only in projections.
+    #[inline]
+    fn apply<'x>(self, view: Transaction<'x, DigestPending>) -> Transaction<'x, DigestReady>
+    where
+        'x: 'x,
+    {
+        let Transaction(SenderSignedData {
+            bytes,
+            intent,
+            data,
+            tx_signatures,
+        }) = view;
+        Transaction(SenderSignedData {
+            bytes,
+            intent,
+            data: TransactionData {
+                bytes: data.bytes,
+                kind: data.kind,
+                sender: data.sender,
+                gas_data: data.gas_data,
+                expiration: data.expiration,
+                index: data.index,
+                digest: data.digest,
+                state: PhantomData,
+            },
+            tx_signatures,
+        })
+    }
+}
+
 // Mainnet p99 of arena over wire size: 2.16 and 2.09.
-crate::impl_wire!(TransactionData, guess = 35);
-crate::impl_wire!(SenderSignedData, guess = 34);
+crate::impl_wire!(TransactionData<D>, guess = 35);
+crate::impl_wire!(SenderSignedData<D>, guess = 34);
+crate::impl_wire!(Transaction<D>, guess = 34);
 
 crate::base::assert_wire_layout!(SharedObjectArg = 41, Intent = 3);
 
-impl crate::message::Digested for TransactionData<'_> {
+impl crate::message::Digested for TransactionData<'_, DigestReady> {
     fn digest(&self) -> &Digest {
         &self.digest
     }
 }
 
-impl crate::message::Digested for SenderSignedData<'_> {
+impl crate::message::Digested for SenderSignedData<'_, DigestReady> {
     fn digest(&self) -> &Digest {
         &self.data.digest
     }

@@ -7,6 +7,7 @@ members = [
     "crates/protocol-config",
     "crates/validation",
     "crates/validator",
+    "crates/workqueue",
 ]
 exclude = ["tools/sui-oracle", "tools/validator-client"]
 
@@ -23,6 +24,8 @@ arena = { path = "crates/arena" }
 containers = { path = "crates/containers" }
 messages = { path = "crates/messages" }
 protocol-config = { path = "crates/protocol-config" }
+validation = { path = "crates/validation" }
+workqueue = { path = "crates/workqueue" }
 # Two versions of the allocator trait: hashbrown and its Vec use 0.2,
 # arena-btreemap uses 0.4. The arena implements both.
 allocator-api2 = { version = "0.2", default-features = false, features = ["alloc"] }
@@ -48,6 +51,7 @@ imbl = "7"
 insta = { version = "1", features = ["yaml"] }
 # The gRPC stack, at the versions in sui's lockfile.
 bytes = "1.11"
+crossbeam-channel = "0.5.15"
 prost = "0.14.1"
 tokio = { version = "1.52", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1.17", default-features = false }
