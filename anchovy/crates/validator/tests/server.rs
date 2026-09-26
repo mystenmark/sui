@@ -36,11 +36,12 @@ async fn serve() -> SocketAddr {
         Digest::new([0x11; 32]),
         1000,
         4,
+        [],
     ));
     let processors = Processors::start(&epoch, 64);
     let service = Validator::new(epoch, processors.transactions.clone()).into_service();
     tokio::spawn(async move {
-        // The pool lives as long as the server.
+        // The processors live as long as the server.
         let _processors = processors;
         tonic::transport::Server::builder()
             .add_service(service)
