@@ -19,14 +19,16 @@ use containers::Bump;
 use messages::Message;
 use messages::base::Digest;
 use messages::checkpoint::CheckpointData;
-use messages::transaction::{DigestPending, DigestReady, Transaction};
+use messages::transaction::{DigestPending, DigestReady, Transaction, TransactionKind};
 use protocol_config::{Chain, ProtocolVersion};
 use tokio::sync::oneshot;
 use tonic::transport::Channel;
 use tonic::transport::server::TcpIncoming;
 use validator::Validator;
 use validator::epoch::EpochState;
-use validator::processors::{Processors, TransactionValidator, ValidateTransactions};
+use validator::processors::{
+    Processors, SignatureVerifier, TransactionValidator, ValidateTransactions,
+};
 use validator::proto::{RawSubmitTxRequest, RawValidatorHealthRequest, SubmitTxType};
 use validator::service::validator_client::ValidatorClient;
 use workqueue::Processor;
@@ -67,8 +69,8 @@ fn unhex(s: &str) -> Vec<u8> {
         .collect()
 }
 
-/// The corpus's transactions as `SubmitTransaction` carries them, and the
-/// epoch of the first checkpoint.
+/// The corpus's user transactions as `SubmitTransaction` carries them, and
+/// the epoch of the first checkpoint.
 fn load() -> (Vec<Bytes>, u64) {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut paths = vec![manifest.join("../messages/tests/data/mainnet-325300367.chk")];
@@ -85,8 +87,15 @@ fn load() -> (Vec<Bytes>, u64) {
         let checkpoint = Message::<CheckpointData>::parse(bytes).unwrap();
         let view = checkpoint.get();
         epoch.get_or_insert(view.checkpoint_summary.data.epoch);
+        // Users submit only programmable transactions; checkpoints also hold
+        // system ones.
         for tx in view.transactions {
-            transactions.push(Bytes::copy_from_slice(tx.transaction.bytes));
+            if matches!(
+                tx.transaction.data.kind,
+                TransactionKind::ProgrammableTransaction(_)
+            ) {
+                transactions.push(Bytes::copy_from_slice(tx.transaction.bytes));
+            }
         }
     }
     (transactions, epoch.unwrap())
@@ -100,6 +109,8 @@ fn epoch_state(epoch: u64) -> Arc<EpochState> {
         Digest::new(unhex(MAINNET_CHAIN_ID).try_into().unwrap()),
         1,
         100,
+        // No JWKs: zkLogin transactions fail verification early.
+        [],
     ))
 }
 
@@ -137,27 +148,41 @@ fn row(name: &str, (time, allocations): (Duration, f64)) {
 }
 
 /// The layers a transaction passes through, each on one thread.
+// A flat list of rows, one measurement each.
+#[allow(clippy::too_many_lines)]
 fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
     println!("single thread, per transaction:");
     let decoded: Vec<_> = txs.iter().map(decode).collect();
     let bump = Bump::with_capacity(64 * 1024);
     let mut bump = bump;
-    let accepted = decoded
-        .iter()
-        .filter(|m| {
-            bump.reset();
-            validation::transaction_data::validity_check(&m.get().0.data, &epoch.context(), &bump)
-                .is_ok()
-        })
-        .count();
+    let mut verdicts = std::collections::BTreeMap::<String, usize>::new();
+    for m in &decoded {
+        bump.reset();
+        let verdict = validation::check(&m.get().0, &epoch.context(), &epoch.verifier, &[], &bump)
+            .map_or_else(|e| format!("{:?}", e.kind), |_| "ok".to_owned());
+        *verdicts.entry(verdict).or_default() += 1;
+    }
     println!(
-        "  {} transactions, mean {} bytes, {accepted} accepted",
+        "  {} transactions, mean {} bytes; validation::check: {verdicts:?}",
         txs.len(),
         txs.iter().map(Bytes::len).sum::<usize>() / txs.len()
     );
 
     row(
-        "validity_check",
+        "SenderSignedData validity_check",
+        per_tx(txs, 50, |_| {
+            for m in &decoded {
+                bump.reset();
+                let _ = black_box(validation::sender_signed::validity_check(
+                    &m.get().0,
+                    &epoch.context(),
+                    &bump,
+                ));
+            }
+        }),
+    );
+    row(
+        "  of which: TransactionData validity_check",
         per_tx(txs, 50, |_| {
             for m in &decoded {
                 bump.reset();
@@ -169,6 +194,67 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
             }
         }),
     );
+    row(
+        "signatures: deserialization_checks + verify",
+        per_tx(txs, 5, |_| {
+            for m in &decoded {
+                bump.reset();
+                let signed = &m.get().0;
+                let Ok((signatures, _)) =
+                    validation::sender_signed::deserialization_checks(signed, &bump)
+                else {
+                    continue;
+                };
+                let _ = black_box(validation::verify::verify_signatures(
+                    signed,
+                    signatures,
+                    epoch.epoch,
+                    &epoch.verifier,
+                    &[],
+                    &bump,
+                ));
+            }
+        }),
+    );
+    for (flag, scheme) in [
+        (0, "Ed25519"),
+        (1, "Secp256k1"),
+        (2, "Secp256r1"),
+        (3, "multisig"),
+        (5, "zkLogin"),
+        (6, "passkey"),
+    ] {
+        let group: Vec<_> = decoded
+            .iter()
+            .filter(|m| m.get().0.tx_signatures.first().and_then(|s| s.0.first()) == Some(&flag))
+            .collect();
+        if group.is_empty() {
+            continue;
+        }
+        let (time, allocations) = per_tx(&txs[..group.len()], 5, |_| {
+            for m in &group {
+                bump.reset();
+                let signed = &m.get().0;
+                let Ok((signatures, _)) =
+                    validation::sender_signed::deserialization_checks(signed, &bump)
+                else {
+                    continue;
+                };
+                let _ = black_box(validation::verify::verify_signatures(
+                    signed,
+                    signatures,
+                    epoch.epoch,
+                    &epoch.verifier,
+                    &[],
+                    &bump,
+                ));
+            }
+        });
+        row(
+            &format!("  {scheme} first ({} transactions)", group.len()),
+            (time, allocations),
+        );
+    }
     row(
         "decode (copy + parse), then drop",
         per_tx(txs, 50, |txs| {
@@ -223,16 +309,21 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
             }
         }),
     );
-    let mut validator = TransactionValidator::new(epoch.clone());
+    let (signatures, verification) = workqueue::queue(1);
+    let mut validator = TransactionValidator::new(epoch.clone(), signatures);
+    let mut verifier = SignatureVerifier::new(epoch.clone());
     row(
-        "decode + TransactionValidator::process (+ digest)",
-        per_tx(txs, 50, |txs| {
+        "decode + both processors (+ digest)",
+        per_tx(txs, 5, |txs| {
             for bytes in txs {
                 let (reply, verdict) = oneshot::channel();
                 validator.process(ValidateTransactions {
                     transactions: vec![decode(bytes)],
                     reply,
                 });
+                if let Some(next) = verification.try_pop() {
+                    verifier.process(next);
+                }
                 black_box(verdict.blocking_recv().unwrap().is_ok());
             }
         }),
@@ -265,21 +356,25 @@ fn with_digest_per_tx(
     )
 }
 
-/// Decodes and validates on the calling thread, in its own arena.
+/// The processors' work on the calling thread, in its own arena: decode,
+/// validate and verify, then hash.
 fn validate_inline(bytes: &Bytes, epoch: &EpochState) -> bool {
     thread_local! {
         static BUMP: std::cell::RefCell<Bump> = std::cell::RefCell::new(Bump::with_capacity(64 * 1024));
     }
     let transaction = decode(bytes);
-    BUMP.with_borrow_mut(|bump| {
+    let ok = BUMP.with_borrow_mut(|bump| {
         bump.reset();
-        validation::transaction_data::validity_check(
-            &transaction.get().0.data,
+        validation::check(
+            &transaction.get().0,
             &epoch.context(),
+            &epoch.verifier,
+            &[],
             bump,
         )
         .is_ok()
-    })
+    });
+    ok && black_box(Message::with_digests(vec![transaction])).len() == 1
 }
 
 /// Tasks on a `workers`-thread runtime, each in a closed loop (decode,
