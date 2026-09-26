@@ -54,9 +54,20 @@ impl fmt::Debug for WireBuf {
     }
 }
 
+/// A conversion between views over the same buffers. `apply` works for
+/// every lifetime, so it cannot keep the view's references.
+pub(crate) trait ViewMap<T: Wire, U: Wire> {
+    fn apply(self, view: T::View<'_>) -> U::View<'_>;
+}
+
+/// A change to a view. `apply` works for every lifetime, so it cannot put
+/// in references that do not live as long as the message.
+pub(crate) trait ViewUpdate<T: Wire> {
+    fn apply(self, view: &mut T::View<'_>);
+}
+
 /// A parsed `T`. Dropping it frees the wire buffer and the arena and nothing
-/// else. `repr(C)`, so that messages whose views lay out alike do too.
-#[repr(C)]
+/// else.
 pub struct Message<T: Wire> {
     // Points into `wire` and `arena`; `'static` stands for "while self lives".
     view: T::View<'static>,
@@ -169,11 +180,21 @@ impl<T: Wire> Message<T> {
         Ok((view, arena, build.used()))
     }
 
-    /// # Safety
-    /// Whatever the caller writes must not borrow from outside the message,
-    /// unless for `'static`: the lifetime is erased.
-    pub(crate) unsafe fn view_mut(&mut self) -> &mut T::View<'static> {
-        &mut self.view
+    /// Converts the view, keeping the buffers it points into.
+    #[inline]
+    pub(crate) fn map<U: Wire>(self, f: impl ViewMap<T, U>) -> Message<U> {
+        Message {
+            view: f.apply(self.view),
+            wire: self.wire,
+            arena: self.arena,
+            arena_used: self.arena_used,
+        }
+    }
+
+    /// Changes the view in place.
+    #[inline]
+    pub(crate) fn update(&mut self, f: impl ViewUpdate<T>) {
+        f.apply(&mut self.view);
     }
 
     pub fn get(&self) -> &T::View<'_> {

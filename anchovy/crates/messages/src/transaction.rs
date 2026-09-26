@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::marker::PhantomData;
-use std::mem::ManuallyDrop;
 
 use crate::Message;
 use crate::arena::{Alloc, Ref};
@@ -580,11 +579,7 @@ impl DigestState for DigestReady {
 }
 
 /// `TransactionData::V1`, the only version.
-///
-/// `repr(C)`, as `SenderSignedData` and `Message` are, so that the digest
-/// states lay out alike and one converts to the other in place.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(C)]
 pub struct TransactionData<'a, D: DigestState = DigestReady> {
     /// The exact encoding, which is what gets hashed and signed.
     pub bytes: &'a [u8],
@@ -694,7 +689,6 @@ impl<'a> GenericSignature<'a> {
 
 /// The one `SenderSignedTransaction` a `SenderSignedData` holds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(C)]
 pub struct SenderSignedData<'a, D: DigestState = DigestReady> {
     /// The exact encoding, as it is stored and sent.
     pub bytes: &'a [u8],
@@ -755,7 +749,6 @@ impl<'a, D: DigestState> SenderSignedData<'a, D> {
 /// what the submit RPC carries. The same bytes as `SenderSignedData`, but
 /// the envelope counts toward the container depth limit.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(transparent)]
 pub struct Transaction<'a, D: DigestState>(pub SenderSignedData<'a, D>);
 
 impl<'a, D: DigestState> Transaction<'a, D> {
@@ -767,42 +760,73 @@ impl<'a, D: DigestState> Transaction<'a, D> {
 type Pending = Message<Transaction<'static, DigestPending>>;
 type Ready = Message<Transaction<'static, DigestReady>>;
 
-// The in-place conversions below rely on the two states laying out alike:
-// they differ only in a `PhantomData`, and every struct from `Message` down
-// to the digest is `repr(C)` or `repr(transparent)`.
-const _: () = assert!(
-    size_of::<Pending>() == size_of::<Ready>() && align_of::<Pending>() == align_of::<Ready>()
-);
-
 impl Message<Transaction<'static, DigestPending>> {
-    /// Computes the digest, in place.
-    pub fn with_digest(mut self) -> Message<Transaction<'static, DigestReady>> {
-        self.compute_digest();
-        // SAFETY: the same layout (above), and the digest is now computed.
-        unsafe { std::mem::transmute::<Pending, Ready>(self) }
+    /// Computes the digest.
+    pub fn with_digest(mut self) -> Ready {
+        self.update(ComputeDigest);
+        self.map(AssumeDigested)
     }
 
-    /// Computes the digest of each, in place: no allocation or copy.
-    pub fn with_digests(transactions: Vec<Pending>) -> Vec<Ready> {
-        let mut transactions = ManuallyDrop::new(transactions);
-        for transaction in transactions.iter_mut() {
-            transaction.compute_digest();
+    /// Computes the digest of each. No allocation and no copying: the
+    /// digests are written in place first, so that what remains is a
+    /// field-for-field move into the same allocation, which compiles to
+    /// nothing.
+    pub fn with_digests(mut transactions: Vec<Pending>) -> Vec<Ready> {
+        for transaction in &mut transactions {
+            transaction.update(ComputeDigest);
         }
-        // SAFETY: the buffer came from a `Vec` of a type of the same size and
-        // alignment (above), and every element's digest is now computed.
-        unsafe {
-            Vec::from_raw_parts(
-                transactions.as_mut_ptr().cast::<Ready>(),
-                transactions.len(),
-                transactions.capacity(),
-            )
-        }
+        transactions
+            .into_iter()
+            .map(|transaction| transaction.map(AssumeDigested))
+            .collect()
     }
+}
 
-    fn compute_digest(&mut self) {
-        // SAFETY: only the digest, a value, is written.
-        let data = unsafe { &mut self.view_mut().0.data };
+struct ComputeDigest;
+
+impl crate::message::ViewUpdate<Transaction<'static, DigestPending>> for ComputeDigest {
+    #[inline]
+    fn apply(self, view: &mut Transaction<'_, DigestPending>) {
+        let data = &mut view.0.data;
         data.digest = Digest::of("TransactionData", data.bytes);
+    }
+}
+
+/// Relabels a transaction whose digest is computed. Moves every field
+/// unchanged, so that a relabelling in place is free.
+struct AssumeDigested;
+
+impl crate::message::ViewMap<Transaction<'static, DigestPending>, Transaction<'static, DigestReady>>
+    for AssumeDigested
+{
+    // The bound makes `'x` early-bound, as it is in the trait, where it
+    // appears only in projections.
+    #[inline]
+    fn apply<'x>(self, view: Transaction<'x, DigestPending>) -> Transaction<'x, DigestReady>
+    where
+        'x: 'x,
+    {
+        let Transaction(SenderSignedData {
+            bytes,
+            intent,
+            data,
+            tx_signatures,
+        }) = view;
+        Transaction(SenderSignedData {
+            bytes,
+            intent,
+            data: TransactionData {
+                bytes: data.bytes,
+                kind: data.kind,
+                sender: data.sender,
+                gas_data: data.gas_data,
+                expiration: data.expiration,
+                index: data.index,
+                digest: data.digest,
+                state: PhantomData,
+            },
+            tx_signatures,
+        })
     }
 }
 
