@@ -174,6 +174,6 @@ impl Pipeline {
 
     /// Cache hits and misses so far.
     pub fn stats(&self) -> (u64, u64) {
-        self.verifier.cache().stats()
+        self.verifier.cache_stats()
     }
 }

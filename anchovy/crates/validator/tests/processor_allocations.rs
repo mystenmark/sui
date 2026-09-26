@@ -88,7 +88,7 @@ fn verifying_allocates_nothing_once_warm() {
         // A cache that has not seen it, made before counting: it is verified.
         let mut verifier = SignatureVerifier::new(epoch.clone());
         let (ok, allocations) = process(&mut validator, &mut verifier, &verification, case);
-        assert_eq!(verifier.cache().stats().0, 0);
+        assert_eq!(verifier.cache_stats().0, 0);
         if ok && plain_signatures(case) {
             accepted += 1;
             assert_eq!(allocations, 0, "{}", case.label);
@@ -110,11 +110,11 @@ fn a_cache_hit_allocates_nothing() {
         .filter(|case| process(&mut validator, &mut verifier, &verification, case).0)
         .collect();
     assert!(!accepted.is_empty());
-    let (hits, _) = verifier.cache().stats();
+    let (hits, _) = verifier.cache_stats();
     for case in &accepted {
         let (ok, allocations) = process(&mut validator, &mut verifier, &verification, case);
         assert!(ok);
         assert_eq!(allocations, 0, "{}", case.label);
     }
-    assert_eq!(verifier.cache().stats().0, hits + accepted.len() as u64);
+    assert_eq!(verifier.cache_stats().0, hits + accepted.len() as u64);
 }
