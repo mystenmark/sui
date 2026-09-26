@@ -43,10 +43,10 @@ async fn compare(epoch: &Arc<EpochState>, requests: &[Vec<&Case>]) -> (usize, us
             (Ok(Validated(transactions)), Ok(())) => {
                 assert_eq!(transactions.len(), request.len(), "{labels:?}");
                 for (i, hashed) in transactions.iter().enumerate() {
-                    let parsed =
+                    let expected =
                         Message::<Transaction<DigestReady>>::parse(request[i].bytes.clone())
                             .unwrap();
-                    assert_eq!(hashed.get(), parsed.get(), "{labels:?}");
+                    assert_eq!(hashed.get(), expected.get(), "{labels:?}");
                 }
                 passed += 1;
             }
