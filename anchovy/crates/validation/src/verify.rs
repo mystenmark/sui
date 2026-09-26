@@ -17,7 +17,9 @@ use fastcrypto::hash::{HashFunction, Sha256};
 use fastcrypto::secp256k1::{Secp256k1PublicKey, Secp256k1Signature};
 use fastcrypto::secp256r1::{Secp256r1PublicKey, Secp256r1Signature};
 use fastcrypto::traits::{ToFromBytes, VerifyingKey};
-use fastcrypto_zkp::bn254::zk_login::{JWK, JwkId, OIDCProvider};
+use fastcrypto_zkp::bn254::zk_login::OIDCProvider;
+/// The JWK types a [`Verifier`] is built from.
+pub use fastcrypto_zkp::bn254::zk_login::{JWK, JwkId};
 use fastcrypto_zkp::bn254::zk_login_api::{ZkLoginCircuitMode, ZkLoginEnv};
 use messages::base::SuiAddress;
 use messages::signature::{CompressedSignature, MultiSig, PublicKey};
