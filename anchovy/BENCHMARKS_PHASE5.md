@@ -67,19 +67,22 @@ digest, and signature verification hashes the intent message itself.
 | handler decode, per tx | 1,200 ns | 519 ns |
 | processor, per tx | 131 ns | 139 + 690 ns |
 
-Converting a batch costs nothing beyond the hash, in safe code:
-`with_digests` writes each digest through `&mut`, then relabels with
-`into_iter().map(..).collect()`, the map moving every field unchanged.
-Measured in the `bench` profile (fat LTO): 649–674 ns/tx, against 681–688
-ns for Blake2b alone (the hash inlines into the loop); no allocation. In
-the `release` profile the relabelling compiles to nothing: one loop, the
-hash call and a 33-byte store. Under fat LTO a partial identity copy of
-each element survives (a load/store round trip through the stack), too
-cheap to measure. The optimizer is not bound to remove it: std's no-loop
-in-place collect path (`TrustedRandomAccessNoCoerce`) needs items without
-a destructor, and `Message` has one, so it takes the `try_fold` path.
-Hashing in the map instead (`map(Message::with_digest)`) keeps three
-448-byte `memcpy`s per element: 704 ns/tx.
+Converting a batch costs nothing beyond the hash: `with_digests` writes
+each digest through `&mut`, then relabels the `Vec`'s allocation with
+`into_raw_parts`/`from_raw_parts`. The digest-state types are `repr(C)`
+(`Transaction` `repr(transparent)`), and compile-time asserts compare the
+size, alignment and every field offset of both states. In both the
+`release` and `bench` profiles the only loop over elements is the hash
+call and a 33-byte store; 678 ns/tx against 682 ns for Blake2b alone, no
+allocation. Miri passes.
+
+A safe relabel, `into_iter().map(..).collect()` moving every field
+unchanged, was measured first. It compiled to nothing when inlined next to
+the hashing loop in `release`, but out of line (and under fat LTO) it
+kept a copy of each element, ~12 ns/tx: std's no-loop in-place collect path
+(`TrustedRandomAccessNoCoerce`) needs items without a destructor, and
+`Message` has one. Hashing in the map (`map(Message::with_digest)`) keeps
+three 448-byte `memcpy`s per element: 700 ns/tx.
 
 End to end, one-tx requests gain a little (143–151k req/s, from
 135–148k). 16-tx requests lose (0.77–0.84M tx/s, from 0.96–1.28M): at
