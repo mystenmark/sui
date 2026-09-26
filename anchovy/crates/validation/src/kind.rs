@@ -8,8 +8,8 @@ use containers::Bump;
 use messages::base::ObjectId;
 use messages::system_transaction::EndOfEpochTransactionKind;
 use messages::transaction::{
-    Argument, CallArg, Command, ObjectArg, ProgrammableMoveCall, ProgrammableTransaction,
-    SharedObjectMutability, TransactionData, TransactionKind,
+    Argument, CallArg, Command, DigestState, ObjectArg, ProgrammableMoveCall,
+    ProgrammableTransaction, SharedObjectMutability, TransactionData, TransactionKind,
 };
 use messages::type_tag::{TypeInput, TypeTag};
 use protocol_config::{PerObjectCongestionControlMode, ProtocolConfig};
@@ -31,7 +31,7 @@ fn size_limit(what: &str, limit: impl std::fmt::Display) -> Error {
 }
 
 pub fn validity_check(
-    tx: &TransactionData<'_>,
+    tx: &TransactionData<'_, impl DigestState>,
     config: &ProtocolConfig,
     bump: &Bump,
 ) -> Result<(), Error> {
@@ -130,7 +130,7 @@ fn end_of_epoch_transaction(
 }
 
 fn programmable_transaction(
-    tx: &TransactionData<'_>,
+    tx: &TransactionData<'_, impl DigestState>,
     pt: &ProgrammableTransaction<'_>,
     config: &ProtocolConfig,
     bump: &Bump,

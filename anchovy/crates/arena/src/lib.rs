@@ -50,8 +50,8 @@ pub struct Bump {
     used: Cell<usize>,
     /// Every allocation ever made, chunk changes included.
     allocated: Cell<usize>,
-    // Only ever read through `current`; held so that it is freed with the arena.
-    _first: Chunk,
+    /// Bumped through `current` until it overflows; `reset` returns to it.
+    first: Chunk,
     /// Chunks after the first, oldest first. An empty `Vec` allocates
     /// nothing, so an arena that never overflows is one allocation.
     extra: RefCell<Vec<Chunk>>,
@@ -65,7 +65,7 @@ impl Bump {
             current: Cell::new((first.ptr, first.size)),
             used: Cell::new(0),
             allocated: Cell::new(0),
-            _first: first,
+            first,
             extra: RefCell::new(Vec::new()),
         }
     }
@@ -84,6 +84,18 @@ impl Bump {
     /// Bytes used in the current chunk.
     pub fn used(&self) -> usize {
         self.used.get()
+    }
+
+    /// Frees everything allocated, for reuse: overflow chunks are released
+    /// and the first chunk is bumped from its start again.
+    ///
+    /// Taking `&mut self` is what makes this sound: every allocation borrows
+    /// the arena, so none can be alive here.
+    pub fn reset(&mut self) {
+        self.extra.get_mut().clear();
+        self.current.set((self.first.ptr, self.first.size));
+        self.used.set(0);
+        self.allocated.set(0);
     }
 
     #[inline]
@@ -180,6 +192,28 @@ mod tests {
         }
         assert!(bump.chunks() > 1);
         assert_eq!(bump.allocated(), 160);
+    }
+
+    #[test]
+    fn reset_reuses_the_first_chunk() {
+        let mut bump = Bump::with_capacity(64);
+        let first = (&bump)
+            .allocate(Layout::from_size_align(8, 8).unwrap())
+            .unwrap()
+            .as_ptr()
+            .cast::<u8>();
+        (&bump)
+            .allocate(Layout::from_size_align(1000, 1).unwrap())
+            .unwrap();
+        assert_eq!(bump.chunks(), 2);
+        bump.reset();
+        assert_eq!((bump.chunks(), bump.used(), bump.allocated()), (1, 0, 0));
+        let again = (&bump)
+            .allocate(Layout::from_size_align(8, 8).unwrap())
+            .unwrap()
+            .as_ptr()
+            .cast::<u8>();
+        assert_eq!(first, again);
     }
 
     #[test]

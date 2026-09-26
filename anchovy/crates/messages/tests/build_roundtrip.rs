@@ -523,7 +523,7 @@ fn programmable_transactions() {
         let built = transaction(kind, 3);
         let message = check::<TransactionData, tx::TransactionData>(&built);
         let data = message.get();
-        expect_digest("TransactionData", data.bytes, data.digest);
+        expect_digest("TransactionData", data.bytes, *data.digest());
         check_programmable_index(&data.index, user);
         let calls: Vec<usize> = data.move_calls().map(|(i, _)| i).collect();
         assert_eq!(calls, if user { vec![0, 8] } else { vec![] });
@@ -1246,7 +1246,7 @@ fn check_executed(transaction: &SenderSignedData<'_>, effects: &TransactionEffec
     expect_digest(
         "TransactionData",
         transaction.data.bytes,
-        transaction.data.digest,
+        *transaction.data.digest(),
     );
     expect_digest("TransactionEffects", effects.bytes, effects.digest);
 }

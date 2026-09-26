@@ -160,7 +160,7 @@ fn sender_signed_data() {
     let len = parsed_wire_len::<transaction::SenderSignedData<'static>, _>(
         &smallest_sender_signed_data(),
     );
-    assert_eq!(len, transaction::SenderSignedData::MIN_WIRE_SIZE);
+    assert_eq!(len, <transaction::SenderSignedData>::MIN_WIRE_SIZE);
 }
 
 #[test]

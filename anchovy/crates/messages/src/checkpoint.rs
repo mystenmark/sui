@@ -310,7 +310,7 @@ impl<'a> FullCheckpointContents<'a> {
         a: &mut A,
     ) -> Result<FullCheckpointContents<'a>> {
         r.enter()?;
-        let n = r.seq_len(SenderSignedData::MIN_WIRE_SIZE + TransactionEffects::MIN_WIRE_SIZE)?;
+        let n = r.seq_len(<SenderSignedData>::MIN_WIRE_SIZE + TransactionEffects::MIN_WIRE_SIZE)?;
         let mut transactions = a.slice(n)?;
         for _ in 0..n {
             r.enter()?;
@@ -342,7 +342,7 @@ pub struct CheckpointTransaction<'a> {
 impl<'a> CheckpointTransaction<'a> {
     /// A transaction, its effects, an option tag and two lengths.
     pub const MIN_WIRE_SIZE: usize =
-        SenderSignedData::MIN_WIRE_SIZE + TransactionEffects::MIN_WIRE_SIZE + 3;
+        <SenderSignedData>::MIN_WIRE_SIZE + TransactionEffects::MIN_WIRE_SIZE + 3;
 
     pub fn parse<A: Alloc<'a>>(r: &mut Reader<'a>, a: &mut A) -> Result<CheckpointTransaction<'a>> {
         r.enter()?;

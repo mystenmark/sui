@@ -35,6 +35,7 @@
 
 use std::fmt::Write as _;
 
+mod depth;
 mod mutations;
 mod signatures;
 mod validity;
@@ -122,6 +123,13 @@ fn main() {
             println!("{path}");
             return;
         }
+    }
+    if let [flag, path] = args.as_slice()
+        && flag == "--depth-vectors"
+    {
+        std::fs::write(path, depth::vectors()).unwrap();
+        println!("{path}");
+        return;
     }
     if let [flag, path] = args.as_slice()
         && flag == "--mutation-vectors"
