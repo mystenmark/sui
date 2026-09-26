@@ -77,6 +77,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         chain_identifier(&args.chain_id)?,
         args.reference_gas_price,
         args.committee_size,
+        // JWKs are chain state, which does not exist yet: zkLogin fails.
+        [],
     ));
 
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
