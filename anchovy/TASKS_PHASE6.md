@@ -3,7 +3,7 @@
 Plan: `IMPLEMENTATION_PLAN_PHASE6.md`. Branch `mlogan-phase6`, to be merged
 into `anchovy-main`.
 
-## Status: step 6 (verified-signature cache) in progress
+## Status: all steps done
 
 ## Done
 
@@ -26,10 +26,15 @@ into `anchovy-main`.
    signature refused.
 5. Benchmark (below).
 
-## Remaining
-
-6. Verified-signature cache (plan: "Verified-signature cache"), tests, and
-   an independent security review.
+6. Verified-signature cache (plan: "Verified-signature cache"), reviewed
+   by three independent agents and revised (plan: "Security review").
+   Tests: resubmissions hit with the same verdicts; every single-bit change
+   of a cached transaction is judged as without the cache and never hits;
+   the same data with other signatures is refused; failures are not
+   cached; another epoch empties it; hits evict nothing and an entry
+   outlives a generation; the key distinguishes signature order, count,
+   boundaries and epoch; verification uses the validation epoch; a hit
+   allocates nothing.
 
 ## Measurements
 
@@ -54,4 +59,5 @@ thread caps throughput: 25k tx/s in process (inline on 4 runtime workers:
   verification inbox given to more workers.
 - Ed25519 batch verification, and the reference's cache of verified
   signatures.
-- Aliases and JWK updates come with state.
+- Aliases and JWK updates come with state; see the plan's "Security
+  review" for what each must preserve in the signature cache.

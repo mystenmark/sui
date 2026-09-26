@@ -107,34 +107,69 @@ versions. Only successes are cached. The cache belongs to the epoch's
 store, so a new epoch starts empty. (A second cache, of verified zkLogin
 proof inputs, is not reproduced here.)
 
-The same, in the verifier processor:
+The same, in the verifier processor (revised after the security review,
+below):
 
 - Key: Blake2b-256 over a domain tag, the epoch, the transaction digest,
   the intent, and each signature's bytes, length-prefixed, in order. The
-  transaction digest commits to the data's bytes (only
-  `DigestReady` transactions, hashed from their own bytes, reach the
-  verifier). So the key covers every byte verification reads, as the
-  reference's does, and a transaction resubmitted with any other
+  transaction digest commits to the data's bytes, from which the rest of
+  the data is parsed, so the key covers every byte verification reads, as
+  the reference's does; a transaction resubmitted with any other
   signatures misses.
+- The cache takes a whole `Message<Transaction<DigestReady>>`, whose view
+  cannot be changed and whose digest was computed from its own bytes, and
+  hands that same view to the verification closure: the key and what is
+  verified cannot differ. `SignatureCache` is crate-private.
 - Only a verification that succeeded is cached; the verdict is otherwise
   unchanged.
 - Everything else verification depends on is the epoch's: its number
-  (zkLogin's max epoch), protocol config and JWKs. The cache holds the
-  `Arc<EpochState>` it was filled under and empties when handed another,
-  and the epoch number is in the key besides.
+  (zkLogin's max epoch), protocol config and JWKs. A request carries the
+  `Arc<EpochState>` it was validated in; the verifier verifies in it, and
+  the cache empties when handed another, besides having the epoch number
+  in the key.
+- Only `TransactionValidator` makes a `VerifySignatures` (private fields):
+  `verify_signatures` does not repeat validation (it passes system
+  transactions, for one), so neither verifying nor caching may happen
+  without it.
 - Aliases would change the verdict and are not in the key: there are none
-  yet (verification passes `&[]`), and the cached path takes no aliases.
-  When they arrive the key must include the signers' alias versions, as
-  the reference's does.
-- Bounded, and no allocation once built: two generations of 50,000 (the
-  reference's 100,000 in all). Inserts go to the current one; when it is
-  full it becomes the previous one and the old previous is cleared (its
-  table kept). A hit in the previous generation is copied forward. This
-  approximates LRU.
+  yet (verification passes `&[]`), and the cached closure takes none. When
+  they arrive the key must include the signers' alias versions, as the
+  reference's does.
+- Bounded, and no allocation once built: two generations of 100,000.
+  Inserts go to the current one; when it is full it becomes the previous
+  one and the old previous is cleared (its table kept). Hits insert
+  nothing, so every entry outlives at least 100,000 later insertions (the
+  reference, which does not refresh on hits either, keeps 100,000), and
+  resubmitting cached transactions evicts nothing. About 8.5 MiB.
 - The table is `hashbrown` with the `containers::DigestHasher`: a per-map
   secret seed, so that keys ground to collide in the table's low bits do
   not degrade it.
 - Owned by the verifier processor, on its thread: no lock.
+
+### Security review
+
+Three independent reviews (key soundness; lifecycle and pipeline; denial
+of service) found no way, through the RPC path, for the cache to accept a
+transaction without a valid signature or refuse a valid one. Fixed from
+their findings: a view could be edited, or measure-parsed with a zero
+digest, and still hit another transaction's entry (in-process code only);
+anyone could build a `VerifySignatures`, and the verifier alone accepts a
+system transaction; validation and verification held separate epochs;
+hits could evict other entries, and the effective capacity was
+50,000–100,000. Recorded, not changed:
+
+- Aliases: the reference enables address aliases from protocol version
+  116; verifying with none differs from it for any address that has
+  aliases, cache or not. Needs object state.
+- JWKs: the reference adds them within an epoch. If JWKs are ever updated
+  in place rather than by replacing the `EpochState`, updates must only
+  add, or cached successes go stale.
+- An invalid transaction after a valid one in a request is reported as
+  `Overloaded` when the signature queue is full: the request was not
+  judged, and a retry gets its verdict.
+- `[t, t]` is accepted; the reference refuses the repeat. Request-level
+  checks are a phase 5 non-goal.
+- A hit is visible in the response time, as in the reference.
 
 ## Testing
 
