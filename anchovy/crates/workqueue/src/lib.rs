@@ -122,6 +122,7 @@ impl<W> Drop for Pool<W> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::mpsc;
 
     use super::*;
@@ -157,9 +158,16 @@ mod tests {
                 .iter()
                 .all(|(_, thread, _)| thread.starts_with("echo-"))
         );
-        // Each thread's count is its own.
-        let most = results.iter().map(|(_, _, seen)| *seen).max().unwrap();
-        assert!(most < 19);
+        // Each thread's count is its own: each counts 1, 2, … over the items
+        // it ran, however they were spread.
+        let mut counts: BTreeMap<&str, Vec<usize>> = BTreeMap::default();
+        for (_, thread, seen) in &results {
+            counts.entry(thread).or_default().push(*seen);
+        }
+        for seen in counts.values_mut() {
+            seen.sort_unstable();
+            assert!(seen.iter().copied().eq(1..=seen.len()), "{seen:?}");
+        }
         drop(pool);
         assert!(matches!(
             queue.try_push((0, mpsc::channel().0)),
