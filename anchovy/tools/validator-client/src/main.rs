@@ -8,10 +8,11 @@
 //! format, starts the server with it, and connects as
 //! `NetworkAuthorityClient::connect` does (`sui-tls` pinning the key,
 //! `mysten-network`'s channel). Then: health must answer; a signed
-//! transaction must validate (and stop at consensus submission) and one
-//! with too low a gas budget must not; every other route must
-//! reach its handler, which the server's `todo!()` message on stderr
-//! shows; a client pinning another key must be refused.
+//! transaction must validate and verify (and stop at consensus
+//! submission), and ones with too low a gas budget or a corrupted signature
+//! must not; every other route must reach its handler, which the server's
+//! `todo!()` message on stderr shows; a client pinning another key must be
+//! refused.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
@@ -211,6 +212,20 @@ async fn main() -> Result<()> {
     );
     println!(
         "ok  a transaction with too low a budget refused: {}",
+        status.message()
+    );
+    // The encoding ends with the Ed25519 signature: a flag, 64 bytes of
+    // signature, then the 32-byte public key.
+    let mut corrupted = transfer(50_000_000)?.to_vec();
+    let at = corrupted.len() - 32 - 10;
+    corrupted[at] ^= 1;
+    let status = submit(&mut client, corrupted.into()).await;
+    ensure!(
+        status.code() == Code::InvalidArgument && status.message().starts_with("InvalidSignature"),
+        "transaction with a corrupted signature: {status:?}"
+    );
+    println!(
+        "ok  a transaction with a corrupted signature refused: {}",
         status.message()
     );
 
