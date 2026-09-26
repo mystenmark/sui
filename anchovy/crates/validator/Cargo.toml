@@ -30,6 +30,7 @@ workqueue.workspace = true
 [dev-dependencies]
 base64.workspace = true
 hyper-util.workspace = true
+serde_json.workspace = true
 tower.workspace = true
 
 [[bench]]
