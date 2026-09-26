@@ -67,13 +67,19 @@ digest, and signature verification hashes the intent message itself.
 | handler decode, per tx | 1,200 ns | 519 ns |
 | processor, per tx | 131 ns | 139 + 690 ns |
 
-Converting a batch is zero-cost beyond the hash: `with_digests` 690 ns/tx
-against 688 ns for Blake2b alone, no allocation. Its loop is the hash call
-and a 33-byte store into the element; the `Vec` is relabelled, which the
-`repr(C)` layouts make sound (Miri passes). The idiomatic
-`into_iter().map(Message::with_digest).collect()` also reuses the
-allocation, but moves each 448-byte message out and back (three `memcpy`s
-per element, more with `#[inline]`): 708 ns/tx.
+Converting a batch costs nothing beyond the hash, in safe code:
+`with_digests` writes each digest through `&mut`, then relabels with
+`into_iter().map(..).collect()`, the map moving every field unchanged.
+Measured in the `bench` profile (fat LTO): 649–674 ns/tx, against 681–688
+ns for Blake2b alone (the hash inlines into the loop); no allocation. In
+the `release` profile the relabelling compiles to nothing: one loop, the
+hash call and a 33-byte store. Under fat LTO a partial identity copy of
+each element survives (a load/store round trip through the stack), too
+cheap to measure. The optimizer is not bound to remove it: std's no-loop
+in-place collect path (`TrustedRandomAccessNoCoerce`) needs items without
+a destructor, and `Message` has one, so it takes the `try_fold` path.
+Hashing in the map instead (`map(Message::with_digest)`) keeps three
+448-byte `memcpy`s per element: 704 ns/tx.
 
 End to end, one-tx requests gain a little (143–151k req/s, from
 135–148k). 16-tx requests lose (0.77–0.84M tx/s, from 0.96–1.28M): at
