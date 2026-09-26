@@ -97,6 +97,45 @@ which is differential-tested against the reference.
 - `Processors::start` builds both queues and one worker running both
   processors.
 
+### Verified-signature cache
+
+The reference (`sui-core` `SignatureVerifier::verify_tx`) skips verifying a
+transaction it has verified before: an LRU of 100,000
+`full_message_digest_with_alias_versions`, a hash of the whole
+`SenderSignedData` (intent, data and signatures) and the signers' alias
+versions. Only successes are cached. The cache belongs to the epoch's
+store, so a new epoch starts empty. (A second cache, of verified zkLogin
+proof inputs, is not reproduced here.)
+
+The same, in the verifier processor:
+
+- Key: Blake2b-256 over a domain tag, the epoch, the transaction digest,
+  the intent, and each signature's bytes, length-prefixed, in order. The
+  transaction digest commits to the data's bytes (only
+  `DigestReady` transactions, hashed from their own bytes, reach the
+  verifier). So the key covers every byte verification reads, as the
+  reference's does, and a transaction resubmitted with any other
+  signatures misses.
+- Only a verification that succeeded is cached; the verdict is otherwise
+  unchanged.
+- Everything else verification depends on is the epoch's: its number
+  (zkLogin's max epoch), protocol config and JWKs. The cache holds the
+  `Arc<EpochState>` it was filled under and empties when handed another,
+  and the epoch number is in the key besides.
+- Aliases would change the verdict and are not in the key: there are none
+  yet (verification passes `&[]`), and the cached path takes no aliases.
+  When they arrive the key must include the signers' alias versions, as
+  the reference's does.
+- Bounded, and no allocation once built: two generations of 50,000 (the
+  reference's 100,000 in all). Inserts go to the current one; when it is
+  full it becomes the previous one and the old previous is cleared (its
+  table kept). A hit in the previous generation is copied forward. This
+  approximates LRU.
+- The table is `hashbrown` with the `containers::DigestHasher`: a per-map
+  secret seed, so that keys ground to collide in the table's low bits do
+  not degrade it.
+- Owned by the verifier processor, on its thread: no lock.
+
 ## Testing
 
 - `workqueue`: two processors on one thread run there and both drain; a
@@ -126,3 +165,5 @@ which is differential-tested against the reference.
    one worker for both.
 4. Tests: pipeline, gRPC, allocations, validator-client.
 5. Benchmark and notes.
+6. The verified-signature cache, its tests, and a security review of it by
+   independent agents.
