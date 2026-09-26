@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Warm processors accept an Ed25519 or Secp256k1 transaction, validation
-//! and signature verification both, without touching the heap. Its own
+//! and signature verification both, without touching the heap, and answer
+//! a resubmission from the signature cache without it either. Its own
 //! binary, for the counting global allocator.
 
 mod common;
@@ -73,19 +74,21 @@ fn plain_signatures(case: &common::Case) -> bool {
 }
 
 #[test]
-fn accepting_allocates_nothing_once_warm() {
+fn verifying_allocates_nothing_once_warm() {
     let (cases, epoch) = common::mainnet();
     let epoch = common::mainnet_epoch(epoch);
     let (signatures, verification) = workqueue::queue(1);
     let mut validator = TransactionValidator::new(epoch.clone(), signatures);
-    let mut verifier = SignatureVerifier::new(epoch);
-
+    let mut warm = SignatureVerifier::new(epoch.clone());
     for case in &cases {
-        process(&mut validator, &mut verifier, &verification, case);
+        process(&mut validator, &mut warm, &verification, case);
     }
     let mut accepted = 0;
     for case in &cases {
+        // A cache that has not seen it, made before counting: it is verified.
+        let mut verifier = SignatureVerifier::new(epoch.clone());
         let (ok, allocations) = process(&mut validator, &mut verifier, &verification, case);
+        assert_eq!(verifier.cache().stats().0, 0);
         if ok && plain_signatures(case) {
             accepted += 1;
             assert_eq!(allocations, 0, "{}", case.label);
@@ -93,4 +96,25 @@ fn accepting_allocates_nothing_once_warm() {
     }
     assert!(accepted > 0, "no Ed25519 or Secp256k1 transaction accepted");
     eprintln!("{accepted} of {} accepted without allocating", cases.len());
+}
+
+#[test]
+fn a_cache_hit_allocates_nothing() {
+    let (cases, epoch) = common::mainnet();
+    let epoch = common::mainnet_epoch(epoch);
+    let (signatures, verification) = workqueue::queue(1);
+    let mut validator = TransactionValidator::new(epoch.clone(), signatures);
+    let mut verifier = SignatureVerifier::new(epoch);
+    let accepted: Vec<_> = cases
+        .iter()
+        .filter(|case| process(&mut validator, &mut verifier, &verification, case).0)
+        .collect();
+    assert!(!accepted.is_empty());
+    let (hits, _) = verifier.cache().stats();
+    for case in &accepted {
+        let (ok, allocations) = process(&mut validator, &mut verifier, &verification, case);
+        assert!(ok);
+        assert_eq!(allocations, 0, "{}", case.label);
+    }
+    assert_eq!(verifier.cache().stats().0, hits + accepted.len() as u64);
 }

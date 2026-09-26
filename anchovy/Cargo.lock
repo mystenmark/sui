@@ -3656,9 +3656,11 @@ name = "validator"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "blake2",
  "bytes",
  "clap",
  "containers",
+ "hashbrown 0.17.1",
  "hyper-util",
  "messages",
  "prost",

@@ -11,9 +11,11 @@ path = "src/main.rs"
 
 [dependencies]
 base64.workspace = true
+blake2.workspace = true
 bytes.workspace = true
 clap.workspace = true
 containers.workspace = true
+hashbrown.workspace = true
 messages.workspace = true
 protocol-config.workspace = true
 prost.workspace = true

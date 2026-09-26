@@ -129,3 +129,51 @@ pub fn expected(epoch: &EpochState, cases: &[&Case]) -> Result<(), ErrorKind> {
     }
     Ok(())
 }
+
+/// The two processors, run by hand on the calling thread, so that tests can
+/// look at the verifier's cache.
+pub struct Pipeline {
+    pub validator: validator::processors::TransactionValidator,
+    pub verifier: validator::processors::SignatureVerifier,
+    verification: workqueue::Inbox<validator::processors::VerifySignatures>,
+}
+
+impl Pipeline {
+    pub fn new(epoch: &Arc<EpochState>, generation: usize) -> Pipeline {
+        use validator::processors::{SignatureVerifier, TransactionValidator};
+        let (signatures, verification) = workqueue::queue(1);
+        Pipeline {
+            validator: TransactionValidator::new(epoch.clone(), signatures),
+            verifier: SignatureVerifier::with_cache(epoch.clone(), generation),
+            verification,
+        }
+    }
+
+    /// The request's verdict: the kind of its first failure, or `Ok`.
+    pub fn run(&mut self, bytes: &[&[u8]]) -> Result<(), ErrorKind> {
+        use validator::processors::{Rejected, ValidateTransactions};
+        use workqueue::Processor;
+        let (reply, verdict) = tokio::sync::oneshot::channel();
+        let transactions = bytes
+            .iter()
+            .map(|b| Message::parse(b.to_vec()).map_err(|(e, _)| e).unwrap())
+            .collect();
+        self.validator.process(ValidateTransactions {
+            transactions,
+            reply,
+        });
+        if let Some(next) = self.verification.try_pop() {
+            self.verifier.process(next);
+        }
+        match verdict.blocking_recv().unwrap() {
+            Ok(_) => Ok(()),
+            Err(Rejected::Invalid(e)) => Err(e.kind),
+            Err(other) => panic!("{other:?}"),
+        }
+    }
+
+    /// Cache hits and misses so far.
+    pub fn stats(&self) -> (u64, u64) {
+        self.verifier.cache().stats()
+    }
+}

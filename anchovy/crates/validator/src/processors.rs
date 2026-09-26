@@ -15,6 +15,7 @@ use validation::{sender_signed, verify};
 use workqueue::{Inbox, Processor, PushError, Queue, Worker, WorkerHandle};
 
 use crate::epoch::EpochState;
+use crate::signature_cache::{self, SignatureCache};
 
 /// Where a request's verdict goes.
 pub type Reply = oneshot::Sender<Result<Validated, Rejected>>;
@@ -127,39 +128,52 @@ impl Processor<ValidateTransactions> for TransactionValidator {
     }
 }
 
-/// Verifies each transaction's signatures, then replies. The signatures are
-/// parsed again, into this processor's arena: validation's is reset for
-/// every transaction.
+/// Verifies each transaction's signatures, unless they verified before in
+/// this epoch, then replies. The signatures are parsed again, into this
+/// processor's arena: validation's is reset for every transaction.
 pub struct SignatureVerifier {
     epoch: Arc<EpochState>,
     bump: Bump,
+    cache: SignatureCache,
 }
 
 impl SignatureVerifier {
     pub fn new(epoch: Arc<EpochState>) -> SignatureVerifier {
+        SignatureVerifier::with_cache(epoch, signature_cache::GENERATION)
+    }
+
+    /// With a cache of `2 * generation` entries.
+    pub fn with_cache(epoch: Arc<EpochState>, generation: usize) -> SignatureVerifier {
         SignatureVerifier {
+            cache: SignatureCache::new(epoch.clone(), generation),
             epoch,
             bump: Bump::with_capacity(ARENA_BYTES),
         }
+    }
+
+    pub fn cache(&self) -> &SignatureCache {
+        &self.cache
     }
 }
 
 impl Processor<VerifySignatures> for SignatureVerifier {
     fn process(&mut self, item: VerifySignatures) {
-        let epoch = &*self.epoch;
+        let (epoch, bump, cache) = (&self.epoch, &mut self.bump, &mut self.cache);
         let verified = item.transactions.iter().try_for_each(|transaction| {
-            self.bump.reset();
             let signed = &transaction.get().0;
-            let (signatures, _) = sender_signed::deserialization_checks(signed, &self.bump)?;
-            // No aliases: they are object state, which does not exist yet.
-            verify::verify_signatures(
-                signed,
-                signatures,
-                epoch.epoch,
-                &epoch.verifier,
-                &[],
-                &self.bump,
-            )
+            cache.verify(epoch, signed, || {
+                bump.reset();
+                let (signatures, _) = sender_signed::deserialization_checks(signed, bump)?;
+                // No aliases: they are object state, which does not exist yet.
+                verify::verify_signatures(
+                    signed,
+                    signatures,
+                    epoch.epoch,
+                    &epoch.verifier,
+                    &[],
+                    bump,
+                )
+            })
         });
         let result = match (verified, item.then) {
             (Err(e), _) | (Ok(()), Some(e)) => Err(Rejected::Invalid(e)),
