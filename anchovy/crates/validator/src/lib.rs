@@ -8,6 +8,7 @@ pub mod epoch;
 pub mod processors;
 pub mod proto;
 pub mod server;
+pub mod signature_cache;
 pub mod tls;
 
 pub use server::Validator;
