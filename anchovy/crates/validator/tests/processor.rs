@@ -119,3 +119,29 @@ async fn a_bad_signature_comes_before_a_later_invalid_transaction() {
         other => panic!("{:?}", other.map(|_| ())),
     }
 }
+
+/// The verifier checks a request in the epoch it was validated in, not one
+/// of its own: here only the validator's epoch has the JWKs a zkLogin
+/// signature needs.
+#[test]
+fn signatures_are_verified_in_the_epoch_of_validation() {
+    use validator::processors::{SignatureVerifier, TransactionValidator};
+    use workqueue::Processor;
+    let (cases, jwks) = common::signed_vectors();
+    let zklogin = cases.iter().find(|c| c.label == "verify_zklogin").unwrap();
+    let with_jwks = common::vectors_epoch(4, jwks);
+    let without = common::vectors_epoch(4, vec![]);
+    assert!(common::expected(&with_jwks, &[zklogin]).is_ok());
+    assert!(common::expected(&without, &[zklogin]).is_err());
+
+    let (signatures, verification) = workqueue::queue(1);
+    let mut validator = TransactionValidator::new(with_jwks, signatures);
+    let mut verifier = SignatureVerifier::new(without);
+    let (reply, verdict) = oneshot::channel();
+    validator.process(ValidateTransactions {
+        transactions: vec![zklogin.parse().unwrap()],
+        reply,
+    });
+    verifier.process(verification.try_pop().unwrap());
+    assert!(verdict.blocking_recv().unwrap().is_ok());
+}

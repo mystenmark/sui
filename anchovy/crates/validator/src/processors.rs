@@ -28,14 +28,19 @@ pub struct ValidateTransactions {
 }
 
 /// A request's validated transactions, with their digests, whose signatures
-/// are next.
+/// are next. Only `TransactionValidator` makes one: verification (and so the
+/// signature cache) relies on validation having passed, as
+/// `verify_signatures` does not repeat it.
 pub struct VerifySignatures {
-    pub transactions: Vec<Message<Transaction<'static, DigestReady>>>,
+    /// The epoch the transactions were validated in, which they are verified
+    /// in too.
+    epoch: Arc<EpochState>,
+    transactions: Vec<Message<Transaction<'static, DigestReady>>>,
     /// Why the transaction after these failed validation, if one did. The
     /// reference checks each transaction's signatures before validating the
     /// next, so a bad signature among these is the request's error first.
-    pub then: Option<validation::Error>,
-    pub reply: Reply,
+    then: Option<validation::Error>,
+    reply: Reply,
 }
 
 /// Transactions that passed validation and signature verification, with
@@ -114,6 +119,7 @@ impl Processor<ValidateTransactions> for TransactionValidator {
         // Hashing is left until here, off the RPC runtime, and until the
         // cheap checks have passed.
         let next = VerifySignatures {
+            epoch: self.epoch.clone(),
             transactions: Message::with_digests(transactions),
             then,
             reply,
@@ -129,10 +135,9 @@ impl Processor<ValidateTransactions> for TransactionValidator {
 }
 
 /// Verifies each transaction's signatures, unless they verified before in
-/// this epoch, then replies. The signatures are parsed again, into this
+/// the same epoch, then replies. The signatures are parsed again, into this
 /// processor's arena: validation's is reset for every transaction.
 pub struct SignatureVerifier {
-    epoch: Arc<EpochState>,
     bump: Bump,
     cache: SignatureCache,
 }
@@ -145,23 +150,22 @@ impl SignatureVerifier {
     /// With a cache of `2 * generation` entries.
     pub fn with_cache(epoch: Arc<EpochState>, generation: usize) -> SignatureVerifier {
         SignatureVerifier {
-            cache: SignatureCache::new(epoch.clone(), generation),
-            epoch,
+            cache: SignatureCache::new(epoch, generation),
             bump: Bump::with_capacity(ARENA_BYTES),
         }
     }
 
-    pub fn cache(&self) -> &SignatureCache {
-        &self.cache
+    /// Signature cache hits and misses so far.
+    pub fn cache_stats(&self) -> (u64, u64) {
+        self.cache.stats()
     }
 }
 
 impl Processor<VerifySignatures> for SignatureVerifier {
     fn process(&mut self, item: VerifySignatures) {
-        let (epoch, bump, cache) = (&self.epoch, &mut self.bump, &mut self.cache);
+        let (epoch, bump, cache) = (&item.epoch, &mut self.bump, &mut self.cache);
         let verified = item.transactions.iter().try_for_each(|transaction| {
-            let signed = &transaction.get().0;
-            cache.verify(epoch, signed, || {
+            cache.verify(epoch, transaction, |signed| {
                 bump.reset();
                 let (signatures, _) = sender_signed::deserialization_checks(signed, bump)?;
                 // No aliases: they are object state, which does not exist yet.
