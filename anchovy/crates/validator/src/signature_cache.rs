@@ -218,6 +218,35 @@ mod tests {
         assert!(cache.current.len() + cache.previous.len() <= 4);
     }
 
+    /// Inserting many times the capacity, rotating each generation over and
+    /// over, never grows either table.
+    #[test]
+    fn the_tables_never_grow() {
+        let t = transactions();
+        let epoch = epoch(5);
+        let mut cache = SignatureCache::new(epoch.clone(), 4);
+        let capacities = (cache.current.capacity(), cache.previous.capacity());
+        for round in 0..20_u64 {
+            // Another epoch number for each round: new keys, same transactions.
+            let epoch = Arc::new(EpochState::new(
+                Chain::Unknown,
+                ProtocolVersion::MAX.as_u64(),
+                round,
+                Digest::new([0x11; 32]),
+                1000,
+                4,
+                [],
+            ));
+            for transaction in &t {
+                verified(&mut cache, &epoch, transaction);
+            }
+        }
+        let after = (cache.current.capacity(), cache.previous.capacity());
+        // The tables may have swapped places.
+        assert!(after == capacities || after == (capacities.1, capacities.0));
+        assert!(cache.current.len() <= 4 && cache.previous.len() <= 4);
+    }
+
     #[test]
     fn a_failure_is_not_cached() {
         let transactions = transactions();

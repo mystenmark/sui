@@ -31,6 +31,13 @@ pub struct ValidateTransactions {
 /// are next. Only `TransactionValidator` makes one: verification (and so the
 /// signature cache) relies on validation having passed, as
 /// `verify_signatures` does not repeat it.
+///
+/// ```compile_fail
+/// # use validator::processors::VerifySignatures;
+/// # fn unvalidated(item: VerifySignatures) -> VerifySignatures {
+/// VerifySignatures { transactions: vec![], ..item }
+/// # }
+/// ```
 pub struct VerifySignatures {
     /// The epoch the transactions were validated in, which they are verified
     /// in too.
