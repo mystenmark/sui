@@ -17,11 +17,13 @@ use fastcrypto::hash::{HashFunction, Sha256};
 use fastcrypto::secp256k1::{Secp256k1PublicKey, Secp256k1Signature};
 use fastcrypto::secp256r1::{Secp256r1PublicKey, Secp256r1Signature};
 use fastcrypto::traits::{ToFromBytes, VerifyingKey};
-use fastcrypto_zkp::bn254::zk_login::{JWK, JwkId, OIDCProvider};
+use fastcrypto_zkp::bn254::zk_login::OIDCProvider;
+/// The JWK types a [`Verifier`] is built from.
+pub use fastcrypto_zkp::bn254::zk_login::{JWK, JwkId};
 use fastcrypto_zkp::bn254::zk_login_api::{ZkLoginCircuitMode, ZkLoginEnv};
 use messages::base::SuiAddress;
 use messages::signature::{CompressedSignature, MultiSig, PublicKey};
-use messages::transaction::{DigestState, SenderSignedData, TransactionKind};
+use messages::transaction::{SenderSignedData, TransactionKind, TxState};
 use protocol_config::{Chain, ProtocolConfig};
 
 use crate::signature::{ParsedSignature, Passkey, ZkLoginAuthenticator, zklogin};
@@ -99,16 +101,16 @@ fn blake2b(parts: &[&[u8]]) -> [u8; 32] {
 /// `aliases` are the addresses each signer may sign as instead, which the
 /// caller reads from the store; empty means none.
 pub fn verify_signatures(
-    tx: &SenderSignedData<'_, impl DigestState>,
+    tx: &SenderSignedData<'_, impl TxState>,
     signatures: &[ParsedSignature<'_>],
     epoch: u64,
     verifier: &Verifier,
     aliases: &[(SuiAddress, &[SuiAddress])],
     bump: &Bump,
 ) -> Result<(), Error> {
-    let data = &tx.data;
-    let sponsor = (data.gas_data.owner != data.sender).then_some(*data.gas_data.owner);
-    let required = [Some(*data.sender), sponsor];
+    let data = &tx.data();
+    let sponsor = (data.gas_data().owner != data.sender()).then_some(*data.gas_data().owner);
+    let required = [Some(*data.sender()), sponsor];
     let required_count = required.iter().flatten().count();
     if signatures.len() != required_count {
         return Err(Error::new(
@@ -120,7 +122,7 @@ pub fn verify_signatures(
         ));
     }
     // User transactions were checked not to be system transactions.
-    if !matches!(data.kind, TransactionKind::ProgrammableTransaction(_)) {
+    if !matches!(data.kind(), TransactionKind::ProgrammableTransaction(_)) {
         return Ok(());
     }
 
@@ -161,7 +163,7 @@ pub fn verify_signatures(
     }
 
     // The intent message is the intent's three bytes, then the data.
-    let digest = blake2b(&[&[0, 0, 0], data.bytes]);
+    let digest = blake2b(&[&[0, 0, 0], data.bytes()]);
     for (address, i) in &by_signer {
         verify_authenticator(&signatures[*i], address, epoch, &digest, verifier)?;
     }

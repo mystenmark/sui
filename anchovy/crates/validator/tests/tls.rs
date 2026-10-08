@@ -102,6 +102,7 @@ async fn serve(key: NetworkKey) -> SocketAddr {
             messages::base::Digest::new([0; 32]),
             1000,
             1,
+            [],
         ));
         validator::serve(listener, &key, epoch, std::future::pending())
             .await

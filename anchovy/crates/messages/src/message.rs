@@ -12,24 +12,31 @@ use crate::base::Digest;
 use crate::error::{ParseError, Result};
 use crate::reader::Reader;
 
-/// A type that can be parsed from BCS into a borrowed view.
+/// A borrowed view type a [`Message`] can hold.
 ///
 /// # Safety
 /// `shrink` must be implemented as `v`, which the compiler accepts only if
 /// `View` is covariant in its lifetime. [`Message`] relies on that.
-/// Everything `parse` puts in the arena must have an alignment of at most
-/// `ARENA_ALIGN`; `Alloc::slice` refuses larger ones at compile time.
 pub unsafe trait Wire: 'static {
     type View<'a>: Copy + 'a;
 
+    fn shrink<'l, 's: 'l>(v: &'l Self::View<'s>) -> &'l Self::View<'l>;
+}
+
+/// A [`Wire`] type that can be parsed from BCS. Separate, as some views are
+/// only reached from others (a transaction in a checked state, from a
+/// parsed one), and must not be parsed into.
+///
+/// # Safety
+/// Everything `parse` puts in the arena must have an alignment of at most
+/// `ARENA_ALIGN`; `Alloc::slice` refuses larger ones at compile time.
+pub unsafe trait Parse: Wire {
     /// How much arena a single-pass parse reserves, in sixteenths of the
     /// wire size. Picked per type from mainnet data so that about 99% of
     /// messages fit; the rest are parsed again with a measured arena.
     const ARENA_GUESS_SIXTEENTHS: usize;
 
     fn parse<'a, A: Alloc<'a>>(r: &mut Reader<'a>, a: &mut A) -> Result<Self::View<'a>>;
-
-    fn shrink<'l, 's: 'l>(v: &'l Self::View<'s>) -> &'l Self::View<'l>;
 }
 
 /// The bytes of one message as read off the wire. Never touched after
@@ -104,7 +111,7 @@ unsafe impl<T: Wire> Send for Message<T> where for<'a> T::View<'a>: Send {}
 // SAFETY: as above.
 unsafe impl<T: Wire> Sync for Message<T> where for<'a> T::View<'a>: Sync {}
 
-impl<T: Wire> Message<T> {
+impl<T: Parse> Message<T> {
     /// Parses `wire` as exactly one `T`. On failure the buffer is handed back.
     ///
     /// One pass into an arena guessed from the wire size; if the guess is
@@ -192,7 +199,9 @@ impl<T: Wire> Message<T> {
         }
         Ok((view, arena, build.used()))
     }
+}
 
+impl<T: Wire> Message<T> {
     /// Converts the view, keeping the buffers it points into.
     #[inline]
     pub(crate) fn map<U: Wire>(self, f: impl ViewMap<T, U>) -> Message<U> {

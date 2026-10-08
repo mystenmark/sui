@@ -28,7 +28,7 @@ use messages::build::transaction::{
 };
 use messages::build::type_tag::TypeTag;
 use messages::{
-    Message, Wire, checkpoint, effects, object, signature, system_transaction, transaction,
+    Message, Parse, checkpoint, effects, object, signature, system_transaction, transaction,
     type_tag,
 };
 use serde::Serialize;
@@ -38,7 +38,7 @@ fn wire_len<T: Serialize>(value: &T) -> usize {
 }
 
 /// The length of the smallest value, which its view parser must also accept.
-fn parsed_wire_len<T: Wire, B: Serialize>(value: &B) -> usize {
+fn parsed_wire_len<T: Parse, B: Serialize>(value: &B) -> usize {
     let bytes = bcs::to_bytes(value).unwrap();
     let len = bytes.len();
     Message::<T>::parse(bytes).unwrap_or_else(|(e, _)| panic!("{e}"));

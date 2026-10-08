@@ -22,7 +22,7 @@ use tonic::{Request, Response, Status};
 
 use crate::codec::Encoded;
 use crate::epoch::EpochState;
-use crate::processors::{ValidateTransactions, Validated};
+use crate::processors::{self, Rejected, Validated};
 use crate::proto::{
     RawSubmitTxRequest, RawSubmitTxResponse, RawValidatorHealthRequest, RawValidatorHealthResponse,
     RawWaitForEffectsRequest, RawWaitForEffectsResponse, SubmitTxType,
@@ -31,11 +31,14 @@ use crate::service::validator_server::{self, ValidatorServer};
 
 pub struct Validator {
     epoch: Arc<EpochState>,
-    transactions: Queue<ValidateTransactions>,
+    transactions: Queue<processors::Request<DigestPending>>,
 }
 
 impl Validator {
-    pub fn new(epoch: Arc<EpochState>, transactions: Queue<ValidateTransactions>) -> Validator {
+    pub fn new(
+        epoch: Arc<EpochState>,
+        transactions: Queue<processors::Request<DigestPending>>,
+    ) -> Validator {
         Validator {
             epoch,
             transactions,
@@ -80,7 +83,7 @@ impl Validator {
     fn enqueue(
         &self,
         request: &RawSubmitTxRequest,
-    ) -> Result<oneshot::Receiver<Result<Validated, validation::Error>>, Status> {
+    ) -> Result<oneshot::Receiver<Result<Validated, Rejected>>, Status> {
         let mut transactions = Vec::with_capacity(request.transactions.len());
         for bytes in &request.transactions {
             let transaction = Message::<Transaction<DigestPending>>::parse(bytes.to_vec())
@@ -91,10 +94,11 @@ impl Validator {
         }
         let (reply, verdict) = oneshot::channel();
         self.transactions
-            .try_push(ValidateTransactions {
+            .try_push(processors::Request::new(
+                self.epoch.clone(),
                 transactions,
                 reply,
-            })
+            ))
             .map_err(|e| match e {
                 PushError::Full(_) => Status::resource_exhausted("validation queue full"),
                 PushError::Closed(_) => Status::unavailable("shutting down"),
@@ -103,15 +107,20 @@ impl Validator {
     }
 }
 
-fn validation_failure(e: &validation::Error) -> Status {
-    Status::invalid_argument(format!("{:?}: {}", e.kind, e.detail))
+fn rejection(rejected: &Rejected) -> Status {
+    match rejected {
+        Rejected::Invalid(e) => Status::invalid_argument(format!("{:?}: {}", e.kind, e.detail)),
+        Rejected::Overloaded => Status::resource_exhausted("signature verification queue full"),
+        Rejected::ShuttingDown => Status::unavailable("shutting down"),
+    }
 }
 
 #[tonic::async_trait]
 impl validator_server::Validator for Validator {
-    /// Decodes each transaction here, without its digest; validates and
-    /// hashes them on a processor, and fails the request if any is invalid,
-    /// as the reference does. What passes has no consensus to go to yet.
+    /// Decodes each transaction here, without its digest; validates, hashes
+    /// and verifies them on the processors, and fails the request if any is
+    /// invalid, as the reference does. What passes has no consensus to go to
+    /// yet.
     async fn submit_transaction(
         &self,
         request: Request<RawSubmitTxRequest>,
@@ -124,7 +133,7 @@ impl validator_server::Validator for Validator {
         self.enqueue(&request)?
             .await
             .map_err(|_| Status::internal("validation did not finish"))?
-            .map_err(|e| validation_failure(&e))?;
+            .map_err(|e| rejection(&e))?;
         Err(Status::unimplemented("consensus submission"))
     }
 

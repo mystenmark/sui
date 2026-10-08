@@ -89,10 +89,10 @@ fn walk_pt(pt: &ProgrammableTransaction<'_>, user: bool, out: &mut Walked) {
 
 /// Returns false for kinds this walk does not cover.
 fn walk(data: &TransactionData<'_>, out: &mut Walked) -> bool {
-    match &data.kind {
+    match &data.kind() {
         TransactionKind::ProgrammableTransaction(pt) => {
             walk_pt(pt, true, out);
-            for o in data.gas_data.payment {
+            for o in data.gas_data().payment {
                 if o.is_coin_reservation() {
                     out.coin_reservations.push(*o);
                 } else {
@@ -104,7 +104,7 @@ fn walk(data: &TransactionData<'_>, out: &mut Walked) -> bool {
         TransactionKind::ProgrammableSystemTransaction(pt) => {
             walk_pt(pt, false, out);
             // Reservations in the gas payment count for every kind.
-            for o in data.gas_data.payment {
+            for o in data.gas_data().payment {
                 if o.is_coin_reservation() {
                     out.coin_reservations.push(*o);
                 }
@@ -120,8 +120,8 @@ fn check(path: &Path, programmable: &mut usize, system: &mut usize) {
     bytes.remove(0);
     let checkpoint = Message::<CheckpointData>::parse(bytes).unwrap();
     for tx in checkpoint.get().transactions {
-        let data = &tx.transaction.data;
-        let index = &data.index;
+        let data = &tx.transaction.data();
+        let index = &data.index();
         let mut walked = Walked::default();
         if walk(data, &mut walked) {
             *programmable += 1;
@@ -139,7 +139,7 @@ fn check(path: &Path, programmable: &mut usize, system: &mut usize) {
         } else {
             *system += 1;
             assert!(index.owned_inputs.is_empty() && index.packages.is_empty());
-            if let TransactionKind::ConsensusCommitPrologueV4(_) = data.kind {
+            if let TransactionKind::ConsensusCommitPrologueV4(_) = data.kind() {
                 let [clock] = index.shared_inputs else {
                     panic!("a prologue writes the clock and nothing else")
                 };

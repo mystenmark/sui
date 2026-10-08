@@ -1,20 +1,21 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! A warm validation processor accepts a transaction without touching the
-//! heap. Its own binary, for the counting global allocator.
+//! Warm processors accept an Ed25519 or Secp256k1 transaction, validation
+//! and signature verification both, without touching the heap, and answer
+//! a resubmission from the signature cache without it either. Its own
+//! binary, for the counting global allocator.
+
+mod common;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+
 use std::sync::Arc;
 
-use messages::Message;
-use messages::base::Digest;
-use messages::transaction::{DigestPending, Transaction};
-use protocol_config::{Chain, ProtocolVersion};
 use tokio::sync::oneshot;
 use validator::epoch::EpochState;
-use validator::processors::{TransactionValidator, ValidateTransactions};
+use validator::processors::{Request, SignatureVerifier, TransactionValidator, answer};
 use workqueue::Processor;
 
 struct Counting;
@@ -39,71 +40,79 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static COUNTING: Counting = Counting;
 
-fn unhex(s: &str) -> Vec<u8> {
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-        .collect()
-}
-
-fn as_transaction(data: &[u8]) -> Vec<u8> {
-    let mut out = vec![1, 0, 0, 0];
-    out.extend_from_slice(data);
-    out.push(0);
-    out
-}
-
-/// Validates `transaction`, counting the processor's allocations; the work
-/// item and its reply channel are the handler's, made before counting.
-fn process(validator: &mut TransactionValidator, transaction: &[u8]) -> (bool, usize) {
-    let transaction = Message::<Transaction<DigestPending>>::parse(transaction.to_vec())
-        .map_err(|(e, _)| e)
-        .unwrap();
+/// Runs one transaction through the processors, each one's output the next
+/// one's input, counting their allocations; the request and its reply
+/// channel are the handler's, made before counting. Returns whether it was
+/// accepted.
+fn process(
+    epoch: &Arc<EpochState>,
+    validator: &mut TransactionValidator,
+    verifier: &mut SignatureVerifier,
+    case: &common::Case,
+) -> (bool, usize) {
     let (reply, verdict) = oneshot::channel();
-    let item = ValidateTransactions {
-        transactions: vec![transaction],
-        reply,
-    };
+    let request = Request::new(epoch.clone(), vec![case.parse().unwrap()], reply);
     let before = ALLOCATIONS.with(Cell::get);
-    validator.process(item);
+    if let Some(valid) = validator.process(request)
+        && let Some(verified) = verifier.process(valid)
+    {
+        answer(verified);
+    }
     let allocations = ALLOCATIONS.with(Cell::get) - before;
     (verdict.blocking_recv().unwrap().is_ok(), allocations)
 }
 
-#[test]
-fn accepting_allocates_nothing_once_warm() {
-    let epoch = Arc::new(EpochState::new(
-        Chain::Unknown,
-        ProtocolVersion::MAX.as_u64(),
-        5,
-        Digest::new([0x11; 32]),
-        1000,
-        4,
-    ));
-    let mut validator = TransactionValidator::new(epoch);
-    let transactions: Vec<Vec<u8>> = include_str!("../../validation/tests/data/validity.vectors")
-        .lines()
-        .filter_map(|line| {
-            let fields: Vec<&str> = line.split(' ').collect();
-            let ["tx", _, "tx_data", _, hex] = fields[..] else {
-                return None;
-            };
-            let bytes = as_transaction(&unhex(hex));
-            Message::<Transaction<DigestPending>>::parse(bytes.clone()).ok()?;
-            Some(bytes)
-        })
-        .collect();
+/// Whether every signature is a single Ed25519 or Secp256k1 one, by flag.
+fn plain_signatures(case: &common::Case) -> bool {
+    let transaction = case.parse().unwrap();
+    transaction
+        .get()
+        .0
+        .tx_signatures()
+        .iter()
+        .all(|s| matches!(s.0.first(), Some(0 | 1)))
+}
 
-    for transaction in &transactions {
-        process(&mut validator, transaction);
+#[test]
+fn verifying_allocates_nothing_once_warm() {
+    let (cases, epoch) = common::mainnet();
+    let epoch = common::mainnet_epoch(epoch);
+    let mut validator = TransactionValidator::new();
+    let mut warm = SignatureVerifier::new();
+    for case in &cases {
+        process(&epoch, &mut validator, &mut warm, case);
     }
     let mut accepted = 0;
-    for transaction in &transactions {
-        let (ok, allocations) = process(&mut validator, transaction);
-        if ok {
+    for case in &cases {
+        // A cache that has not seen it, made before counting: it is verified.
+        let mut verifier = SignatureVerifier::new();
+        let (ok, allocations) = process(&epoch, &mut validator, &mut verifier, case);
+        assert_eq!(verifier.cache_stats().0, 0);
+        if ok && plain_signatures(case) {
             accepted += 1;
-            assert_eq!(allocations, 0, "accepted transaction {accepted}");
+            assert_eq!(allocations, 0, "{}", case.label);
         }
     }
-    assert!(accepted > 50, "only {accepted} accepted");
+    assert!(accepted > 0, "no Ed25519 or Secp256k1 transaction accepted");
+    eprintln!("{accepted} of {} accepted without allocating", cases.len());
+}
+
+#[test]
+fn a_cache_hit_allocates_nothing() {
+    let (cases, epoch) = common::mainnet();
+    let epoch = common::mainnet_epoch(epoch);
+    let mut validator = TransactionValidator::new();
+    let mut verifier = SignatureVerifier::new();
+    let accepted: Vec<_> = cases
+        .iter()
+        .filter(|case| process(&epoch, &mut validator, &mut verifier, case).0)
+        .collect();
+    assert!(!accepted.is_empty());
+    let (hits, _) = verifier.cache_stats();
+    for case in &accepted {
+        let (ok, allocations) = process(&epoch, &mut validator, &mut verifier, case);
+        assert!(ok);
+        assert_eq!(allocations, 0, "{}", case.label);
+    }
+    assert_eq!(verifier.cache_stats().0, hits + accepted.len() as u64);
 }

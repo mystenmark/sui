@@ -6,6 +6,7 @@
 
 use messages::base::Digest;
 use protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
+use validation::verify::{JWK, JwkId, Verifier};
 
 pub struct EpochState {
     pub config: ProtocolConfig,
@@ -15,6 +16,8 @@ pub struct EpochState {
     pub chain_identifier: Digest,
     pub reference_gas_price: u64,
     pub committee_size: u32,
+    /// Verifies signatures under the epoch's protocol config and JWKs.
+    pub verifier: Verifier,
 }
 
 impl EpochState {
@@ -25,9 +28,12 @@ impl EpochState {
         chain_identifier: Digest,
         reference_gas_price: u64,
         committee_size: u32,
+        jwks: impl IntoIterator<Item = (JwkId, JWK)>,
     ) -> EpochState {
+        let config = ProtocolConfig::get_for_version(ProtocolVersion::new(protocol_version), chain);
         EpochState {
-            config: ProtocolConfig::get_for_version(ProtocolVersion::new(protocol_version), chain),
+            verifier: Verifier::new(&config, chain, jwks),
+            config,
             chain,
             epoch,
             chain_identifier,

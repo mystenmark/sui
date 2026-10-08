@@ -3,6 +3,7 @@
 
 //! The validator's gRPC service, `sui.validator.Validator`.
 
+pub mod checks;
 pub mod codec;
 pub mod epoch;
 pub mod processors;
@@ -26,7 +27,7 @@ pub async fn serve(
     epoch: std::sync::Arc<epoch::EpochState>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
-    let processors = processors::Processors::start(&epoch, processors::VALIDATION_QUEUE);
+    let processors = processors::Processors::start(processors::VALIDATION_QUEUE);
     let validator = Validator::new(epoch, processors.transactions.clone());
     let served = tonic::transport::Server::builder()
         .add_service(validator.into_service())

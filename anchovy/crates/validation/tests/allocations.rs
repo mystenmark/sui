@@ -89,7 +89,7 @@ fn allocations_per_transaction() {
         };
         for tx in checkpoint.transactions {
             let signed = &tx.transaction;
-            let scheme = match signed.tx_signatures.first().map(|s| s.0[0]) {
+            let scheme = match signed.tx_signatures().first().map(|s| s.0[0]) {
                 Some(0) => "ed25519",
                 Some(1) => "secp256k1",
                 Some(2) => "secp256r1",
@@ -113,7 +113,7 @@ fn allocations_per_transaction() {
                     "{n} allocations: arena chunks {} bytes {}, price {}",
                     bump.chunks(),
                     bump.allocated(),
-                    signed.data.gas_data.price
+                    signed.data().gas_data().price
                 );
             }
             seen.entry(("validity_check", outcome, scheme.clone()))

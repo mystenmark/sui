@@ -444,10 +444,10 @@ impl From<&view::TransactionExpiration<'_>> for TransactionExpiration {
 impl From<&view::TransactionData<'_>> for TransactionDataV1 {
     fn from(v: &view::TransactionData<'_>) -> Self {
         TransactionDataV1 {
-            kind: TransactionKind::from(&v.kind),
-            sender: SuiAddress::from(v.sender),
-            gas_data: GasData::from(&v.gas_data),
-            expiration: TransactionExpiration::from(&v.expiration),
+            kind: TransactionKind::from(v.kind()),
+            sender: SuiAddress::from(v.sender()),
+            gas_data: GasData::from(v.gas_data()),
+            expiration: TransactionExpiration::from(v.expiration()),
         }
     }
 }
@@ -472,10 +472,14 @@ impl From<&view::SenderSignedData<'_>> for SenderSignedData {
     fn from(v: &view::SenderSignedData<'_>) -> Self {
         SenderSignedData(SenderSignedTransaction {
             intent_message: IntentMessage {
-                intent: Intent::from(v.intent),
-                value: TransactionData::from(&v.data),
+                intent: Intent::from(v.intent()),
+                value: TransactionData::from(v.data()),
             },
-            tx_signatures: v.tx_signatures.iter().map(GenericSignature::from).collect(),
+            tx_signatures: v
+                .tx_signatures()
+                .iter()
+                .map(GenericSignature::from)
+                .collect(),
         })
     }
 }
