@@ -23,7 +23,7 @@ pub use fastcrypto_zkp::bn254::zk_login::{JWK, JwkId};
 use fastcrypto_zkp::bn254::zk_login_api::{ZkLoginCircuitMode, ZkLoginEnv};
 use messages::base::SuiAddress;
 use messages::signature::{CompressedSignature, MultiSig, PublicKey};
-use messages::transaction::{DigestState, SenderSignedData, TransactionKind};
+use messages::transaction::{SenderSignedData, TransactionKind, TxState};
 use protocol_config::{Chain, ProtocolConfig};
 
 use crate::signature::{ParsedSignature, Passkey, ZkLoginAuthenticator, zklogin};
@@ -101,7 +101,7 @@ fn blake2b(parts: &[&[u8]]) -> [u8; 32] {
 /// `aliases` are the addresses each signer may sign as instead, which the
 /// caller reads from the store; empty means none.
 pub fn verify_signatures(
-    tx: &SenderSignedData<'_, impl DigestState>,
+    tx: &SenderSignedData<'_, impl TxState>,
     signatures: &[ParsedSignature<'_>],
     epoch: u64,
     verifier: &Verifier,

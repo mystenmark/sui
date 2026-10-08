@@ -13,7 +13,7 @@ use messages::effects::{TransactionEffects, TransactionEvents};
 use messages::message::{MAX_ARENA_PER_WIRE_BYTE, MIN_ARENA_GUESS};
 use messages::object::Object;
 use messages::transaction::TransactionData;
-use messages::{Message, Wire};
+use messages::{Message, Parse};
 
 struct Rng(u64);
 
@@ -56,7 +56,7 @@ fn mutate(seed: &[u8], rng: &mut Rng) -> Vec<u8> {
 }
 
 /// Parses `bytes` as `T` and checks what must hold whether or not it parses.
-fn parse_checked<T: Wire>(bytes: Vec<u8>) -> Option<Message<T>> {
+fn parse_checked<T: Parse>(bytes: Vec<u8>) -> Option<Message<T>> {
     let len = bytes.len();
     match Message::<T>::parse(bytes) {
         Ok(m) => {

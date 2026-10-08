@@ -30,7 +30,7 @@ use messages::tx_index::{
     SUI_RANDOMNESS_STATE_OBJECT_ID, SUI_SYSTEM_STATE_OBJECT_ID, TransactionIndex,
 };
 use messages::type_tag::TypeTag;
-use messages::{Message, ParseError, Wire};
+use messages::{Message, Parse, ParseError};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -38,7 +38,7 @@ use serde::de::DeserializeOwned;
 /// must convert back to it.
 fn check<T, B>(built: &B) -> Message<T>
 where
-    T: Wire,
+    T: Parse,
     B: Serialize + DeserializeOwned + PartialEq + Debug + for<'a, 'v> From<&'a T::View<'v>>,
 {
     let bytes = bcs::to_bytes(built).unwrap();

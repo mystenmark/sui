@@ -7,8 +7,7 @@
 
 use containers::Bump;
 use messages::transaction::{
-    CallArg, DigestState, SenderSignedData, TransactionExpiration, TransactionKind,
-    WithdrawalTypeArg,
+    CallArg, SenderSignedData, TransactionExpiration, TransactionKind, TxState, WithdrawalTypeArg,
 };
 use messages::type_tag::TypeTag;
 
@@ -29,7 +28,7 @@ fn malformed(what: &str) -> Error {
 }
 
 pub fn validity_check<'a>(
-    tx: &SenderSignedData<'a, impl DigestState>,
+    tx: &SenderSignedData<'a, impl TxState>,
     ctx: &Context<'_>,
     bump: &'a Bump,
 ) -> Result<Checked<'a>, Error> {
@@ -95,7 +94,7 @@ pub fn validity_check<'a>(
 /// durations) that are not checked here; such a transaction is rejected as
 /// a system transaction instead, with a different error.
 pub fn deserialization_checks<'a>(
-    tx: &SenderSignedData<'a, impl DigestState>,
+    tx: &SenderSignedData<'a, impl TxState>,
     bump: &'a Bump,
 ) -> Result<(&'a [ParsedSignature<'a>], usize), Error> {
     let intent = tx.intent();

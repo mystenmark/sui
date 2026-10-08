@@ -28,31 +28,35 @@ pub mod tx_index;
 pub mod type_tag;
 
 pub use error::{ParseError, Result};
-pub use message::{Message, Wire, WireBuf};
+pub use message::{Message, Parse, Wire, WireBuf};
 
-/// Implements [`Wire`] for a view type with an inherent `parse(r, a)`.
-/// `guess = N` sets the single-pass arena guess to `N / 16` of the wire size.
-/// `$ty<D>` implements it for every digest state of a transaction type.
+/// Implements [`Wire`] and [`message::Parse`] for a view type with an
+/// inherent `parse(r, a)`. `guess = N` sets the single-pass arena guess to
+/// `N / 16` of the wire size. `$ty<S>`, for a transaction type, implements
+/// `Wire` in every state and `Parse` in the states parsing produces.
 macro_rules! impl_wire {
     ($ty:ident) => {
         $crate::impl_wire!($ty, guess = 16);
     };
-    ($ty:ident<D>, guess = $sixteenths:expr) => {
+    ($ty:ident<S>, guess = $sixteenths:expr) => {
         // SAFETY: `shrink` is the identity, so `$ty` is covariant.
-        unsafe impl<D: $crate::transaction::DigestState> $crate::message::Wire for $ty<'static, D> {
-            type View<'a> = $ty<'a, D>;
+        unsafe impl<S: $crate::transaction::TxState> $crate::message::Wire for $ty<'static, S> {
+            type View<'a> = $ty<'a, S>;
 
+            fn shrink<'l, 's: 'l>(v: &'l $ty<'s, S>) -> &'l $ty<'l, S> {
+                v
+            }
+        }
+
+        // SAFETY: the parsers reserve through `Alloc::slice`.
+        unsafe impl<S: $crate::transaction::ParseState> $crate::message::Parse for $ty<'static, S> {
             const ARENA_GUESS_SIXTEENTHS: usize = $sixteenths;
 
             fn parse<'a, A: $crate::arena::Alloc<'a>>(
                 r: &mut $crate::reader::Reader<'a>,
                 a: &mut A,
-            ) -> $crate::error::Result<$ty<'a, D>> {
+            ) -> $crate::error::Result<$ty<'a, S>> {
                 $ty::parse(r, a)
-            }
-
-            fn shrink<'l, 's: 'l>(v: &'l $ty<'s, D>) -> &'l $ty<'l, D> {
-                v
             }
         }
     };
@@ -61,6 +65,13 @@ macro_rules! impl_wire {
         unsafe impl $crate::message::Wire for $ty<'static> {
             type View<'a> = $ty<'a>;
 
+            fn shrink<'l, 's: 'l>(v: &'l $ty<'s>) -> &'l $ty<'l> {
+                v
+            }
+        }
+
+        // SAFETY: the parsers reserve through `Alloc::slice`.
+        unsafe impl $crate::message::Parse for $ty<'static> {
             const ARENA_GUESS_SIXTEENTHS: usize = $sixteenths;
 
             fn parse<'a, A: $crate::arena::Alloc<'a>>(
@@ -68,10 +79,6 @@ macro_rules! impl_wire {
                 a: &mut A,
             ) -> $crate::error::Result<$ty<'a>> {
                 $ty::parse(r, a)
-            }
-
-            fn shrink<'l, 's: 'l>(v: &'l $ty<'s>) -> &'l $ty<'l> {
-                v
             }
         }
     };
