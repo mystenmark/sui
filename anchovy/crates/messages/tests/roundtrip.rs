@@ -55,7 +55,7 @@ fn check_checkpoint(path: &Path, counts: &mut Counts) {
     for tx in checkpoint.get().transactions {
         counts.transactions += 1;
         check::<TransactionData<'static>, build::transaction::TransactionData>(
-            tx.transaction.data.bytes,
+            tx.transaction.data().bytes(),
         );
         check::<TransactionEffects<'static>, build::effects::TransactionEffects>(tx.effects.bytes);
         if let Some(events) = tx.events {
@@ -170,7 +170,7 @@ fn transaction_envelope() {
     bytes.remove(0);
     let checkpoint = Message::<messages::checkpoint::CheckpointData>::parse(bytes).unwrap();
     for tx in checkpoint.get().transactions {
-        let wire = tx.transaction.bytes.to_vec();
+        let wire = tx.transaction.bytes().to_vec();
         let envelope = Message::<Transaction<DigestReady>>::parse(wire.clone()).unwrap();
         let bare = Message::<SenderSignedData>::parse(wire).unwrap();
         assert_eq!(envelope.get().0, *bare.get());
@@ -192,13 +192,13 @@ fn transaction_digest_computed_later() {
     let transactions = checkpoint.get().transactions;
     let pending: Vec<Message<Transaction<DigestPending>>> = transactions
         .iter()
-        .map(|tx| Message::parse(tx.transaction.bytes.to_vec()).unwrap())
+        .map(|tx| Message::parse(tx.transaction.bytes().to_vec()).unwrap())
         .collect();
     let singly: Vec<Message<Transaction<DigestReady>>> = transactions
         .iter()
         .map(|tx| {
             let pending: Message<Transaction<DigestPending>> =
-                Message::parse(tx.transaction.bytes.to_vec()).unwrap();
+                Message::parse(tx.transaction.bytes().to_vec()).unwrap();
             pending.with_digest()
         })
         .collect();

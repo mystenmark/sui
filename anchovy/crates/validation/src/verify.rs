@@ -108,9 +108,9 @@ pub fn verify_signatures(
     aliases: &[(SuiAddress, &[SuiAddress])],
     bump: &Bump,
 ) -> Result<(), Error> {
-    let data = &tx.data;
-    let sponsor = (data.gas_data.owner != data.sender).then_some(*data.gas_data.owner);
-    let required = [Some(*data.sender), sponsor];
+    let data = &tx.data();
+    let sponsor = (data.gas_data().owner != data.sender()).then_some(*data.gas_data().owner);
+    let required = [Some(*data.sender()), sponsor];
     let required_count = required.iter().flatten().count();
     if signatures.len() != required_count {
         return Err(Error::new(
@@ -122,7 +122,7 @@ pub fn verify_signatures(
         ));
     }
     // User transactions were checked not to be system transactions.
-    if !matches!(data.kind, TransactionKind::ProgrammableTransaction(_)) {
+    if !matches!(data.kind(), TransactionKind::ProgrammableTransaction(_)) {
         return Ok(());
     }
 
@@ -163,7 +163,7 @@ pub fn verify_signatures(
     }
 
     // The intent message is the intent's three bytes, then the data.
-    let digest = blake2b(&[&[0, 0, 0], data.bytes]);
+    let digest = blake2b(&[&[0, 0, 0], data.bytes()]);
     for (address, i) in &by_signer {
         verify_authenticator(&signatures[*i], address, epoch, &digest, verifier)?;
     }

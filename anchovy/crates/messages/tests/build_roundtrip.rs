@@ -523,8 +523,8 @@ fn programmable_transactions() {
         let built = transaction(kind, 3);
         let message = check::<TransactionData, tx::TransactionData>(&built);
         let data = message.get();
-        expect_digest("TransactionData", data.bytes, *data.digest());
-        check_programmable_index(&data.index, user);
+        expect_digest("TransactionData", data.bytes(), *data.digest());
+        check_programmable_index(data.index(), user);
         let calls: Vec<usize> = data.move_calls().map(|(i, _)| i).collect();
         assert_eq!(calls, if user { vec![0, 8] } else { vec![] });
     }
@@ -535,7 +535,7 @@ fn system_transactions() {
     for (kind, shared) in system_kinds() {
         let built = transaction(kind, 0);
         let message = check::<TransactionData, tx::TransactionData>(&built);
-        let index = &message.get().index;
+        let index = &message.get().index();
         assert_eq!(index.shared_inputs, shared, "{built:?}");
         assert!(index.owned_inputs.is_empty() && index.packages.is_empty());
         assert!(index.receiving.is_empty() && index.move_calls.is_empty());
@@ -557,9 +557,9 @@ fn expirations_and_sender_signed_data() {
         let data = message.get();
         assert_eq!(
             *data.digest(),
-            Digest::of("TransactionData", data.data.bytes)
+            Digest::of("TransactionData", data.data().bytes())
         );
-        assert_eq!(data.tx_signatures.len(), 2);
+        assert_eq!(data.tx_signatures().len(), 2);
     }
     // The envelope adds no bytes, so it parses as the data it wraps.
     let envelope = signed(tx::TransactionKind::ChangeEpoch(change_epoch()), 1);
@@ -1245,8 +1245,8 @@ fn executed() -> [(tx::Transaction, fx::TransactionEffects); 2] {
 fn check_executed(transaction: &SenderSignedData<'_>, effects: &TransactionEffects<'_>) {
     expect_digest(
         "TransactionData",
-        transaction.data.bytes,
-        *transaction.data.digest(),
+        transaction.data().bytes(),
+        *transaction.data().digest(),
     );
     expect_digest("TransactionEffects", effects.bytes, effects.digest);
 }
@@ -1307,7 +1307,7 @@ fn checkpoint_data() {
             expect_digest("Object", object.bytes, object.digest());
         }
     }
-    check_programmable_index(&view.transactions[0].transaction.data.index, true);
+    check_programmable_index(view.transactions[0].transaction.data().index(), true);
 }
 
 // Signatures and type tags.

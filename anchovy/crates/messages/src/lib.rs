@@ -99,7 +99,7 @@ mod message_identity {
             .get()
             .transactions
             .iter()
-            .map(|tx| Message::<SenderSignedData>::parse(tx.transaction.bytes.to_vec()).unwrap())
+            .map(|tx| Message::<SenderSignedData>::parse(tx.transaction.bytes().to_vec()).unwrap())
             .collect();
         let again = Message::<SenderSignedData>::parse(parsed[0].wire_bytes().to_vec()).unwrap();
         assert_eq!(parsed[0], again);

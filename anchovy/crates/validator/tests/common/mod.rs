@@ -92,7 +92,7 @@ pub fn mainnet() -> (Vec<Case>, u64) {
         .enumerate()
         .map(|(i, tx)| Case {
             label: format!("mainnet {i}"),
-            bytes: tx.transaction.bytes.to_vec(),
+            bytes: tx.transaction.bytes().to_vec(),
         })
         .collect();
     (cases, view.checkpoint_summary.data.epoch)

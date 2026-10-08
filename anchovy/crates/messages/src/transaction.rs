@@ -580,19 +580,28 @@ impl DigestState for DigestReady {
 
 /// `TransactionData::V1`, the only version.
 ///
+/// Fields are private and read through getters, so that every value, as
+/// parsed, agrees with its bytes, and a `DigestReady` one with its digest:
+/// a copy cannot have a field replaced.
+///
+/// ```compile_fail,E0616
+/// # use messages::transaction::TransactionData;
+/// fn forge<'a>(mut data: TransactionData<'a>, other: TransactionData<'a>) {
+///     data.sender = other.sender();
+/// }
+/// ```
+///
 /// `repr(C)` so that the digest states lay out alike, which
 /// `Message::with_digests` relies on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(C)]
 pub struct TransactionData<'a, D: DigestState = DigestReady> {
-    /// The exact encoding, which is what gets hashed and signed.
-    pub bytes: &'a [u8],
-    pub kind: TransactionKind<'a>,
-    pub sender: &'a SuiAddress,
-    pub gas_data: GasData<'a>,
-    pub expiration: TransactionExpiration<'a>,
-    /// Derived from the fields above while parsing.
-    pub index: TransactionIndex<'a>,
+    bytes: &'a [u8],
+    kind: TransactionKind<'a>,
+    sender: &'a SuiAddress,
+    gas_data: GasData<'a>,
+    expiration: TransactionExpiration<'a>,
+    index: TransactionIndex<'a>,
     /// Zero until computed; readable only in `DigestReady`.
     digest: TransactionDigest,
     state: PhantomData<D>,
@@ -605,6 +614,32 @@ impl TransactionData<'_, DigestReady> {
 }
 
 impl<'a, D: DigestState> TransactionData<'a, D> {
+    /// The exact encoding, which is what gets hashed and signed.
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    pub fn kind(&self) -> &TransactionKind<'a> {
+        &self.kind
+    }
+
+    pub fn sender(&self) -> &'a SuiAddress {
+        self.sender
+    }
+
+    pub fn gas_data(&self) -> &GasData<'a> {
+        &self.gas_data
+    }
+
+    pub fn expiration(&self) -> &TransactionExpiration<'a> {
+        &self.expiration
+    }
+
+    /// Derived from the other fields while parsing.
+    pub fn index(&self) -> &TransactionIndex<'a> {
+        &self.index
+    }
+
     /// The `MoveCall` commands of a user transaction, with their positions.
     pub fn move_calls(&self) -> impl Iterator<Item = (usize, &ProgrammableMoveCall<'a>)> {
         let commands = match &self.kind {
@@ -693,14 +728,21 @@ impl<'a> GenericSignature<'a> {
 
 /// The one `SenderSignedTransaction` a `SenderSignedData` holds.
 /// `repr(C)`: see `TransactionData`.
+/// Fields are private: see `TransactionData`.
+///
+/// ```compile_fail,E0616
+/// # use messages::transaction::SenderSignedData;
+/// fn forge<'a>(mut signed: SenderSignedData<'a>, other: SenderSignedData<'a>) {
+///     signed.tx_signatures = other.tx_signatures();
+/// }
+/// ```
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(C)]
 pub struct SenderSignedData<'a, D: DigestState = DigestReady> {
-    /// The exact encoding, as it is stored and sent.
-    pub bytes: &'a [u8],
-    pub intent: &'a Intent,
-    pub data: TransactionData<'a, D>,
-    pub tx_signatures: &'a [GenericSignature<'a>],
+    bytes: &'a [u8],
+    intent: &'a Intent,
+    data: TransactionData<'a, D>,
+    tx_signatures: &'a [GenericSignature<'a>],
 }
 
 impl SenderSignedData<'_, DigestReady> {
@@ -711,6 +753,23 @@ impl SenderSignedData<'_, DigestReady> {
 }
 
 impl<'a, D: DigestState> SenderSignedData<'a, D> {
+    /// The exact encoding, as it is stored and sent.
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    pub fn intent(&self) -> &'a Intent {
+        self.intent
+    }
+
+    pub fn data(&self) -> &TransactionData<'a, D> {
+        &self.data
+    }
+
+    pub fn tx_signatures(&self) -> &'a [GenericSignature<'a>] {
+        self.tx_signatures
+    }
+
     /// A length, an intent, a `TransactionData` (a version, an empty
     /// `EndOfEpochTransaction`, a sender, gas data with no payment, no
     /// expiration) and a length.

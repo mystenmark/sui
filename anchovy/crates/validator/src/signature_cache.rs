@@ -14,7 +14,7 @@ use containers::DigestHasher;
 use hashbrown::HashSet;
 use messages::Message;
 use messages::base::Digest;
-use messages::transaction::{DigestReady, SenderSignedData, Transaction};
+use messages::transaction::{DigestReady, GenericSignature, Intent, SenderSignedData, Transaction};
 
 use crate::epoch::EpochState;
 
@@ -103,15 +103,28 @@ impl SignatureCache {
 /// parsed. Signatures are length-prefixed, so no two lists of them hash
 /// alike.
 fn key(epoch: u64, transaction: &SenderSignedData<'_, DigestReady>) -> Digest {
+    key_of(
+        epoch,
+        transaction.digest(),
+        *transaction.intent(),
+        transaction.tx_signatures(),
+    )
+}
+
+fn key_of(
+    epoch: u64,
+    digest: &Digest,
+    intent: Intent,
+    signatures: &[GenericSignature<'_>],
+) -> Digest {
     use blake2::Digest as _;
-    let intent = transaction.intent;
     let mut hasher = Blake2b::<U32>::new();
     hasher.update(DOMAIN);
     hasher.update(epoch.to_le_bytes());
-    hasher.update(transaction.digest().bytes);
+    hasher.update(digest.bytes);
     hasher.update([intent.scope, intent.version, intent.app_id]);
-    hasher.update((transaction.tx_signatures.len() as u64).to_le_bytes());
-    for signature in transaction.tx_signatures {
+    hasher.update((signatures.len() as u64).to_le_bytes());
+    for signature in signatures {
         hasher.update((signature.0.len() as u64).to_le_bytes());
         hasher.update(signature.0);
     }
@@ -123,7 +136,6 @@ mod tests {
     use std::cell::Cell;
 
     use messages::checkpoint::CheckpointData;
-    use messages::transaction::GenericSignature;
     use protocol_config::{Chain, ProtocolVersion};
 
     use super::*;
@@ -153,7 +165,7 @@ mod tests {
             .transactions
             .iter()
             .map(|t| {
-                Message::parse(t.transaction.bytes.to_vec())
+                Message::parse(t.transaction.bytes().to_vec())
                     .map_err(|(e, _)| e)
                     .unwrap()
             })
@@ -267,16 +279,10 @@ mod tests {
     #[test]
     fn the_key_is_every_signature_byte_in_order() {
         let transactions = transactions();
-        let original = transactions[0].get().0;
+        let original = &transactions[0].get().0;
         let [a, b] = [&b"abc"[..], b"de"].map(GenericSignature);
         let key_with = |epoch: u64, signatures: &[GenericSignature<'_>]| {
-            key(
-                epoch,
-                &SenderSignedData {
-                    tx_signatures: signatures,
-                    ..original
-                },
-            )
+            key_of(epoch, original.digest(), *original.intent(), signatures)
         };
         let base = key_with(5, &[a, b]);
         assert_ne!(base, key_with(5, &[b, a]), "order");

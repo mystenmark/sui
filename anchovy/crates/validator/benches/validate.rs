@@ -91,10 +91,10 @@ fn load() -> (Vec<Bytes>, u64) {
         // system ones.
         for tx in view.transactions {
             if matches!(
-                tx.transaction.data.kind,
+                tx.transaction.data().kind(),
                 TransactionKind::ProgrammableTransaction(_)
             ) {
-                transactions.push(Bytes::copy_from_slice(tx.transaction.bytes));
+                transactions.push(Bytes::copy_from_slice(tx.transaction.bytes()));
             }
         }
     }
@@ -187,7 +187,7 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
             for m in &decoded {
                 bump.reset();
                 let _ = black_box(validation::transaction_data::validity_check(
-                    &m.get().0.data,
+                    m.get().0.data(),
                     &epoch.context(),
                     &bump,
                 ));
@@ -226,7 +226,7 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
     ] {
         let group: Vec<_> = decoded
             .iter()
-            .filter(|m| m.get().0.tx_signatures.first().and_then(|s| s.0.first()) == Some(&flag))
+            .filter(|m| m.get().0.tx_signatures().first().and_then(|s| s.0.first()) == Some(&flag))
             .collect();
         if group.is_empty() {
             continue;
@@ -275,7 +275,7 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
         "Blake2b of TransactionData",
         per_tx(txs, 50, |_| {
             for m in &decoded {
-                black_box(Digest::of("TransactionData", m.get().0.data.bytes));
+                black_box(Digest::of("TransactionData", m.get().0.data().bytes()));
             }
         }),
     );
@@ -312,21 +312,29 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
     let (signatures, verification) = workqueue::queue(1);
     let mut validator = TransactionValidator::new(epoch.clone(), signatures);
     let mut verifier = SignatureVerifier::new(epoch.clone());
-    row(
-        "decode + both processors (+ digest)",
-        per_tx(txs, 5, |txs| {
-            for bytes in txs {
-                let (reply, verdict) = oneshot::channel();
-                validator.process(ValidateTransactions {
-                    transactions: vec![decode(bytes)],
-                    reply,
-                });
-                if let Some(next) = verification.try_pop() {
-                    verifier.process(next);
-                }
-                black_box(verdict.blocking_recv().unwrap().is_ok());
+    let mut both = |verifier: &mut SignatureVerifier, txs: &[Bytes]| {
+        for bytes in txs {
+            let (reply, verdict) = oneshot::channel();
+            validator.process(ValidateTransactions {
+                transactions: vec![decode(bytes)],
+                reply,
+            });
+            if let Some(next) = verification.try_pop() {
+                verifier.process(next);
             }
+            black_box(verdict.blocking_recv().unwrap().is_ok());
+        }
+    };
+    row(
+        "decode + both processors, cache cold",
+        per_tx(txs, 5, |txs| {
+            // Its two tables' allocation is timed too: ~5 ns a transaction.
+            both(&mut SignatureVerifier::new(epoch.clone()), txs);
         }),
+    );
+    row(
+        "decode + both processors, signatures cached",
+        per_tx(txs, 5, |txs| both(&mut verifier, txs)),
     );
 }
 

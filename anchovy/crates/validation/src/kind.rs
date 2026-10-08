@@ -42,7 +42,7 @@ pub fn validity_check(
             Err(unsupported(what))
         }
     };
-    match &tx.kind {
+    match &tx.kind() {
         TransactionKind::ProgrammableTransaction(pt) => {
             programmable_transaction(tx, pt, config, bump)
         }
@@ -145,7 +145,7 @@ fn programmable_transaction(
     // Owned and shared inputs, coin reservations aside, must be distinct;
     // packages the commands use count once each.
     let input_objects = distinct_input_objects(pt, bump)?;
-    let total = input_objects + tx.index.packages.len() + tx.index.receiving.len();
+    let total = input_objects + tx.index().packages.len() + tx.index().receiving.len();
     if total > config.max_input_objects() as usize {
         return Err(size_limit(
             "input and receiving objects",

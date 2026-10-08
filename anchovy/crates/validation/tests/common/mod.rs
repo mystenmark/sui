@@ -83,7 +83,9 @@ fn run(tx: &Tx, ctx: &Context<'_>, verifier: &Verifier) -> String {
             let bump = containers::Bump::with_capacity(4096);
             validation::transaction_data::validity_check(tx.data(), ctx, &bump)
         }
-        "gas_price" => validation::transaction_data::check_gas_price(tx.data().gas_data.price, ctx),
+        "gas_price" => {
+            validation::transaction_data::check_gas_price(tx.data().gas_data().price, ctx)
+        }
         "sender_signed" => {
             let Some(signed) = tx.signed() else {
                 return "TransactionDeserializationError".to_owned();

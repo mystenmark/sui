@@ -68,7 +68,7 @@ fn plain_signatures(case: &common::Case) -> bool {
     transaction
         .get()
         .0
-        .tx_signatures
+        .tx_signatures()
         .iter()
         .all(|s| matches!(s.0.first(), Some(0 | 1)))
 }
