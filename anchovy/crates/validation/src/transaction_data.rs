@@ -6,8 +6,8 @@
 use containers::Bump;
 use messages::base::{ObjectId, ObjectRef};
 use messages::transaction::{
-    AllowedProposers, Argument, Command, DigestState, Reservation, TransactionData,
-    TransactionExpiration, TransactionKind, WithdrawFrom,
+    AllowedProposers, Argument, Command, Reservation, TransactionData, TransactionExpiration,
+    TransactionKind, TxState, WithdrawFrom,
 };
 
 use crate::{Context, Error, ErrorKind, accumulator, gasless, kind};
@@ -25,7 +25,7 @@ const GAS_PRICE_CAP_FROM_GAS_MODEL: u64 = 4;
 
 /// `bump` holds temporaries; checking allocates nothing else.
 pub fn validity_check(
-    tx: &TransactionData<'_, impl DigestState>,
+    tx: &TransactionData<'_, impl TxState>,
     ctx: &Context<'_>,
     bump: &Bump,
 ) -> Result<(), Error> {
@@ -41,7 +41,7 @@ pub fn validity_check(
     }
     kind::validity_check(tx, ctx.config, bump)?;
     if is_gasless(tx, ctx)
-        && let TransactionKind::ProgrammableTransaction(pt) = &tx.kind
+        && let TransactionKind::ProgrammableTransaction(pt) = &tx.kind()
     {
         gasless::validate(pt, ctx.config, bump)?;
     }
@@ -73,18 +73,19 @@ pub fn check_gas_price(gas_price: u64, ctx: &Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-fn is_system_tx(tx: &TransactionData<'_, impl DigestState>) -> bool {
-    !matches!(tx.kind, TransactionKind::ProgrammableTransaction(_))
+fn is_system_tx(tx: &TransactionData<'_, impl TxState>) -> bool {
+    !matches!(tx.kind(), TransactionKind::ProgrammableTransaction(_))
 }
 
 /// The first-class address-balance payment: no gas objects, in a user
 /// transaction. Paying with a coin reservation does not count.
-fn is_gas_paid_from_address_balance(tx: &TransactionData<'_, impl DigestState>) -> bool {
-    tx.gas_data.payment.is_empty() && matches!(tx.kind, TransactionKind::ProgrammableTransaction(_))
+fn is_gas_paid_from_address_balance(tx: &TransactionData<'_, impl TxState>) -> bool {
+    tx.gas_data().payment.is_empty()
+        && matches!(tx.kind(), TransactionKind::ProgrammableTransaction(_))
 }
 
-pub(crate) fn is_gasless(tx: &TransactionData<'_, impl DigestState>, ctx: &Context<'_>) -> bool {
-    ctx.config.enable_gasless() && is_gas_paid_from_address_balance(tx) && tx.gas_data.price == 0
+pub(crate) fn is_gasless(tx: &TransactionData<'_, impl TxState>, ctx: &Context<'_>) -> bool {
+    ctx.config.enable_gasless() && is_gas_paid_from_address_balance(tx) && tx.gas_data().price == 0
 }
 
 /// A one- or two-epoch window: the validator remembers what it executed
@@ -101,10 +102,10 @@ fn is_replay_protected(expiration: &TransactionExpiration<'_>) -> bool {
     )
 }
 
-fn has_funds_withdrawals(tx: &TransactionData<'_, impl DigestState>) -> bool {
-    (is_gas_paid_from_address_balance(tx) && tx.gas_data.budget > 0)
-        || !tx.index.funds_withdrawals.is_empty()
-        || !tx.index.coin_reservations.is_empty()
+fn has_funds_withdrawals(tx: &TransactionData<'_, impl TxState>) -> bool {
+    (is_gas_paid_from_address_balance(tx) && tx.gas_data().budget > 0)
+        || !tx.index().funds_withdrawals.is_empty()
+        || !tx.index().coin_reservations.is_empty()
 }
 
 /// The amount and epoch a coin reservation's digest carries: amount (u64
@@ -117,11 +118,11 @@ fn reservation_amount_and_epoch(r: &ObjectRef) -> (u64, u64) {
 }
 
 fn check_funds_withdrawals(
-    tx: &TransactionData<'_, impl DigestState>,
+    tx: &TransactionData<'_, impl TxState>,
     ctx: &Context<'_>,
 ) -> Result<(), Error> {
     let config = ctx.config;
-    if tx.gas_data.payment.is_empty() && !config.enable_address_balance_gas_payments() {
+    if tx.gas_data().payment.is_empty() && !config.enable_address_balance_gas_payments() {
         return Err(Error::new(ErrorKind::MissingGasPayment, "no gas payment"));
     }
     if !config.enable_accumulators() {
@@ -131,7 +132,7 @@ fn check_funds_withdrawals(
         ));
     }
 
-    for withdrawal in tx.index.funds_withdrawals {
+    for withdrawal in tx.index().funds_withdrawals {
         let withdrawal = withdrawal.get();
         match withdrawal.withdraw_from {
             WithdrawFrom::Sender => {}
@@ -162,7 +163,7 @@ fn check_funds_withdrawals(
 
     // Reservations are good for their epoch and the next, like a two-epoch
     // `ValidDuring`.
-    for reservation in tx.index.coin_reservations {
+    for reservation in tx.index().coin_reservations {
         let (amount, epoch) = reservation_amount_and_epoch(reservation);
         if epoch != ctx.epoch && epoch + 1 != ctx.epoch {
             return Err(Error::new(
@@ -181,7 +182,8 @@ fn check_funds_withdrawals(
     let implicit_gas = usize::from(
         config.enable_address_balance_gas_payments() && is_gas_paid_from_address_balance(tx),
     );
-    let count = tx.index.funds_withdrawals.len() + tx.index.coin_reservations.len() + implicit_gas;
+    let count =
+        tx.index().funds_withdrawals.len() + tx.index().coin_reservations.len() + implicit_gas;
     if count > MAX_WITHDRAWALS {
         return Err(Error::new(
             ErrorKind::InvalidWithdrawReservation,
@@ -194,7 +196,7 @@ fn check_funds_withdrawals(
 /// Address-balance gas when enabled and used; otherwise gas objects are
 /// required.
 fn check_gas_payment(
-    tx: &TransactionData<'_, impl DigestState>,
+    tx: &TransactionData<'_, impl TxState>,
     ctx: &Context<'_>,
 ) -> Result<(), Error> {
     let config = ctx.config;
@@ -202,14 +204,14 @@ fn check_gas_payment(
         && config.enable_address_balance_gas_payments()
         && is_gas_paid_from_address_balance(tx))
     {
-        if tx.gas_data.payment.is_empty() {
+        if tx.gas_data().payment.is_empty() {
             return Err(Error::new(ErrorKind::MissingGasPayment, "no gas payment"));
         }
         return Ok(());
     }
 
     if config.address_balance_gas_reject_gas_coin_arg()
-        && let TransactionKind::ProgrammableTransaction(pt) = &tx.kind
+        && let TransactionKind::ProgrammableTransaction(pt) = &tx.kind()
         && pt
             .commands
             .iter()
@@ -223,13 +225,14 @@ fn check_gas_payment(
 
     if config.address_balance_gas_check_rgp_at_signing()
         && !is_gasless(tx, ctx)
-        && tx.gas_data.price < ctx.reference_gas_price
+        && tx.gas_data().price < ctx.reference_gas_price
     {
         return Err(Error::new(
             ErrorKind::GasPriceUnderRGP,
             format!(
                 "gas price {} under {}",
-                tx.gas_data.price, ctx.reference_gas_price
+                tx.gas_data().price,
+                ctx.reference_gas_price
             ),
         ));
     }
@@ -237,14 +240,14 @@ fn check_gas_payment(
     // Legacy rule: address-balance gas needs a replay-protecting window even
     // with owned inputs. The relaxed rule leaves that to the stateful checks.
     if !config.relax_valid_during_for_owned_inputs() {
-        if matches!(tx.expiration, TransactionExpiration::None) {
+        if matches!(tx.expiration(), TransactionExpiration::None) {
             // The reference's error, kept for compatibility.
             return Err(Error::new(
                 ErrorKind::MissingGasPayment,
                 "address balance gas needs an expiration",
             ));
         }
-        if !is_replay_protected(&tx.expiration) {
+        if !is_replay_protected(tx.expiration()) {
             return Err(Error::new(
                 ErrorKind::InvalidExpiration,
                 "address balance gas needs a one- or two-epoch ValidDuring",
@@ -255,10 +258,10 @@ fn check_gas_payment(
 }
 
 fn check_gas_object_count(
-    tx: &TransactionData<'_, impl DigestState>,
+    tx: &TransactionData<'_, impl TxState>,
     ctx: &Context<'_>,
 ) -> Result<(), Error> {
-    let len = tx.gas_data.payment.len();
+    let len = tx.gas_data().payment.len();
     let max = ctx.config.max_gas_payment_objects() as usize;
     // The old check was off by one.
     let within = if ctx.config.correct_gas_payment_limit_check() {
@@ -277,7 +280,7 @@ fn check_gas_object_count(
 
 /// A coin reservation paying gas must draw on the sender's own SUI balance.
 fn check_coin_reservations_as_gas(
-    tx: &TransactionData<'_, impl DigestState>,
+    tx: &TransactionData<'_, impl TxState>,
     ctx: &Context<'_>,
 ) -> Result<(), Error> {
     let not_owned = || {
@@ -287,7 +290,7 @@ fn check_coin_reservations_as_gas(
         )
     };
     let mut reservations = tx
-        .gas_data
+        .gas_data()
         .payment
         .iter()
         .filter(|r| r.is_coin_reservation())
@@ -298,9 +301,9 @@ fn check_coin_reservations_as_gas(
     if !ctx.config.enable_coin_reservation_obj_refs() {
         return Err(not_owned());
     }
-    let sui_balance = accumulator::sui_balance_id(tx.sender);
+    let sui_balance = accumulator::sui_balance_id(tx.sender());
     for reservation in reservations {
-        if tx.gas_data.owner != tx.sender {
+        if tx.gas_data().owner != tx.sender() {
             return Err(not_owned());
         }
         if unmask(&reservation.id, &ctx.chain_identifier.bytes) != sui_balance {
@@ -317,11 +320,11 @@ fn unmask(id: &ObjectId, chain: &[u8; 32]) -> ObjectId {
 }
 
 fn check_gas_price_and_budget(
-    tx: &TransactionData<'_, impl DigestState>,
+    tx: &TransactionData<'_, impl TxState>,
     ctx: &Context<'_>,
 ) -> Result<(), Error> {
     let config = ctx.config;
-    let gas = &tx.gas_data;
+    let gas = &tx.gas_data();
     if config.gas_model_version() >= GAS_PRICE_CAP_FROM_GAS_MODEL
         && gas.price >= config.max_gas_price()
     {
@@ -370,8 +373,8 @@ fn check_gas_price_and_budget(
 }
 
 /// Only user transactions may have gas paid by someone other than the sender.
-fn check_sponsorship(tx: &TransactionData<'_, impl DigestState>) -> Result<(), Error> {
-    if tx.gas_data.owner != tx.sender && is_system_tx(tx) {
+fn check_sponsorship(tx: &TransactionData<'_, impl TxState>) -> Result<(), Error> {
+    if tx.gas_data().owner != tx.sender() && is_system_tx(tx) {
         return Err(Error::new(
             ErrorKind::UnsupportedSponsoredTransactionKind,
             "only programmable transactions may be sponsored",
@@ -397,10 +400,10 @@ pub(crate) fn command_arguments<'c>(
 }
 
 fn check_expiration(
-    tx: &TransactionData<'_, impl DigestState>,
+    tx: &TransactionData<'_, impl TxState>,
     ctx: &Context<'_>,
 ) -> Result<(), Error> {
-    let (window, allowed_proposers) = match tx.expiration {
+    let (window, allowed_proposers) = match *tx.expiration() {
         TransactionExpiration::None => return Ok(()),
         TransactionExpiration::Epoch(max_epoch) => {
             if ctx.epoch > max_epoch {
@@ -475,7 +478,7 @@ fn check_expiration(
 }
 
 fn check_allowed_proposers(
-    tx: &TransactionData<'_, impl DigestState>,
+    tx: &TransactionData<'_, impl TxState>,
     ctx: &Context<'_>,
     allowed: &AllowedProposers<'_>,
 ) -> Result<(), Error> {
@@ -485,7 +488,7 @@ fn check_allowed_proposers(
     // gas price, and no price buys more proposers than there are validators.
     // Checked first so the checks below walk a bounded list.
     let max_proposers = MAX_UNPAID_ALLOWED_PROPOSERS
-        .max(tx.gas_data.price / ctx.reference_gas_price.max(1))
+        .max(tx.gas_data().price / ctx.reference_gas_price.max(1))
         .min(u64::from(ctx.committee_size));
     if proposers.len() as u64 > max_proposers {
         return Err(Error::new(

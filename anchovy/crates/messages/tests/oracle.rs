@@ -32,8 +32,8 @@ fn render(checkpoint: &CheckpointData<'_>) -> String {
     )
     .unwrap();
     for (i, tx) in checkpoint.transactions.iter().enumerate() {
-        let data = &tx.transaction.data;
-        let index = &data.index;
+        let data = &tx.transaction.data();
+        let index = &data.index();
         writeln!(out, "tx {i}").unwrap();
         for s in index.shared_inputs {
             writeln!(
@@ -47,7 +47,7 @@ fn render(checkpoint: &CheckpointData<'_>) -> String {
         }
         // The reference lists owned inputs, then packages; it errors instead
         // when an object is named twice, which the index leaves to validation.
-        let no_duplicate = match data.kind {
+        let no_duplicate = match data.kind() {
             TransactionKind::ProgrammableTransaction(_)
             | TransactionKind::ProgrammableSystemTransaction(_) => {
                 // The check covers the input arguments: owned inputs before
@@ -116,7 +116,7 @@ fn render(checkpoint: &CheckpointData<'_>) -> String {
         // The oracle can only reach the reference's reservations among the
         // inputs; those in the gas payment come last in the index.
         let gas_reservations = data
-            .gas_data
+            .gas_data()
             .payment
             .iter()
             .filter(|o| o.is_coin_reservation())
@@ -182,9 +182,9 @@ fn render_effects(effects: &VersionedEffects<'_>, out: &mut String) {
 }
 
 fn gas_count(data: &messages::transaction::TransactionData<'_>) -> usize {
-    match data.kind {
+    match data.kind() {
         TransactionKind::ProgrammableTransaction(_) => data
-            .gas_data
+            .gas_data()
             .payment
             .iter()
             .filter(|o| !o.is_coin_reservation())

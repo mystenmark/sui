@@ -81,7 +81,7 @@ fn load() -> Corpus {
             .contents
             .push(view.checkpoint_contents.bytes.to_vec());
         for tx in view.transactions {
-            corpus.transactions.push(tx.transaction.bytes.to_vec());
+            corpus.transactions.push(tx.transaction.bytes().to_vec());
         }
         corpus.checkpoint_data.push(bytes);
     }

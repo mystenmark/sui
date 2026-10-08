@@ -8,8 +8,8 @@ use containers::Bump;
 use messages::base::ObjectId;
 use messages::system_transaction::EndOfEpochTransactionKind;
 use messages::transaction::{
-    Argument, CallArg, Command, DigestState, ObjectArg, ProgrammableMoveCall,
-    ProgrammableTransaction, SharedObjectMutability, TransactionData, TransactionKind,
+    Argument, CallArg, Command, ObjectArg, ProgrammableMoveCall, ProgrammableTransaction,
+    SharedObjectMutability, TransactionData, TransactionKind, TxState,
 };
 use messages::type_tag::{TypeInput, TypeTag};
 use protocol_config::{PerObjectCongestionControlMode, ProtocolConfig};
@@ -31,7 +31,7 @@ fn size_limit(what: &str, limit: impl std::fmt::Display) -> Error {
 }
 
 pub fn validity_check(
-    tx: &TransactionData<'_, impl DigestState>,
+    tx: &TransactionData<'_, impl TxState>,
     config: &ProtocolConfig,
     bump: &Bump,
 ) -> Result<(), Error> {
@@ -42,7 +42,7 @@ pub fn validity_check(
             Err(unsupported(what))
         }
     };
-    match &tx.kind {
+    match &tx.kind() {
         TransactionKind::ProgrammableTransaction(pt) => {
             programmable_transaction(tx, pt, config, bump)
         }
@@ -130,7 +130,7 @@ fn end_of_epoch_transaction(
 }
 
 fn programmable_transaction(
-    tx: &TransactionData<'_, impl DigestState>,
+    tx: &TransactionData<'_, impl TxState>,
     pt: &ProgrammableTransaction<'_>,
     config: &ProtocolConfig,
     bump: &Bump,
@@ -145,7 +145,7 @@ fn programmable_transaction(
     // Owned and shared inputs, coin reservations aside, must be distinct;
     // packages the commands use count once each.
     let input_objects = distinct_input_objects(pt, bump)?;
-    let total = input_objects + tx.index.packages.len() + tx.index.receiving.len();
+    let total = input_objects + tx.index().packages.len() + tx.index().receiving.len();
     if total > config.max_input_objects() as usize {
         return Err(size_limit(
             "input and receiving objects",

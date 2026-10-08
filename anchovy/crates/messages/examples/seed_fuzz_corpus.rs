@@ -23,8 +23,8 @@ fn main() {
         (8, &checkpoint),
     ];
     for tx in view.transactions {
-        seeds.push((0, tx.transaction.bytes));
-        seeds.push((1, tx.transaction.data.bytes));
+        seeds.push((0, tx.transaction.bytes()));
+        seeds.push((1, tx.transaction.data().bytes()));
         seeds.push((2, tx.effects.bytes));
         if let Some(events) = &tx.events {
             seeds.push((3, events.bytes));

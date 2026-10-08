@@ -13,7 +13,7 @@ use messages::effects::{TransactionEffects, TransactionEvents};
 use messages::message::{MAX_ARENA_PER_WIRE_BYTE, MIN_ARENA_GUESS};
 use messages::object::Object;
 use messages::transaction::TransactionData;
-use messages::{Message, Wire};
+use messages::{Message, Parse};
 
 struct Rng(u64);
 
@@ -56,7 +56,7 @@ fn mutate(seed: &[u8], rng: &mut Rng) -> Vec<u8> {
 }
 
 /// Parses `bytes` as `T` and checks what must hold whether or not it parses.
-fn parse_checked<T: Wire>(bytes: Vec<u8>) -> Option<Message<T>> {
+fn parse_checked<T: Parse>(bytes: Vec<u8>) -> Option<Message<T>> {
     let len = bytes.len();
     match Message::<T>::parse(bytes) {
         Ok(m) => {
@@ -98,7 +98,9 @@ fn seeds() -> Seeds {
         objects: Vec::new(),
     };
     for tx in parsed.get().transactions {
-        seeds.transactions.push(tx.transaction.data.bytes.to_vec());
+        seeds
+            .transactions
+            .push(tx.transaction.data().bytes().to_vec());
         seeds.effects.push(tx.effects.bytes.to_vec());
         if let Some(events) = tx.events {
             seeds.events.push(events.bytes.to_vec());
@@ -129,8 +131,8 @@ fn transactions() {
         };
         accepted += 1;
         let data = m.get();
-        assert_eq!(data.bytes, m.wire_bytes());
-        assert_eq!(data.move_calls().count(), data.index.move_calls.len());
+        assert_eq!(data.bytes(), m.wire_bytes());
+        assert_eq!(data.move_calls().count(), data.index().move_calls.len());
     }
     eprintln!("{accepted} mutated transactions accepted");
     assert!(accepted > 0);
@@ -173,9 +175,9 @@ fn checkpoints() {
         };
         accepted += 1;
         for tx in m.get().transactions {
-            let alone = parse_checked::<TransactionData>(tx.transaction.data.bytes.to_vec())
+            let alone = parse_checked::<TransactionData>(tx.transaction.data().bytes().to_vec())
                 .expect("a span the checkpoint parser accepted");
-            assert_eq!(*alone.get(), tx.transaction.data);
+            assert_eq!(*alone.get(), *tx.transaction.data());
         }
     }
     assert!(accepted > 0);

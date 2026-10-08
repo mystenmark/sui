@@ -7,8 +7,7 @@
 
 use containers::Bump;
 use messages::transaction::{
-    CallArg, DigestState, SenderSignedData, TransactionExpiration, TransactionKind,
-    WithdrawalTypeArg,
+    CallArg, SenderSignedData, TransactionExpiration, TransactionKind, TxState, WithdrawalTypeArg,
 };
 use messages::type_tag::TypeTag;
 
@@ -29,7 +28,7 @@ fn malformed(what: &str) -> Error {
 }
 
 pub fn validity_check<'a>(
-    tx: &SenderSignedData<'a, impl DigestState>,
+    tx: &SenderSignedData<'a, impl TxState>,
     ctx: &Context<'_>,
     bump: &'a Bump,
 ) -> Result<Checked<'a>, Error> {
@@ -52,7 +51,10 @@ pub fn validity_check<'a>(
     }
 
     // Users cannot send system transactions.
-    if !matches!(tx.data.kind, TransactionKind::ProgrammableTransaction(_)) {
+    if !matches!(
+        tx.data().kind(),
+        TransactionKind::ProgrammableTransaction(_)
+    ) {
         return Err(Error::new(
             ErrorKind::Unsupported,
             "a user transaction cannot be a system transaction",
@@ -66,7 +68,7 @@ pub fn validity_check<'a>(
             format!("transaction of {tx_size} bytes, limit {max}"),
         ));
     }
-    if transaction_data::is_gasless(&tx.data, ctx) {
+    if transaction_data::is_gasless(tx.data(), ctx) {
         let max = config.get_gasless_max_tx_size_bytes();
         if tx_size as u64 > max {
             return Err(Error::new(
@@ -76,7 +78,7 @@ pub fn validity_check<'a>(
         }
     }
 
-    transaction_data::validity_check(&tx.data, ctx, bump)?;
+    transaction_data::validity_check(tx.data(), ctx, bump)?;
     Ok(Checked {
         signatures,
         tx_size,
@@ -92,21 +94,21 @@ pub fn validity_check<'a>(
 /// durations) that are not checked here; such a transaction is rejected as
 /// a system transaction instead, with a different error.
 pub fn deserialization_checks<'a>(
-    tx: &SenderSignedData<'a, impl DigestState>,
+    tx: &SenderSignedData<'a, impl TxState>,
     bump: &'a Bump,
 ) -> Result<(&'a [ParsedSignature<'a>], usize), Error> {
-    let intent = tx.intent;
+    let intent = tx.intent();
     if (intent.scope, intent.version, intent.app_id) != (0, 0, 0) {
         return Err(malformed("not a transaction intent"));
     }
 
-    if let TransactionExpiration::Validity(_, Some(allowed)) = tx.data.expiration
+    if let TransactionExpiration::Validity(_, Some(allowed)) = tx.data().expiration()
         && allowed.proposers.is_empty()
     {
         return Err(malformed("empty allowed proposers"));
     }
 
-    if let TransactionKind::ProgrammableTransaction(pt) = &tx.data.kind {
+    if let TransactionKind::ProgrammableTransaction(pt) = &tx.data().kind() {
         for input in pt.inputs {
             if let CallArg::FundsWithdrawal(w) = input {
                 let WithdrawalTypeArg::Balance(ty) = &w.get().type_arg;
@@ -118,9 +120,9 @@ pub fn deserialization_checks<'a>(
     }
 
     // Signatures re-serialize to their wire bytes, except legacy multisig.
-    let mut size = tx.bytes.len();
-    let mut parsed = containers::Vec::with_capacity_in(tx.tx_signatures.len(), bump);
-    for sig in tx.tx_signatures {
+    let mut size = tx.bytes().len();
+    let mut parsed = containers::Vec::with_capacity_in(tx.tx_signatures().len(), bump);
+    for sig in tx.tx_signatures() {
         let (sig_parsed, len) = signature::parse(sig.0, bump)?;
         size = size - uleb_len(sig.0.len()) - sig.0.len() + uleb_len(len) + len;
         parsed.push(sig_parsed);

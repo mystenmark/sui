@@ -13,7 +13,7 @@ use messages::effects::{TransactionEffects, TransactionEvents};
 use messages::object::Object;
 use messages::signature::MultiSig;
 use messages::transaction::TransactionData;
-use messages::{Message, Wire, build};
+use messages::{Message, Parse, build};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -28,7 +28,7 @@ fn read_chk(path: &Path) -> Vec<u8> {
 /// Checks one encoding of `T` against its mirror `B`.
 fn check<T, B>(bytes: &[u8])
 where
-    T: Wire,
+    T: Parse,
     B: Serialize + DeserializeOwned + PartialEq + Debug + for<'a, 'v> From<&'a T::View<'v>>,
 {
     let decoded: B = bcs::from_bytes(bytes).unwrap();
@@ -55,7 +55,7 @@ fn check_checkpoint(path: &Path, counts: &mut Counts) {
     for tx in checkpoint.get().transactions {
         counts.transactions += 1;
         check::<TransactionData<'static>, build::transaction::TransactionData>(
-            tx.transaction.data.bytes,
+            tx.transaction.data().bytes(),
         );
         check::<TransactionEffects<'static>, build::effects::TransactionEffects>(tx.effects.bytes);
         if let Some(events) = tx.events {
@@ -170,7 +170,7 @@ fn transaction_envelope() {
     bytes.remove(0);
     let checkpoint = Message::<messages::checkpoint::CheckpointData>::parse(bytes).unwrap();
     for tx in checkpoint.get().transactions {
-        let wire = tx.transaction.bytes.to_vec();
+        let wire = tx.transaction.bytes().to_vec();
         let envelope = Message::<Transaction<DigestReady>>::parse(wire.clone()).unwrap();
         let bare = Message::<SenderSignedData>::parse(wire).unwrap();
         assert_eq!(envelope.get().0, *bare.get());
@@ -192,13 +192,13 @@ fn transaction_digest_computed_later() {
     let transactions = checkpoint.get().transactions;
     let pending: Vec<Message<Transaction<DigestPending>>> = transactions
         .iter()
-        .map(|tx| Message::parse(tx.transaction.bytes.to_vec()).unwrap())
+        .map(|tx| Message::parse(tx.transaction.bytes().to_vec()).unwrap())
         .collect();
     let singly: Vec<Message<Transaction<DigestReady>>> = transactions
         .iter()
         .map(|tx| {
             let pending: Message<Transaction<DigestPending>> =
-                Message::parse(tx.transaction.bytes.to_vec()).unwrap();
+                Message::parse(tx.transaction.bytes().to_vec()).unwrap();
             pending.with_digest()
         })
         .collect();
@@ -214,6 +214,45 @@ fn transaction_digest_computed_later() {
         assert_eq!(ready.get().0, *tx);
         assert_eq!(ready.get().0.digest(), tx.digest());
         assert_eq!(singly[i].get(), ready.get());
+    }
+}
+
+/// Relabelling a batch into another state keeps the allocation and the
+/// views, digest included.
+#[test]
+fn transactions_relabel_in_place() {
+    use messages::transaction::{Attested, DigestPending, HasDigest, Transaction, TxState};
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    struct Checked;
+    impl TxState for Checked {}
+    impl HasDigest for Checked {}
+    impl Attested for Checked {
+        type Witness = ();
+    }
+    let mut bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/mainnet-325300367.chk"
+    ))
+    .unwrap();
+    bytes.remove(0);
+    let checkpoint = Message::<messages::checkpoint::CheckpointData>::parse(bytes).unwrap();
+    let transactions = checkpoint.get().transactions;
+    let pending: Vec<Message<Transaction<DigestPending>>> = transactions
+        .iter()
+        .map(|tx| Message::parse(tx.transaction.bytes().to_vec()).unwrap())
+        .collect();
+    let ready = Message::with_digests(pending);
+    let (ptr, capacity) = (ready.as_ptr().cast::<u8>(), ready.capacity());
+    let checked: Vec<Message<Transaction<Checked>>> = Message::relabel_all(ready, &());
+    assert_eq!(
+        (checked.as_ptr().cast::<u8>(), checked.capacity()),
+        (ptr, capacity)
+    );
+    assert_eq!(checked.len(), transactions.len());
+    for (i, checked) in checked.iter().enumerate() {
+        let tx = &transactions[i].transaction;
+        assert_eq!(checked.get().0.digest(), tx.digest());
+        assert_eq!(checked.get().0.bytes(), tx.bytes());
     }
 }
 

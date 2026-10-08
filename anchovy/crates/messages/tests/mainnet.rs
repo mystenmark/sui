@@ -56,7 +56,7 @@ fn check(path: &Path, counts: &mut Counts) {
             VersionedEffects::V2(v2) => (v2.transaction_digest, v2.events_digest),
             VersionedEffects::V1(v1) => (v1.transaction_digest, v1.events_digest),
         };
-        assert_eq!(*transaction_digest, *tx.transaction.data.digest());
+        assert_eq!(*transaction_digest, *tx.transaction.data().digest());
         assert_eq!(events_digest.copied(), tx.events.map(|e| e.digest()));
         for object in tx.output_objects {
             let digest = object.digest();
@@ -74,8 +74,9 @@ fn check(path: &Path, counts: &mut Counts) {
             );
         }
 
-        let data = Message::<TransactionData>::parse(tx.transaction.data.bytes.to_vec()).unwrap();
-        assert_eq!(*data.get(), tx.transaction.data);
+        let data =
+            Message::<TransactionData>::parse(tx.transaction.data().bytes().to_vec()).unwrap();
+        assert_eq!(*data.get(), *tx.transaction.data());
 
         let effects = Message::<TransactionEffects>::parse(tx.effects.bytes.to_vec()).unwrap();
         assert_eq!(*effects.get(), tx.effects);

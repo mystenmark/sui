@@ -32,7 +32,25 @@ fn bump(off: &mut usize, layout: Layout) -> Result<usize> {
     Ok(start)
 }
 
-pub trait Alloc<'a> {
+/// Sealed: every allocator that leaves the crate builds. A measure-pass view
+/// is incomplete (a transaction's digest, for one, is not computed), so it
+/// must not reach code outside the crate, which could not tell.
+///
+/// ```compile_fail,E0603
+/// use messages::arena::Measure;
+/// ```
+///
+/// ```compile_fail,E0277
+/// use messages::arena::{Alloc, SliceWriter};
+/// struct Count;
+/// impl<'a> Alloc<'a> for Count {
+///     const BUILD: bool = false;
+///     fn slice<T: Copy + 'a>(&mut self, _: usize) -> messages::Result<SliceWriter<'a, T>> {
+///         unimplemented!()
+///     }
+/// }
+/// ```
+pub trait Alloc<'a>: sealed::Sealed {
     /// Whether values are kept. Code that reads back what it parsed, which
     /// the measure pass cannot do, runs only when this is true; it must
     /// still make the same reservations in both passes.
@@ -193,8 +211,17 @@ impl<'a> Alloc<'a> for BumpAlloc<'a> {
     }
 }
 
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::BumpAlloc<'_> {}
+    impl Sealed for super::Measure {}
+    impl Sealed for super::Build<'_> {}
+}
+
+/// Crate-private, with the `Alloc` trait sealed, so that only this crate can
+/// run a measure pass. See `Alloc`.
 #[derive(Default)]
-pub struct Measure {
+pub(crate) struct Measure {
     off: usize,
 }
 
