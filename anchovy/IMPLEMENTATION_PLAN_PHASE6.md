@@ -152,7 +152,9 @@ Three independent reviews (key soundness; lifecycle and pipeline; denial
 of service) found no way, through the RPC path, for the cache to accept a
 transaction without a valid signature or refuse a valid one. Fixed from
 their findings: a view could be edited, or measure-parsed with a zero
-digest, and still hit another transaction's entry (in-process code only);
+digest, and still hit another transaction's entry (in-process code only;
+closed at the root afterwards: the views' fields are private behind
+getters, `Measure` is crate-private and `Alloc` sealed);
 anyone could build a `VerifySignatures`, and the verifier alone accepts a
 system transaction; validation and verification held separate epochs;
 hits could evict other entries, and the effective capacity was

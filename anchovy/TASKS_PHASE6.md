@@ -35,6 +35,10 @@ into `anchovy-main`.
    outlives a generation; the key distinguishes signature order, count,
    boundaries and epoch; verification uses the validation epoch; a hit
    allocates nothing.
+7. `messages`: `TransactionData` and `SenderSignedData` fields private
+   behind getters; `Measure` crate-private and `Alloc` sealed. No view
+   outside the crate can disagree with its bytes or digest
+   (`compile_fail` doctests).
 
 ## Measurements
 
@@ -47,7 +51,8 @@ transactions (system transactions excluded), M4 Max VM:
 | decode (handler) | 616 ns |
 | Blake2b digest | 793 ns |
 | signatures (1,679 Ed25519, 1 Secp256k1, 1 zkLogin) | 28.2 µs |
-| both processors | 30.0 µs |
+| both processors | 30.0 µs (31.0 µs with a cold signature cache) |
+| both processors, signatures cached | 2.1 µs |
 
 Signature verification is 94% of the processor thread's work, and the
 thread caps throughput: 25k tx/s in process (inline on 4 runtime workers:
