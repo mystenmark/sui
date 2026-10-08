@@ -13,8 +13,8 @@ use common::{Case, Pipeline};
 use messages::Message;
 use messages::transaction::{DigestPending, Transaction};
 use validation::ErrorKind;
+use validator::checks::GENERATION;
 use validator::epoch::EpochState;
-use validator::signature_cache::GENERATION;
 
 /// The contexts, each with its cases. A few vectors share their bytes
 /// under two labels; only the first is kept, as the second would rightly

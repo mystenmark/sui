@@ -14,8 +14,9 @@ use containers::DigestHasher;
 use hashbrown::HashSet;
 use messages::Message;
 use messages::base::Digest;
-use messages::transaction::{DigestReady, GenericSignature, Intent, SenderSignedData, Transaction};
+use messages::transaction::{GenericSignature, Intent, SenderSignedData, Transaction};
 
+use super::Valid;
 use crate::epoch::EpochState;
 
 /// Entries per generation. An entry survives at least this many later
@@ -26,9 +27,9 @@ pub const GENERATION: usize = 100_000;
 const DOMAIN: &[u8] = b"anchovy verified signatures v1\0";
 
 pub(crate) struct SignatureCache {
-    /// What the entries were verified under. Verification reads the epoch
-    /// number, protocol config and JWKs from it.
-    epoch: Arc<EpochState>,
+    /// What the entries were verified under, once there are any.
+    /// Verification reads the epoch number, protocol config and JWKs from it.
+    epoch: Option<Arc<EpochState>>,
     current: HashSet<Digest, DigestHasher>,
     previous: HashSet<Digest, DigestHasher>,
     generation: usize,
@@ -38,10 +39,10 @@ pub(crate) struct SignatureCache {
 
 impl SignatureCache {
     /// Holds up to `2 * generation` entries, allocated here and never grown.
-    pub(crate) fn new(epoch: Arc<EpochState>, generation: usize) -> SignatureCache {
+    pub(crate) fn new(generation: usize) -> SignatureCache {
         let table = || HashSet::with_capacity_and_hasher(generation, DigestHasher::new());
         SignatureCache {
-            epoch,
+            epoch: None,
             current: table(),
             previous: table(),
             generation,
@@ -55,22 +56,24 @@ impl SignatureCache {
     ///
     /// The key is computed from the message, whose view cannot be changed
     /// and whose digest was computed from its own bytes, and `verify` is
-    /// handed that same view: what is cached is what was verified. `verify`
-    /// must depend on nothing but the view and `epoch`. In particular it
-    /// takes no aliases: they would have to be in the key.
+    /// handed that same view: what is cached is what was verified. Only a
+    /// `Valid` transaction gets here: verification does not repeat
+    /// validation. `verify` must depend on nothing but the view and
+    /// `epoch`. In particular it takes no aliases: they would have to be in
+    /// the key.
     pub(crate) fn verify(
         &mut self,
         epoch: &Arc<EpochState>,
-        transaction: &Message<Transaction<'static, DigestReady>>,
-        verify: impl FnOnce(&SenderSignedData<'_, DigestReady>) -> Result<(), validation::Error>,
+        transaction: &Message<Transaction<'static, Valid>>,
+        verify: impl FnOnce(&SenderSignedData<'_, Valid>) -> Result<(), validation::Error>,
     ) -> Result<(), validation::Error> {
-        if !Arc::ptr_eq(&self.epoch, epoch) {
-            self.epoch = epoch.clone();
+        if !self.epoch.as_ref().is_some_and(|e| Arc::ptr_eq(e, epoch)) {
+            self.epoch = Some(epoch.clone());
             self.current.clear();
             self.previous.clear();
         }
         let signed = &transaction.get().0;
-        let key = key(self.epoch.epoch, signed);
+        let key = key(epoch.epoch, signed);
         if self.current.contains(&key) || self.previous.contains(&key) {
             self.hits += 1;
             return Ok(());
@@ -102,7 +105,7 @@ impl SignatureCache {
 /// commits to the data's bytes, from which the rest of the data view was
 /// parsed. Signatures are length-prefixed, so no two lists of them hash
 /// alike.
-fn key(epoch: u64, transaction: &SenderSignedData<'_, DigestReady>) -> Digest {
+fn key(epoch: u64, transaction: &SenderSignedData<'_, Valid>) -> Digest {
     key_of(
         epoch,
         transaction.digest(),
@@ -135,7 +138,10 @@ fn key_of(
 mod tests {
     use std::cell::Cell;
 
+    use std::marker::PhantomData;
+
     use messages::checkpoint::CheckpointData;
+    use messages::transaction::DigestReady;
     use protocol_config::{Chain, ProtocolVersion};
 
     use super::*;
@@ -153,14 +159,16 @@ mod tests {
     }
 
     fn checkpoint() -> Message<CheckpointData<'static>> {
-        let mut bytes = include_bytes!("../../messages/tests/data/mainnet-325300367.chk").to_vec();
+        let mut bytes =
+            include_bytes!("../../../messages/tests/data/mainnet-325300367.chk").to_vec();
         bytes.remove(0);
         Message::parse(bytes).map_err(|(e, _)| e).unwrap()
     }
 
-    /// The checkpoint's transactions, as the verifier gets them.
-    fn transactions() -> Vec<Message<Transaction<'static, DigestReady>>> {
-        checkpoint()
+    /// The checkpoint's transactions, as the verifier gets them. (Not
+    /// validated: the cache does not look.)
+    fn transactions() -> Vec<Message<Transaction<'static, Valid>>> {
+        let parsed: Vec<Message<Transaction<'static, DigestReady>>> = checkpoint()
             .get()
             .transactions
             .iter()
@@ -169,14 +177,15 @@ mod tests {
                     .map_err(|(e, _)| e)
                     .unwrap()
             })
-            .collect()
+            .collect();
+        Message::relabel_all(parsed, &super::super::Witness(PhantomData))
     }
 
     /// Verifies through `cache`; whether the verification ran.
     fn verified(
         cache: &mut SignatureCache,
         epoch: &Arc<EpochState>,
-        transaction: &Message<Transaction<'static, DigestReady>>,
+        transaction: &Message<Transaction<'static, Valid>>,
     ) -> bool {
         let ran = Cell::new(false);
         cache
@@ -193,7 +202,7 @@ mod tests {
         let transactions = transactions();
         let transaction = &transactions[0];
         let first = epoch(5);
-        let mut cache = SignatureCache::new(first.clone(), 8);
+        let mut cache = SignatureCache::new(8);
         assert!(verified(&mut cache, &first, transaction));
         assert!(!verified(&mut cache, &first, transaction));
         // Another epoch, even with the same number: verified again.
@@ -208,7 +217,7 @@ mod tests {
         let t = transactions();
         assert!(t.len() >= 5);
         let epoch = epoch(5);
-        let mut cache = SignatureCache::new(epoch.clone(), 2);
+        let mut cache = SignatureCache::new(2);
         // 0 and 1, then 2 rotates them into the previous generation.
         for transaction in &t[..3] {
             assert!(verified(&mut cache, &epoch, transaction));
@@ -235,8 +244,7 @@ mod tests {
     #[test]
     fn the_tables_never_grow() {
         let t = transactions();
-        let epoch = epoch(5);
-        let mut cache = SignatureCache::new(epoch.clone(), 4);
+        let mut cache = SignatureCache::new(4);
         let capacities = (cache.current.capacity(), cache.previous.capacity());
         for round in 0..20_u64 {
             // Another epoch number for each round: new keys, same transactions.
@@ -263,7 +271,7 @@ mod tests {
     fn a_failure_is_not_cached() {
         let transactions = transactions();
         let epoch = epoch(5);
-        let mut cache = SignatureCache::new(epoch.clone(), 8);
+        let mut cache = SignatureCache::new(8);
         for _ in 0..2 {
             let refused = cache.verify(&epoch, &transactions[0], |_| {
                 Err(validation::Error::new(

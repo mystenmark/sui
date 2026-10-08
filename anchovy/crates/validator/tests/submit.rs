@@ -12,12 +12,13 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use common::Case;
+use messages::transaction::DigestPending;
 use tonic::Code;
 use tonic::transport::Channel;
 use tonic::transport::server::TcpIncoming;
 use validator::Validator;
 use validator::epoch::EpochState;
-use validator::processors::{Processors, ValidateTransactions};
+use validator::processors::{Processors, Request};
 use validator::proto::{RawSubmitTxRequest, SubmitTxType};
 use validator::service::validator_client::ValidatorClient;
 use workqueue::Queue;
@@ -28,7 +29,7 @@ fn cases() -> (Vec<Case>, Arc<EpochState>) {
 }
 
 async fn serve(epoch: Arc<EpochState>) -> ValidatorClient<Channel> {
-    let processors = Processors::start(&epoch, 64);
+    let processors = Processors::start(64);
     let queue = processors.transactions.clone();
     serve_with(epoch, queue, processors).await
 }
@@ -37,7 +38,7 @@ async fn serve(epoch: Arc<EpochState>) -> ValidatorClient<Channel> {
 /// the server.
 async fn serve_with(
     epoch: Arc<EpochState>,
-    queue: Queue<ValidateTransactions>,
+    queue: Queue<Request<DigestPending>>,
     processors: impl Send + 'static,
 ) -> ValidatorClient<Channel> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -183,7 +184,7 @@ async fn a_full_queue_between_processors_refuses_work() {
     // A signature queue of no capacity, whose only reader is the validator's
     // own thread, never takes an item.
     let (queue, inbox) = workqueue::queue(16);
-    let worker = Processors::worker(&epoch, inbox, 0).spawn();
+    let worker = Processors::worker(inbox, 0).spawn();
     let mut client = serve_with(epoch, queue, worker).await;
     let status = client
         .submit_transaction(submit(&[valid], SubmitTxType::Default))

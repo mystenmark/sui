@@ -130,40 +130,38 @@ pub fn expected(epoch: &EpochState, cases: &[&Case]) -> Result<(), ErrorKind> {
     Ok(())
 }
 
-/// The two processors, run by hand on the calling thread, so that tests can
-/// look at the verifier's cache.
+/// The processors, run by hand on the calling thread, each one's output the
+/// next one's input, so that tests can look at the verifier's cache.
 pub struct Pipeline {
+    epoch: Arc<EpochState>,
     pub validator: validator::processors::TransactionValidator,
     pub verifier: validator::processors::SignatureVerifier,
-    verification: workqueue::Inbox<validator::processors::VerifySignatures>,
 }
 
 impl Pipeline {
     pub fn new(epoch: &Arc<EpochState>, generation: usize) -> Pipeline {
         use validator::processors::{SignatureVerifier, TransactionValidator};
-        let (signatures, verification) = workqueue::queue(1);
         Pipeline {
-            validator: TransactionValidator::new(epoch.clone(), signatures),
-            verifier: SignatureVerifier::with_cache(epoch.clone(), generation),
-            verification,
+            epoch: epoch.clone(),
+            validator: TransactionValidator::new(),
+            verifier: SignatureVerifier::with_cache(generation),
         }
     }
 
     /// The request's verdict: the kind of its first failure, or `Ok`.
     pub fn run(&mut self, bytes: &[&[u8]]) -> Result<(), ErrorKind> {
-        use validator::processors::{Rejected, ValidateTransactions};
+        use validator::processors::{Rejected, Request, answer};
         use workqueue::Processor;
         let (reply, verdict) = tokio::sync::oneshot::channel();
         let transactions = bytes
             .iter()
             .map(|b| Message::parse(b.to_vec()).map_err(|(e, _)| e).unwrap())
             .collect();
-        self.validator.process(ValidateTransactions {
-            transactions,
-            reply,
-        });
-        if let Some(next) = self.verification.try_pop() {
-            self.verifier.process(next);
+        let request = Request::new(self.epoch.clone(), transactions, reply);
+        if let Some(valid) = self.validator.process(request)
+            && let Some(verified) = self.verifier.process(valid)
+        {
+            answer(verified);
         }
         match verdict.blocking_recv().unwrap() {
             Ok(_) => Ok(()),

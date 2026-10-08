@@ -22,7 +22,7 @@ use tonic::{Request, Response, Status};
 
 use crate::codec::Encoded;
 use crate::epoch::EpochState;
-use crate::processors::{Rejected, ValidateTransactions, Validated};
+use crate::processors::{self, Rejected, Validated};
 use crate::proto::{
     RawSubmitTxRequest, RawSubmitTxResponse, RawValidatorHealthRequest, RawValidatorHealthResponse,
     RawWaitForEffectsRequest, RawWaitForEffectsResponse, SubmitTxType,
@@ -31,11 +31,14 @@ use crate::service::validator_server::{self, ValidatorServer};
 
 pub struct Validator {
     epoch: Arc<EpochState>,
-    transactions: Queue<ValidateTransactions>,
+    transactions: Queue<processors::Request<DigestPending>>,
 }
 
 impl Validator {
-    pub fn new(epoch: Arc<EpochState>, transactions: Queue<ValidateTransactions>) -> Validator {
+    pub fn new(
+        epoch: Arc<EpochState>,
+        transactions: Queue<processors::Request<DigestPending>>,
+    ) -> Validator {
         Validator {
             epoch,
             transactions,
@@ -91,10 +94,11 @@ impl Validator {
         }
         let (reply, verdict) = oneshot::channel();
         self.transactions
-            .try_push(ValidateTransactions {
+            .try_push(processors::Request::new(
+                self.epoch.clone(),
                 transactions,
                 reply,
-            })
+            ))
             .map_err(|e| match e {
                 PushError::Full(_) => Status::resource_exhausted("validation queue full"),
                 PushError::Closed(_) => Status::unavailable("shutting down"),

@@ -11,11 +11,12 @@ mod common;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
+use std::sync::Arc;
+
 use tokio::sync::oneshot;
-use validator::processors::{
-    SignatureVerifier, TransactionValidator, ValidateTransactions, VerifySignatures,
-};
-use workqueue::{Inbox, Processor};
+use validator::epoch::EpochState;
+use validator::processors::{Request, SignatureVerifier, TransactionValidator, answer};
+use workqueue::Processor;
 
 struct Counting;
 
@@ -39,24 +40,23 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static COUNTING: Counting = Counting;
 
-/// Runs one transaction through both processors, counting their
-/// allocations; the request and its reply channel are the handler's, made
-/// before counting. Returns whether it was accepted.
+/// Runs one transaction through the processors, each one's output the next
+/// one's input, counting their allocations; the request and its reply
+/// channel are the handler's, made before counting. Returns whether it was
+/// accepted.
 fn process(
+    epoch: &Arc<EpochState>,
     validator: &mut TransactionValidator,
     verifier: &mut SignatureVerifier,
-    verification: &Inbox<VerifySignatures>,
     case: &common::Case,
 ) -> (bool, usize) {
     let (reply, verdict) = oneshot::channel();
-    let item = ValidateTransactions {
-        transactions: vec![case.parse().unwrap()],
-        reply,
-    };
+    let request = Request::new(epoch.clone(), vec![case.parse().unwrap()], reply);
     let before = ALLOCATIONS.with(Cell::get);
-    validator.process(item);
-    if let Some(next) = verification.try_pop() {
-        verifier.process(next);
+    if let Some(valid) = validator.process(request)
+        && let Some(verified) = verifier.process(valid)
+    {
+        answer(verified);
     }
     let allocations = ALLOCATIONS.with(Cell::get) - before;
     (verdict.blocking_recv().unwrap().is_ok(), allocations)
@@ -77,17 +77,16 @@ fn plain_signatures(case: &common::Case) -> bool {
 fn verifying_allocates_nothing_once_warm() {
     let (cases, epoch) = common::mainnet();
     let epoch = common::mainnet_epoch(epoch);
-    let (signatures, verification) = workqueue::queue(1);
-    let mut validator = TransactionValidator::new(epoch.clone(), signatures);
-    let mut warm = SignatureVerifier::new(epoch.clone());
+    let mut validator = TransactionValidator::new();
+    let mut warm = SignatureVerifier::new();
     for case in &cases {
-        process(&mut validator, &mut warm, &verification, case);
+        process(&epoch, &mut validator, &mut warm, case);
     }
     let mut accepted = 0;
     for case in &cases {
         // A cache that has not seen it, made before counting: it is verified.
-        let mut verifier = SignatureVerifier::new(epoch.clone());
-        let (ok, allocations) = process(&mut validator, &mut verifier, &verification, case);
+        let mut verifier = SignatureVerifier::new();
+        let (ok, allocations) = process(&epoch, &mut validator, &mut verifier, case);
         assert_eq!(verifier.cache_stats().0, 0);
         if ok && plain_signatures(case) {
             accepted += 1;
@@ -102,17 +101,16 @@ fn verifying_allocates_nothing_once_warm() {
 fn a_cache_hit_allocates_nothing() {
     let (cases, epoch) = common::mainnet();
     let epoch = common::mainnet_epoch(epoch);
-    let (signatures, verification) = workqueue::queue(1);
-    let mut validator = TransactionValidator::new(epoch.clone(), signatures);
-    let mut verifier = SignatureVerifier::new(epoch);
+    let mut validator = TransactionValidator::new();
+    let mut verifier = SignatureVerifier::new();
     let accepted: Vec<_> = cases
         .iter()
-        .filter(|case| process(&mut validator, &mut verifier, &verification, case).0)
+        .filter(|case| process(&epoch, &mut validator, &mut verifier, case).0)
         .collect();
     assert!(!accepted.is_empty());
     let (hits, _) = verifier.cache_stats();
     for case in &accepted {
-        let (ok, allocations) = process(&mut validator, &mut verifier, &verification, case);
+        let (ok, allocations) = process(&epoch, &mut validator, &mut verifier, case);
         assert!(ok);
         assert_eq!(allocations, 0, "{}", case.label);
     }

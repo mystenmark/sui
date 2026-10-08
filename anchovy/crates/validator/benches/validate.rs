@@ -26,9 +26,7 @@ use tonic::transport::Channel;
 use tonic::transport::server::TcpIncoming;
 use validator::Validator;
 use validator::epoch::EpochState;
-use validator::processors::{
-    Processors, SignatureVerifier, TransactionValidator, ValidateTransactions,
-};
+use validator::processors::{Processors, Request, SignatureVerifier, TransactionValidator, answer};
 use validator::proto::{RawSubmitTxRequest, RawValidatorHealthRequest, SubmitTxType};
 use validator::service::validator_client::ValidatorClient;
 use workqueue::Processor;
@@ -309,18 +307,16 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
             }
         }),
     );
-    let (signatures, verification) = workqueue::queue(1);
-    let mut validator = TransactionValidator::new(epoch.clone(), signatures);
-    let mut verifier = SignatureVerifier::new(epoch.clone());
+    let mut validator = TransactionValidator::new();
+    let mut verifier = SignatureVerifier::new();
     let mut both = |verifier: &mut SignatureVerifier, txs: &[Bytes]| {
         for bytes in txs {
             let (reply, verdict) = oneshot::channel();
-            validator.process(ValidateTransactions {
-                transactions: vec![decode(bytes)],
-                reply,
-            });
-            if let Some(next) = verification.try_pop() {
-                verifier.process(next);
+            let request = Request::new(epoch.clone(), vec![decode(bytes)], reply);
+            if let Some(valid) = validator.process(request)
+                && let Some(verified) = verifier.process(valid)
+            {
+                answer(verified);
             }
             black_box(verdict.blocking_recv().unwrap().is_ok());
         }
@@ -329,7 +325,7 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
         "decode + both processors, cache cold",
         per_tx(txs, 5, |txs| {
             // Its two tables' allocation is timed too: ~5 ns a transaction.
-            both(&mut SignatureVerifier::new(epoch.clone()), txs);
+            both(&mut SignatureVerifier::new(), txs);
         }),
     );
     row(
@@ -397,7 +393,7 @@ fn pool(
     tasks: usize,
     rounds: usize,
 ) -> (f64, Duration) {
-    let processors = Processors::start(epoch, 1 << 16);
+    let processors = Processors::start(1 << 16);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .build()
@@ -423,10 +419,7 @@ fn pool(
                         let (reply, verdict) = oneshot::channel();
                         let transaction = decode(&txs[i % txs.len()]);
                         if queue
-                            .try_push(ValidateTransactions {
-                                transactions: vec![transaction],
-                                reply,
-                            })
+                            .try_push(Request::new(epoch.clone(), vec![transaction], reply))
                             .is_err()
                         {
                             panic!("queue full");
@@ -493,7 +486,7 @@ fn server(epoch: &Arc<EpochState>, workers: usize) -> (SocketAddr, impl Drop) {
         .enable_all()
         .build()
         .unwrap();
-    let processors = Processors::start(epoch, 1 << 16);
+    let processors = Processors::start(1 << 16);
     let service = Validator::new(epoch.clone(), processors.transactions.clone()).into_service();
     let listener = runtime
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
