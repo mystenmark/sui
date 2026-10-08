@@ -3,7 +3,7 @@
 Plan: `IMPLEMENTATION_PLAN_PHASE6.md`. Branch `mlogan-phase6`, to be merged
 into `anchovy-main`.
 
-## Status: all steps done
+## Status: step 8 (checks in the types) in progress
 
 ## Done
 
@@ -39,6 +39,12 @@ into `anchovy-main`.
    behind getters; `Measure` crate-private and `Alloc` sealed. No view
    outside the crate can disagree with its bytes or digest
    (`compile_fail` doctests).
+
+## Remaining
+
+8. Checks in the types (plan: "Checks in the types"): `messages` states
+   and relabelling; `workqueue` processor input/output; `validator::checks`
+   and `Request<S>`.
 
 ## Measurements
 

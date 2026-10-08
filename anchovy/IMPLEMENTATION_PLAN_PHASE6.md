@@ -173,6 +173,39 @@ hits could evict other entries, and the effective capacity was
   checks are a phase 5 non-goal.
 - A hit is visible in the response time, as in the reference.
 
+### Checks in the types
+
+What has been checked about a transaction is in its type, and each
+processor declares the state it takes and the state it emits, so that a
+stage that needs a check cannot be wired before the stage that makes it.
+
+- `messages`: the state parameter generalizes `DigestState`. `TxState` is
+  any state; `ParseState` (sealed: `DigestPending`, `DigestReady`) the only
+  ones parsing produces, so nothing is parsed straight into a checked
+  state; `HasDigest` the states with a computed digest, which alone have
+  the digest accessor. `Attested: HasDigest` is a state with a `Witness`
+  type: `Message::relabel`/`relabel_all` move a `HasDigest` message into an
+  `Attested` state only given a witness, in place (the layouts are alike
+  for every state: `repr(C)`, asserted generically). Whoever can make a
+  state's witness decides what reaches it.
+- `validator::checks`: `Valid` (passed `SenderSignedData` validation, digest
+  computed) and `Verified` (and signatures verified), with witnesses only
+  this module can make, and the only two functions that make them:
+  `validate` (validity checks, then digests) and `verify` (signature
+  verification through the signature cache, which moves here, as a hit
+  mints `Verified` too). This module and the cache are what the
+  guarantees rest on.
+- `workqueue`: `Processor { type Input; type Output; fn process(&mut
+  self, Self::Input) -> Option<Self::Output> }`. `Worker::run(inbox, make,
+  sink)` sends each output to `sink`; a stage's output type must be the
+  next one's input type, or the wiring does not compile. A `Queue<T>` is a
+  sink for `T: Refuse`: when it is full the item is refused (a request
+  replies `Overloaded`).
+- `validator`: `Request<S>` (epoch, transactions in state `S`, pending
+  error, reply) flows `Request<DigestPending>` → `TransactionValidator` →
+  `Request<Valid>` → `SignatureVerifier` → `Request<Verified>` → the reply
+  sink, which answers the handler with `Message<Transaction<Verified>>`s.
+
 ## Testing
 
 - `workqueue`: two processors on one thread run there and both drain; a
@@ -204,3 +237,5 @@ hits could evict other entries, and the effective capacity was
 5. Benchmark and notes.
 6. The verified-signature cache, its tests, and a security review of it by
    independent agents.
+7. Checks in the types: transaction states, witness-gated relabelling,
+   processors with input and output types.
