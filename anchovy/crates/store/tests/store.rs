@@ -133,3 +133,70 @@ fn executed_transactions_round_trip_and_survive_reopening() {
             .map(|w| w.version)
     );
 }
+
+/// Versions of one object, written as if by successive transactions; and a
+/// neighbour in id order, which must not be found in its place. Each
+/// version holds a different object's bytes, to tell them apart.
+#[test]
+fn the_version_at_or_before_a_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let checkpoint = checkpoint();
+    let objects: Vec<&[u8]> = checkpoint
+        .get()
+        .transactions
+        .iter()
+        .flat_map(|tx| tx.output_objects.iter())
+        .map(|o| o.bytes)
+        .take(4)
+        .collect();
+    let id = messages::base::ObjectId([0x42; 32]);
+    let next = messages::base::ObjectId([0x43; 32]);
+    let write = |id, version, bytes: &[u8]| Written {
+        id,
+        version,
+        digest: Digest::new([version as u8; 32]),
+        bytes: bytes.to_vec(),
+    };
+    store
+        .commit(Commit {
+            written: vec![
+                write(id, 3, objects[0]),
+                write(id, 7, objects[1]),
+                write(id, 12, objects[2]),
+                write(next, 5, objects[3]),
+            ],
+            ..Commit::default()
+        })
+        .unwrap();
+    let found = |bound| {
+        store
+            .object_at_or_before(&id, bound)
+            .unwrap()
+            .map(|o| o.get().bytes.to_vec())
+    };
+    assert_eq!(found(2), None);
+    for (bound, expected) in [
+        (3, 0),
+        (6, 0),
+        (7, 1),
+        (11, 1),
+        (12, 2),
+        (100, 2),
+        (u64::MAX, 2),
+    ] {
+        assert_eq!(
+            found(bound).as_deref(),
+            Some(objects[expected]),
+            "bound {bound}"
+        );
+    }
+    let before = messages::base::ObjectId([0x41; 32]);
+    assert_eq!(
+        store
+            .object_at_or_before(&before, u64::MAX)
+            .unwrap()
+            .map(|_| ()),
+        None
+    );
+}

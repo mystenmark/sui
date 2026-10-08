@@ -160,6 +160,36 @@ impl Store {
         }))
     }
 
+    /// The object's highest version at or below `bound`, live or not.
+    /// Version `u64::MAX` is never found.
+    pub fn object_at_or_before(
+        &self,
+        id: &ObjectId,
+        bound: u64,
+    ) -> Result<Option<Message<Object<'static>>>> {
+        let mut versions = self.db.iterator(self.objects);
+        versions.reverse();
+        versions.set_lower_bound(object_key(id, 0).to_vec());
+        // Exclusive; at `u64::MAX` the bound misses that version, which sui
+        // reserves and never gives an object.
+        versions.set_upper_bound(object_key(id, bound.saturating_add(1)).to_vec());
+        match versions.next() {
+            Some(entry) => {
+                let (key, value) = entry?;
+                if key[..ID] != id.0 {
+                    return Ok(None);
+                }
+                Message::parse(value.to_vec())
+                    .map(Some)
+                    .map_err(|(error, _)| Error::Corrupt {
+                        table: "objects",
+                        error,
+                    })
+            }
+            None => Ok(None),
+        }
+    }
+
     /// The object's live version.
     pub fn live_object(&self, id: &ObjectId) -> Result<Option<Message<Object<'static>>>> {
         match self.live(id)? {
