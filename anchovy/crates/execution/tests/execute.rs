@@ -11,6 +11,7 @@ use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
 use sui_types::crypto::{AccountKeyPair, get_key_pair};
 use sui_types::effects::{TransactionEffects, TransactionEffectsAPI};
 use sui_types::execution_status::ExecutionStatus;
+use sui_types::message_envelope::Message as _;
 use sui_types::object::Object;
 use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
 use sui_types::transaction::{CallArg, Transaction, TransactionData};
@@ -109,9 +110,39 @@ fn transfers_execute_one_after_another() {
         RGP,
     ));
     assert_eq!(effects.status(), &ExecutionStatus::Success, "{effects:?}");
-    // The transaction and its effects are in the store.
-    let digest = messages::base::Digest::new(effects.transaction_digest().into_inner());
-    assert!(node.store.executed_effects(&digest).unwrap().is_some());
+    // Its results read back as the reference answers for an executed one.
+    let executed = execution::executed(&node.store, &effects.transaction_digest().into_inner())
+        .unwrap()
+        .unwrap();
+    assert_eq!(executed.effects_digest, effects.digest().into_inner());
+    assert_eq!(executed.effects, bcs::to_bytes(&effects).unwrap());
+    assert!(executed.events.is_none(), "a transfer emits no events");
+    let decode = |objects: &[Vec<u8>]| -> Vec<ObjectRef> {
+        let mut refs: Vec<ObjectRef> = objects
+            .iter()
+            .map(|o| {
+                bcs::from_bytes::<Object>(o)
+                    .unwrap()
+                    .compute_object_reference()
+            })
+            .collect();
+        refs.sort();
+        refs
+    };
+    assert_eq!(decode(&executed.input_objects), vec![second_gas]);
+    let mut changed: Vec<ObjectRef> = effects
+        .all_changed_objects()
+        .into_iter()
+        .map(|(r, _, _)| r)
+        .collect();
+    changed.sort();
+    assert_eq!(decode(&executed.output_objects), changed);
+    assert!(
+        execution::executed(&node.store, &[7; 32])
+            .unwrap()
+            .is_none(),
+        "never executed"
+    );
 }
 
 #[test]

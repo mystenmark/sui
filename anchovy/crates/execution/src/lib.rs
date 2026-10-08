@@ -39,6 +39,8 @@ pub enum Error {
     /// An input the input checks found is gone: they were not run against
     /// this store.
     Missing(ObjectID),
+    /// An executed transaction's effects or events are not in the store.
+    MissingEffects(messages::base::Digest),
 }
 
 impl From<store::Error> for Error {
@@ -79,15 +81,24 @@ pub struct Execution {
     reference_gas_price: u64,
 }
 
-/// What executing a transaction produced, as BCS, and what to commit.
+/// What executing a transaction produced: its effects, as BCS, and what
+/// to commit.
 pub struct Outcome {
+    pub effects: Vec<u8>,
+    /// Applied by the caller, before it executes the next transaction.
+    pub commit: store::Commit,
+}
+
+/// An executed transaction as the reference answers for it
+/// (`ExecutedData`), each part BCS.
+pub struct Executed {
     pub effects_digest: [u8; 32],
     pub effects: Vec<u8>,
     pub events: Option<Vec<u8>>,
+    /// The objects the transaction changed, at their versions before it.
     pub input_objects: Vec<Vec<u8>>,
+    /// The objects it changed, at their versions after it.
     pub output_objects: Vec<Vec<u8>>,
-    /// Applied by the caller, before it executes the next transaction.
-    pub commit: store::Commit,
 }
 
 impl Execution {
@@ -136,11 +147,6 @@ impl Execution {
                 ObjectReadResultKind::Object(object),
             ));
         }
-        let input_objects: Vec<Vec<u8>> = inputs
-            .iter()
-            .filter_map(|input| input.as_object())
-            .map(bcs::to_bytes)
-            .collect::<std::result::Result<_, _>>()?;
         let gas_status = SuiGasStatus::new(
             data.gas_budget(),
             data.gas_price(),
@@ -178,7 +184,6 @@ impl Execution {
             .values()
             .map(written)
             .collect::<Result<_>>()?;
-        let output_objects = written.iter().map(|w| w.bytes.clone()).collect();
         let removed = removed(&effects);
         let effects_digest = effects.digest();
         let effects_bytes = bcs::to_bytes(&effects)?;
@@ -188,11 +193,7 @@ impl Execution {
             Some(bcs::to_bytes(&store_out.events)?)
         };
         Ok(Outcome {
-            effects_digest: effects_digest.into_inner(),
             effects: effects_bytes.clone(),
-            events: events.clone(),
-            input_objects,
-            output_objects,
             commit: store::Commit {
                 written,
                 removed,
@@ -206,6 +207,52 @@ impl Execution {
             },
         })
     }
+}
+
+/// The transaction with digest `transaction`, if it executed: read back
+/// from the store as the reference's `complete_executed_data` reads it.
+pub fn executed(store: &store::Store, transaction: &[u8; 32]) -> Result<Option<Executed>> {
+    let Some(effects_digest) =
+        store.executed_effects(&messages::base::Digest::new(*transaction))?
+    else {
+        return Ok(None);
+    };
+    let bytes = store
+        .effects(&effects_digest)?
+        .ok_or(Error::MissingEffects(effects_digest))?
+        .get()
+        .bytes
+        .to_vec();
+    let effects: TransactionEffects = bcs::from_bytes(&bytes)?;
+    let events = match effects.events_digest() {
+        Some(_) => Some(
+            store
+                .events(&messages::base::Digest::new(*transaction))?
+                .ok_or(Error::MissingEffects(effects_digest))?
+                .get()
+                .bytes
+                .to_vec(),
+        ),
+        None => None,
+    };
+    let view = StoreView::new(store);
+    let objects = |objects: Vec<Object>| -> Result<Vec<Vec<u8>>> {
+        Ok(objects
+            .iter()
+            .map(bcs::to_bytes)
+            .collect::<std::result::Result<_, _>>()?)
+    };
+    let input_objects = sui_types::storage::get_transaction_input_objects(&view, &effects)
+        .map_err(|e| Error::Sui(e.into()))?;
+    let output_objects = sui_types::storage::get_transaction_output_objects(&view, &effects)
+        .map_err(|e| Error::Sui(e.into()))?;
+    Ok(Some(Executed {
+        effects_digest: effects_digest.bytes,
+        effects: bytes,
+        events,
+        input_objects: objects(input_objects)?,
+        output_objects: objects(output_objects)?,
+    }))
 }
 
 /// An input as execution reads it: packages and shared objects at their
