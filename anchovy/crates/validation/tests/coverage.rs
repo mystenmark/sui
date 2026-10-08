@@ -21,6 +21,15 @@ const UNREACHABLE: &[(ErrorKind, &str)] = &[
         "a zkLogin signature's signer is its own address; nested in a multisig the \
          reference reports InvalidSignature",
     ),
+    (
+        ErrorKind::ObjectInputArityViolation,
+        "a transaction with no input objects pays from an address balance, which the \
+         input checks refuse as unsupported first",
+    ),
+    (
+        ErrorKind::SharedObjectStartingVersionMismatch,
+        "loading a shared input requires its start version to match, else ObjectNotFound",
+    ),
 ];
 
 #[test]
@@ -29,10 +38,15 @@ fn every_error_kind_has_a_vector() {
     flate2::read::GzDecoder::new(&include_bytes!("data/mutations.vectors.gz")[..])
         .read_to_string(&mut mutations)
         .unwrap();
+    let mut inputs = String::new();
+    flate2::read::GzDecoder::new(&include_bytes!("data/inputs.vectors.gz")[..])
+        .read_to_string(&mut inputs)
+        .unwrap();
     let files = [
         include_str!("data/validity.vectors"),
         &mutations,
         include_str!("data/mainnet-325300367.validity"),
+        &inputs,
     ];
     let seen: HashSet<&str> = files
         .iter()
