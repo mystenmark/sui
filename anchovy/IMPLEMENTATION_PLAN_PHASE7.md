@@ -78,7 +78,7 @@ over objects read from the store, in its order:
 
 No owned-object locks yet: they come with voting. Until then two
 transactions can both pass input checks against the same owned object
-version before either executes; execution catches it (below).
+version before either executes; execution panics on it (below).
 
 `validation::ErrorKind` gains the reference's stateful kinds. Not now:
 checks of packages to be published (bytecode verification at signing;
@@ -93,10 +93,11 @@ executed is answered from the store instead (the reference does the same).
 
 - `TransactionExecutor` executes a request's transactions one at a time,
   each committed before the next, so each reads the latest version of
-  every object. Shared objects: the latest version. Owned objects: a
-  debug assertion that the live version and digest are the ones given;
-  in a release build a mismatch (the race above, until locks) refuses the
-  transaction rather than execute it against a consumed version.
+  every object. Shared objects: the latest version. Owned objects: an
+  assertion (in every build) that the live version and digest are the
+  ones given. A mismatch is equivocation, which consensus will rule out;
+  until then (no locks) it panics rather than execute against a consumed
+  version.
 - `sui-execution` with the real `sui-protocol-config` (anchovy's copy is
   for validation; `EpochState` holds both, for the same version and
   chain), `CheckedInputObjects` built from the loaded inputs, a
@@ -114,8 +115,8 @@ executed is answered from the store instead (the reference does the same).
   dependency) over crafted object sets and transactions: every check's
   pass and fail sides.
 - Execution: transfers, a Move call, a failed transaction (gas still
-  charged), serial dependence (a transaction using another's outputs),
-  a double spend refused, a resubmission answered from the store.
+  charged), serial dependence (a transaction using another's outputs), a
+  resubmission answered from the store.
 - End to end over gRPC, and `tools/validator-client` with a funded account.
 - Benchmark: per-stage cost.
 
