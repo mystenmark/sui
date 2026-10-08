@@ -7377,10 +7377,12 @@ name = "validator"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "bcs",
  "blake2",
  "bytes",
  "clap",
  "containers",
+ "execution",
  "hashbrown 0.17.1",
  "hyper-util",
  "messages",
@@ -7389,6 +7391,9 @@ dependencies = [
  "rcgen",
  "rustls",
  "serde_json",
+ "store",
+ "sui-types",
+ "tempfile",
  "tokio",
  "tokio-rustls",
  "tokio-stream",

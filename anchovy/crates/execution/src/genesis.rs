@@ -68,6 +68,24 @@ fn system_objects(execution: &Execution, packages: Vec<Object>) -> Result<Vec<Ob
     Ok(output.written.into_values().collect())
 }
 
+/// Writes genesis, with gas coins for `allocations` (address, amount), into
+/// `store` unless it has one; whether it wrote it.
+pub fn init(
+    execution: &Execution,
+    store: &store::Store,
+    allocations: &[([u8; 32], u64)],
+) -> Result<bool> {
+    if store.has_genesis()? {
+        return Ok(false);
+    }
+    let allocations: Vec<(SuiAddress, u64)> = allocations
+        .iter()
+        .map(|(address, amount)| (SuiAddress::from_bytes(address).expect("32 bytes"), *amount))
+        .collect();
+    commit(store, &objects(execution, &allocations)?)?;
+    Ok(true)
+}
+
 /// Writes genesis into an empty store.
 pub fn commit(store: &store::Store, objects: &[Object]) -> Result<()> {
     let written = objects

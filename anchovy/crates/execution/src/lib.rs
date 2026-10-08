@@ -12,7 +12,7 @@ mod store_view;
 use std::sync::Arc;
 
 use sui_execution::Executor;
-use sui_protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
+use sui_protocol_config::{ProtocolConfig, ProtocolVersion};
 use sui_types::accumulator_root::EmptyUnsettledObjectFunds;
 use sui_types::base_types::{ConsensusObjectVersion, ObjectID, SystemObjectVersions};
 use sui_types::digests::TransactionDigest;
@@ -29,6 +29,8 @@ use sui_types::transaction::{
 };
 
 pub use store_view::StoreView;
+/// The chain, as sui's executor takes it.
+pub use sui_protocol_config::Chain;
 
 #[derive(Debug)]
 pub enum Error {
@@ -91,6 +93,7 @@ pub struct Outcome {
 
 /// An executed transaction as the reference answers for it
 /// (`ExecutedData`), each part BCS.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Executed {
     pub effects_digest: [u8; 32],
     pub effects: Vec<u8>,
@@ -99,6 +102,16 @@ pub struct Executed {
     pub input_objects: Vec<Vec<u8>>,
     /// The objects it changed, at their versions after it.
     pub output_objects: Vec<Vec<u8>>,
+}
+
+impl Executed {
+    /// The effects digest as the reference's `TransactionEffectsDigest` BCS.
+    pub fn effects_digest_bcs(&self) -> Vec<u8> {
+        bcs::to_bytes(&sui_types::digests::TransactionEffectsDigest::new(
+            self.effects_digest,
+        ))
+        .expect("a digest serializes")
+    }
 }
 
 impl Execution {

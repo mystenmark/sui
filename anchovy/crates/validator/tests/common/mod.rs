@@ -80,6 +80,20 @@ pub fn vectors_epoch(epoch: u64, jwks: Vec<(JwkId, JWK)>) -> Arc<EpochState> {
     ))
 }
 
+/// A store with genesis (no gas coins) in a temporary directory, for the
+/// processors.
+pub struct TestStore {
+    _dir: tempfile::TempDir,
+    pub store: Arc<store::Store>,
+}
+
+pub fn store(epoch: &EpochState) -> TestStore {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(store::Store::open(dir.path()).unwrap());
+    execution::genesis::init(&epoch.execution, &store, &[]).unwrap();
+    TestStore { _dir: dir, store }
+}
+
 /// The checked-in mainnet checkpoint's transactions, and its epoch.
 pub fn mainnet() -> (Vec<Case>, u64) {
     let mut bytes = include_bytes!("../../../messages/tests/data/mainnet-325300367.chk").to_vec();
@@ -148,26 +162,36 @@ impl Pipeline {
         }
     }
 
-    /// The request's verdict: the kind of its first failure, or `Ok`.
+    /// The request's verdict: the kind of its first failure, or `Ok`, when
+    /// what passes comes out with the digests parsing would compute.
     pub fn run(&mut self, bytes: &[&[u8]]) -> Result<(), ErrorKind> {
-        use validator::processors::{Rejected, Request, answer};
+        use messages::transaction::DigestReady;
+        use validator::processors::{Rejected, Request};
         use workqueue::Processor;
-        let (reply, verdict) = tokio::sync::oneshot::channel();
+        let (reply, mut verdict) = tokio::sync::oneshot::channel();
         let transactions = bytes
             .iter()
             .map(|b| Message::parse(b.to_vec()).map_err(|(e, _)| e).unwrap())
             .collect();
         let request = Request::new(self.epoch.clone(), transactions, reply);
-        if let Some(valid) = self.validator.process(request)
-            && let Some(verified) = self.verifier.process(valid)
-        {
-            answer(verified);
+        let Some(verified) = self
+            .validator
+            .process(request)
+            .and_then(|valid| self.verifier.process(valid))
+        else {
+            return match verdict.try_recv().unwrap() {
+                Err(Rejected::Invalid(e)) => Err(e.kind),
+                other => panic!("{:?}", other.map(|_| ())),
+            };
+        };
+        assert_eq!(verified.transactions().len(), bytes.len());
+        for (i, hashed) in verified.transactions().iter().enumerate() {
+            let expected = Message::<Transaction<DigestReady>>::parse(bytes[i].to_vec()).unwrap();
+            let (hashed, expected) = (&hashed.get().0, &expected.get().0);
+            assert_eq!(hashed.digest(), expected.digest());
+            assert_eq!(hashed.bytes(), expected.bytes());
         }
-        match verdict.blocking_recv().unwrap() {
-            Ok(_) => Ok(()),
-            Err(Rejected::Invalid(e)) => Err(e.kind),
-            Err(other) => panic!("{other:?}"),
-        }
+        Ok(())
     }
 
     /// Cache hits and misses so far.

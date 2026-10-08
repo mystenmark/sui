@@ -104,7 +104,10 @@ async fn serve(key: NetworkKey) -> SocketAddr {
             1,
             [],
         ));
-        validator::serve(listener, &key, epoch, std::future::pending())
+        // No genesis: these requests read no objects.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(store::Store::open(dir.path()).unwrap());
+        validator::serve(listener, &key, epoch, store, std::future::pending())
             .await
             .unwrap();
     });
