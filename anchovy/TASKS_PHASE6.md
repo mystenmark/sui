@@ -3,7 +3,7 @@
 Plan: `IMPLEMENTATION_PLAN_PHASE6.md`. Branch `mlogan-phase6`, to be merged
 into `anchovy-main`.
 
-## Status: step 8 (checks in the types) in progress
+## Status: all steps done
 
 ## Done
 
@@ -39,12 +39,20 @@ into `anchovy-main`.
    behind getters; `Measure` crate-private and `Alloc` sealed. No view
    outside the crate can disagree with its bytes or digest
    (`compile_fail` doctests).
-
-## Remaining
-
-8. Checks in the types (plan: "Checks in the types"): `messages` states
-   and relabelling; `workqueue` processor input/output; `validator::checks`
-   and `Request<S>`.
+8. Checks in the types (plan: "Checks in the types"). `messages`:
+   `TxState`, `ParseState` (sealed), `HasDigest`, `Attested`;
+   `Message::relabel`/`relabel_all` with a witness, in place; `Wire` split
+   into `Wire` and `Parse`. `workqueue`: processors declare `Input` and
+   `Output`, the worker routes outputs to a `Sink` (a `Queue` refuses
+   through `Refuse`). `validator::checks`: `Valid`, `Verified`, their
+   witnesses, `validate`, `SignatureChecks` (the cache moved here and takes
+   only `Valid`). `Request<S>` carries the epoch through
+   `TransactionValidator` → `SignatureVerifier` → `answer`; processors no
+   longer hold an epoch. `compile_fail` doctests: parsing into a checked
+   state, implementing `ParseState`, forging a witness, giving a `Valid`
+   transaction where a `Verified` one is needed, wiring a mismatched
+   inbox. Their error codes are checked only by nightly rustdoc
+   (`cargo +nightly test --doc`); stable checks only that they fail.
 
 ## Measurements
 
