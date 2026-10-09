@@ -431,6 +431,29 @@ pub struct UpgradeTicket {
     pub digest: std::vec::Vec<u8>,
 }
 
+impl UpgradeCap {
+    /// `UpgradeCap::new`: the cap for the newly published package at `package_id`, with the
+    /// fresh `uid`.
+    pub fn new(uid: ObjectId, package_id: ObjectId) -> Self {
+        UpgradeCap {
+            id: uid,
+            package: package_id,
+            version: 1,
+            policy: sui_types::move_package::UpgradePolicy::COMPATIBLE,
+        }
+    }
+}
+
+impl UpgradeReceipt {
+    /// `UpgradeReceipt::new`: the receipt for the upgraded package at `upgraded_package_id`.
+    pub fn new(upgrade_ticket: UpgradeTicket, upgraded_package_id: ObjectId) -> Self {
+        UpgradeReceipt {
+            cap: upgrade_ticket.cap,
+            package: upgraded_package_id,
+        }
+    }
+}
+
 impl Value {
     pub fn upgrade_cap(cap: UpgradeCap) -> Self {
         // public struct UpgradeCap has key, store {

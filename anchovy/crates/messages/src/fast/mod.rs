@@ -30,7 +30,7 @@ pub mod events;
 
 pub use checkpoint::{ContentsBuilder, SummaryBuilder};
 pub use effects::EffectsBuilder;
-pub use events::EventsBuilder;
+pub use events::{EventsBuilder, event_digest};
 
 /// A finished message: its BCS bytes in the builder's arena, and its digest
 /// if the type has one.

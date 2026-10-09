@@ -1920,6 +1920,8 @@ dependencies = [
  "move-vm-runtime",
  "natives",
  "serde",
+ "sui-adapter-latest",
+ "sui-framework",
  "sui-protocol-config",
  "sui-types",
  "sui-verifier-latest",

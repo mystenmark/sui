@@ -28,6 +28,7 @@ pub mod gas_model;
 pub mod inputs;
 pub mod layout_resolver;
 pub mod ptb_builder;
+pub mod move_package;
 pub mod static_programmable_transactions;
 pub mod storage;
 pub mod temporary_store;

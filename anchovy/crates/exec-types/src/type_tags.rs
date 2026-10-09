@@ -137,6 +137,68 @@ pub fn move_object_type_in<'a>(bump: &'a Bump, s: &move_tags::StructTag) -> Move
     }
 }
 
+fn view_is(s: &StructTag<'_>, address: &AccountAddress, module: &str, name: &str) -> bool {
+    s.address == address && s.module == module && s.name == name
+}
+
+fn view_is_gas_type(t: &TypeTag<'_>) -> bool {
+    matches!(t, TypeTag::Struct(s)
+        if view_is(s, &SUI_FRAMEWORK_ADDRESS, "sui", "SUI") && s.type_params.is_empty())
+}
+
+/// `accumulator_value_balance_type_maybe`, for a view.
+fn view_accumulator_value_balance_type_maybe<'a>(s: &StructTag<'a>) -> Option<TypeTag<'a>> {
+    if !(view_is(s, &SUI_FRAMEWORK_ADDRESS, "dynamic_field", "Field") && s.type_params.len() == 2) {
+        return None;
+    }
+    let TypeTag::Struct(key) = s.type_params[0] else {
+        return None;
+    };
+    let key = key.get();
+    if !(view_is(key, &SUI_FRAMEWORK_ADDRESS, "accumulator", "Key") && key.type_params.len() == 1) {
+        return None;
+    }
+    let is_u128 = matches!(&s.type_params[1], TypeTag::Struct(v)
+        if view_is(v, &SUI_FRAMEWORK_ADDRESS, "accumulator", "U128") && v.type_params.is_empty());
+    if !is_u128 {
+        return None;
+    }
+    // `Balance::maybe_get_balance_type_param`.
+    match key.type_params[0] {
+        TypeTag::Struct(b)
+            if view_is(&b, &SUI_FRAMEWORK_ADDRESS, "balance", "Balance")
+                && b.type_params.len() == 1 =>
+        {
+            Some(b.get().type_params[0])
+        }
+        _ => None,
+    }
+}
+
+/// `MoveObjectType::from(StructTag)`, for a view: the compact form of the framework's well-known
+/// types, borrowing the tag's parts.
+pub fn move_object_type_of<'a>(s: &StructTag<'a>) -> MoveObjectType<'a> {
+    let is_coin = view_is(s, &SUI_FRAMEWORK_ADDRESS, "coin", "Coin");
+    if is_coin && s.type_params.len() == 1 && view_is_gas_type(&s.type_params[0]) {
+        MoveObjectType::GasCoin
+    } else if is_coin {
+        // A coin has exactly one type parameter.
+        MoveObjectType::Coin(*s.type_params.last().expect("a coin has a type parameter"))
+    } else if view_is(s, &SUI_SYSTEM_ADDRESS, "staking_pool", "StakedSui")
+        && s.type_params.is_empty()
+    {
+        MoveObjectType::StakedSui
+    } else if let Some(balance_type) = view_accumulator_value_balance_type_maybe(s) {
+        if view_is_gas_type(&balance_type) {
+            MoveObjectType::SuiBalanceAccumulatorField
+        } else {
+            MoveObjectType::BalanceAccumulatorField(balance_type)
+        }
+    } else {
+        MoveObjectType::Other(*s)
+    }
+}
+
 /// `StructTag::from(MoveObjectType)`: the full type.
 pub fn to_move_struct_tag_of(t: &MoveObjectType<'_>) -> move_tags::StructTag {
     let framework = move_core_types::account_address::AccountAddress::new(SUI_FRAMEWORK_ADDRESS.0);
@@ -180,6 +242,33 @@ pub fn to_move_struct_tag_of(t: &MoveObjectType<'_>) -> move_tags::StructTag {
         MoveObjectType::SuiBalanceAccumulatorField => balance_field(gas()),
         MoveObjectType::BalanceAccumulatorField(inner) => balance_field(to_move_type_tag(inner)),
         MoveObjectType::Other(s) => to_move_struct_tag(s),
+    }
+}
+
+/// `StructTag::from(MoveObjectType)`, in `bump`: the full type, as a view.
+pub fn move_object_type_struct_tag_in<'a>(bump: &'a Bump, t: &MoveObjectType<'a>) -> StructTag<'a> {
+    let framework: &'static AccountAddress = &SUI_FRAMEWORK_ADDRESS;
+    let tag = |address, module, name, type_params: &[TypeTag<'a>]| StructTag {
+        address,
+        module,
+        name,
+        type_params: containers::alloc_slice_copy(bump, type_params),
+    };
+    let struct_ = |s: StructTag<'a>| TypeTag::Struct(Ref::new(alloc(bump, s)));
+    let gas = || struct_(tag(framework, "sui", "SUI", &[]));
+    let balance_field = |balance_type| {
+        let balance = struct_(tag(framework, "balance", "Balance", &[balance_type]));
+        let key = struct_(tag(framework, "accumulator", "Key", &[balance]));
+        let value = struct_(tag(framework, "accumulator", "U128", &[]));
+        tag(framework, "dynamic_field", "Field", &[key, value])
+    };
+    match t {
+        MoveObjectType::GasCoin => tag(framework, "coin", "Coin", &[gas()]),
+        MoveObjectType::StakedSui => tag(&SUI_SYSTEM_ADDRESS, "staking_pool", "StakedSui", &[]),
+        MoveObjectType::Coin(inner) => tag(framework, "coin", "Coin", &[*inner]),
+        MoveObjectType::SuiBalanceAccumulatorField => balance_field(gas()),
+        MoveObjectType::BalanceAccumulatorField(inner) => balance_field(*inner),
+        MoveObjectType::Other(s) => *s,
     }
 }
 

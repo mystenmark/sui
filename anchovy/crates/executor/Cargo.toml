@@ -28,6 +28,8 @@ serde.workspace = true
 
 [dev-dependencies]
 bcs.workspace = true
+sui-adapter.workspace = true
+sui-framework.workspace = true
 
 [lints]
 workspace = true

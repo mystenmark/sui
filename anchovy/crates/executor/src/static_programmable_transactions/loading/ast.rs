@@ -503,6 +503,59 @@ impl TryFrom<Type<'_>> for TypeTag {
     }
 }
 
+impl<'a> Type<'a> {
+    /// The type's `TypeTag` as a view in `bump`, for what execution records (transfers, written
+    /// objects) rather than hands to the VM. The reference converts to an owned `TypeTag`.
+    pub fn type_tag_in(
+        &self,
+        bump: &'a Bump,
+    ) -> Result<messages::type_tag::TypeTag<'a>, &'static str> {
+        use messages::type_tag::TypeTag as V;
+        Ok(match self {
+            Type::Bool => V::Bool,
+            Type::U8 => V::U8,
+            Type::U16 => V::U16,
+            Type::U32 => V::U32,
+            Type::U64 => V::U64,
+            Type::U128 => V::U128,
+            Type::U256 => V::U256,
+            Type::Address => V::Address,
+            Type::Signer => V::Signer,
+            Type::Vector(inner) => V::Vector(messages::arena::Ref::new(containers::alloc(
+                bump,
+                inner.element_type.type_tag_in(bump)?,
+            ))),
+            Type::Datatype(dt) => V::Struct(messages::arena::Ref::new(containers::alloc(
+                bump,
+                dt.struct_tag_in(bump)?,
+            ))),
+            Type::Reference(_, _) => return Err("unexpected reference type"),
+        })
+    }
+}
+
+impl<'a> Datatype<'a> {
+    /// The datatype's `StructTag` as a view in `bump` (see `Type::type_tag_in`).
+    pub fn struct_tag_in(
+        &self,
+        bump: &'a Bump,
+    ) -> Result<messages::type_tag::StructTag<'a>, &'static str> {
+        let mut type_params = Vec::with_capacity_in(self.type_arguments.len(), bump);
+        for t in self.type_arguments {
+            type_params.push(t.type_tag_in(bump)?);
+        }
+        Ok(messages::type_tag::StructTag {
+            address: containers::alloc(
+                bump,
+                messages::base::AccountAddress(self.module.address.into_bytes()),
+            ),
+            module: self.module.name,
+            name: self.name,
+            type_params: type_params.leak(),
+        })
+    }
+}
+
 impl TryFrom<&Datatype<'_>> for StructTag {
     type Error = &'static str;
 
@@ -522,5 +575,56 @@ impl TryFrom<&Datatype<'_>> for StructTag {
                 .map(|t| (*t).try_into())
                 .collect::<Result<std::vec::Vec<TypeTag>, _>>()?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `type_tag_in` is the owned conversion, as a view.
+    #[test]
+    fn type_tag_views_match_owned_tags() {
+        let bump = Bump::with_capacity(1 << 12);
+        let module = |address: u16, name| ModuleId {
+            address: AccountAddress::from_suffix(address),
+            name,
+        };
+        let inner = Datatype {
+            abilities: AbilitySet::EMPTY,
+            module: module(7, "m"),
+            name: "Inner",
+            type_arguments: containers::alloc_slice_copy(&bump, &[Type::U8, Type::Address]),
+        };
+        let vector = Vector {
+            abilities: AbilitySet::EMPTY,
+            element_type: Type::Datatype(&inner),
+        };
+        let outer = Datatype {
+            abilities: AbilitySet::EMPTY,
+            module: module(2, "coin"),
+            name: "Coin",
+            type_arguments: containers::alloc_slice_copy(
+                &bump,
+                &[Type::Vector(&vector), Type::U256, Type::Bool],
+            ),
+        };
+        for ty in [
+            Type::U64,
+            Type::Signer,
+            Type::Vector(&vector),
+            Type::Datatype(&inner),
+            Type::Datatype(&outer),
+        ] {
+            let owned: TypeTag = ty.try_into().unwrap();
+            let view = ty.type_tag_in(&bump).unwrap();
+            assert_eq!(
+                exec_types::type_tags::to_move_type_tag(&view),
+                owned,
+                "{ty:?}"
+            );
+        }
+        let reference = Type::Reference(false, &Type::U8);
+        assert!(reference.type_tag_in(&bump).is_err());
     }
 }

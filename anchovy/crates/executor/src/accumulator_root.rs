@@ -19,6 +19,17 @@ use crate::accumulator_event::AccumulatorEvent;
 /// `SequenceNumber::MAX`, the bound of an unbounded read.
 const SEQUENCE_NUMBER_MAX: SequenceNumber = 0x7fff_ffff_ffff_ffff;
 
+/// `is_settle_u128_call`: whether the call is `0x2::accumulator_settlement::settle_u128`.
+pub fn is_settle_u128_call(
+    module_address: &move_core_types::account_address::AccountAddress,
+    module: &str,
+    function: &str,
+) -> bool {
+    module_address.into_bytes() == SUI_FRAMEWORK_ADDRESS.0
+        && module == sui_types::accumulator_root::ACCUMULATOR_SETTLEMENT_MODULE.as_str()
+        && function == sui_types::accumulator_root::ACCUMULATOR_ROOT_SETTLE_U128_FUNC.as_str()
+}
+
 /// `Balance::is_balance_type`: `0x2::balance::Balance<T>`.
 pub fn is_balance_type(ty: &TypeTag<'_>) -> bool {
     matches!(ty, TypeTag::Struct(s)

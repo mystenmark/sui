@@ -85,6 +85,21 @@ fn object_types_match() {
         w.move_object_type(&ours);
         assert_eq!(w.finish_bytes(), bcs::to_bytes(&theirs).unwrap(), "{tag}");
         assert_eq!(ours.bcs_size(), bcs::to_bytes(&theirs).unwrap().len());
+        // From a view of the tag, and back to the full tag as a view.
+        let of_view = exec_types::type_tags::move_object_type_of(
+            &exec_types::type_tags::struct_tag_in(&bump, &tag),
+        );
+        let mut w = messages::fast::Writer::new_in(&bump, 256);
+        w.move_object_type(&of_view);
+        assert_eq!(w.finish_bytes(), bcs::to_bytes(&theirs).unwrap(), "{tag}");
+        let full = exec_types::type_tags::move_object_type_struct_tag_in(&bump, &ours);
+        let mut w = messages::fast::Writer::new_in(&bump, 256);
+        w.struct_tag(&full);
+        assert_eq!(
+            w.finish_bytes(),
+            bcs::to_bytes(&StructTag::from(theirs.clone())).unwrap(),
+            "{tag}"
+        );
         assert_eq!(
             exec_types::type_tags::to_move_struct_tag_of(&ours),
             StructTag::from(theirs),
