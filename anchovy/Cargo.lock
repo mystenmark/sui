@@ -1275,6 +1275,7 @@ dependencies = [
  "arena-btreemap",
  "foldhash 0.2.0",
  "hashbrown 0.17.1",
+ "indexmap 2.14.2",
 ]
 
 [[package]]

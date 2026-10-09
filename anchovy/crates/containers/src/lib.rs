@@ -19,6 +19,12 @@ pub type HashSet<'a, K> = hashbrown::HashSet<K, foldhash::fast::RandomState, &'a
 /// support by `arena-btreemap`.
 pub type BTreeMap<'a, K, V> = arena_btreemap::BTreeMap<K, V, &'a Bump>;
 
+mod btree_set;
+mod index_map;
+
+pub use btree_set::BTreeSet;
+pub use index_map::{Entry, IndexMap, IndexSet, OccupiedEntry, VacantEntry};
+
 pub fn hash_map<K, V>(bump: &Bump, capacity: usize) -> HashMap<'_, K, V> {
     HashMap::with_capacity_and_hasher_in(capacity, foldhash::fast::RandomState::default(), bump)
 }
