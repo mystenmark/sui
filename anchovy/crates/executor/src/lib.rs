@@ -6,13 +6,9 @@
 //! and objects as `messages` views, with per-transaction temporaries in an
 //! arena. See `IMPLEMENTATION_PLAN_PHASE8.md`.
 
-// Style-only lints that would reshape code ported line for line from the reference.
-#![allow(
-    clippy::doc_markdown,
-    clippy::single_match_else,
-    clippy::too_many_arguments,
-    clippy::too_many_lines
-)]
+// Pedantic style lints would reshape code ported line for line from the reference; the
+// reference is held to sui's lints instead.
+#![allow(clippy::pedantic, clippy::too_many_arguments)]
 
 pub mod error;
 pub mod gas;
