@@ -24,7 +24,7 @@ use crate::{
     storage::DenyListResult,
 };
 use containers::{
-    BTreeMap, BTreeSet, Bump, HashMap, IndexMap, IndexSet, Vec, alloc, alloc_slice_copy, alloc_str,
+    BTreeMap, BTreeSet, Bump, IndexMap, IndexSet, Vec, alloc, alloc_slice_copy, alloc_str,
 };
 use exec_types::base::{move_address, object_id};
 use exec_types::error::{ExecutionError, ExecutionErrorKind, SafeIndex, command_argument_error};
@@ -59,10 +59,7 @@ use move_vm_runtime::{
         vm::{LoadedFunctionInformation, MoveVM},
     },
     natives::extensions::NativeExtensions,
-    shared::{
-        gas::{GasMeter as _, SimpleInstruction},
-        linkage_context::LinkageHash,
-    },
+    shared::gas::{GasMeter as _, SimpleInstruction},
     validation::verification::ast::Package as VerifiedPackage,
 };
 use natives::NativesCostTable;
@@ -152,13 +149,30 @@ macro_rules! charge_gas {
 
 // Helper macro to manage Move VM cache for different linkage contexts. If the given linkage is
 // found the VM is reused, otherwise a new VM is created and inserted into the cache.
+//
+// The reference keys the cache by `LinkageHash`, the linkage table as addresses, built on every
+// call. Here an entry is found by its `ResolvedLinkage`'s `linkage` map, which converts to that
+// table one to one, so equal maps are equal keys. The `LinkageContext` is built only on a miss: a
+// hit means an equal table already passed `LinkageContext::new`, which is deterministic, so it
+// would pass again. As in the reference, the VM is out of the cache while the body runs and is
+// put back only if the body succeeds.
 macro_rules! with_vm {
     ($self:ident, $linkage:expr, $body:expr) => {{
-        let link_context = $linkage.linkage_context()?;
-        let linkage_hash = link_context.to_linkage_hash();
-        let mut vm = if let Some(vm) = $self.executable_vm_cache.remove(&linkage_hash) {
+        let linkage: &ExecutableLinkage<'a> = $linkage;
+        let cached = $self
+            .executable_vm_cache
+            .iter()
+            .position(|(l, _)| std::ptr::eq(*l, linkage.0) || l.linkage == linkage.0.linkage);
+        let mut vm = if let Some(i) = cached {
+            let (_, vm) = $self.executable_vm_cache.swap_remove(i);
+            debug_assert_eq!(
+                linkage.linkage_context().ok().as_ref(),
+                Some(vm.linkage_context()),
+                "a cached VM's linkage differs from the linkage it was found by"
+            );
             vm
         } else {
+            let link_context = linkage.linkage_context()?;
             let data_store = &$self.env.linkable_store.package_store;
             $self
                 .env
@@ -168,10 +182,17 @@ macro_rules! with_vm {
                     link_context,
                     $self.native_extensions.clone(),
                 )
-                .map_err(|e| $self.env.convert_linked_vm_error(e, $linkage))?
+                .map_err(|e| $self.env.convert_linked_vm_error(e, linkage))?
         };
         let result = $body(&mut vm)?;
-        $self.executable_vm_cache.insert(linkage_hash, vm);
+        // The body never makes a VM itself, so no equal entry was added meanwhile.
+        debug_assert!(
+            $self
+                .executable_vm_cache
+                .iter()
+                .all(|(l, _)| l.linkage != linkage.0.linkage)
+        );
+        $self.executable_vm_cache.push((linkage.0, vm));
         Ok(result)
     }};
 }
@@ -269,8 +290,9 @@ where
     /// Tracks where the gas coin was sent, if it was moved by value
     gas_coin_transfer: Option<GasCoinTransfer>,
     // cache of Move VMs created this transaction for different linkage contexts so that we can reuse them.
-    // The reference's is an LRU of 1024 VMs, more than a transaction's commands can make.
-    executable_vm_cache: HashMap<'a, LinkageHash, MoveVM<'a>>,
+    // The reference's is an LRU of 1024 VMs, more than a transaction's commands can make. A
+    // transaction makes few, so they are searched linearly (see `with_vm!`).
+    executable_vm_cache: Vec<'a, (&'a ResolvedLinkage<'a>, MoveVM<'a>)>,
 }
 
 impl<'a> Locations<'a> {
@@ -501,7 +523,7 @@ where
                 results: Vec::new_in(bump),
             },
             gas_coin_transfer: None,
-            executable_vm_cache: containers::hash_map(bump, 0),
+            executable_vm_cache: Vec::new_in(bump),
         })
     }
 
