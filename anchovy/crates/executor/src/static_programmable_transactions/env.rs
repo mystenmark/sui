@@ -42,6 +42,7 @@ use move_core_types::{
 use move_vm_runtime::{
     execution::{self as vm_runtime, vm::MoveVM},
     runtime::MoveRuntime,
+    shared::constants::{HISTORICAL_MAX_TYPE_TO_LAYOUT_NODES, VALUE_DEPTH_MAX},
 };
 use std::{
     cell::{OnceCell, RefCell},
@@ -204,6 +205,61 @@ where
     }
 
     pub fn runtime_layout(
+        &self,
+        ty: &Type<'a>,
+    ) -> Result<runtime_value::MoveTypeLayout, ExecutionError<'a>> {
+        if let Some(layout) = self.scalar_runtime_layout(ty) {
+            debug_assert_eq!(
+                Some(format!("{layout:?}")),
+                self.vm_runtime_layout(ty).ok().map(|l| format!("{l:?}"))
+            );
+            return Ok(layout);
+        }
+        self.vm_runtime_layout(ty)
+    }
+
+    /// The layout of a scalar (`bool`, an unsigned integer or `address`) or a vector of one,
+    /// without the VM. Not in the reference, which always asks the VM.
+    ///
+    /// The VM's answer is this layout: the tag has no addresses, so its type linkage is empty and
+    /// cannot fail, and loading it and computing its layout visit one node per level of nesting
+    /// (at most 2), within the type traversal limits (`TYPE_DEPTH_MAX`,
+    /// `MAX_TYPE_INSTANTIATION_NODES`) and, as checked here, within the VM's value depth and
+    /// layout node limits.
+    fn scalar_runtime_layout(&self, ty: &Type<'a>) -> Option<runtime_value::MoveTypeLayout> {
+        use runtime_value::MoveTypeLayout as R;
+        fn scalar(ty: &Type<'_>) -> Option<R> {
+            Some(match ty {
+                Type::Bool => R::Bool,
+                Type::U8 => R::U8,
+                Type::U16 => R::U16,
+                Type::U32 => R::U32,
+                Type::U64 => R::U64,
+                Type::U128 => R::U128,
+                Type::U256 => R::U256,
+                Type::Address => R::Address,
+                Type::Signer | Type::Vector(_) | Type::Datatype(_) | Type::Reference(_, _) => {
+                    return None;
+                }
+            })
+        }
+        let (layout, depth) = match ty {
+            Type::Vector(v) => (R::Vector(Box::new(scalar(&v.element_type)?)), 2),
+            ty => (scalar(ty)?, 1),
+        };
+        let config = self.input_type_resolution_vm.vm_config();
+        let max_depth = config
+            .runtime_limits_config
+            .max_value_nest_depth
+            .unwrap_or(VALUE_DEPTH_MAX);
+        let max_nodes = config
+            .max_type_to_layout_nodes
+            .unwrap_or(HISTORICAL_MAX_TYPE_TO_LAYOUT_NODES);
+        (depth <= max_depth && depth <= max_nodes).then_some(layout)
+    }
+
+    /// `runtime_layout`, from the VM.
+    fn vm_runtime_layout(
         &self,
         ty: &Type<'a>,
     ) -> Result<runtime_value::MoveTypeLayout, ExecutionError<'a>> {
