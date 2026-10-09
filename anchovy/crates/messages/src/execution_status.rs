@@ -148,6 +148,10 @@ pub enum ExecutionErrorKind<'a> {
 }
 
 impl<'a> ExecutionErrorKind<'a> {
+    pub fn command_argument_error(kind: CommandArgumentError, arg_idx: u16) -> Self {
+        Self::CommandArgumentError { arg_idx, kind }
+    }
+
     // One arm per variant of a 42-variant enum.
     #[allow(clippy::too_many_lines)]
     pub fn parse(r: &mut Reader<'a>) -> Result<ExecutionErrorKind<'a>> {

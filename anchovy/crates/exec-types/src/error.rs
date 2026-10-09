@@ -97,6 +97,18 @@ impl std::error::Error for ExecutionError<'_> {
     }
 }
 
+// The reference truncates the index with `as`.
+#[allow(clippy::cast_possible_truncation)]
+pub fn command_argument_error(
+    e: messages::execution_status::CommandArgumentError,
+    arg_idx: usize,
+) -> ExecutionError<'static> {
+    ExecutionError::from_kind(ExecutionErrorKind::command_argument_error(
+        e,
+        arg_idx as u16,
+    ))
+}
+
 /// The `sui_types::error::UserInputError` variants execution raises.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UserInputError {
