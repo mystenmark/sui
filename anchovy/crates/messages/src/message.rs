@@ -300,3 +300,47 @@ where
         self.digest().hash(state);
     }
 }
+
+/// Messages kept together, each lending its view for as long as the keeper is borrowed: for
+/// what a computation reads one message at a time but borrows all together, such as the
+/// objects a transaction reads during execution.
+pub struct Kept<T: Wire> {
+    // Only ever pushed to, so every message lives as long as the keeper.
+    messages: std::cell::RefCell<Vec<Message<T>>>,
+}
+
+impl<T: Wire> Default for Kept<T> {
+    fn default() -> Self {
+        Kept {
+            messages: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+}
+
+impl<T: Wire> Kept<T> {
+    pub fn new() -> Kept<T> {
+        Kept::default()
+    }
+
+    /// Keeps `message`, lending its view for as long as `self` is borrowed.
+    pub fn keep(&self, message: Message<T>) -> T::View<'_> {
+        let view: *const T::View<'static> = &raw const message.view;
+        // SAFETY: the view is read before `message` moves. It points into the message's wire
+        // buffer and arena, two heap allocations that moving the message does not move, and
+        // `messages` is only pushed to, so they live until `self` drops. `View` is covariant
+        // (`Wire::shrink`), so the `'static` standing for "while the message lives" may be
+        // shortened to the borrow of `self`.
+        let view = unsafe { *T::shrink(&*view) };
+        self.messages.borrow_mut().push(message);
+        view
+    }
+
+    /// How many messages are kept.
+    pub fn len(&self) -> usize {
+        self.messages.borrow().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
