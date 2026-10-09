@@ -12,6 +12,7 @@
 
 pub mod accumulator_event;
 pub mod accumulator_root;
+pub mod adapter;
 pub mod data_store;
 pub mod deny_list_v2;
 pub mod effects;
