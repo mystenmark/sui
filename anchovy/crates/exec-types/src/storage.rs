@@ -95,6 +95,30 @@ pub trait RuntimeObjectResolver<'a>: BackingPackageStore<'a> {
     }
 }
 
+/// `sui_types::storage::ObjectStore`: objects by id, live or at a version.
+pub trait ObjectStore<'a> {
+    fn get_object(&self, object_id: &ObjectId) -> Option<Object<'a>>;
+
+    fn get_object_by_key(&self, object_id: &ObjectId, version: SequenceNumber)
+    -> Option<Object<'a>>;
+
+    /// Load an implicitly read system object at the given version.
+    /// Returns None if the store no longer has that version.
+    fn load_implicitly_read_system_object(
+        &self,
+        object_id: &ObjectId,
+        version: SequenceNumber,
+    ) -> Option<Object<'a>> {
+        self.get_object_by_key(object_id, version)
+    }
+}
+
+/// `sui_types::storage::BackingStore`, without `ParentSync`, which only older protocol versions
+/// read.
+pub trait BackingStore<'a>: RuntimeObjectResolver<'a> + ObjectStore<'a> {}
+
+impl<'a, T> BackingStore<'a> for T where T: RuntimeObjectResolver<'a> + ObjectStore<'a> {}
+
 /// Resolves the balance available for object-funds withdrawals during execution.
 pub trait ObjectFundsResolver {
     fn object_available_balance(&self, owner: SuiAddress, type_: &TypeTag<'_>) -> SuiResult<u128>;
