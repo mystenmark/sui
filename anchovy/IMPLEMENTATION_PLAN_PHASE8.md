@@ -102,6 +102,15 @@ representation (e.g. `ExecutionErrorKind<'a>`, `Owner<'a>`), and
 - Per-transaction maps (`BTreeMap`, `IndexMap`, `IndexSet`) become arena
   containers. `Rc<RefCell<TxContext>>` stays where the natives share it.
 
+## Execution inputs
+
+Not the reference's `InputObjects`/`ObjectReadResult` (sui-core's loader handing inputs to
+execution). A processor will load all of a transaction's inputs; the execution processor takes
+the transaction plus those loaded inputs, which is all execution needs. That interface is
+designed with the loader, not copied; until then the temporary store and engine are ported
+against it last, and the parts that do not depend on it (typing, verification, execution
+context, natives, effects) first.
+
 ## Child objects
 
 - The fingerprint that decides whether a loaded child changed is its
