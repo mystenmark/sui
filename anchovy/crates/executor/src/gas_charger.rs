@@ -4,9 +4,6 @@
 
 //! The adapter's `gas_charger`. Only gas model 15 on exists, so the legacy charging is left out.
 
-// The engine, which calls the rest, is not yet ported.
-#![allow(dead_code)]
-
 use containers::{Bump, IndexMap};
 use exec_types::base::ObjectRef;
 use exec_types::object::Object;
@@ -32,6 +29,7 @@ use exec_types::invariant_violation;
 pub struct GasCharger<'a> {
     tx_digest: TransactionDigest,
     // Read only by the legacy charging, which is left out.
+    #[allow(dead_code)]
     gas_model_version: u64,
     payment: PaymentMetadata<'a>,
     gas_status: SuiGasStatus,

@@ -6,9 +6,6 @@
 //! during execution. Reads that execution discovers (packages, children, received and system
 //! objects) go to the backing store.
 
-// Gas charging and the engine, which call the rest, are not yet ported.
-#![allow(dead_code)]
-
 use crate::accumulator_event::{AccumulatorEvent, signed_balance_changes_from_events};
 use crate::accumulator_root;
 use crate::deny_list_v2::check_coin_deny_list_v2_during_execution;
