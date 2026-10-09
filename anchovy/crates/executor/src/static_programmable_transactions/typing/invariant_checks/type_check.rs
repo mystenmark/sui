@@ -149,7 +149,7 @@ fn withdrawal_input(w: &T::WithdrawalInput) -> anyhow::Result<()> {
 fn pure_input<Mode: ExecutionMode>(bump: &Bump, p: &T::PureInput) -> anyhow::Result<()> {
     if !Mode::allow_arbitrary_values() {
         anyhow::ensure!(
-            input_arguments::is_valid_pure_type(bump, &p.ty)?,
+            input_arguments::is_valid_pure_type(bump, &p.ty).map_err(to_anyhow)?,
             "pure type must be valid"
         );
     }
