@@ -28,5 +28,9 @@ validation.workspace = true
 sui-move-build.workspace = true
 tempfile.workspace = true
 
+[[bench]]
+name = "execute"
+harness = false
+
 [lints]
 workspace = true
