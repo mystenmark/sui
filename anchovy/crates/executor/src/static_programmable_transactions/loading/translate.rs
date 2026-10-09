@@ -18,7 +18,7 @@ use exec_types::tx_context::TxContext;
 use exec_types::type_tags::{to_move_struct_tag_of, to_move_type_tag};
 use exec_types::{assert_invariant, invariant_violation, make_invariant_violation};
 use messages::base::SuiAddress;
-use messages::object::{Owner, Party};
+use messages::object::{MoveObjectType, Owner, Party};
 use messages::transaction::{
     self as P, CallArg, FundsWithdrawalArg, ObjectArg, SharedObjectMutability,
 };
@@ -57,11 +57,13 @@ pub fn transaction<'a, Mode: ExecutionMode>(
         "withdrawal compatibility inputs must be the same length as the inputs"
     );
     let mut loaded_inputs = Vec::with_capacity_in(inputs.len(), env.bump);
+    let mut object_types = Vec::new_in(env.bump);
     for (idx, arg) in inputs.iter().enumerate() {
         let is_withdrawal_compatibility_input =
             withdrawal_compatibility_inputs.is_some_and(|w| w.get(idx).copied().unwrap_or(false));
         loaded_inputs.push(input(
             env,
+            &mut object_types,
             tx_context,
             is_withdrawal_compatibility_input,
             *arg,
@@ -134,8 +136,32 @@ fn command_arguments<'b>(command: &P::Command<'b>) -> impl Iterator<Item = P::Ar
     before.into_iter().chain(rest.iter().copied()).chain(after)
 }
 
+/// The loaded type of an object input whose object has type `ty`. Not in the reference, which loads
+/// the type again for every object input.
+///
+/// `object_types` memoizes the types loaded for the transaction's inputs. A hit is what loading
+/// would return: equal views denote the same struct tag, which is loaded by the same input type
+/// resolution VM over the same packages (loading publishes nothing). Only loaded types are kept.
+fn object_type<'a, Mode: ExecutionMode>(
+    env: &Env<'a, '_, '_, '_, '_, '_, Mode>,
+    object_types: &mut Vec<'a, (MoveObjectType<'a>, L::Type<'a>)>,
+    ty: &MoveObjectType<'a>,
+) -> Result<L::Type<'a>, ExecutionError<'a>> {
+    if let Some((_, loaded)) = object_types.iter().find(|(key, _)| key == ty) {
+        debug_assert!(
+            env.load_type_from_struct(to_move_struct_tag_of(ty))
+                .is_ok_and(|reloaded| reloaded == *loaded)
+        );
+        return Ok(*loaded);
+    }
+    let loaded = env.load_type_from_struct(to_move_struct_tag_of(ty))?;
+    object_types.push((*ty, loaded));
+    Ok(loaded)
+}
+
 fn input<'a, Mode: ExecutionMode>(
     env: &Env<'a, '_, '_, '_, '_, '_, Mode>,
+    object_types: &mut Vec<'a, (MoveObjectType<'a>, L::Type<'a>)>,
     tx_context: &TxContext,
     // True iff this is a withdrawal that needs to be converted to a coin
     is_withdrawal_compatibility_input: bool,
@@ -159,8 +185,7 @@ fn input<'a, Mode: ExecutionMode>(
             let Some(ty) = obj.type_() else {
                 invariant_violation!("Object {:?} has does not have a Move type", id);
             };
-            let tag = to_move_struct_tag_of(ty);
-            let ty = env.load_type_from_struct(tag)?;
+            let ty = object_type(env, object_types, ty)?;
             let arg = match obj.owner() {
                 Owner::AddressOwner(_) => L::ObjectArg {
                     kind: L::ObjectArgKind::OwnedObject(oref),
@@ -207,8 +232,7 @@ fn input<'a, Mode: ExecutionMode>(
             let Some(ty) = obj.type_() else {
                 invariant_violation!("Object {:?} does not have a Move type", id);
             };
-            let tag = to_move_struct_tag_of(ty);
-            let ty = env.load_type_from_struct(tag)?;
+            let ty = object_type(env, object_types, ty)?;
             let owner_permissions = match obj.owner() {
                 Owner::AddressOwner(_) | Owner::ObjectOwner(_) | Owner::Immutable => {
                     assert_invariant!(
