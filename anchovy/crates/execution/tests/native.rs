@@ -577,3 +577,168 @@ fn generic_calls_match() {
     b.command(Command::MergeCoins(first, vec![second]));
     assert!(run(b).status().is_ok());
 }
+
+
+// Dynamic fields through the framework's collections: children added, borrowed mutably (a linked
+// table's push and pop relink neighbouring nodes), mutated and removed, within one transaction and
+// across transactions, and re-added with the same or a different value.
+
+use move_core_types::language_storage::TypeTag;
+use sui_types::transaction::{Argument, Command};
+
+impl Node {
+    /// A PTB built by `f`, paid with the gas coin; the effects.
+    fn ptb(&self, f: impl FnOnce(&mut ProgrammableTransactionBuilder)) -> TransactionEffects {
+        let mut builder = ProgrammableTransactionBuilder::new();
+        f(&mut builder);
+        self.execute_both_and_commit(TransactionData::new_programmable(
+            self.sender,
+            vec![self.gas()],
+            builder.finish(),
+            BUDGET,
+            RGP,
+        ))
+    }
+
+    /// The created object whose type's name is `name`.
+    fn created_named(&self, effects: &TransactionEffects, name: &str) -> ObjectID {
+        let view = execution::StoreView::new(&self.store);
+        effects
+            .created()
+            .into_iter()
+            .map(|(r, _)| r.0)
+            .find(|id| {
+                view.live_object(id)
+                    .unwrap()
+                    .unwrap()
+                    .struct_tag()
+                    .is_some_and(|t| t.name.as_str() == name)
+            })
+            .unwrap()
+    }
+
+    fn owned_arg(&self, b: &mut ProgrammableTransactionBuilder, id: ObjectID) -> Argument {
+        b.obj(ObjectArg::ImmOrOwnedObject(self.live_ref(id)))
+            .unwrap()
+    }
+}
+
+fn framework(
+    b: &mut ProgrammableTransactionBuilder,
+    module: &str,
+    function: &str,
+    type_args: Vec<TypeTag>,
+    args: Vec<Argument>,
+) -> Argument {
+    b.programmable_move_call(
+        sui_types::SUI_FRAMEWORK_PACKAGE_ID,
+        move_core_types::identifier::Identifier::new(module).unwrap(),
+        move_core_types::identifier::Identifier::new(function).unwrap(),
+        type_args,
+        args,
+    )
+}
+
+/// `collection`, a key and a value, as a call's arguments.
+fn ckv(
+    b: &mut ProgrammableTransactionBuilder,
+    collection: Argument,
+    k: u64,
+    v: u64,
+) -> Vec<Argument> {
+    vec![collection, b.pure(k).unwrap(), b.pure(v).unwrap()]
+}
+
+#[test]
+fn dynamic_fields_match() {
+    let node = Node::new();
+    let u64s = || vec![TypeTag::U64, TypeTag::U64];
+    let coin = TypeTag::Struct(Box::new(sui_types::gas_coin::GasCoin::type_()));
+    let bag_args = || vec![TypeTag::U64, coin.clone()];
+
+    // Created, filled, relinked and partly emptied in one transaction.
+    let effects = node.ptb(|b| {
+        let lt = framework(b, "linked_table", "new", u64s(), vec![]);
+        for (k, v) in [(1, 10), (2, 20), (3, 30)] {
+            let args = ckv(b, lt, k, v);
+            framework(b, "linked_table", "push_back", u64s(), args);
+        }
+        framework(b, "linked_table", "pop_front", u64s(), vec![lt]);
+        let t = framework(b, "table", "new", u64s(), vec![]);
+        for (k, v) in [(1, 100), (2, 200)] {
+            let args = ckv(b, t, k, v);
+            framework(b, "table", "add", u64s(), args);
+        }
+        let two = b.pure(2u64).unwrap();
+        framework(b, "table", "remove", u64s(), vec![t, two]);
+        let bag = framework(b, "object_bag", "new", vec![], vec![]);
+        let amount = b.pure(1000u64).unwrap();
+        let c = b.command(Command::SplitCoins(Argument::GasCoin, vec![amount]));
+        let one = b.pure(1u64).unwrap();
+        framework(b, "object_bag", "add", bag_args(), vec![bag, one, c]);
+        b.transfer_args(node.sender, vec![lt, t, bag]);
+    });
+    assert!(effects.status().is_ok(), "{effects:?}");
+    let lt = node.created_named(&effects, "LinkedTable");
+    let t = node.created_named(&effects, "Table");
+    let bag = node.created_named(&effects, "ObjectBag");
+
+    // Stored children loaded, relinked and removed; one removed and re-added unchanged; one new.
+    let effects = node.ptb(|b| {
+        let lt = node.owned_arg(b, lt);
+        let args = ckv(b, lt, 4, 40);
+        framework(b, "linked_table", "push_back", u64s(), args);
+        let two = b.pure(2u64).unwrap();
+        framework(b, "linked_table", "remove", u64s(), vec![lt, two]);
+        let three = b.pure(3u64).unwrap();
+        framework(b, "linked_table", "contains", u64s(), vec![lt, three]);
+        let t = node.owned_arg(b, t);
+        let one = b.pure(1u64).unwrap();
+        let v = framework(b, "table", "remove", u64s(), vec![t, one]);
+        framework(b, "table", "add", u64s(), vec![t, one, v]);
+        let args = ckv(b, t, 3, 300);
+        framework(b, "table", "add", u64s(), args);
+        let bag = node.owned_arg(b, bag);
+        let c = framework(b, "object_bag", "remove", bag_args(), vec![bag, one]);
+        b.command(Command::MergeCoins(Argument::GasCoin, vec![c]));
+    });
+    assert!(effects.status().is_ok(), "{effects:?}");
+
+    // Stored children mutated: re-added with new values, relinked at both ends.
+    let effects = node.ptb(|b| {
+        let t = node.owned_arg(b, t);
+        for k in [1u64, 3] {
+            let key = b.pure(k).unwrap();
+            framework(b, "table", "remove", u64s(), vec![t, key]);
+            let args = ckv(b, t, k, k * 1000 + 1);
+            framework(b, "table", "add", u64s(), args);
+        }
+        let lt = node.owned_arg(b, lt);
+        framework(b, "linked_table", "pop_front", u64s(), vec![lt]);
+        let args = ckv(b, lt, 6, 60);
+        framework(b, "linked_table", "push_front", u64s(), args);
+        let args = ckv(b, lt, 5, 50);
+        framework(b, "linked_table", "push_back", u64s(), args);
+    });
+    assert!(effects.status().is_ok(), "{effects:?}");
+
+    // An abort after children were loaded and changed.
+    let effects = node.ptb(|b| {
+        let t = node.owned_arg(b, t);
+        let args = ckv(b, t, 4, 400);
+        framework(b, "table", "add", u64s(), args);
+        let missing = b.pure(99u64).unwrap();
+        framework(b, "table", "remove", u64s(), vec![t, missing]);
+    });
+    assert!(!effects.status().is_ok(), "{effects:?}");
+
+    // Emptied and destroyed.
+    let effects = node.ptb(|b| {
+        let lt = node.owned_arg(b, lt);
+        for _ in 0..3 {
+            framework(b, "linked_table", "pop_back", u64s(), vec![lt]);
+        }
+        framework(b, "linked_table", "destroy_empty", u64s(), vec![lt]);
+    });
+    assert!(effects.status().is_ok(), "{effects:?}");
+}
