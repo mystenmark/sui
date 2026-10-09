@@ -291,7 +291,7 @@ mod input_type_resolution_analysis {
                 )
             })?;
             let ids = all_addresses(bump, ty).into_iter().map(|a| object_id(&a));
-            Ok(resolution_table.add_type_linkages_to_table(ids, package_store)?)
+            resolution_table.add_type_linkages_to_table(ids, package_store)
         };
         match command {
             Command::MoveCall(pmc) => {

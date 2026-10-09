@@ -320,17 +320,17 @@ pub fn compute_digest_for_modules_and_deps(
         containers::Vec::with_capacity_in(modules.len(), bump);
     let mut components: containers::Vec<'_, &[u8]> =
         containers::Vec::with_capacity_in(modules.len() + object_ids.len(), bump);
-    if !hash_modules {
-        for module in modules {
-            components.push(module);
-        }
-    } else {
+    if hash_modules {
         for module in modules {
             let mut digest = Blake2b256::new();
             digest.update(module);
             module_digests.push(digest.finalize().into());
         }
-        components.extend(module_digests.iter().map(|d| d.as_ref()));
+        components.extend(module_digests.iter().map(<[u8; 32]>::as_slice));
+    } else {
+        for module in modules {
+            components.push(module);
+        }
     }
 
     components.extend(object_ids.iter().map(|o| o.0.as_ref()));
