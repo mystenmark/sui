@@ -7,6 +7,7 @@
 //! own views.
 
 pub mod genesis;
+pub mod native;
 pub mod reads;
 mod store_view;
 
@@ -44,6 +45,10 @@ pub enum Error {
     Missing(ObjectID),
     /// An executed transaction's effects or events are not in the store.
     MissingEffects(messages::base::Digest),
+    /// Anchovy's executor failed outside the transaction.
+    Native(String),
+    /// An input the input checks found is gone, read by anchovy's executor.
+    MissingNative(messages::base::ObjectId),
 }
 
 impl From<store::Error> for Error {

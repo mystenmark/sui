@@ -39,6 +39,10 @@ impl<'a> StoreReads<'a> {
         object.map(|m| Object::from_view(&self.kept.keep(m)))
     }
 
+    pub fn live(&self, id: &ObjectId) -> Result<Option<store::Live>, store::Error> {
+        self.store.live(id)
+    }
+
     pub fn live_object(&self, id: &ObjectId) -> Result<Option<Object<'a>>, store::Error> {
         Ok(self.keep(self.store.live_object(id)?))
     }

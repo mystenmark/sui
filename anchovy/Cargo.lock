@@ -1890,9 +1890,13 @@ name = "execution"
 version = "0.1.0"
 dependencies = [
  "bcs",
+ "containers",
  "exec-types",
+ "executor",
  "messages",
  "move-core-types",
+ "move-vm-runtime",
+ "natives",
  "prometheus",
  "store",
  "sui-execution",
@@ -1900,6 +1904,7 @@ dependencies = [
  "sui-protocol-config",
  "sui-types",
  "tempfile",
+ "validation",
 ]
 
 [[package]]
