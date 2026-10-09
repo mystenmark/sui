@@ -26,8 +26,14 @@ use validation::inputs::{InputKind, input_objects, receiving_objects};
 use crate::reads::StoreReads;
 use crate::{Error, Outcome, Result};
 
+/// The arena's first chunk: most transactions fit in it.
+const ARENA_CAPACITY: usize = 1 << 20;
+
 /// Anchovy's executor for one epoch.
 pub struct NativeExecution {
+    /// The transactions' arena, reset after each: execution is serial, so the lock is
+    /// uncontended.
+    arena: std::sync::Mutex<Bump>,
     config: ProtocolConfig,
     move_vm: Arc<MoveRuntime>,
     metrics: Arc<ExecutionMetrics>,
@@ -50,6 +56,7 @@ impl NativeExecution {
         )
         .map_err(|e| Error::Native(e.0))?;
         Ok(NativeExecution {
+            arena: std::sync::Mutex::new(Bump::with_capacity(ARENA_CAPACITY)),
             config,
             move_vm: Arc::new(move_vm),
             metrics,
@@ -81,18 +88,35 @@ impl NativeExecution {
         data: &TransactionData<'_, S>,
         transaction: &[u8],
     ) -> Result<Outcome> {
-        let bump = Bump::with_capacity(1 << 20);
+        let mut arena = self.arena.lock().expect("the arena's lock is not poisoned");
+        let outcome = self.execute_in(&arena, store, data, transaction);
+        if arena.chunks() > 1 {
+            // Grow the first chunk so that later transactions this large fit in it.
+            *arena = Bump::with_capacity(arena.allocated().next_power_of_two().max(ARENA_CAPACITY));
+        } else {
+            arena.reset();
+        }
+        outcome
+    }
+
+    fn execute_in<S: TxState + HasDigest>(
+        &self,
+        bump: &Bump,
+        store: &store::Store,
+        data: &TransactionData<'_, S>,
+        transaction: &[u8],
+    ) -> Result<Outcome> {
         let kept = Kept::new();
         let reads = StoreReads::new(store, &kept);
         let digest = *data.digest();
 
         let kinds = input_objects(data).map_err(|e| Error::Native(format!("{e:?}")))?;
-        let mut loaded = containers::Vec::with_capacity_in(kinds.len(), &bump);
+        let mut loaded = containers::Vec::with_capacity_in(kinds.len(), bump);
         for kind in &kinds {
             loaded.push(load(&reads, kind)?);
         }
         let receiving = receiving_objects(data);
-        let mut receiving_refs = containers::Vec::with_capacity_in(receiving.len(), &bump);
+        let mut receiving_refs = containers::Vec::with_capacity_in(receiving.len(), bump);
         receiving_refs.extend(receiving.iter().map(|r| exec_types::base::object_ref(r)));
         let accumulator_version = if self.config.enable_accumulators() {
             reads
@@ -101,8 +125,7 @@ impl NativeExecution {
         } else {
             None
         };
-        let inputs =
-            ExecutionInputs::new(&bump, loaded, receiving_refs.leak(), accumulator_version);
+        let inputs = ExecutionInputs::new(bump, loaded, receiving_refs.leak(), accumulator_version);
 
         let gas_data = *data.gas_data();
         let gas_status = SuiGasStatus::new(
@@ -118,7 +141,7 @@ impl NativeExecution {
             effects,
             ..
         } = execute_transaction_to_effects::<Normal>(
-            &bump,
+            bump,
             &reads,
             &inputs,
             &EmptyUnsettledObjectFunds,
@@ -144,7 +167,7 @@ impl NativeExecution {
             None
         } else {
             Some(
-                executor::effects::build_events(&bump, &inner_store.events)
+                executor::effects::build_events(bump, &inner_store.events)
                     .bytes
                     .to_vec(),
             )
