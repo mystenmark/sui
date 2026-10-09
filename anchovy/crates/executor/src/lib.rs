@@ -14,6 +14,7 @@ pub mod accumulator_event;
 pub mod accumulator_root;
 pub mod data_store;
 pub mod deny_list_v2;
+pub mod effects;
 pub mod error;
 pub mod execution;
 pub mod execution_mode;
