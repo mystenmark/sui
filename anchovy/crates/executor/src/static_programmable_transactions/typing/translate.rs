@@ -35,12 +35,19 @@ enum SplatLocation {
     Result(u16, u16),
 }
 
+/// The reference keys `objects`, `withdrawals`, `receiving_refs` and the pure inputs' byte
+/// indices by input index in maps; inputs are added in index order and never removed, so here each
+/// kind carries its position instead.
 #[derive(Debug, Clone, Copy)]
 enum InputKind {
-    Object,
-    Withdrawal,
-    Pure,
-    Receiving,
+    /// Position in `objects`
+    Object(u16),
+    /// Position in `withdrawals`
+    Withdrawal(u16),
+    /// Index into `bytes`
+    Pure(T::ByteIndex),
+    /// Position in `receiving_refs`
+    Receiving(u16),
 }
 
 struct Context<'a> {
@@ -50,11 +57,9 @@ struct Context<'a> {
     /// What kind of input is at each original index
     input_resolution: Vec<'a, InputKind>,
     bytes: IndexSet<'a, &'a [u8]>,
-    // Mapping from original index to `bytes`
-    bytes_idx_remapping: IndexMap<'a, T::InputIndex, T::ByteIndex>,
-    receiving_refs: IndexMap<'a, T::InputIndex, ObjectRef>,
-    objects: IndexMap<'a, T::InputIndex, T::ObjectInput<'a>>,
-    withdrawals: IndexMap<'a, T::InputIndex, T::WithdrawalInput<'a>>,
+    receiving_refs: Vec<'a, ObjectRef>,
+    objects: Vec<'a, T::ObjectInput<'a>>,
+    withdrawals: Vec<'a, T::WithdrawalInput<'a>>,
     pure: IndexMap<'a, (T::InputIndex, Type<'a>), T::PureInput<'a>>,
     receiving: IndexMap<'a, (T::InputIndex, Type<'a>), T::ReceivingInput<'a>>,
     withdrawal_compatibility_conversions:
@@ -81,10 +86,9 @@ impl<'a> Context<'a> {
             input_resolution: Vec::with_capacity_in(linputs.len(), bump),
             original_command_len,
             bytes: IndexSet::new_in(bump),
-            bytes_idx_remapping: IndexMap::new_in(bump),
-            receiving_refs: IndexMap::new_in(bump),
-            objects: IndexMap::new_in(bump),
-            withdrawals: IndexMap::new_in(bump),
+            receiving_refs: Vec::new_in(bump),
+            objects: Vec::new_in(bump),
+            withdrawals: Vec::new_in(bump),
             pure: IndexMap::new_in(bump),
             withdrawal_compatibility_conversions: IndexMap::new_in(bump),
             receiving: IndexMap::new_in(bump),
@@ -98,12 +102,13 @@ impl<'a> Context<'a> {
             let kind = match (*arg, *ty) {
                 (L::InputArg::Pure(bytes), L::InputType::Bytes) => {
                     let (byte_index, _) = context.bytes.insert_full(bytes);
-                    context.bytes_idx_remapping.insert(idx, byte_index);
-                    InputKind::Pure
+                    InputKind::Pure(byte_index)
                 }
                 (L::InputArg::Receiving(oref), L::InputType::Bytes) => {
-                    context.receiving_refs.insert(idx, oref);
-                    InputKind::Receiving
+                    // At most `idx`, which fits.
+                    let position = checked_as!(context.receiving_refs.len(), u16)?;
+                    context.receiving_refs.push(oref);
+                    InputKind::Receiving(position)
                 }
                 (L::InputArg::Object(arg), L::InputType::Fixed(ty)) => {
                     let o = T::ObjectInput {
@@ -111,8 +116,9 @@ impl<'a> Context<'a> {
                         arg,
                         ty,
                     };
-                    context.objects.insert(idx, o);
-                    InputKind::Object
+                    let position = checked_as!(context.objects.len(), u16)?;
+                    context.objects.push(o);
+                    InputKind::Object(position)
                 }
                 (L::InputArg::FundsWithdrawal(withdrawal), L::InputType::Fixed(input_ty)) => {
                     let L::FundsWithdrawalArg {
@@ -128,8 +134,9 @@ impl<'a> Context<'a> {
                         source,
                         amount,
                     };
-                    context.withdrawals.insert(idx, withdrawal);
-                    InputKind::Withdrawal
+                    let position = checked_as!(context.withdrawals.len(), u16)?;
+                    context.withdrawals.push(withdrawal);
+                    InputKind::Withdrawal(position)
                 }
                 (arg, ty) => invariant_violation!(
                     "Input arg, type mismatch. Unexpected {arg:?} with type {ty:?}"
@@ -144,7 +151,7 @@ impl<'a> Context<'a> {
             for (i, (arg, _)) in linputs.iter().enumerate() {
                 if let L::InputArg::Pure(bytes) = arg {
                     let idx = T::InputIndex(checked_as!(i, u16)?);
-                    let Some(byte_index) = context.bytes_idx_remapping.get(&idx) else {
+                    let Some(InputKind::Pure(byte_index)) = context.input_resolution.get(i) else {
                         invariant_violation!("Unbound pure input {}", idx.0);
                     };
                     let Some(interned_bytes) = context.bytes.get_index(*byte_index) else {
@@ -177,8 +184,6 @@ impl<'a> Context<'a> {
             unified_linkage,
             ..
         } = self;
-        let objects = values(bump, objects);
-        let withdrawals = values(bump, withdrawals);
         let pure = values(bump, pure);
         let receiving = values(bump, receiving);
         T::Transaction {
@@ -219,13 +224,13 @@ impl<'a> Context<'a> {
                 *tys.safe_get(j as usize)?
             }
             T::Location::ObjectInput(i) => {
-                let Some((_, object_input)) = self.objects.get_index(i as usize) else {
+                let Some(object_input) = self.objects.get(i as usize) else {
                     invariant_violation!("Unbound object input {}", i)
                 };
                 object_input.ty
             }
             T::Location::WithdrawalInput(i) => {
-                let Some((_, withdrawal_input)) = self.withdrawals.get_index(i as usize) else {
+                let Some(withdrawal_input) = self.withdrawals.get(i as usize) else {
                     invariant_violation!("Unbound withdrawal input {}", i)
                 };
                 withdrawal_input.ty
@@ -243,20 +248,12 @@ impl<'a> Context<'a> {
         let location = match splat_location {
             SplatLocation::GasCoin => T::Location::GasCoin,
             SplatLocation::Result(i, j) => T::Location::Result(i, j),
-            SplatLocation::Input(i) => match self.input_resolution.safe_get(i.0 as usize)? {
-                InputKind::Object => {
-                    let Some(index) = self.objects.get_index_of(&i) else {
-                        invariant_violation!("Unbound object input {}", i.0)
-                    };
-                    T::Location::ObjectInput(checked_as!(index, u16)?)
+            SplatLocation::Input(i) => match *self.input_resolution.safe_get(i.0 as usize)? {
+                InputKind::Object(index) => T::Location::ObjectInput(index),
+                InputKind::Withdrawal(withdrawal_index) => {
+                    T::Location::WithdrawalInput(withdrawal_index)
                 }
-                InputKind::Withdrawal => {
-                    let Some(withdrawal_index) = self.withdrawals.get_index_of(&i) else {
-                        invariant_violation!("Unbound withdrawal input {}", i.0)
-                    };
-                    T::Location::WithdrawalInput(checked_as!(withdrawal_index, u16)?)
-                }
-                InputKind::Pure | InputKind::Receiving => return Ok(None),
+                InputKind::Pure(_) | InputKind::Receiving(_) => return Ok(None),
             },
         };
         let Some(ty) = self.fixed_location_type(env, location)? else {
@@ -275,29 +272,16 @@ impl<'a> Context<'a> {
         let location = match splat_location {
             SplatLocation::GasCoin => T::Location::GasCoin,
             SplatLocation::Result(i, j) => T::Location::Result(i, j),
-            SplatLocation::Input(i) => match self.input_resolution.safe_get(i.0 as usize)? {
-                InputKind::Object => {
-                    let Some(index) = self.objects.get_index_of(&i) else {
-                        invariant_violation!("Unbound object input {}", i.0)
-                    };
-                    T::Location::ObjectInput(checked_as!(index, u16)?)
-                }
-                InputKind::Withdrawal => {
-                    let Some(index) = self.withdrawals.get_index_of(&i) else {
-                        invariant_violation!("Unbound withdrawal input {}", i.0)
-                    };
-                    T::Location::WithdrawalInput(checked_as!(index, u16)?)
-                }
-                InputKind::Pure => {
+            SplatLocation::Input(i) => match *self.input_resolution.safe_get(i.0 as usize)? {
+                InputKind::Object(index) => T::Location::ObjectInput(index),
+                InputKind::Withdrawal(index) => T::Location::WithdrawalInput(index),
+                InputKind::Pure(byte_index) => {
                     let ty = match expected_ty {
                         Type::Reference(_, inner) => **inner,
                         ty => *ty,
                     };
                     let k = (i, ty);
                     if !self.pure.contains_key(&k) {
-                        let Some(byte_index) = self.bytes_idx_remapping.get(&i).copied() else {
-                            invariant_violation!("Unbound pure input {}", i.0);
-                        };
                         let pure = T::PureInput {
                             original_input_index: i,
                             byte_index,
@@ -309,14 +293,15 @@ impl<'a> Context<'a> {
                     let byte_index = self.pure.get_index_of(&k).unwrap();
                     return Ok((T::Location::PureInput(checked_as!(byte_index, u16)?), ty));
                 }
-                InputKind::Receiving => {
+                InputKind::Receiving(position) => {
                     let ty = match expected_ty {
                         Type::Reference(_, inner) => **inner,
                         ty => *ty,
                     };
                     let k = (i, ty);
                     if !self.receiving.contains_key(&k) {
-                        let Some(object_ref) = self.receiving_refs.get(&i).copied() else {
+                        let Some(object_ref) = self.receiving_refs.get(position as usize).copied()
+                        else {
                             invariant_violation!("Unbound receiving input {}", i.0);
                         };
                         let receiving = T::ReceivingInput {
