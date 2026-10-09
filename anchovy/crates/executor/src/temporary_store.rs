@@ -263,6 +263,11 @@ impl<'a> TemporaryStore<'a> {
         Some(object)
     }
 
+    /// The transaction's arena.
+    pub fn bump(&self) -> &'a Bump {
+        self.bump
+    }
+
     pub fn unsettled_object_funds(&self) -> &dyn UnsettledObjectFundsRead {
         self.unsettled_object_funds
     }
