@@ -891,10 +891,7 @@ impl<'a> InvariantChecker<'a> {
                     // objects.
                     // The reference keys the non-exclusive inputs by id; they are few, so a scan.
                     store.inputs.exclusive_mutable_inputs().contains_key(id)
-                        || store
-                            .inputs
-                            .non_exclusive_input_objects()
-                            .any(|(non_exclusive, _)| non_exclusive == *id)
+                        || store.inputs.is_non_exclusive_input(id)
                 })
                 .copied()
                 // Add any object IDs generated in the object runtime during execution to the

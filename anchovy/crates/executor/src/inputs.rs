@@ -223,6 +223,11 @@ impl<'a> ExecutionInputs<'a> {
         })
     }
 
+    /// Whether `id` is a non-exclusive write input.
+    pub fn is_non_exclusive_input(&self, id: &ObjectId) -> bool {
+        self.non_exclusive_inputs.contains(id)
+    }
+
     pub fn consensus_stream_ended_objects(&self) -> &BTreeMap<'a, ObjectId, SequenceNumber> {
         &self.consensus_stream_ended
     }
