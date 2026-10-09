@@ -55,6 +55,22 @@ impl<'a> Object<'a> {
         }
     }
 
+    /// An object of `data` and `owner`, with no storage rebate: `ObjectInner` as genesis
+    /// builds it.
+    pub fn new_from_data(
+        data: Data<'a>,
+        owner: Owner<'a>,
+        previous_transaction: TransactionDigest,
+    ) -> Object<'a> {
+        Object {
+            data,
+            owner,
+            previous_transaction,
+            storage_rebate: 0,
+            stored: None,
+        }
+    }
+
     pub fn new_from_package(
         package: MovePackage<'a>,
         previous_transaction: TransactionDigest,
