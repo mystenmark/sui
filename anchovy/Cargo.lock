@@ -1888,6 +1888,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "executor"
+version = "0.1.0"
+dependencies = [
+ "containers",
+ "messages",
+ "move-binary-format",
+ "move-core-types",
+ "sui-protocol-config",
+ "sui-types",
+]
+
+[[package]]
 name = "eyre"
 version = "0.6.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
