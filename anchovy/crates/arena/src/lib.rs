@@ -136,6 +136,11 @@ impl Default for Bump {
 
 // SAFETY: allocations are distinct, aligned, and live until the `Bump` is
 // dropped; deallocation is a no-op, which the trait permits.
+// SAFETY: a `Bump` owns its chunks outright and hands out only borrows of itself, so moving it
+// to another thread moves sole ownership: nothing can borrow it while it moves. It is not
+// `Sync`: its `Cell`s are not.
+unsafe impl Send for Bump {}
+
 unsafe impl allocator_api2::alloc::Allocator for &Bump {
     #[inline]
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
