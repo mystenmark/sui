@@ -11,6 +11,7 @@ publish = false
 blake2.workspace = true
 containers.workspace = true
 messages.workspace = true
+move-binary-format.workspace = true
 move-core-types.workspace = true
 sui-protocol-config.workspace = true
 

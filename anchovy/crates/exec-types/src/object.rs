@@ -285,3 +285,24 @@ pub fn move_package_size(p: &MovePackage<'_>) -> usize {
 
     8 /* SequenceNumber */ + module_map_size + type_origin_table_size + linkage_table_size
 }
+
+/// `OBJECT_START_VERSION`: the version objects and packages are created at.
+pub const OBJECT_START_VERSION: SequenceNumber = 1;
+
+/// `MovePackage::original_package_id`: the id a package was first published at, which every
+/// version's modules carry as their address.
+///
+/// # Panics
+/// If an upgraded package's first module does not deserialize, as the reference does.
+pub fn original_package_id(package: &MovePackage<'_>) -> ObjectId {
+    if package.version == OBJECT_START_VERSION {
+        // for a non-upgraded package, original ID is just the package ID
+        return *package.id;
+    }
+    // The reference takes the first module in name order and this the first in encoded order,
+    // but every module of a package carries the same address.
+    let (_, bytes) = package.module_map.first().expect("Empty module map");
+    let module = move_binary_format::CompiledModule::deserialize_with_defaults(bytes)
+        .expect("A Move package contains a module that cannot be deserialized");
+    ObjectId(module.address().into_bytes())
+}

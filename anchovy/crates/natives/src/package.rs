@@ -3,9 +3,7 @@
 
 use crate::{get_extension, object_runtime::ObjectRuntime};
 use exec_types::base::{move_address, object_id};
-use exec_types::object::move_package_size;
-use messages::object::MovePackage;
-use move_binary_format::CompiledModule;
+use exec_types::object::{move_package_size, original_package_id};
 use move_binary_format::{checked_as, safe_assert_eq, safe_unwrap};
 use move_core_types::{account_address::AccountAddress, gas_algebra::InternalGas};
 use move_vm_runtime::{
@@ -18,9 +16,6 @@ use smallvec::smallvec;
 use std::collections::VecDeque;
 
 const E_INVALID_PACKAGE_VERSION: u64 = 6;
-
-/// `OBJECT_START_VERSION`: the version objects and packages are created at.
-const OBJECT_START_VERSION: u64 = 1;
 
 #[derive(Clone)]
 pub struct PackageVersioningOriginalPackageIdImplCostParams {
@@ -66,25 +61,10 @@ pub fn original_package_id_impl(
         package_original_package_id_impl_cost_per_byte
             * checked_as!(move_package_size(package.try_as_package().unwrap()), u64)?.into()
     );
-    let original_id = original_package_id(package.try_as_package().unwrap());
+    let original_id = move_address(&original_package_id(package.try_as_package().unwrap()));
 
     Ok(NativeResult::ok(
         context.gas_used(),
         smallvec![Value::address(original_id)],
     ))
-}
-
-/// `MovePackage::original_package_id`: the id a package was first published at, which every
-/// version's modules carry as their address.
-fn original_package_id(package: &MovePackage<'_>) -> AccountAddress {
-    if package.version == OBJECT_START_VERSION {
-        // for a non-upgraded package, original ID is just the package ID
-        return move_address(package.id);
-    }
-    // The reference takes the first module in name order and this the first in encoded order,
-    // but every module of a package carries the same address.
-    let (_, bytes) = package.module_map.first().expect("Empty module map");
-    let module = CompiledModule::deserialize_with_defaults(bytes)
-        .expect("A Move package contains a module that cannot be deserialized");
-    *module.address()
 }

@@ -11,6 +11,7 @@
 #![allow(clippy::pedantic, clippy::too_many_arguments)]
 
 pub mod accumulator_event;
+pub mod data_store;
 pub mod error;
 pub mod execution;
 pub mod execution_mode;
