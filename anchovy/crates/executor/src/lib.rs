@@ -11,6 +11,7 @@
 #![allow(clippy::pedantic, clippy::too_many_arguments)]
 
 pub mod accumulator_event;
+pub mod accumulator_root;
 pub mod data_store;
 pub mod error;
 pub mod execution;
@@ -22,4 +23,3 @@ pub mod gas_meter;
 pub mod gas_model;
 pub mod static_programmable_transactions;
 pub mod storage;
-pub mod transaction;
