@@ -34,24 +34,26 @@ mod refine {
             },
         },
     };
-    use containers::{BTreeSet, Bump, Vec};
+    use containers::{Bump, HashSet, Vec};
     use exec_types::error::ExecutionError;
     use exec_types::{assert_invariant, checked_as, invariant_violation};
 
+    // The reference's sets are `BTreeSet`s; both are only inserted into and queried, never
+    // iterated, so their order is not observable.
     struct Context<'a> {
         // All locations that were used
-        used: BTreeSet<'a, T::Location>,
+        used: HashSet<'a, T::Location>,
         // All locations that were used via a Move. This is a subset of `used`, but `used` does
         // not track how each value was used in each instance. For simplicity, this is kept as a
         // separate set.
-        moved: BTreeSet<'a, T::Location>,
+        moved: HashSet<'a, T::Location>,
     }
 
     impl<'a> Context<'a> {
         fn new(bump: &'a Bump) -> Self {
             Self {
-                used: BTreeSet::new_in(bump),
-                moved: BTreeSet::new_in(bump),
+                used: containers::hash_set(bump, 0),
+                moved: containers::hash_set(bump, 0),
             }
         }
     }
@@ -129,7 +131,7 @@ mod refine {
     fn return_unused_withdrawal_conversions<'a, Mode: ExecutionMode>(
         env: &Env<'a, '_, '_, '_, '_, '_, Mode>,
         ast: &mut T::Transaction<'a>,
-        moved_locations: &BTreeSet<'_, T::Location>,
+        moved_locations: &HashSet<'_, T::Location>,
     ) -> Result<(), ExecutionError<'a>> {
         // withdrawal conversions not empty ==> accumulators enabled
         assert_invariant!(

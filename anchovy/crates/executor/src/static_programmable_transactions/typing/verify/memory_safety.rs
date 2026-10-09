@@ -11,7 +11,7 @@ use crate::{
         typing::ast::{self as T, Type},
     },
 };
-use containers::{BTreeMap, BTreeSet, Bump, Vec};
+use containers::{Bump, Vec};
 use exec_types::error::{ExecutionError, SafeIndex};
 use exec_types::{assert_invariant, invariant_violation, make_invariant_violation};
 use messages::execution_status::{CommandArgumentError, ExecutionErrorKind};
@@ -220,21 +220,25 @@ impl<'a> Context<'a> {
         &self,
         refs: &StdBTreeSet<Ref>,
     ) -> Result<Option<Ref>, ExecutionError<'a>> {
-        let mut borrows = BTreeMap::new_in(self.bump);
+        // The reference's `borrows` is a `BTreeMap` and `mut_refs` a `BTreeSet`. `refs` iterates
+        // in sorted order without duplicates, so both vectors are sorted by `Ref` and `borrows` is
+        // visited in the map's order.
+        let mut borrows = Vec::with_capacity_in(refs.len(), self.bump);
         for r in refs.iter().copied() {
-            borrows.insert(r, self.borrowed_by(r)?);
+            borrows.push((r, self.borrowed_by(r)?));
         }
-        let mut mut_refs = BTreeSet::new_in(self.bump);
+        let mut mut_refs = Vec::with_capacity_in(refs.len(), self.bump);
         for r in refs.iter().copied() {
             if self.is_mutable(r)? {
-                mut_refs.insert(r);
+                mut_refs.push(r);
             }
         }
+        let is_mut_ref = |r: &Ref| mut_refs.binary_search(r).is_ok();
         for (r, borrowed_by) in borrows {
-            let is_mut = mut_refs.contains(&r);
+            let is_mut = is_mut_ref(&r);
             for (borrower, paths) in borrowed_by {
                 if !is_mut {
-                    if mut_refs.contains(&borrower) {
+                    if is_mut_ref(&borrower) {
                         // If the ref is imm, but is borrowed by a mut ref in the set
                         // the mut ref is not transferrable
                         // In other words, the mut ref is an extension of the imm ref

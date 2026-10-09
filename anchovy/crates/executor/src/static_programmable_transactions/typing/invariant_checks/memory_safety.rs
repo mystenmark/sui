@@ -6,10 +6,10 @@ use crate::{
     sp,
     static_programmable_transactions::{env::Env, typing::ast as T},
 };
-use containers::{BTreeMap, BTreeSet, Bump, IndexMap, IndexSet, Vec};
+use containers::{BTreeSet, Bump, HashMap, IndexSet, Vec};
 use exec_types::{assert_invariant, checked_as, error::ExecutionError, make_invariant_violation};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum RootLocation {
     Unknown { command: u16 },
     Known(T::Location),
@@ -36,15 +36,17 @@ struct Node<'a> {
     /// Contains the node itself and all of its transitive ancestors
     ancestors: BitSet<'a>,
     children: Vec<'a, NodeID>,
+    /// Commands that created delta children of this node. Used to detect when a parent has
+    /// children from more than one command. The reference keeps these in a map by node ID
+    /// (`Memory::parent_commands`), which is only inserted into and queried.
+    child_commands: BitSet<'a>,
 }
 
 #[derive(Debug)]
 struct Memory<'a> {
     nodes: Vec<'a, Node<'a>>,
-    roots: BTreeMap<'a, RootLocation, NodeID>,
-    /// Commands that created delta children of each parent. Used to detect when a parent
-    /// has children from more than one command.
-    parent_commands: IndexMap<'a, NodeID, BitSet<'a>>,
+    /// The reference's is a `BTreeMap`; it is only inserted into and queried.
+    roots: HashMap<'a, RootLocation, NodeID>,
     /// Parents with delta children from multiple commands. Only these parents can
     /// cause cross-command overlap.
     conflict_parents: IndexSet<'a, NodeID>,
@@ -189,8 +191,7 @@ impl<'a> Memory<'a> {
     fn new(bump: &'a Bump) -> Self {
         Self {
             nodes: Vec::new_in(bump),
-            roots: BTreeMap::new_in(bump),
-            parent_commands: IndexMap::new_in(bump),
+            roots: containers::hash_map(bump, 0),
             conflict_parents: IndexSet::new_in(bump),
         }
     }
@@ -235,10 +236,7 @@ impl<'a> Memory<'a> {
             let command = *command as usize;
             for &parent in parents {
                 let is_conflict = {
-                    let commands = self
-                        .parent_commands
-                        .entry(parent)
-                        .or_insert_with(|| BitSet::new_in(bump));
+                    let commands = &mut self.node_mut(parent)?.child_commands;
                     commands.set_grow(command);
                     commands.count() >= 2
                 };
@@ -251,6 +249,7 @@ impl<'a> Memory<'a> {
             kind,
             ancestors,
             children: Vec::new_in(bump),
+            child_commands: BitSet::new_in(bump),
         });
         Ok(id)
     }
@@ -346,9 +345,9 @@ impl<'a> Memory<'a> {
         } else {
             left_ancestors.try_any_common(right_ancestors, |common| {
                 let is_conflict_parent = self
-                    .parent_commands
-                    .get(&common)
-                    .is_some_and(|commands| commands.count() >= 2);
+                    .nodes
+                    .get(common)
+                    .is_some_and(|node| node.child_commands.count() >= 2);
                 Ok(is_conflict_parent
                     && self.common_has_cross_command(common, left_ancestors, right_ancestors)?)
             })
