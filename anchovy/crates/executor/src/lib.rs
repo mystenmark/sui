@@ -22,3 +22,4 @@ pub mod gas_meter;
 pub mod gas_model;
 pub mod static_programmable_transactions;
 pub mod storage;
+pub mod transaction;

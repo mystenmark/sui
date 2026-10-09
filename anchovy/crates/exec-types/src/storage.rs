@@ -99,8 +99,11 @@ pub trait RuntimeObjectResolver<'a>: BackingPackageStore<'a> {
 pub trait ObjectStore<'a> {
     fn get_object(&self, object_id: &ObjectId) -> Option<Object<'a>>;
 
-    fn get_object_by_key(&self, object_id: &ObjectId, version: SequenceNumber)
-    -> Option<Object<'a>>;
+    fn get_object_by_key(
+        &self,
+        object_id: &ObjectId,
+        version: SequenceNumber,
+    ) -> Option<Object<'a>>;
 
     /// Load an implicitly read system object at the given version.
     /// Returns None if the store no longer has that version.
