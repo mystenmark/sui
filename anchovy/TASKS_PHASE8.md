@@ -28,12 +28,24 @@ into `anchovy-main`.
 - Execution values and locals; `adapter.rs` (Move runtime, native
   extensions, metered verifier).
 
+- Execution inputs split (plan, "Execution inputs"): `ExecutionInputs`
+  (checked against `InputObjects`), the temporary store over it, gas smashing
+  and charging, early errors, the arena PTB builder (checked against
+  sui-types'), `messages::Kept` and the store reads it lends views through.
+
+## In progress
+
+- Invariant checks and the type layout resolver (agent).
+- Execution context, interpreter and `SPT::execute` (agent).
+- The engine (`execution_engine.rs`, written; compiles once the above land).
+
 ## Remaining
 
-- Execution context and interpreter: the context loads inputs from the state
-  view and writes results back, so it waits on the inputs interface below.
-- Deferred until the input-loading processor's interface is designed: the
-  temporary store, gas smashing and final charging, the engine paths.
+- Loading inputs: for now in the executor processor, just before execution.
+  A loader that runs ahead needs shared objects' versions assigned (consensus):
+  loaded early, they would miss earlier transactions' writes.
+- System transactions: epoch change, end-of-epoch kinds, authenticator state
+  update, safe mode.
 
 3. Static PTBs and the engine path for user PTBs; differential harness.
 4. System transactions and genesis.

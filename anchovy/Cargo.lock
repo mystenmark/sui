@@ -1890,6 +1890,7 @@ name = "execution"
 version = "0.1.0"
 dependencies = [
  "bcs",
+ "exec-types",
  "messages",
  "move-core-types",
  "prometheus",
