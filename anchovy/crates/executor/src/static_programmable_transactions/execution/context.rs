@@ -1,6 +1,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use exec_types::error::{ExecutionError, command_argument_error};
+use messages::execution_status::CommandArgumentError;
 use move_binary_format::errors::{Location, PartialVMResult, VMResult};
 use move_vm_runtime::execution::{Type as VMType, TypeSubst as _, vm::LoadedFunctionInformation};
 
@@ -36,4 +38,30 @@ pub fn subst_signature(
         index,
         instruction_count,
     })
+}
+
+pub enum EitherError<'a> {
+    CommandArgument(CommandArgumentError),
+    Execution(ExecutionError<'a>),
+}
+
+impl<'a> From<ExecutionError<'a>> for EitherError<'a> {
+    fn from(e: ExecutionError<'a>) -> Self {
+        EitherError::Execution(e)
+    }
+}
+
+impl From<CommandArgumentError> for EitherError<'_> {
+    fn from(e: CommandArgumentError) -> Self {
+        EitherError::CommandArgument(e)
+    }
+}
+
+impl<'a> EitherError<'a> {
+    pub fn into_execution_error(self, command_index: usize) -> ExecutionError<'a> {
+        match self {
+            EitherError::CommandArgument(e) => command_argument_error(e, command_index),
+            EitherError::Execution(e) => e,
+        }
+    }
 }
