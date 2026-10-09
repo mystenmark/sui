@@ -25,6 +25,7 @@ sui-types.workspace = true
 validation.workspace = true
 
 [dev-dependencies]
+sui-move-build.workspace = true
 tempfile.workspace = true
 
 [lints]

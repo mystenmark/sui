@@ -229,3 +229,101 @@ fn split_and_merge_match() {
     ));
     assert!(effects.status().is_ok(), "{effects:?}");
 }
+
+// Packages: publish, then calls that create, mutate, wrap, unwrap, delete and freeze objects,
+// emit events and use dynamic (object) fields.
+
+use sui_types::transaction::ObjectArg;
+
+impl Node {
+    fn live_ref(&self, id: ObjectID) -> ObjectRef {
+        execution::StoreView::new(&self.store)
+            .live_object(&id)
+            .unwrap()
+            .unwrap()
+            .compute_object_reference()
+    }
+
+    fn publish(&self, path: &str) -> ObjectID {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../crates/sui-core/src/unit_tests/data")
+            .join(path);
+        let package = sui_move_build::BuildConfig::new_for_testing()
+            .build(&path)
+            .unwrap();
+        let modules = package.get_package_bytes(false);
+        let deps = package.get_dependency_storage_package_ids();
+        let effects = self.execute_both_and_commit(TransactionData::new_module(
+            self.sender,
+            self.gas(),
+            modules,
+            deps,
+            BUDGET * 10,
+            RGP,
+        ));
+        assert!(effects.status().is_ok(), "{effects:?}");
+        effects
+            .created()
+            .into_iter()
+            .find(|(_, owner)| *owner == sui_types::object::Owner::Immutable)
+            .unwrap()
+            .0
+            .0
+    }
+
+    /// Calls `examples::object_basics::<function>`; the objects it created.
+    fn call(&self, package: ObjectID, function: &str, args: Vec<CallArg>) -> Vec<ObjectID> {
+        let mut builder = ProgrammableTransactionBuilder::new();
+        builder
+            .move_call(
+                package,
+                ident_str!("object_basics").to_owned(),
+                move_core_types::identifier::Identifier::new(function).unwrap(),
+                vec![],
+                args,
+            )
+            .unwrap();
+        let effects = self.execute_both_and_commit(TransactionData::new_programmable(
+            self.sender,
+            vec![self.gas()],
+            builder.finish(),
+            BUDGET,
+            RGP,
+        ));
+        assert!(effects.status().is_ok(), "{function}: {effects:?}");
+        effects.created().into_iter().map(|(r, _)| r.0).collect()
+    }
+
+    fn owned(&self, id: ObjectID) -> CallArg {
+        CallArg::Object(ObjectArg::ImmOrOwnedObject(self.live_ref(id)))
+    }
+}
+
+#[test]
+fn object_basics_match() {
+    let node = Node::new();
+    let package = node.publish("object_basics");
+    macro_rules! pure {
+        ($v:expr) => {
+            CallArg::Pure(bcs::to_bytes($v).unwrap())
+        };
+    }
+
+    let a = node.call(package, "create", vec![pure!(&7u64), pure!(&node.sender)])[0];
+    let b = node.call(package, "create", vec![pure!(&9u64), pure!(&node.sender)])[0];
+    // Reads b, writes a, emits an event.
+    node.call(package, "update", vec![node.owned(a), node.owned(b)]);
+    node.call(package, "set_value", vec![node.owned(a), pure!(&11u64)]);
+    // Wrapped, then unwrapped.
+    let wrapper = node.call(package, "wrap", vec![node.owned(b)])[0];
+    node.call(package, "unwrap", vec![node.owned(wrapper)]);
+    // A dynamic object field, added and removed; then a dynamic field.
+    node.call(package, "add_ofield", vec![node.owned(a), node.owned(b)]);
+    node.call(package, "remove_ofield", vec![node.owned(a)]);
+    node.call(package, "add_field", vec![node.owned(a), node.owned(b)]);
+    node.call(package, "remove_field", vec![node.owned(a)]);
+    // Shared, frozen, deleted.
+    node.call(package, "share", vec![]);
+    node.call(package, "freeze_object", vec![node.owned(b)]);
+    node.call(package, "delete", vec![node.owned(a)]);
+}
