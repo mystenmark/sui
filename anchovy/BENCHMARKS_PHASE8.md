@@ -84,3 +84,21 @@ touches (4 by default, all touched as keys spread over the keyspaces), and the W
 sends its tracker thread a message. The woken threads then spend comparable CPU
 (`promote_dirty_pending`, parking). Committing one transaction per batch pays these wakeups per
 transaction.
+
+## After the first fixes
+
+A per-transaction memo of the runtime's packages in `CachedPackageStore` (61 runtime lookups
+per `create` transaction become 4) and one arena reused across transactions:
+
+| workload | execute before | execute after | allocs before | allocs after |
+|---|---|---|---|---|
+| transfer | 36.9 µs | 28.1 µs | 437 | 382 |
+| create | 45.3 µs | 33.8 µs | 539 | 442 |
+
+Clock reads fell from 15% to 3% of execution, runtime package resolution from 23% to 4%.
+
+What is left of the per-transaction type work is not repeated within a transaction: a
+`create` makes 3 runtime layouts, 2 struct type loads, 2 write-out layouts and one write-out VM,
+~1–1.5 µs each. Removing them needs caches across transactions (layouts and types by type tag),
+which rest on a separate argument: that a type tag's layout does not depend on which version
+of its packages the linkage picks, since upgrades preserve struct layouts.
