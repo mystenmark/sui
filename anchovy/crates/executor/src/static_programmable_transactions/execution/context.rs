@@ -65,3 +65,27 @@ impl<'a> EitherError<'a> {
         }
     }
 }
+
+/// There is validation to do on top of the BCS layout. Currently only needed for
+/// strings
+// The reference boxes the inner layouts; here they are in the transaction's arena.
+#[derive(Debug, Clone, Copy)]
+pub enum PrimitiveArgumentLayout<'a> {
+    /// An option
+    Option(&'a PrimitiveArgumentLayout<'a>),
+    /// A vector
+    Vector(&'a PrimitiveArgumentLayout<'a>),
+    /// An ASCII encoded string
+    Ascii,
+    /// A UTF8 encoded string
+    UTF8,
+    // needed for Option validation
+    Bool,
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
+    U256,
+    Address,
+}

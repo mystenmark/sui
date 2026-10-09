@@ -1,7 +1,4 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-pub mod ast;
-pub mod invariant_checks;
-pub mod translate;
-pub mod verify;
+pub mod input_arguments;
