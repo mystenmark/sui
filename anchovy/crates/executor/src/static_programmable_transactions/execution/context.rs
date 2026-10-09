@@ -28,6 +28,7 @@ use containers::{
 };
 use exec_types::base::{move_address, object_id};
 use exec_types::error::{ExecutionError, ExecutionErrorKind, SafeIndex, command_argument_error};
+use exec_types::execution::DynamicallyLoadedObjectMetadata;
 use exec_types::object::{Object, get_owner_address, original_package_id};
 use exec_types::storage::{BackingPackageStore, ObjectFundsResolver, RuntimeObjectResolver};
 use exec_types::tx_context::TxContext;
@@ -544,7 +545,12 @@ where
         Ok(())
     }
 
-    pub fn finish(mut self) -> Result<ExecutionResultsV2<'a>, ExecutionError<'a>> {
+    /// `loaded_runtime_objects` must be the object runtime's `loaded_runtime_objects()`, taken
+    /// after the last command.
+    pub fn finish(
+        mut self,
+        loaded_runtime_objects: &BTreeMap<'a, ObjectId, DynamicallyLoadedObjectMetadata<'a>>,
+    ) -> Result<ExecutionResultsV2<'a>, ExecutionError<'a>> {
         let bump = self.env.bump;
         assert_invariant!(
             !self.locations.tx_context_value.local(0)?.is_invalid()?,
@@ -559,6 +565,7 @@ where
             Locals::new_invalid(bump, 0)?,
         );
         let mut created_input_object_ids = BTreeSet::new_in(bump);
+        let child_loaded_runtime_objects = loaded_runtime_objects;
         let mut loaded_runtime_objects = BTreeMap::new_in(bump);
         let mut by_value_shared_objects = BTreeSet::new_in(bump);
         let mut consensus_owner_objects = BTreeMap::new_in(bump);
@@ -651,7 +658,7 @@ where
             mut accumulator_events,
             settlement_input_sui,
             settlement_output_sui,
-        } = object_runtime.finish()?;
+        } = object_runtime.finish(child_loaded_runtime_objects)?;
         assert_invariant!(
             loaded_runtime_objects
                 .keys()

@@ -135,7 +135,7 @@ where
     };
 
     // apply changes
-    let finished = context.finish();
+    let finished = context.finish(&loaded_runtime_objects);
     // Save loaded objects for debug. We dont want to lose the info
     env.state_view
         .save_loaded_runtime_objects(loaded_runtime_objects);

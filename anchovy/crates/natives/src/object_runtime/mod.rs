@@ -680,8 +680,21 @@ impl<'a> ObjectRuntime<'a> {
             .get_package_at_version(package_id, version)
     }
 
-    pub fn finish(mut self) -> Result<RuntimeResults<'a>, ExecutionError<'a>> {
-        let loaded_child_objects = self.loaded_runtime_objects();
+    /// `loaded_runtime_objects` must be what `loaded_runtime_objects()` returns now. The
+    /// reference recomputes it here, digests included, and keeps only the versions; the caller
+    /// has computed it already, and loading stops before the runtime finishes.
+    pub fn finish(
+        mut self,
+        loaded_runtime_objects: &BTreeMap<'a, ObjectId, DynamicallyLoadedObjectMetadata<'a>>,
+    ) -> Result<RuntimeResults<'a>, ExecutionError<'a>> {
+        debug_assert!(
+            loaded_runtime_objects
+                .iter()
+                .map(|(id, m)| (*id, m.version))
+                .eq(self.loaded_runtime_object_versions()),
+            "the loaded runtime objects given are not the runtime's"
+        );
+        let loaded_child_objects = loaded_runtime_objects;
         let child_effects = self.child_object_store.take_effects().map_err(|e| {
             ExecutionError::invariant_violation(format!("Failed to take child object effects: {e}"))
         })?;
@@ -722,6 +735,24 @@ impl<'a> ObjectRuntime<'a> {
                 .chain(self.state.received.iter().map(|(id, meta)| (*id, *meta))),
         );
         loaded
+    }
+
+    /// The ids and versions of `loaded_runtime_objects()`, in its order, without the digests.
+    fn loaded_runtime_object_versions(&self) -> impl Iterator<Item = (ObjectId, SequenceNumber)> {
+        let mut versions = BTreeMap::new_in(self.bump);
+        versions.extend(
+            self.child_object_store
+                .cached_objects()
+                .iter()
+                .filter_map(|(id, obj_opt)| obj_opt.as_ref().map(|obj| (*id, obj.version())))
+                .chain(
+                    self.state
+                        .received
+                        .iter()
+                        .map(|(id, meta)| (*id, meta.version)),
+                ),
+        );
+        versions.into_iter()
     }
 
     /// A map from wrapped objects to the object that wraps them at the beginning of the
@@ -765,14 +796,14 @@ impl<'a> ObjectRuntimeState<'a> {
     pub(crate) fn finish(
         mut self,
         bump: &'a Bump,
-        loaded_child_objects: BTreeMap<'a, ObjectId, DynamicallyLoadedObjectMetadata<'a>>,
+        loaded_child_objects: &BTreeMap<'a, ObjectId, DynamicallyLoadedObjectMetadata<'a>>,
         child_object_effects: ChildObjectEffects<'a>,
     ) -> Result<RuntimeResults<'a>, ExecutionError<'a>> {
         let mut loaded_child_objects_: BTreeMap<'a, ObjectId, LoadedRuntimeObject> =
             BTreeMap::new_in(bump);
-        loaded_child_objects_.extend(loaded_child_objects.into_iter().map(|(id, metadata)| {
+        loaded_child_objects_.extend(loaded_child_objects.iter().map(|(id, metadata)| {
             (
-                id,
+                *id,
                 LoadedRuntimeObject {
                     version: metadata.version,
                     is_modified: false,
