@@ -83,7 +83,7 @@ macro_rules! get_or_init_ty {
         let env = $env;
         if env.$ident.get().is_none() {
             let tag = $tag;
-            let ty = env.load_type_from_struct(&tag)?;
+            let ty = env.load_type_from_struct(tag)?;
             env.$ident.set(ty).unwrap();
         }
         Ok(*env.$ident.get().unwrap())
@@ -182,12 +182,8 @@ where
         let tag: TypeTag = (*ty).try_into().map_err(|s| {
             ExecutionError::new_with_source(ExecutionErrorKind::VMInvariantViolation, s)
         })?;
-        let objects = tag.all_addresses();
-        let tag_linkage = ExecutableLinkage::type_linkage(
-            *self.linkage_analysis.config(),
-            objects.iter().map(object_id),
-            self.linkable_store,
-        )?;
+        let objects = tag_addresses(self.bump, &tag);
+        let tag_linkage = self.type_linkage(&objects)?;
         self.input_type_resolution_vm
             .annotated_type_layout(&tag)
             .map_err(|e| self.convert_linked_vm_error(e, &tag_linkage))
@@ -200,15 +196,20 @@ where
         let tag: TypeTag = (*ty).try_into().map_err(|s| {
             ExecutionError::new_with_source(ExecutionErrorKind::VMInvariantViolation, s)
         })?;
-        let objects = tag.all_addresses();
-        let tag_linkage = ExecutableLinkage::type_linkage(
-            *self.linkage_analysis.config(),
-            objects.iter().map(object_id),
-            self.linkable_store,
-        )?;
+        let objects = tag_addresses(self.bump, &tag);
+        let tag_linkage = self.type_linkage(&objects)?;
         self.input_type_resolution_vm
             .runtime_type_layout(&tag)
             .map_err(|e| self.convert_linked_vm_error(e, &tag_linkage))
+    }
+
+    /// `ExecutableLinkage::type_linkage` for `ids`.
+    fn type_linkage(&self, ids: &[ObjectId]) -> Result<ExecutableLinkage<'a>, ExecutionError<'a>> {
+        Ok(ExecutableLinkage::type_linkage(
+            *self.linkage_analysis.config(),
+            ids,
+            self.linkable_store,
+        )?)
     }
 
     pub fn load_framework_function(
@@ -357,15 +358,16 @@ where
     }
 
     /// We verify that all types in the `StructTag` are defining ID-based types.
-    pub fn load_type_from_struct(&self, tag: &StructTag) -> Result<Type<'a>, ExecutionError<'a>> {
-        let vm_type =
-            self.load_vm_type_from_type_tag(None, &TypeTag::Struct(Box::new(tag.clone())))?;
+    ///
+    /// The reference borrows the tag and clones it; every caller has an owned tag to give.
+    pub fn load_type_from_struct(&self, tag: StructTag) -> Result<Type<'a>, ExecutionError<'a>> {
+        let vm_type = self.load_vm_type_from_type_tag(None, &TypeTag::Struct(Box::new(tag)))?;
         self.adapter_type_from_vm_type(self.input_type_resolution_vm, &vm_type)
     }
 
     pub fn type_layout_for_struct(
         &self,
-        tag: &StructTag,
+        tag: StructTag,
     ) -> Result<MoveTypeLayout, ExecutionError<'a>> {
         let ty: Type = self.load_type_from_struct(tag)?;
         self.runtime_layout(&ty)
@@ -522,13 +524,9 @@ where
             }
         }
 
-        let objects = tag.all_addresses();
+        let objects = tag_addresses(self.bump, tag);
 
-        let tag_linkage = ExecutableLinkage::type_linkage(
-            *self.linkage_analysis.config(),
-            objects.iter().map(object_id),
-            self.linkable_store,
-        )?;
+        let tag_linkage = self.type_linkage(&objects)?;
         let ty = self
             .input_type_resolution_vm
             .load_type(tag)
@@ -749,6 +747,42 @@ fn to_identifier(name: &str) -> Result<Identifier, ExecutionError<'static>> {
     Identifier::new(name).map_err(|e| {
         ExecutionError::new_with_source(ExecutionErrorKind::VMInvariantViolation, e.to_string())
     })
+}
+
+/// `TypeTag::all_addresses` as package IDs in the arena: each address once, in pre-order of
+/// first occurrence.
+fn tag_addresses<'a>(bump: &'a Bump, tag: &TypeTag) -> Vec<'a, ObjectId> {
+    fn add(tag: &TypeTag, ids: &mut Vec<'_, ObjectId>) {
+        match tag {
+            TypeTag::Bool
+            | TypeTag::U8
+            | TypeTag::U16
+            | TypeTag::U32
+            | TypeTag::U64
+            | TypeTag::U128
+            | TypeTag::U256
+            | TypeTag::Address
+            | TypeTag::Signer => (),
+            TypeTag::Vector(inner) => add(inner, ids),
+            TypeTag::Struct(s) => {
+                let id = object_id(&s.address);
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+                for param in &s.type_params {
+                    add(param, ids);
+                }
+            }
+        }
+    }
+    let mut ids = Vec::new_in(bump);
+    add(tag, &mut ids);
+    debug_assert!(
+        ids.iter()
+            .copied()
+            .eq(tag.all_addresses().iter().map(object_id))
+    );
+    ids
 }
 
 fn convert_vm_error<'a>(

@@ -160,7 +160,7 @@ fn input<'a, Mode: ExecutionMode>(
                 invariant_violation!("Object {:?} has does not have a Move type", id);
             };
             let tag = to_move_struct_tag_of(ty);
-            let ty = env.load_type_from_struct(&tag)?;
+            let ty = env.load_type_from_struct(tag)?;
             let arg = match obj.owner() {
                 Owner::AddressOwner(_) => L::ObjectArg {
                     kind: L::ObjectArgKind::OwnedObject(oref),
@@ -208,7 +208,7 @@ fn input<'a, Mode: ExecutionMode>(
                 invariant_violation!("Object {:?} does not have a Move type", id);
             };
             let tag = to_move_struct_tag_of(ty);
-            let ty = env.load_type_from_struct(&tag)?;
+            let ty = env.load_type_from_struct(tag)?;
             let owner_permissions = match obj.owner() {
                 Owner::AddressOwner(_) | Owner::ObjectOwner(_) | Owner::Immutable => {
                     assert_invariant!(
