@@ -40,6 +40,16 @@ pub struct CachedPackageStore<'state, 'runtime> {
     /// published later in the transaction is never shadowed; packages published in the
     /// transaction are looked up before this, as before.
     resolved: RefCell<IndexMap<'state, ObjectId, Arc<VerifiedPackage>>>,
+
+    /// Types resolved to their defining ID while no package was published in the transaction:
+    /// (package ID, module, type, defining ID). Not in the reference, which builds an owned
+    /// `IntraPackageName` for every lookup; the transaction's few types are looked up repeatedly.
+    ///
+    /// A hit is what the lookup would return: with no published packages, the package at an ID is
+    /// the runtime's immutable package for it (see `resolved`) and its type origin table does not
+    /// change. Entries are made and used only while `new_packages` is empty, so a package
+    /// published (or rolled back) in the transaction never takes part; only found types are kept.
+    defining_ids: RefCell<containers::Vec<'state, (ObjectId, &'state str, &'state str, ObjectId)>>,
 }
 
 impl<'state, 'runtime> CachedPackageStore<'state, 'runtime> {
@@ -50,6 +60,7 @@ impl<'state, 'runtime> CachedPackageStore<'state, 'runtime> {
         Self {
             runtime,
             resolved: RefCell::new(IndexMap::new_in(package_store.bump())),
+            defining_ids: RefCell::new(containers::Vec::new_in(package_store.bump())),
             package_store,
         }
     }
@@ -107,16 +118,9 @@ impl<'state, 'runtime> CachedPackageStore<'state, 'runtime> {
             ResolvedPackageResult::NotFound => Ok(None),
         }
     }
-}
 
-impl PackageStore for CachedPackageStore<'_, '_> {
-    type Package = Arc<VerifiedPackage>;
-
-    fn get_package(&self, id: &ObjectId) -> SuiResult<Option<Self::Package>> {
-        self.get_package(id)
-    }
-
-    fn resolve_type_to_defining_id(
+    /// `resolve_type_to_defining_id` without the memo.
+    fn resolve_type_to_defining_id_uncached(
         &self,
         module_address: ObjectId,
         module_name: &IdentStr,
@@ -133,5 +137,53 @@ impl PackageStore for CachedPackageStore<'_, '_> {
                 type_name: type_name.to_owned(),
             })
             .map(|id| ObjectId(id.into_bytes())))
+    }
+}
+
+impl PackageStore for CachedPackageStore<'_, '_> {
+    type Package = Arc<VerifiedPackage>;
+
+    fn get_package(&self, id: &ObjectId) -> SuiResult<Option<Self::Package>> {
+        self.get_package(id)
+    }
+
+    fn resolve_type_to_defining_id(
+        &self,
+        module_address: ObjectId,
+        module_name: &IdentStr,
+        type_name: &IdentStr,
+    ) -> SuiResult<Option<ObjectId>> {
+        let memoize = !self.package_store.has_new_packages();
+        if memoize {
+            let hit = self
+                .defining_ids
+                .borrow()
+                .iter()
+                .find(|(address, module, name, _)| {
+                    *address == module_address
+                        && *module == module_name.as_str()
+                        && *name == type_name.as_str()
+                })
+                .map(|(_, _, _, defining_id)| *defining_id);
+            if let Some(defining_id) = hit {
+                debug_assert!(matches!(
+                    self.resolve_type_to_defining_id_uncached(module_address, module_name, type_name),
+                    Ok(Some(id)) if id == defining_id
+                ));
+                return Ok(Some(defining_id));
+            }
+        }
+        let resolved =
+            self.resolve_type_to_defining_id_uncached(module_address, module_name, type_name)?;
+        if memoize && let Some(defining_id) = resolved {
+            let bump = self.package_store.bump();
+            self.defining_ids.borrow_mut().push((
+                module_address,
+                containers::alloc_str(bump, module_name.as_str()),
+                containers::alloc_str(bump, type_name.as_str()),
+                defining_id,
+            ));
+        }
+        Ok(resolved)
     }
 }
