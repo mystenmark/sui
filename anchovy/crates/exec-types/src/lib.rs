@@ -18,3 +18,4 @@ pub mod execution;
 pub mod object;
 pub mod storage;
 pub mod tx_context;
+pub mod type_tags;

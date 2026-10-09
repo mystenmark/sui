@@ -58,3 +58,37 @@ fn legacy_contexts_match() {
         }
     }
 }
+
+#[test]
+fn object_types_match() {
+    use std::str::FromStr;
+
+    use move_core_types::language_storage::StructTag;
+    let tags = [
+        "0x2::coin::Coin<0x2::sui::SUI>",
+        "0x2::coin::Coin<0xabc::usdc::USDC>",
+        "0x2::coin::Coin<vector<u8>>",
+        "0x3::staking_pool::StakedSui",
+        "0x2::dynamic_field::Field<0x2::accumulator::Key<0x2::balance::Balance<0x2::sui::SUI>>, 0x2::accumulator::U128>",
+        "0x2::dynamic_field::Field<0x2::accumulator::Key<0x2::balance::Balance<0x7::t::T>>, 0x2::accumulator::U128>",
+        "0x2::dynamic_field::Field<0x2::accumulator::Key<0x7::t::T>, 0x2::accumulator::U128>",
+        "0x2::dynamic_field::Field<u64, vector<0x2::object::ID>>",
+        "0x2::balance::Balance<0x2::sui::SUI>",
+        "0xdee9::clob::Pool<0x2::sui::SUI, 0x5::x::Y<u128, address>>",
+    ];
+    let bump = containers::Bump::with_capacity(1 << 16);
+    for tag in tags {
+        let tag = StructTag::from_str(tag).unwrap();
+        let ours = exec_types::type_tags::move_object_type_in(&bump, &tag);
+        let theirs = sui_types::base_types::MoveObjectType::from(tag.clone());
+        let mut w = messages::fast::Writer::new_in(&bump, 256);
+        w.move_object_type(&ours);
+        assert_eq!(w.finish_bytes(), bcs::to_bytes(&theirs).unwrap(), "{tag}");
+        assert_eq!(ours.bcs_size(), bcs::to_bytes(&theirs).unwrap().len());
+        assert_eq!(
+            exec_types::type_tags::to_move_struct_tag_of(&ours),
+            StructTag::from(theirs),
+            "{tag}"
+        );
+    }
+}
