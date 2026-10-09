@@ -5,6 +5,8 @@
 #![deny(clippy::indexing_slicing)]
 #![deny(clippy::cast_possible_truncation)]
 
+pub mod env;
+pub mod execution;
 pub mod linkage;
 pub mod loading;
 pub mod spanned;

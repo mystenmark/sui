@@ -117,3 +117,24 @@ fn object_type_addresses_match() {
         assert_eq!(ours, theirs, "{tag}");
     }
 }
+
+#[test]
+fn package_digests_match() {
+    let modules: Vec<Vec<u8>> = vec![vec![1, 2, 3], vec![9; 40], vec![]];
+    let deps = [[7u8; 32], [1u8; 32]];
+    let bump = containers::Bump::with_capacity(1 << 12);
+    for hash_modules in [true, false] {
+        let ours = exec_types::object::compute_digest_for_modules_and_deps(
+            &bump,
+            &modules.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            &deps.map(messages::base::ObjectId),
+            hash_modules,
+        );
+        let theirs = sui_types::move_package::MovePackage::compute_digest_for_modules_and_deps(
+            &modules,
+            &deps.map(sui_types::base_types::ObjectID::new),
+            hash_modules,
+        );
+        assert_eq!(ours, theirs);
+    }
+}

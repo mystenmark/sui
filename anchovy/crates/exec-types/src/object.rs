@@ -306,3 +306,40 @@ pub fn original_package_id(package: &MovePackage<'_>) -> ObjectId {
         .expect("A Move package contains a module that cannot be deserialized");
     ObjectId(module.address().into_bytes())
 }
+
+/// `MovePackage::compute_digest_for_modules_and_deps`.
+pub fn compute_digest_for_modules_and_deps(
+    bump: &Bump,
+    modules: &[&[u8]],
+    object_ids: &[ObjectId],
+    hash_modules: bool,
+) -> [u8; 32] {
+    use blake2::Digest as _;
+    type Blake2b256 = blake2::Blake2b<blake2::digest::consts::U32>;
+    let mut module_digests: containers::Vec<'_, [u8; 32]> =
+        containers::Vec::with_capacity_in(modules.len(), bump);
+    let mut components: containers::Vec<'_, &[u8]> =
+        containers::Vec::with_capacity_in(modules.len() + object_ids.len(), bump);
+    if !hash_modules {
+        for module in modules {
+            components.push(module);
+        }
+    } else {
+        for module in modules {
+            let mut digest = Blake2b256::new();
+            digest.update(module);
+            module_digests.push(digest.finalize().into());
+        }
+        components.extend(module_digests.iter().map(|d| d.as_ref()));
+    }
+
+    components.extend(object_ids.iter().map(|o| o.0.as_ref()));
+    // NB: sorting so the order of the modules and the order of the dependencies does not matter.
+    components.sort();
+
+    let mut digest = Blake2b256::new();
+    for c in components {
+        digest.update(c);
+    }
+    digest.finalize().into()
+}
