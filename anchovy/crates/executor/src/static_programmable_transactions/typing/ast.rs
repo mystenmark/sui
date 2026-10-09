@@ -284,14 +284,15 @@ impl<'a> Command__<'a> {
     pub fn types(&self) -> impl Iterator<Item = &Type<'a>> + '_ {
         // The types of an optional first argument and of a list of arguments, then an optional
         // type and three lists of types.
-        let (first_arg, args, ty, types1, types2, types3): (
-            Option<&Argument<'a>>,
-            &[Argument<'a>],
-            Option<&Type<'a>>,
-            &[Type<'a>],
-            &[Type<'a>],
-            &[Type<'a>],
-        ) = match self {
+        type Parts<'b, 'a> = (
+            Option<&'b Argument<'a>>,
+            &'b [Argument<'a>],
+            Option<&'b Type<'a>>,
+            &'b [Type<'a>],
+            &'b [Type<'a>],
+            &'b [Type<'a>],
+        );
+        let (first_arg, args, ty, types1, types2, types3): Parts<'_, 'a> = match self {
             Command__::TransferObjects(args, arg) => (Some(arg), args, None, &[], &[], &[]),
             Command__::SplitCoins(ty, arg, args) | Command__::MergeCoins(ty, arg, args) => {
                 (Some(arg), args, Some(ty), &[], &[], &[])

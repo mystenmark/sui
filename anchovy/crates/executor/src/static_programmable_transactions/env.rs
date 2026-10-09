@@ -411,12 +411,10 @@ where
             Some(loaded) => {
                 debug_assert!(
                     loaded.len() == type_arguments.len()
-                        && type_arguments.iter().zip(&loaded).enumerate().all(
-                            |(idx, (ty, vm_ty))| {
-                                self.load_vm_type_argument_from_adapter_type(idx, ty)
-                                    .is_ok_and(|reloaded| reloaded == *vm_ty)
-                            }
-                        )
+                        && type_arguments.iter().enumerate().all(|(idx, ty)| {
+                            self.load_vm_type_argument_from_adapter_type(idx, ty)
+                                .is_ok_and(|reloaded| loaded.get(idx) == Some(&reloaded))
+                        })
                 );
                 loaded
             }
