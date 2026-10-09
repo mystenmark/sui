@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/arena",
     "crates/containers",
+    "crates/exec-types",
     "crates/execution",
     "crates/executor",
     "crates/messages",
@@ -45,6 +46,7 @@ arena = { path = "crates/arena" }
 containers = { path = "crates/containers" }
 execution = { path = "crates/execution" }
 executor = { path = "crates/executor" }
+exec-types = { path = "crates/exec-types" }
 natives = { path = "crates/natives" }
 messages = { path = "crates/messages" }
 protocol-config = { path = "crates/protocol-config" }

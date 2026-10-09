@@ -133,6 +133,20 @@ pub struct MoveObject<'a> {
     pub contents: &'a [u8],
 }
 
+impl MoveObject<'_> {
+    /// The `UID` its contents begin with, as the reference's `MoveObject::id`.
+    ///
+    /// # Panics
+    /// If the contents are shorter than an id, as the reference does.
+    pub fn id(&self) -> ObjectId {
+        ObjectId(
+            self.contents[..ObjectId::LENGTH]
+                .try_into()
+                .expect("a Move object begins with its id"),
+        )
+    }
+}
+
 impl<'a> MoveObject<'a> {
     pub fn parse<A: Alloc<'a>>(r: &mut Reader<'a>, a: &mut A) -> Result<MoveObject<'a>> {
         r.enter()?;

@@ -1872,6 +1872,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40404c3f5f511ec4da6fe866ddf6a717c309fdbb69fbbad7b0f3edab8f2e835f"
 
 [[package]]
+name = "exec-types"
+version = "0.1.0"
+dependencies = [
+ "blake2",
+ "containers",
+ "messages",
+ "move-core-types",
+ "sui-protocol-config",
+ "sui-types",
+]
+
+[[package]]
 name = "execution"
 version = "0.1.0"
 dependencies = [
@@ -1892,6 +1904,7 @@ name = "executor"
 version = "0.1.0"
 dependencies = [
  "containers",
+ "exec-types",
  "messages",
  "move-binary-format",
  "move-core-types",
