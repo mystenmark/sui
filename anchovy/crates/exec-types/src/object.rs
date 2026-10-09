@@ -17,6 +17,8 @@ use messages::base::{
 };
 use messages::object::{Data, MoveObject, MoveObjectType, MovePackage, Owner};
 
+use std::cell::OnceCell;
+
 use crate::base::ObjectRef;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,18 +28,64 @@ pub struct Object<'a> {
     previous_transaction: TransactionDigest,
     storage_rebate: u64,
     /// The object's encoding, while it is unchanged since read or sealed.
-    stored: Option<&'a [u8]>,
+    stored: Option<&'a Stored<'a>>,
 }
+
+/// An object's encoding and its digest. In the arena, so every copy of the object shares the
+/// digest, which is hashed at most once.
+#[derive(Debug)]
+pub struct Stored<'a> {
+    bytes: &'a [u8],
+    digest: OnceCell<ObjectDigest>,
+}
+
+impl Stored<'_> {
+    fn digest(&self) -> ObjectDigest {
+        *self.digest.get_or_init(|| Digest::of("Object", self.bytes))
+    }
+}
+
+/// The encodings decide: the digest is theirs, computed or not.
+impl PartialEq for Stored<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for Stored<'_> {}
 
 impl<'a> Object<'a> {
     /// An object as the store holds it.
-    pub fn from_view(view: &messages::object::Object<'a>) -> Object<'a> {
+    pub fn from_view(bump: &'a Bump, view: &messages::object::Object<'a>) -> Object<'a> {
+        Self::from_view_and_digest(bump, view, None)
+    }
+
+    /// An object as the store holds it, with its digest if the caller already knows it.
+    ///
+    /// # Panics
+    /// In debug builds, if `digest` is not the digest of the view's bytes.
+    pub fn from_view_and_digest(
+        bump: &'a Bump,
+        view: &messages::object::Object<'a>,
+        digest: Option<ObjectDigest>,
+    ) -> Object<'a> {
+        let stored = containers::leak(
+            bump,
+            Stored {
+                bytes: view.bytes,
+                digest: OnceCell::new(),
+            },
+        );
+        if let Some(digest) = digest {
+            debug_assert_eq!(digest, Digest::of("Object", view.bytes));
+            let _ = stored.digest.set(digest);
+        }
         Object {
             data: view.data,
             owner: view.owner,
             previous_transaction: *view.previous_transaction,
             storage_rebate: view.storage_rebate,
-            stored: Some(view.bytes),
+            stored: Some(stored),
         }
     }
 
@@ -102,7 +150,7 @@ impl<'a> Object<'a> {
 
     /// The encoding, if unchanged since read or sealed.
     pub fn stored_bytes(&self) -> Option<&'a [u8]> {
-        self.stored
+        self.stored.map(|s| s.bytes)
     }
 
     /// Encodes the object into `bump`, so that its digest and its stored
@@ -119,15 +167,22 @@ impl<'a> Object<'a> {
             &self.previous_transaction,
             self.storage_rebate,
         );
+        let stored = containers::leak(
+            bump,
+            Stored {
+                bytes: w.finish_bytes(),
+                digest: OnceCell::new(),
+            },
+        );
         Object {
-            stored: Some(w.finish_bytes()),
+            stored: Some(stored),
             ..self
         }
     }
 
     fn encoded_len_hint(&self) -> usize {
         let data = match &self.data {
-            Data::Move(m) => m.contents.len() + 64,
+            Data::Move(m) => m.contents.len() + m.type_.bcs_size() + 16,
             Data::Package(p) => p.module_map.iter().map(|(_, m)| m.len()).sum::<usize>() + 256,
         };
         data + 128
@@ -138,11 +193,9 @@ impl<'a> Object<'a> {
     /// # Panics
     /// If the object changed since it was read and was not sealed since.
     pub fn digest(&self) -> ObjectDigest {
-        Digest::of(
-            "Object",
-            self.stored
-                .expect("an object's digest is taken once it is sealed"),
-        )
+        self.stored
+            .expect("an object's digest is taken once it is sealed")
+            .digest()
     }
 
     pub fn id(&self) -> ObjectId {

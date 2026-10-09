@@ -15,8 +15,7 @@ use executor::gas::SuiGasStatus;
 use executor::inputs::{ExecutionInputs, InputObjectKind, InputState, LoadedInput};
 use executor::storage::EmptyUnsettledObjectFunds;
 use messages::Kept;
-use messages::base::{ObjectId, TransactionDigest};
-use messages::effects::TransactionEffects;
+use messages::base::TransactionDigest;
 use messages::transaction::{HasDigest, TransactionData, TxState};
 use move_vm_runtime::runtime::MoveRuntime;
 use sui_protocol_config::ProtocolConfig;
@@ -107,7 +106,7 @@ impl NativeExecution {
         transaction: &[u8],
     ) -> Result<Outcome> {
         let kept = Kept::new();
-        let reads = StoreReads::new(store, &kept);
+        let reads = StoreReads::new(bump, store, &kept);
         let digest = *data.digest();
 
         let kinds = input_objects(data).map_err(|e| Error::Native(format!("{e:?}")))?;
@@ -118,10 +117,12 @@ impl NativeExecution {
         let receiving = receiving_objects(data);
         let mut receiving_refs = containers::Vec::with_capacity_in(receiving.len(), bump);
         receiving_refs.extend(receiving.iter().map(|r| exec_types::base::object_ref(r)));
+        // The root's live version is the version of its live object (the store keys objects by
+        // version), without reading it.
         let accumulator_version = if self.config.enable_accumulators() {
             reads
-                .live_object(&exec_types::base::SUI_ACCUMULATOR_ROOT_OBJECT_ID)?
-                .map(|root| root.version())
+                .live(&exec_types::base::SUI_ACCUMULATOR_ROOT_OBJECT_ID)?
+                .map(|live| live.version)
         } else {
             None
         };
@@ -160,29 +161,19 @@ impl NativeExecution {
             ExecutionOrEarlyError::ok(None),
         );
 
-        let written = inner_store.written.values().map(|o| written(o)).collect();
+        let written = inner_store.written.values().map(written).collect();
         let effects_bytes = effects.bytes.to_vec();
-        let removed = removed(&effects_bytes)?;
-        let events = if inner_store.events.is_empty() {
-            None
-        } else {
-            Some(
-                executor::effects::build_events(bump, &inner_store.events)
-                    .bytes
-                    .to_vec(),
-            )
-        };
         Ok(Outcome {
             effects: effects_bytes.clone(),
             commit: store::Commit {
                 written,
-                removed,
+                removed: inner_store.removed.iter().copied().collect(),
                 executed: Some(store::Executed {
                     digest: digest_of(digest),
                     transaction: transaction.to_vec(),
                     effects_digest: effects.digest,
                     effects: effects_bytes,
-                    events,
+                    events: inner_store.encoded_events.map(|built| built.bytes.to_vec()),
                 }),
             },
         })
@@ -202,8 +193,9 @@ fn load<'a>(reads: &StoreReads<'a>, kind: &InputKind<'_>) -> Result<LoadedInput<
                 "equivocation: {id} at {version} {:?} is not live ({live:?})",
                 r.digest
             );
+            // Live at this version, so its digest is the live one just checked.
             let object = reads
-                .object_at(&id, version)?
+                .object_at_with_digest(&id, version, r.digest)?
                 .ok_or(Error::MissingNative(id))?;
             (
                 InputObjectKind::ImmOrOwnedMoveObject(exec_types::base::object_ref(r)),
@@ -239,22 +231,6 @@ fn written(object: &Object<'_>) -> store::Written {
             .expect("written objects are sealed")
             .to_vec(),
     }
-}
-
-/// Objects the transaction leaves without a live version.
-fn removed(effects: &[u8]) -> Result<std::vec::Vec<ObjectId>> {
-    let effects = messages::Message::<TransactionEffects<'static>>::parse(effects.to_vec())
-        .map_err(|(e, _)| Error::Native(format!("{e:?}")))?;
-    let messages::effects::VersionedEffects::V2(effects) = effects.get().version else {
-        return Err(Error::Native("effects are V2".to_string()));
-    };
-    // Deleted, wrapped, and unwrapped then deleted: every change without an output.
-    Ok(effects
-        .changed_objects
-        .iter()
-        .filter(|c| matches!(c.output_state, messages::effects::ObjectOut::NotExist))
-        .map(|c| *c.id)
-        .collect())
 }
 
 fn digest_of(digest: TransactionDigest) -> messages::base::Digest {

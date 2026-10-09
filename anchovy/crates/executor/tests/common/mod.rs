@@ -115,7 +115,7 @@ pub fn accumulator_write<'a>(
 /// The object as the store holds it, with its stored bytes.
 pub fn stored_object<'a>(bump: &'a Bump, o: &Object) -> exec_types::object::Object<'a> {
     let view = messages::object::Object::parse(&mut reader(bump, o), &mut BumpAlloc(bump)).unwrap();
-    exec_types::object::Object::from_view(&view)
+    exec_types::object::Object::from_view(bump, &view)
 }
 
 /// The object rebuilt from its parts and sealed, as execution writes it.

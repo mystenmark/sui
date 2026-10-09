@@ -245,12 +245,16 @@ struct TestStore<'a> {
 }
 
 impl<'a> TestStore<'a> {
-    fn new(objects: &[Object], messages: &'a [Message<messages::object::Object<'static>>]) -> Self {
+    fn new(
+        bump: &'a Bump,
+        objects: &[Object],
+        messages: &'a [Message<messages::object::Object<'static>>],
+    ) -> Self {
         let reference = objects.iter().map(|o| (o.id(), o.clone())).collect();
         let ours = messages
             .iter()
             .map(|m| {
-                let o = exec_types::object::Object::from_view(m.get());
+                let o = exec_types::object::Object::from_view(bump, m.get());
                 (o.id(), o)
             })
             .collect();
@@ -335,7 +339,8 @@ fn run_both(
             Message::<messages::object::Object<'static>>::parse(bcs::to_bytes(o).unwrap()).unwrap()
         })
         .collect();
-    let store = TestStore::new(&objects, &messages);
+    let store_bump = Bump::with_capacity(1 << 12);
+    let store = TestStore::new(&store_bump, &objects, &messages);
 
     let reference_input: StdBTreeMap<TypeTag, StdBTreeSet<SuiAddress>> = receiving
         .iter()

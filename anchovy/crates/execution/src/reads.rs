@@ -5,6 +5,7 @@
 //! messages, kept for the transaction (`'a`). The same answers as `StoreView`, which serves
 //! sui's executor.
 
+use containers::Bump;
 use exec_types::base::EpochId;
 use exec_types::object::Object;
 use exec_types::storage::{
@@ -15,6 +16,7 @@ use messages::base::{ObjectId, SequenceNumber};
 use messages::object::Owner;
 
 pub struct StoreReads<'a> {
+    bump: &'a Bump,
     store: &'a store::Store,
     kept: &'a Kept<messages::object::Object<'static>>,
 }
@@ -24,27 +26,45 @@ fn storage_error(e: &store::Error) -> SuiError {
 }
 
 impl<'a> StoreReads<'a> {
-    /// Objects read are kept in `kept`, whose borrow bounds the views handed out.
+    /// Objects read are kept in `kept`, whose borrow bounds the views handed out, and their
+    /// digests go in `bump`.
     pub fn new(
+        bump: &'a Bump,
         store: &'a store::Store,
         kept: &'a Kept<messages::object::Object<'static>>,
     ) -> StoreReads<'a> {
-        StoreReads { store, kept }
+        StoreReads { bump, store, kept }
     }
 
     fn keep(
         &self,
         object: Option<messages::Message<messages::object::Object<'static>>>,
+        digest: Option<messages::base::ObjectDigest>,
     ) -> Option<Object<'a>> {
-        object.map(|m| Object::from_view(&self.kept.keep(m)))
+        object.map(|m| Object::from_view_and_digest(self.bump, &self.kept.keep(m), digest))
     }
 
     pub fn live(&self, id: &ObjectId) -> Result<Option<store::Live>, store::Error> {
         self.store.live(id)
     }
 
+    /// The live version, with the digest the store keeps beside it: `Store::live_object`,
+    /// without hashing the object again.
     pub fn live_object(&self, id: &ObjectId) -> Result<Option<Object<'a>>, store::Error> {
-        Ok(self.keep(self.store.live_object(id)?))
+        let Some(live) = self.store.live(id)? else {
+            return Ok(None);
+        };
+        Ok(self.keep(self.store.object(id, live.version)?, Some(live.digest)))
+    }
+
+    /// The object at `version`, whose digest the caller knows.
+    pub fn object_at_with_digest(
+        &self,
+        id: &ObjectId,
+        version: u64,
+        digest: messages::base::ObjectDigest,
+    ) -> Result<Option<Object<'a>>, store::Error> {
+        Ok(self.keep(self.store.object(id, version)?, Some(digest)))
     }
 
     pub fn object_at(
@@ -52,7 +72,7 @@ impl<'a> StoreReads<'a> {
         id: &ObjectId,
         version: u64,
     ) -> Result<Option<Object<'a>>, store::Error> {
-        Ok(self.keep(self.store.object(id, version)?))
+        Ok(self.keep(self.store.object(id, version)?, None))
     }
 }
 
@@ -90,6 +110,7 @@ impl<'a> RuntimeObjectResolver<'a> for StoreReads<'a> {
             self.store
                 .object_at_or_before(child, child_version_upper_bound)
                 .map_err(|e| storage_error(&e))?,
+            None,
         ) else {
             return Ok(None);
         };

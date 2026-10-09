@@ -149,6 +149,13 @@ pub struct InnerTemporaryStore<'a> {
     pub loaded_runtime_objects: BTreeMap<'a, ObjectId, DynamicallyLoadedObjectMetadata<'a>>,
     pub lamport_version: SequenceNumber,
     pub accumulator_running_max_withdraws: BTreeMap<'a, ObjectId, u128>,
+    /// Not in the reference, which hands its caller the events to encode again: the encoded
+    /// events whose digest the effects carry, if there are any.
+    pub encoded_events: Option<messages::fast::Built<'a>>,
+    /// Not in the reference, whose caller reads them back from the effects: the objects left
+    /// without a live version, as the effects' `deleted`, `wrapped` and
+    /// `unwrapped_then_deleted` classify them.
+    pub removed: Vec<'a, ObjectId>,
 }
 
 impl<'a> TemporaryStore<'a> {
@@ -431,6 +438,8 @@ impl<'a> TemporaryStore<'a> {
             loaded_runtime_objects: self.loaded_runtime_objects,
             lamport_version: self.inputs.lamport_timestamp(),
             accumulator_running_max_withdraws,
+            encoded_events: None,
+            removed: Vec::new_in(self.bump),
         }
     }
 
@@ -552,13 +561,17 @@ impl<'a> TemporaryStore<'a> {
         drop(loaded_per_epoch_config_objects);
         drop(loaded_system_objects);
         let bump = self.bump;
-        let inner = self.into_inner(accumulator_running_max_withdraws);
+        let mut inner = self.into_inner(accumulator_running_max_withdraws);
+        inner.removed.extend(
+            object_changes
+                .iter()
+                .filter(|(_, change)| removes_live_version(change))
+                .map(|(id, _)| *id),
+        );
 
-        let events_digest = if inner.events.is_empty() {
-            None
-        } else {
-            Some(effects::build_events(bump, &inner.events).digest)
-        };
+        inner.encoded_events =
+            (!inner.events.is_empty()).then(|| effects::build_events(bump, &inner.events));
+        let events_digest = inner.encoded_events.as_ref().map(|built| built.digest);
         let effects = effects::new_from_execution_v2(
             bump,
             status,
@@ -1175,6 +1188,29 @@ impl ObjectFundsResolver for TemporaryStore<'_> {
             .checked_sub(unsettled)
             .ok_or_else(|| SuiError("ExecutionInvariantViolation".to_string()))
     }
+}
+
+/// Whether the change leaves the object without a live version: the effects' `deleted`
+/// (`Exist → NotExist`, `Deleted`), `wrapped` (`Exist → NotExist`, `None`) and
+/// `unwrapped_then_deleted` (`NotExist → NotExist`, `Deleted`).
+fn removes_live_version(change: &EffectsObjectChange<'_>) -> bool {
+    use messages::effects::{IdOperation, ObjectIn, ObjectOut};
+    matches!(
+        (
+            &change.input_state,
+            &change.output_state,
+            change.id_operation
+        ),
+        (
+            ObjectIn::Exist { .. },
+            ObjectOut::NotExist,
+            IdOperation::Deleted | IdOperation::None
+        ) | (
+            ObjectIn::NotExist,
+            ObjectOut::NotExist,
+            IdOperation::Deleted
+        )
+    )
 }
 
 /// `MoveObjectType::coin_type_maybe(..).is_some()` for the object's type.
