@@ -25,10 +25,13 @@ into `anchovy-main`.
   against sui-types), the store-independent half of `GasCharger`.
 - PTB translation: metering, loading, typing, verify passes and invariant
   checks (`translate_and_verify`). Untested until the differential harness.
+- Execution values and locals; `adapter.rs` (Move runtime, native
+  extensions, metered verifier).
 
 ## Remaining
 
-- Execution context, values and interpreter; `adapter.rs` (VM, extensions).
+- Execution context and interpreter: the context loads inputs from the state
+  view and writes results back, so it waits on the inputs interface below.
 - Deferred until the input-loading processor's interface is designed: the
   temporary store, gas smashing and final charging, the engine paths.
 
