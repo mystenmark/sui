@@ -3,7 +3,7 @@
 
 //! Transactions submitted over gRPC: decoded in the handler, validated and
 //! their signatures verified on the processors, answered with
-//! `validation::check`'s verdict.
+//! `validation::check`'s verdict, or, past it, a result per transaction.
 
 mod common;
 
@@ -19,7 +19,7 @@ use tonic::transport::server::TcpIncoming;
 use validator::Validator;
 use validator::epoch::EpochState;
 use validator::processors::{Processors, Request};
-use validator::proto::{RawSubmitTxRequest, SubmitTxType};
+use validator::proto::{RawSubmitTxRequest, RawValidatorSubmitStatus, SubmitTxType};
 use validator::service::validator_client::ValidatorClient;
 use workqueue::Queue;
 
@@ -29,9 +29,10 @@ fn cases() -> (Vec<Case>, Arc<EpochState>) {
 }
 
 async fn serve(epoch: Arc<EpochState>) -> ValidatorClient<Channel> {
-    let processors = Processors::start(64);
+    let store = common::store(&epoch);
+    let processors = Processors::start(64, store.store.clone());
     let queue = processors.transactions.clone();
-    serve_with(epoch, queue, processors).await
+    serve_with(epoch, queue, (processors, store)).await
 }
 
 /// Serves with `queue`; `processors` (whatever drains it) live as long as
@@ -85,21 +86,26 @@ async fn verdicts_come_back_over_grpc() {
     let mut client = serve(epoch.clone()).await;
     let (mut passed, mut failed) = (0, 0);
     for case in &cases {
-        let status = client
+        let response = client
             .submit_transaction(submit(&[case], SubmitTxType::Default))
-            .await
-            .unwrap_err();
+            .await;
         match common::expected(&epoch, &[case]) {
             Ok(()) => {
-                assert_eq!(
-                    status.code(),
-                    Code::Unimplemented,
-                    "{}: {status:?}",
+                // Genesis has none of its objects.
+                let results = response.unwrap().into_inner().results;
+                assert_eq!(results.len(), 1, "{}", case.label);
+                assert!(
+                    matches!(
+                        results[0].inner,
+                        Some(RawValidatorSubmitStatus::Rejected(_))
+                    ),
+                    "{}: {results:?}",
                     case.label
                 );
                 passed += 1;
             }
             Err(kind) => {
+                let status = response.unwrap_err();
                 assert_eq!(
                     status.code(),
                     Code::InvalidArgument,
@@ -184,8 +190,9 @@ async fn a_full_queue_between_processors_refuses_work() {
     // A signature queue of no capacity, whose only reader is the validator's
     // own thread, never takes an item.
     let (queue, inbox) = workqueue::queue(16);
-    let worker = Processors::worker(inbox, 0).spawn();
-    let mut client = serve_with(epoch, queue, worker).await;
+    let store = common::store(&epoch);
+    let worker = Processors::worker(inbox, 0, store.store.clone()).spawn();
+    let mut client = serve_with(epoch, queue, (worker, store)).await;
     let status = client
         .submit_transaction(submit(&[valid], SubmitTxType::Default))
         .await

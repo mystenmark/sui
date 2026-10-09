@@ -3,8 +3,8 @@
 
 //! The handlers. They decode, hand work to processors and await it; none
 //! does transaction work on the RPC runtime. Health answers; submission
-//! validates and stops short of consensus; the rest need consensus, storage
-//! or execution, which do not exist yet. Pings are among them, since a
+//! checks and executes, with no consensus yet; the rest need consensus or
+//! more of storage, which do not exist yet. Pings are among them, since a
 //! ping's answer is a consensus position and then that position's commit.
 
 use std::sync::Arc;
@@ -22,10 +22,11 @@ use tonic::{Request, Response, Status};
 
 use crate::codec::Encoded;
 use crate::epoch::EpochState;
-use crate::processors::{self, Rejected, Validated};
+use crate::processors::{self, Outcome, Rejected};
 use crate::proto::{
-    RawSubmitTxRequest, RawSubmitTxResponse, RawValidatorHealthRequest, RawValidatorHealthResponse,
-    RawWaitForEffectsRequest, RawWaitForEffectsResponse, SubmitTxType,
+    RawExecutedData, RawExecutedStatus, RawRejectedStatus, RawSubmitTxRequest, RawSubmitTxResponse,
+    RawSubmitTxResult, RawValidatorHealthRequest, RawValidatorHealthResponse,
+    RawValidatorSubmitStatus, RawWaitForEffectsRequest, RawWaitForEffectsResponse, SubmitTxType,
 };
 use crate::service::validator_server::{self, ValidatorServer};
 
@@ -83,7 +84,7 @@ impl Validator {
     fn enqueue(
         &self,
         request: &RawSubmitTxRequest,
-    ) -> Result<oneshot::Receiver<Result<Validated, Rejected>>, Status> {
+    ) -> Result<oneshot::Receiver<Result<Vec<Outcome>, Rejected>>, Status> {
         let mut transactions = Vec::with_capacity(request.transactions.len());
         for bytes in &request.transactions {
             let transaction = Message::<Transaction<DigestPending>>::parse(bytes.to_vec())
@@ -107,6 +108,33 @@ impl Validator {
     }
 }
 
+/// A transaction's result as the reference's `SubmitTxResult`.
+fn result(outcome: Outcome) -> RawSubmitTxResult {
+    let status = match outcome {
+        Outcome::Executed(executed) => RawValidatorSubmitStatus::Executed(RawExecutedStatus {
+            effects_digest: executed.effects_digest_bcs().into(),
+            details: Some(RawExecutedData {
+                effects: executed.effects.into(),
+                events: executed.events.map(Into::into),
+                input_objects: executed.input_objects.into_iter().map(Into::into).collect(),
+                output_objects: executed
+                    .output_objects
+                    .into_iter()
+                    .map(Into::into)
+                    .collect(),
+            }),
+        }),
+        // Without the reason: it would be BCS of the reference's `SuiError`,
+        // which anchovy's errors do not map to yet.
+        Outcome::Rejected(_) | Outcome::Failed(_) => {
+            RawValidatorSubmitStatus::Rejected(RawRejectedStatus { error: None })
+        }
+    };
+    RawSubmitTxResult {
+        inner: Some(status),
+    }
+}
+
 fn rejection(rejected: &Rejected) -> Status {
     match rejected {
         Rejected::Invalid(e) => Status::invalid_argument(format!("{:?}: {}", e.kind, e.detail)),
@@ -119,8 +147,8 @@ fn rejection(rejected: &Rejected) -> Status {
 impl validator_server::Validator for Validator {
     /// Decodes each transaction here, without its digest; validates, hashes
     /// and verifies them on the processors, and fails the request if any is
-    /// invalid, as the reference does. What passes has no consensus to go to
-    /// yet.
+    /// invalid, as the reference does. Then, with no consensus yet, checks
+    /// each one's inputs and executes it, answering with its effects.
     async fn submit_transaction(
         &self,
         request: Request<RawSubmitTxRequest>,
@@ -130,11 +158,14 @@ impl validator_server::Validator for Validator {
             todo!("ping: a consensus position")
         }
 
-        self.enqueue(&request)?
+        let outcomes = self
+            .enqueue(&request)?
             .await
-            .map_err(|_| Status::internal("validation did not finish"))?
+            .map_err(|_| Status::internal("processing did not finish"))?
             .map_err(|e| rejection(&e))?;
-        Err(Status::unimplemented("consensus submission"))
+        Ok(Response::new(RawSubmitTxResponse {
+            results: outcomes.into_iter().map(result).collect(),
+        }))
     }
 
     async fn wait_for_effects(

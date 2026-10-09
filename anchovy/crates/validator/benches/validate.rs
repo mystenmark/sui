@@ -4,7 +4,9 @@
 //! Validity checking through the work queue and processors, layer by
 //! layer, over the mainnet corpus (`scripts/fetch-mainnet.sh`): the check
 //! alone, the handler's decode, the processor, the queue and pool, and the
-//! whole gRPC path. Run with `cargo bench -p validator`.
+//! whole gRPC path. Run with `cargo bench -p validator`. Through the queue
+//! and gRPC, valid transactions go on to the input checks, against an empty
+//! store, where the first object read rejects them.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
@@ -26,7 +28,7 @@ use tonic::transport::Channel;
 use tonic::transport::server::TcpIncoming;
 use validator::Validator;
 use validator::epoch::EpochState;
-use validator::processors::{Processors, Request, SignatureVerifier, TransactionValidator, answer};
+use validator::processors::{Processors, Request, SignatureVerifier, TransactionValidator};
 use validator::proto::{RawSubmitTxRequest, RawValidatorHealthRequest, SubmitTxType};
 use validator::service::validator_client::ValidatorClient;
 use workqueue::Processor;
@@ -311,14 +313,13 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
     let mut verifier = SignatureVerifier::new();
     let mut both = |verifier: &mut SignatureVerifier, txs: &[Bytes]| {
         for bytes in txs {
-            let (reply, verdict) = oneshot::channel();
+            let (reply, _verdict) = oneshot::channel();
             let request = Request::new(epoch.clone(), vec![decode(bytes)], reply);
-            if let Some(valid) = validator.process(request)
-                && let Some(verified) = verifier.process(valid)
-            {
-                answer(verified);
-            }
-            black_box(verdict.blocking_recv().unwrap().is_ok());
+            let accepted = validator
+                .process(request)
+                .and_then(|valid| verifier.process(valid))
+                .is_some();
+            black_box(accepted);
         }
     };
     row(
@@ -393,7 +394,8 @@ fn pool(
     tasks: usize,
     rounds: usize,
 ) -> (f64, Duration) {
-    let processors = Processors::start(1 << 16);
+    let (_dir, store) = empty_store();
+    let processors = Processors::start(1 << 16, store);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .build()
@@ -470,12 +472,23 @@ fn pools(txs: &[Bytes], epoch: &Arc<EpochState>) {
     }
 }
 
+/// A store with no objects, in a temporary directory.
+fn empty_store() -> (tempfile::TempDir, Arc<store::Store>) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(store::Store::open(dir.path()).unwrap());
+    (dir, store)
+}
+
 /// Stops a benchmark server: its runtime, then its processors.
-struct Guard(Option<tokio::runtime::Runtime>, Option<Processors>);
+struct Guard {
+    runtime: Option<tokio::runtime::Runtime>,
+    processors: Option<Processors>,
+    _dir: tempfile::TempDir,
+}
 impl Drop for Guard {
     fn drop(&mut self) {
-        self.0.take().unwrap().shutdown_background();
-        drop(self.1.take());
+        self.runtime.take().unwrap().shutdown_background();
+        drop(self.processors.take());
     }
 }
 
@@ -486,7 +499,8 @@ fn server(epoch: &Arc<EpochState>, workers: usize) -> (SocketAddr, impl Drop) {
         .enable_all()
         .build()
         .unwrap();
-    let processors = Processors::start(1 << 16);
+    let (dir, store) = empty_store();
+    let processors = Processors::start(1 << 16, store);
     let service = Validator::new(epoch.clone(), processors.transactions.clone()).into_service();
     let listener = runtime
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
@@ -498,7 +512,14 @@ fn server(epoch: &Arc<EpochState>, workers: usize) -> (SocketAddr, impl Drop) {
             .serve_with_incoming(TcpIncoming::from(listener))
             .await
     });
-    (addr, Guard(Some(runtime), Some(processors)))
+    (
+        addr,
+        Guard {
+            runtime: Some(runtime),
+            processors: Some(processors),
+            _dir: dir,
+        },
+    )
 }
 
 /// Requests per second from `tasks` concurrent callers over `connections`

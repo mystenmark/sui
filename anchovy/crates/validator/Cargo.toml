@@ -15,12 +15,14 @@ blake2.workspace = true
 bytes.workspace = true
 clap.workspace = true
 containers.workspace = true
+execution.workspace = true
 hashbrown.workspace = true
 messages.workspace = true
 protocol-config.workspace = true
 prost.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
+store.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 tokio-stream.workspace = true
@@ -31,6 +33,9 @@ workqueue.workspace = true
 
 [dev-dependencies]
 base64.workspace = true
+bcs.workspace = true
+sui-types.workspace = true
+tempfile.workspace = true
 hyper-util.workspace = true
 serde_json.workspace = true
 tower.workspace = true

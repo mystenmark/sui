@@ -3,8 +3,10 @@ resolver = "2"
 members = [
     "crates/arena",
     "crates/containers",
+    "crates/execution",
     "crates/messages",
     "crates/protocol-config",
+    "crates/store",
     "crates/validation",
     "crates/validator",
     "crates/workqueue",
@@ -20,10 +22,22 @@ license = "Apache-2.0"
 bcs = "=0.1.6"
 # The crate behind fastcrypto's Blake2b256, at the version sui's lockfile has.
 blake2 = "=0.10.6"
+# The revision sui's typed-store uses.
+tidehunter = { git = "https://github.com/mystenlabs/tidehunter.git", rev = "f8bc93cf6a973d31fbbe6fa7c2b643ddd8e83ddf" }
+tempfile = "3.20.0"
+# Sui's executor, its types and its framework, linked only by `execution`.
+sui-execution = { path = "../sui-execution" }
+sui-framework = { path = "../crates/sui-framework" }
+sui-protocol-config = { path = "../crates/sui-protocol-config" }
+sui-types = { path = "../crates/sui-types" }
+move-core-types = { path = "../external-crates/move/crates/move-core-types" }
+prometheus = "0.14"
 arena = { path = "crates/arena" }
 containers = { path = "crates/containers" }
+execution = { path = "crates/execution" }
 messages = { path = "crates/messages" }
 protocol-config = { path = "crates/protocol-config" }
+store = { path = "crates/store" }
 validation = { path = "crates/validation" }
 workqueue = { path = "crates/workqueue" }
 # Two versions of the allocator trait: hashbrown and its Vec use 0.2,
