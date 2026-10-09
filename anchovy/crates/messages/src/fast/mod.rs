@@ -21,7 +21,7 @@ use crate::execution_status::{
     CommandArgumentError, ExecutionErrorKind, ExecutionStatus, MoveLocation, PackageUpgradeError,
     TypeArgumentError,
 };
-use crate::object::Owner;
+use crate::object::{Data, MoveObject, MoveObjectType, MovePackage, Owner};
 use crate::type_tag::{StructTag, TypeTag};
 
 pub mod checkpoint;
@@ -232,6 +232,82 @@ impl<'a> Writer<'a> {
         for p in s.type_params {
             self.type_tag(p);
         }
+    }
+
+    pub fn move_object_type(&mut self, ty: &MoveObjectType<'_>) {
+        match ty {
+            MoveObjectType::Other(s) => {
+                self.u8(0);
+                self.struct_tag(s);
+            }
+            MoveObjectType::GasCoin => self.u8(1),
+            MoveObjectType::StakedSui => self.u8(2),
+            MoveObjectType::Coin(t) => {
+                self.u8(3);
+                self.type_tag(t);
+            }
+            MoveObjectType::SuiBalanceAccumulatorField => self.u8(4),
+            MoveObjectType::BalanceAccumulatorField(t) => {
+                self.u8(5);
+                self.type_tag(t);
+            }
+        }
+    }
+
+    pub fn move_object(&mut self, o: &MoveObject<'_>) {
+        self.move_object_type(&o.type_);
+        self.bool(o.has_public_transfer);
+        self.u64(o.version);
+        self.bytes(o.contents);
+    }
+
+    pub fn move_package(&mut self, p: &MovePackage<'_>) {
+        self.raw(&p.id.0);
+        self.u64(p.version);
+        self.len_prefix(p.module_map.len());
+        for (name, module) in p.module_map {
+            self.str(name);
+            self.bytes(module);
+        }
+        self.len_prefix(p.type_origin_table.len());
+        for t in p.type_origin_table {
+            self.str(t.module_name);
+            self.str(t.datatype_name);
+            self.raw(&t.package.0);
+        }
+        self.len_prefix(p.linkage_table.len());
+        for l in p.linkage_table {
+            self.raw(&l.original_id.0);
+            self.raw(&l.upgraded_id.0);
+            self.raw(&l.upgraded_version.0);
+        }
+    }
+
+    pub fn data(&mut self, data: &Data<'_>) {
+        match data {
+            Data::Move(o) => {
+                self.u8(0);
+                self.move_object(o);
+            }
+            Data::Package(p) => {
+                self.u8(1);
+                self.move_package(p);
+            }
+        }
+    }
+
+    /// An `Object`, from its parts.
+    pub fn object(
+        &mut self,
+        data: &Data<'_>,
+        owner: &Owner<'_>,
+        previous_transaction: &Digest,
+        storage_rebate: u64,
+    ) {
+        self.data(data);
+        self.owner(owner);
+        self.digest(previous_transaction);
+        self.u64(storage_rebate);
     }
 
     fn move_location(&mut self, l: &MoveLocation<'_>) {

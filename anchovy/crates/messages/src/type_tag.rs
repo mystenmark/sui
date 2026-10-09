@@ -36,6 +36,45 @@ pub struct StructTag<'a> {
 pub type TypeInput<'a> = TypeTag<'a>;
 pub type StructInput<'a> = StructTag<'a>;
 
+/// The length of a ULEB128-encoded `n`.
+pub(crate) fn uleb128_len(n: usize) -> usize {
+    let mut len = 1;
+    let mut n = n >> 7;
+    while n != 0 {
+        len += 1;
+        n >>= 7;
+    }
+    len
+}
+
+impl TypeTag<'_> {
+    /// The length of its BCS encoding, without encoding it.
+    pub fn bcs_size(&self) -> usize {
+        1 + match self {
+            TypeTag::Vector(inner) => inner.bcs_size(),
+            TypeTag::Struct(s) => s.bcs_size(),
+            _ => 0,
+        }
+    }
+}
+
+impl StructTag<'_> {
+    /// The length of its BCS encoding, without encoding it.
+    pub fn bcs_size(&self) -> usize {
+        AccountAddress::LENGTH
+            + uleb128_len(self.module.len())
+            + self.module.len()
+            + uleb128_len(self.name.len())
+            + self.name.len()
+            + uleb128_len(self.type_params.len())
+            + self
+                .type_params
+                .iter()
+                .map(TypeTag::bcs_size)
+                .sum::<usize>()
+    }
+}
+
 impl<'a> TypeTag<'a> {
     pub const MIN_WIRE_SIZE: usize = 1;
 

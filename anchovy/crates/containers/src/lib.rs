@@ -25,6 +25,26 @@ mod index_map;
 pub use btree_set::BTreeSet;
 pub use index_map::{Entry, IndexMap, IndexSet, OccupiedEntry, VacantEntry};
 
+/// `value` in the arena, for the arena's lifetime. Arena values are never
+/// dropped, so only `Copy` values go here.
+pub fn alloc<T: Copy>(bump: &Bump, value: T) -> &T {
+    Box::leak(Box::new_in(value, bump))
+}
+
+/// A copy of `slice` in the arena.
+pub fn alloc_slice_copy<'a, T: Copy>(bump: &'a Bump, slice: &[T]) -> &'a [T] {
+    let mut v = Vec::with_capacity_in(slice.len(), bump);
+    v.extend_from_slice(slice);
+    v.leak()
+}
+
+/// A copy of `s` in the arena.
+pub fn alloc_str<'a>(bump: &'a Bump, s: &str) -> &'a str {
+    let bytes = alloc_slice_copy(bump, s.as_bytes());
+    // SAFETY: a copy of a `str`'s bytes is UTF-8.
+    unsafe { core::str::from_utf8_unchecked(bytes) }
+}
+
 pub fn hash_map<K, V>(bump: &Bump, capacity: usize) -> HashMap<'_, K, V> {
     HashMap::with_capacity_and_hasher_in(capacity, foldhash::fast::RandomState::default(), bump)
 }
