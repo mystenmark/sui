@@ -1909,6 +1909,7 @@ dependencies = [
  "messages",
  "move-binary-format",
  "move-core-types",
+ "move-vm-runtime",
  "sui-protocol-config",
  "sui-types",
 ]

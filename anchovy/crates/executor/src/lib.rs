@@ -14,6 +14,7 @@
     clippy::too_many_lines
 )]
 
-pub use exec_types::error;
+pub mod error;
 pub mod gas;
+pub mod gas_meter;
 pub mod gas_model;
