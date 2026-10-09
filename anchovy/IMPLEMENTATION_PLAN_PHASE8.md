@@ -104,12 +104,25 @@ representation (e.g. `ExecutionErrorKind<'a>`, `Owner<'a>`), and
 
 ## Execution inputs
 
-Not the reference's `InputObjects`/`ObjectReadResult` (sui-core's loader handing inputs to
-execution). A processor will load all of a transaction's inputs; the execution processor takes
-the transaction plus those loaded inputs, which is all execution needs. That interface is
-designed with the loader, not copied; until then the temporary store and engine are ported
-against it last, and the parts that do not depend on it (typing, verification, execution
-context, natives, effects) first.
+Execution takes the transaction plus its loaded inputs; it never loads an input itself.
+
+- **Loader.** The input checker already loads every input object to check it. It hands them on
+  with the transaction instead of dropping them: per input object its kind and either the
+  object (its stored message), a consensus-stream-ended marker, or a cancellation. These are
+  owned messages, so they cross the queue to the execution processor.
+- **`ExecutionInputs<'a>`** (executor `inputs.rs`) is built in the execution arena from those
+  messages. It holds the transaction view, the input objects as `Object<'a>` keyed by id (stored
+  bytes kept, so digests come from them), and what the reference derives from `InputObjects`:
+  exclusive mutable inputs, non-exclusive inputs (ids only: the originals are the input objects,
+  which nothing changes), stream-ended objects, shared inputs for effects, cancellations,
+  dependencies, receiving objects and the lamport version. The derivations are ported from
+  `InputObjects`' methods and checked against them. It is read-only during execution.
+- **Reads during execution** go through one handle, the `BackingStore<'a>` and
+  `ObjectFundsResolver` traits: packages, child objects, received objects, implicitly read
+  system objects and config objects, balances. These cannot be known before execution.
+- **Temporary store** borrows `&'a ExecutionInputs<'a>` in place of the fields it derived from
+  `InputObjects` and the input object map it cloned; its write set, accounting and checks are
+  ported as they are.
 
 ## Child objects
 
