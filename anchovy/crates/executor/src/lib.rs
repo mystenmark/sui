@@ -10,7 +10,12 @@
 // reference is held to sui's lints instead.
 #![allow(clippy::pedantic, clippy::too_many_arguments)]
 
+pub mod accumulator_event;
 pub mod error;
+pub mod execution;
+pub mod execution_mode;
+pub mod execution_value;
 pub mod gas;
 pub mod gas_meter;
 pub mod gas_model;
+pub mod storage;

@@ -69,6 +69,20 @@ impl<'a, T: Ord> BTreeSet<'a, T> {
         self.map.keys()
     }
 
+    /// Whether no value is in both.
+    pub fn is_disjoint(&self, other: &BTreeSet<'_, T>) -> bool {
+        let (small, large) = if self.len() <= other.len() {
+            (self, other)
+        } else {
+            (other, self)
+        };
+        small.iter().all(|v| !large.contains(v))
+    }
+
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
+
     pub fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
         self.map.retain(|k, ()| keep(k));
     }
@@ -85,6 +99,14 @@ impl<T: Ord> Extend<T> for BTreeSet<'_, T> {
 impl<T: fmt::Debug + Ord> fmt::Debug for BTreeSet<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_set().entries(self.iter()).finish()
+    }
+}
+
+impl<'m, T> IntoIterator for &'m BTreeSet<'_, T> {
+    type Item = &'m T;
+    type IntoIter = arena_btreemap::btree::map::Keys<'m, T, ()>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.map.keys()
     }
 }
 

@@ -108,3 +108,101 @@ pub enum UserInputError {
         max_gas_price: u64,
     },
 }
+
+#[macro_export]
+macro_rules! make_invariant_violation {
+    ($($args:expr),* $(,)?) => {{
+        if cfg!(debug_assertions) {
+            panic!($($args),*)
+        }
+        $crate::error::ExecutionError::invariant_violation(format!($($args),*))
+    }}
+}
+
+#[macro_export]
+macro_rules! invariant_violation {
+    ($($args:expr),* $(,)?) => {
+        return Err($crate::make_invariant_violation!($($args),*).into())
+    };
+}
+
+#[macro_export]
+macro_rules! assert_invariant {
+    ($cond:expr, $($args:expr),* $(,)?) => {{
+        if !$cond {
+            $crate::invariant_violation!($($args),*)
+        }
+    }};
+}
+
+/// A helper macro for performing a checked cast from one type to another, returning a
+/// ExecutionError invariant violation if the cast fails.
+#[macro_export]
+macro_rules! checked_as {
+    ($value:expr, $target_type:ty) => {{
+        let v = $value;
+        <$target_type>::try_from(v).map_err(|e| {
+            $crate::make_invariant_violation!(
+                "Value {} cannot be safely cast to {}: {:?}",
+                v,
+                stringify!($target_type),
+                e
+            )
+        })
+    }};
+}
+
+/// A trait for safe indexing into collections that returns a ExecutionError as long as the
+/// collection implements `AsRef<[T]>`.
+/// This is useful for avoiding panics on out-of-bounds access, and instead returning a proper
+/// error.
+pub trait SafeIndex<T> {
+    /// Get a reference to the element at the given `index`, or return invariant violation error
+    /// if the index is out of bounds.
+    fn safe_get<'a, I>(&'a self, index: I) -> Result<&'a I::Output, ExecutionError<'static>>
+    where
+        I: std::slice::SliceIndex<[T]>,
+        T: 'a;
+
+    /// Get a mutable reference to the element at the given `index`, or return invariant violation
+    /// error if the index is out of bounds.
+    fn safe_get_mut<'a, I>(
+        &'a mut self,
+        index: I,
+    ) -> Result<&'a mut I::Output, ExecutionError<'static>>
+    where
+        I: std::slice::SliceIndex<[T]>,
+        T: 'a;
+}
+
+impl<T, C> SafeIndex<T> for C
+where
+    C: AsRef<[T]> + AsMut<[T]>,
+{
+    fn safe_get<'a, I>(&'a self, index: I) -> Result<&'a I::Output, ExecutionError<'static>>
+    where
+        I: std::slice::SliceIndex<[T]>,
+        T: 'a,
+    {
+        let slice = self.as_ref();
+        let len = slice.len();
+        slice.get(index).ok_or_else(|| {
+            crate::make_invariant_violation!("Index out of bounds for collection of length {}", len)
+        })
+    }
+
+    fn safe_get_mut<'a, I>(
+        &'a mut self,
+        index: I,
+    ) -> Result<&'a mut I::Output, ExecutionError<'static>>
+    where
+        I: std::slice::SliceIndex<[T]>,
+        T: 'a,
+    {
+        let slice = self.as_mut();
+        let len = slice.len();
+        slice.get_mut(index).ok_or_else(|| {
+            crate::make_invariant_violation!("Index out of bounds for collection of length {}", len)
+        })
+    }
+}
