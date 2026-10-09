@@ -104,7 +104,9 @@ mod validator;
 
 // TODO: remove in later PRs once we define the proper cost of native functions
 const DEFAULT_UNUSED_TX_CONTEXT_ENTRY_COST: u64 = 10;
-#[derive(Tid)]
+/// A pure function of the protocol config (`from_protocol_config`), so one table can be built
+/// per epoch and cloned into each transaction's extensions.
+#[derive(Tid, Clone)]
 pub struct NativesCostTable {
     // Address natives
     pub address_from_bytes_cost_params: AddressFromBytesCostParams,

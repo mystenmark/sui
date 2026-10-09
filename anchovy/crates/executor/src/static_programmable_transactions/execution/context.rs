@@ -65,6 +65,7 @@ use move_vm_runtime::{
     },
     validation::verification::ast::Package as VerifiedPackage,
 };
+use natives::NativesCostTable;
 use natives::object_runtime::{
     self, LoadedRuntimeObject, MoveAccumulatorAction, MoveAccumulatorEvent, MoveAccumulatorValue,
     ObjectRuntime, RuntimeResults, get_all_uids, max_event_error,
@@ -365,6 +366,7 @@ where
         input_withdrawal_metadata: Vec<'a, T::WithdrawalInput<'a>>,
         pure_input_metadata: Vec<'a, T::PureInput<'a>>,
         receiving_input_metadata: Vec<'a, T::ReceivingInput<'a>>,
+        natives_cost_table: Option<&NativesCostTable>,
     ) -> Result<Self, ExecutionError<'a>>
     where
         'pc: 'a,
@@ -453,6 +455,7 @@ where
             input_object_map,
             !gas_charger.is_unmetered(),
             env.protocol_config,
+            natives_cost_table,
             metrics.clone(),
             tx_context.clone(),
         )?;

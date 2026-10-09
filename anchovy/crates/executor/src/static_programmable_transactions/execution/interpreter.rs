@@ -38,7 +38,7 @@ pub fn execute<'env, 'a, 'pc, 'vm, 'state, 'linkage, 'extension, Mode: Execution
     tx_context: Rc<RefCell<TxContext>>,
     gas_charger: &mut GasCharger<'a>,
     ast: T::Transaction<'a>,
-    options: ExecuteOptions,
+    options: ExecuteOptions<'_>,
 ) -> ResultWithTimings<'a, (), ExecutionError<'a>>
 where
     'pc: 'a,
@@ -69,7 +69,7 @@ fn execute_inner<'env, 'a, 'pc, 'vm, 'state, 'linkage, 'extension, Mode: Executi
     tx_context: Rc<RefCell<TxContext>>,
     gas_charger: &mut GasCharger<'a>,
     ast: T::Transaction<'a>,
-    options: ExecuteOptions,
+    options: ExecuteOptions<'_>,
 ) -> Result<(), ExecutionError<'a>>
 where
     'pc: 'a,
@@ -98,6 +98,7 @@ where
         withdrawals,
         pure,
         receiving,
+        options.natives_cost_table,
     )?;
 
     for sp!(annotated_index, c) in commands {

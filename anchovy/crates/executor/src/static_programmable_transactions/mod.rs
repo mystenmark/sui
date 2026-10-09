@@ -23,6 +23,7 @@ use containers::{Bump, Vec};
 use exec_types::storage::BackingPackageStore;
 use exec_types::tx_context::TxContext;
 use move_vm_runtime::runtime::MoveRuntime;
+use natives::NativesCostTable;
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 use sui_protocol_config::ProtocolConfig;
 use sui_types::metrics::ExecutionMetrics;
@@ -36,18 +37,22 @@ pub mod spanned;
 pub mod typing;
 
 /// Options for [`execute_with_options`]. [`execute`] uses the `Default`.
-#[derive(Clone, Copy, Debug)]
-pub struct ExecuteOptions {
+#[derive(Clone, Copy)]
+pub struct ExecuteOptions<'t> {
     /// Whether to save the wrapped object containers and generated object ids into the state
     /// view. Only the ownership invariant check reads them, and it runs only with
     /// `enable_expensive_checks`.
     pub record_invariant_bookkeeping: bool,
+    /// The epoch's natives cost table, which must have been built from this `protocol_config`
+    /// by `NativesCostTable::from_protocol_config`. `None` builds it for this transaction.
+    pub natives_cost_table: Option<&'t NativesCostTable>,
 }
 
-impl Default for ExecuteOptions {
+impl Default for ExecuteOptions<'_> {
     fn default() -> Self {
         Self {
             record_invariant_bookkeeping: true,
+            natives_cost_table: None,
         }
     }
 }
@@ -94,7 +99,7 @@ pub fn execute_with_options<'a, Mode: ExecutionMode>(
     // which inputs are withdrawals that need to be converted to coins
     withdrawal_compatibility_inputs: Option<&[bool]>,
     txn: messages::transaction::ProgrammableTransaction<'a>,
-    options: ExecuteOptions,
+    options: ExecuteOptions<'_>,
 ) -> ResultWithTimings<'a, (), ExecutionError<'a>> {
     let gas_payment = gas_charger.gas_payment_amount();
     let package_store =

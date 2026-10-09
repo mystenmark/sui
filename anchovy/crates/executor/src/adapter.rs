@@ -79,6 +79,8 @@ pub fn new_native_extensions<'a>(
     input_objects: BTreeMap<'a, ObjectId, object_runtime::InputObject<'a>>,
     is_metered: bool,
     protocol_config: &'a ProtocolConfig,
+    // Built from `protocol_config` when `None`; when given, it must have been.
+    natives_cost_table: Option<&NativesCostTable>,
     metrics: Arc<ExecutionMetrics>,
     tx_context: Rc<RefCell<TxContext>>,
 ) -> Result<NativeExtensions<'a>, ExecutionError<'a>> {
@@ -99,7 +101,10 @@ pub fn new_native_extensions<'a>(
         metrics,
         current_epoch_id,
     ));
-    exts.add(NativesCostTable::from_protocol_config(protocol_config));
+    exts.add(match natives_cost_table {
+        Some(table) => table.clone(),
+        None => NativesCostTable::from_protocol_config(protocol_config),
+    });
     exts.add(ScratchRuntime::new(protocol_config));
     exts.add(TransactionContext::new(tx_context));
     drop(exts);
