@@ -9,5 +9,6 @@ pub mod env;
 pub mod execution;
 pub mod linkage;
 pub mod loading;
+pub mod metering;
 pub mod spanned;
 pub mod typing;
