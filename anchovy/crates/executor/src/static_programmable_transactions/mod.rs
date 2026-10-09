@@ -10,3 +10,4 @@ pub mod execution;
 pub mod linkage;
 pub mod loading;
 pub mod spanned;
+pub mod typing;
