@@ -5,7 +5,7 @@
 //! out owned `TypeTag`s (and takes them back to load types); execution
 //! keeps types as views in the transaction's arena.
 
-use containers::{Bump, alloc, alloc_str};
+use containers::{Bump, IndexSet, alloc, alloc_str};
 use messages::arena::Ref;
 use messages::base::AccountAddress;
 use messages::object::MoveObjectType;
@@ -180,5 +180,104 @@ pub fn to_move_struct_tag_of(t: &MoveObjectType<'_>) -> move_tags::StructTag {
         MoveObjectType::SuiBalanceAccumulatorField => balance_field(gas()),
         MoveObjectType::BalanceAccumulatorField(inner) => balance_field(to_move_type_tag(inner)),
         MoveObjectType::Other(s) => to_move_struct_tag(s),
+    }
+}
+
+/// `TypeTag::all_addresses`: every address in the type, in pre-order.
+pub fn all_addresses<'a>(
+    bump: &'a Bump,
+    tag: &TypeTag<'_>,
+) -> IndexSet<'a, move_core_types::account_address::AccountAddress> {
+    let mut addresses = IndexSet::new_in(bump);
+    find_addresses(tag, &mut addresses);
+    addresses
+}
+
+/// `StructTag::all_addresses`: the struct's address, then its type parameters', in pre-order.
+pub fn struct_all_addresses<'a>(
+    bump: &'a Bump,
+    tag: &StructTag<'_>,
+) -> IndexSet<'a, move_core_types::account_address::AccountAddress> {
+    let mut addresses = IndexSet::new_in(bump);
+    struct_addresses(tag, &mut addresses);
+    addresses
+}
+
+fn find_addresses(
+    tag: &TypeTag<'_>,
+    addresses: &mut IndexSet<'_, move_core_types::account_address::AccountAddress>,
+) {
+    match tag {
+        TypeTag::Bool
+        | TypeTag::U8
+        | TypeTag::U64
+        | TypeTag::U128
+        | TypeTag::U16
+        | TypeTag::U32
+        | TypeTag::U256
+        | TypeTag::Address
+        | TypeTag::Signer => (),
+        TypeTag::Vector(inner) => find_addresses(inner, addresses),
+        TypeTag::Struct(s) => struct_addresses(s, addresses),
+    }
+}
+
+fn struct_addresses(
+    tag: &StructTag<'_>,
+    addresses: &mut IndexSet<'_, move_core_types::account_address::AccountAddress>,
+) {
+    // Traverse in a pre-order manner. So the address is added first, then the type parameters.
+    addresses.insert(move_core_types::account_address::AccountAddress::new(
+        tag.address.0,
+    ));
+    for param in tag.type_params {
+        find_addresses(param, addresses);
+    }
+}
+
+/// `StructTag::from(MoveObjectType).all_addresses()`, without building the full type: the
+/// framework's types expand to addresses 0x2 and 0x3 around their type parameters.
+pub fn move_object_type_all_addresses<'a>(
+    bump: &'a Bump,
+    ty: &MoveObjectType<'_>,
+) -> IndexSet<'a, move_core_types::account_address::AccountAddress> {
+    let framework = move_core_types::account_address::AccountAddress::new(SUI_FRAMEWORK_ADDRESS.0);
+    let mut addresses = IndexSet::new_in(bump);
+    match ty {
+        MoveObjectType::Other(s) => struct_addresses(s, &mut addresses),
+        // 0x2::coin::Coin<0x2::sui::SUI>, and the SUI accumulator field, are all framework types.
+        MoveObjectType::GasCoin | MoveObjectType::SuiBalanceAccumulatorField => {
+            addresses.insert(framework);
+        }
+        MoveObjectType::StakedSui => {
+            addresses.insert(move_core_types::account_address::AccountAddress::new(
+                SUI_SYSTEM_ADDRESS.0,
+            ));
+        }
+        // 0x2::coin::Coin<T>, and 0x2::dynamic_field::Field<0x2::accumulator::Key<
+        // 0x2::balance::Balance<T>>, 0x2::accumulator::U128>: 0x2, then T's.
+        MoveObjectType::Coin(t) | MoveObjectType::BalanceAccumulatorField(t) => {
+            addresses.insert(framework);
+            find_addresses(t, &mut addresses);
+        }
+    }
+    addresses
+}
+
+/// `TypeInput::to_type_tag`'s failure, without building the tag: the first module or type name
+/// that is not a Move identifier. Views do not check names when parsed; the reference's
+/// conversion does.
+pub fn check_type_input(tag: &TypeTag<'_>) -> Result<(), String> {
+    match tag {
+        TypeTag::Vector(inner) => check_type_input(inner),
+        TypeTag::Struct(s) => {
+            for name in [s.module, s.name] {
+                if !move_core_types::identifier::is_valid(name) {
+                    return Err(format!("Invalid identifier: {name}"));
+                }
+            }
+            s.type_params.iter().try_for_each(check_type_input)
+        }
+        _ => Ok(()),
     }
 }

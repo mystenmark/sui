@@ -36,6 +36,12 @@ pub fn alloc<T: Copy>(bump: &Bump, value: T) -> &T {
     Box::leak(Box::new_in(value, bump))
 }
 
+/// `value` in the arena, for the arena's lifetime, never dropped: only for values whose drop
+/// would just free memory in this same arena (arena containers of `Copy` data).
+pub fn leak<T>(bump: &Bump, value: T) -> &T {
+    Box::leak(Box::new_in(value, bump))
+}
+
 /// A copy of `slice` in the arena.
 pub fn alloc_slice_copy<'a, T: Copy>(bump: &'a Bump, slice: &[T]) -> &'a [T] {
     let mut v = Vec::with_capacity_in(slice.len(), bump);

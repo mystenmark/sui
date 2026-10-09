@@ -17,6 +17,8 @@ pub mod execution;
 pub mod execution_mode;
 pub mod execution_value;
 pub mod gas;
+pub mod gas_charger;
 pub mod gas_meter;
 pub mod gas_model;
+pub mod static_programmable_transactions;
 pub mod storage;

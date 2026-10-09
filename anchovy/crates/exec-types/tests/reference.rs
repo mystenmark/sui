@@ -92,3 +92,28 @@ fn object_types_match() {
         );
     }
 }
+
+#[test]
+fn object_type_addresses_match() {
+    use std::str::FromStr;
+
+    use move_core_types::language_storage::StructTag;
+    let tags = [
+        "0x2::coin::Coin<0x2::sui::SUI>",
+        "0x2::coin::Coin<0xabc::usdc::USDC>",
+        "0x3::staking_pool::StakedSui",
+        "0x2::dynamic_field::Field<0x2::accumulator::Key<0x2::balance::Balance<0x2::sui::SUI>>, 0x2::accumulator::U128>",
+        "0x2::dynamic_field::Field<0x2::accumulator::Key<0x2::balance::Balance<0x7::t::T<0x9::a::B>>>, 0x2::accumulator::U128>",
+        "0xdee9::clob::Pool<0x2::sui::SUI, 0x5::x::Y<u128, 0x6::z::Z>>",
+    ];
+    let bump = containers::Bump::with_capacity(1 << 16);
+    for tag in tags {
+        let tag = StructTag::from_str(tag).unwrap();
+        let ours = exec_types::type_tags::move_object_type_in(&bump, &tag);
+        let theirs: Vec<_> = tag.all_addresses().into_iter().collect();
+        let ours: Vec<_> = exec_types::type_tags::move_object_type_all_addresses(&bump, &ours)
+            .into_iter()
+            .collect();
+        assert_eq!(ours, theirs, "{tag}");
+    }
+}
