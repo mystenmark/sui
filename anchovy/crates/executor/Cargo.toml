@@ -7,6 +7,7 @@ publish = false
 
 # sui-execution's latest version, ported onto anchovy's zero-copy types.
 [dependencies]
+bcs.workspace = true
 containers.workspace = true
 exec-types.workspace = true
 messages.workspace = true
@@ -22,6 +23,7 @@ move-bytecode-verifier-meter.workspace = true
 move-vm-config.workspace = true
 move-regex-borrow-graph.workspace = true
 natives.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
 
