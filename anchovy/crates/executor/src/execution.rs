@@ -126,7 +126,7 @@ impl<'a> ExecutionResultsV2<'a> {
         &mut self,
         lamport_version: SequenceNumber,
         prev_tx: TransactionDigest,
-        input_objects: &BTreeMap<'a, ObjectId, Object<'a>>,
+        input_objects: &containers::VecMap<'a, ObjectId, Object<'a>>,
         reshare_at_initial_version: bool,
     ) {
         for (id, obj) in self.written_objects.iter_mut() {

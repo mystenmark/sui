@@ -426,6 +426,12 @@ fn run(seed: u64, coverage: &mut Coverage) {
         &sui_changes,
         sui_system,
     );
+    // The port takes the changes as a map built once, from the same entries in the same order.
+    let port_changes = {
+        let mut entries = containers::Vec::new_in(bump);
+        entries.extend(port_changes);
+        containers::VecMap::from_entries(entries)
+    };
     let port_unchanged = port::compute_unchanged_consensus_objects(
         bump,
         &port_shared,

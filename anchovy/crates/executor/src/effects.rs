@@ -5,7 +5,7 @@
 //! (`object_change`, `effects_v2`, `mod`) and `sui_types::execution`, built
 //! with `messages::fast` instead of an owned `TransactionEffects`.
 
-use containers::{BTreeMap, BTreeSet, Bump};
+use containers::{BTreeMap, BTreeSet, Bump, VecMap};
 use messages::arena::Ref;
 use messages::base::{Digest, ObjectDigest, ObjectId, SequenceNumber, TransactionDigest};
 use messages::effects::{
@@ -46,7 +46,7 @@ pub fn new_from_execution_v2<'a>(
     unchanged_consensus_objects: containers::Vec<'a, (ObjectId, UnchangedConsensusKind<'a>)>,
     transaction_digest: TransactionDigest,
     lamport_version: SequenceNumber,
-    changed_objects: BTreeMap<'a, ObjectId, EffectsObjectChange<'a>>,
+    changed_objects: VecMap<'a, ObjectId, EffectsObjectChange<'a>>,
     gas_object: Option<ObjectId>,
     events_digest: Option<Digest>,
     dependencies: impl IntoIterator<Item = TransactionDigest>,
@@ -320,7 +320,7 @@ pub fn compute_unchanged_consensus_objects<'a>(
     bump: &'a Bump,
     shared_objects: &[SharedInput],
     loaded_per_epoch_config_objects: &BTreeSet<'_, ObjectId>,
-    changed_objects: &BTreeMap<'a, ObjectId, EffectsObjectChange<'a>>,
+    changed_objects: &VecMap<'a, ObjectId, EffectsObjectChange<'a>>,
     loaded_system_objects: &BTreeMap<'_, ObjectId, VersionDigest>,
 ) -> containers::Vec<'a, (ObjectId, UnchangedConsensusKind<'a>)> {
     let mut unchanged_consensus_objects = containers::Vec::with_capacity_in(
@@ -380,6 +380,10 @@ pub fn compute_unchanged_consensus_objects<'a>(
     // recovery) can reproduce the read. Skip any that already appear as a changed object or as
     // an unchanged consensus object, keeping the version (and digest) each such entry records
     // to check it matches what the in-execution read observed.
+    // With no system objects read there is nothing to record or check.
+    if loaded_system_objects.is_empty() {
+        return unchanged_consensus_objects;
+    }
     let mut already_recorded: BTreeMap<'_, ObjectId, Option<VersionDigest>> =
         BTreeMap::new_in(bump);
     for (id, change) in changed_objects {
@@ -431,7 +435,7 @@ pub fn compute_unchanged_consensus_objects<'a>(
 fn check_invariant(
     bump: &Bump,
     lamport_version: SequenceNumber,
-    changed_objects: &BTreeMap<'_, ObjectId, EffectsObjectChange<'_>>,
+    changed_objects: &VecMap<'_, ObjectId, EffectsObjectChange<'_>>,
     gas_object: Option<ObjectId>,
     unchanged_consensus_objects: &[(ObjectId, UnchangedConsensusKind<'_>)],
 ) {

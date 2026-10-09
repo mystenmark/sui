@@ -243,7 +243,10 @@ fn run(seed: u64) {
         .into_iter()
         .map(digest)
         .collect();
-    let actual: Vec<_> = port.transaction_dependencies(&bump).into_iter().collect();
+    // Unsorted with repeats: the effects builder sorts and deduplicates, as the reference's set.
+    let mut actual: Vec<_> = port.transaction_dependencies(&bump).into_iter().collect();
+    actual.sort_unstable();
+    actual.dedup();
     assert_eq!(actual, expected, "seed {seed}");
 
     let expected = reference

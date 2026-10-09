@@ -23,7 +23,7 @@ use crate::transaction::{
     get_funds_withdrawals, get_gasless_allowed_token_types, is_gas_paid_from_address_balance,
     is_gasless_transaction,
 };
-use containers::{BTreeMap, BTreeSet, Bump, Vec};
+use containers::{BTreeMap, BTreeSet, Bump, Vec, VecMap};
 use exec_types::assert_invariant;
 use exec_types::base::{EpochId, SUI_DENY_LIST_OBJECT_ID, SUI_SYSTEM_STATE_OBJECT_ID};
 use exec_types::execution::DynamicallyLoadedObjectMetadata;
@@ -280,7 +280,7 @@ impl<'a> TemporaryStore<'a> {
     }
 
     // Helpers to access private fields
-    pub fn objects(&self) -> &BTreeMap<'a, ObjectId, Object<'a>> {
+    pub fn objects(&self) -> &containers::VecMap<'a, ObjectId, Object<'a>> {
         self.inputs.objects()
     }
 
@@ -459,20 +459,33 @@ impl<'a> TemporaryStore<'a> {
         }
     }
 
-    fn get_object_changes(&self) -> BTreeMap<'a, ObjectId, EffectsObjectChange<'a>> {
+    fn get_object_changes(&self) -> VecMap<'a, ObjectId, EffectsObjectChange<'a>> {
         let results = &self.execution_results;
-        let mut all_ids = BTreeSet::new_in(self.bump);
+        // The reference collects the ids into a `BTreeSet` and the changes into a `BTreeMap`;
+        // both are only built and then read, so a sorted, deduplicated `Vec` and a `VecMap`
+        // give the same ids and the same changes in the same order.
+        let mut all_ids = Vec::with_capacity_in(
+            results.created_object_ids.len()
+                + results.deleted_object_ids.len()
+                + results.modified_objects.len()
+                + results.written_objects.len(),
+            self.bump,
+        );
         all_ids.extend(
             results
                 .created_object_ids
                 .iter()
                 .chain(&results.deleted_object_ids)
                 .chain(&results.modified_objects)
-                .chain(results.written_objects.keys()),
+                .chain(results.written_objects.keys())
+                .copied(),
         );
-        let mut changes = BTreeMap::new_in(self.bump);
-        for id in all_ids {
-            changes.insert(
+        all_ids.sort_unstable();
+        all_ids.dedup();
+        let mut changes =
+            Vec::with_capacity_in(all_ids.len() + results.accumulator_events.len(), self.bump);
+        for id in &all_ids {
+            changes.push((
                 *id,
                 EffectsObjectChange::new(
                     self.bump,
@@ -482,19 +495,20 @@ impl<'a> TemporaryStore<'a> {
                     results.created_object_ids.contains(id),
                     results.deleted_object_ids.contains(id),
                 ),
-            );
+            ));
         }
+        // Inserted after the object changes, so on an equal id they win, as `insert` would.
         for AccumulatorEvent {
             accumulator_obj,
             write,
         } in &results.accumulator_events
         {
-            changes.insert(
+            changes.push((
                 *accumulator_obj,
                 EffectsObjectChange::new_from_accumulator_write(self.bump, *write),
-            );
+            ));
         }
-        changes
+        VecMap::from_entries(changes)
     }
 
     /// Returns the inner store and the effects, built as `messages::fast` bytes.
@@ -502,7 +516,7 @@ impl<'a> TemporaryStore<'a> {
         mut self,
         shared_object_refs: &[SharedInput],
         transaction_digest: &TransactionDigest,
-        mut transaction_dependencies: BTreeSet<'a, TransactionDigest>,
+        mut transaction_dependencies: Vec<'a, TransactionDigest>,
         gas_cost_summary: GasCostSummary,
         status: ExecutionStatus<'a>,
         gas_coin: Option<ObjectId>,
@@ -537,7 +551,7 @@ impl<'a> TemporaryStore<'a> {
                         && obj_meta.digest == *expected_digest
                         && matches!(obj_meta.owner, Owner::AddressOwner(_));
                     if loaded_via_receive {
-                        transaction_dependencies.insert(obj_meta.previous_transaction);
+                        transaction_dependencies.push(obj_meta.previous_transaction);
                     }
                 }
             }

@@ -17,7 +17,7 @@ use crate::static_programmable_transactions as SPT;
 use crate::storage::UnsettledObjectFundsRead;
 use crate::temporary_store::{InnerTemporaryStore, TemporaryStore};
 use crate::transaction::is_gasless_transaction;
-use containers::{BTreeSet, Bump, Vec};
+use containers::{Bump, Vec};
 use exec_types::assert_invariant;
 use exec_types::base::{EpochId, SUI_RANDOMNESS_STATE_OBJECT_ID};
 use exec_types::object::Object;
@@ -172,7 +172,7 @@ pub fn execute_transaction_to_effects<'a, Mode: ExecutionMode>(
 ) -> ExecutionOutput<'a> {
     let shared_object_refs = inputs.filter_shared_objects(bump);
     let mut transaction_dependencies = if protocol_config.disable_effects_tx_dependencies() {
-        BTreeSet::new_in(bump)
+        Vec::new_in(bump)
     } else {
         inputs.transaction_dependencies(bump)
     };
@@ -268,7 +268,7 @@ pub fn execute_transaction_to_effects<'a, Mode: ExecutionMode>(
         status: gas_status,
     } = gas;
     // `TransactionDigest::genesis_marker`
-    transaction_dependencies.remove(&Digest::ZERO);
+    transaction_dependencies.retain(|d| *d != Digest::ZERO);
     let (inner, effects) = temporary_store.into_effects(
         &shared_object_refs,
         &transaction_digest,

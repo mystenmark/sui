@@ -5,7 +5,7 @@
 //! input object's kind and what it read; the facts the reference derives from `InputObjects`
 //! when it builds the temporary store are derived here, once, and read during execution.
 
-use containers::{BTreeMap, BTreeSet, Bump, Vec};
+use containers::{Bump, Vec, VecMap};
 use exec_types::base::ObjectRef;
 use exec_types::object::Object;
 use messages::base::{ObjectId, SequenceNumber, TransactionDigest};
@@ -120,14 +120,16 @@ pub struct ExecutionInputs<'a> {
     loaded: Vec<'a, LoadedInput<'a>>,
     /// `InputObjects::into_object_map`: the inputs that are objects. The reference's temporary
     /// store holds a copy; here it is borrowed.
-    objects: BTreeMap<'a, ObjectId, Object<'a>>,
+    // These maps are built once and then only read; the reference's are `BTreeMap`s, and these
+    // answer and iterate as they would.
+    objects: VecMap<'a, ObjectId, Object<'a>>,
     /// `InputObjects::exclusive_mutable_inputs`.
-    exclusive_mutable_inputs: BTreeMap<'a, ObjectId, (VersionDigest, Owner<'a>)>,
+    exclusive_mutable_inputs: VecMap<'a, ObjectId, (VersionDigest, Owner<'a>)>,
     /// `InputObjects::non_exclusive_input_objects`, as ids: the original objects are in
     /// `objects`, which nothing changes.
-    non_exclusive_inputs: BTreeSet<'a, ObjectId>,
+    non_exclusive_inputs: VecMap<'a, ObjectId, ()>,
     /// `InputObjects::consensus_stream_ended_objects`: id to initial shared version.
-    consensus_stream_ended: BTreeMap<'a, ObjectId, SequenceNumber>,
+    consensus_stream_ended: VecMap<'a, ObjectId, SequenceNumber>,
     receiving: &'a [ObjectRef],
     lamport_timestamp: SequenceNumber,
     /// `SystemObjectVersions`: the accumulator root's version assigned to this transaction,
@@ -144,13 +146,13 @@ impl<'a> ExecutionInputs<'a> {
         receiving: &'a [ObjectRef],
         accumulator_version: Option<SequenceNumber>,
     ) -> ExecutionInputs<'a> {
-        let mut objects = BTreeMap::new_in(bump);
-        let mut exclusive_mutable_inputs = BTreeMap::new_in(bump);
-        let mut non_exclusive_inputs = BTreeSet::new_in(bump);
-        let mut consensus_stream_ended = BTreeMap::new_in(bump);
+        let mut objects = Vec::with_capacity_in(loaded.len(), bump);
+        let mut exclusive_mutable_inputs = Vec::with_capacity_in(loaded.len(), bump);
+        let mut non_exclusive_inputs = Vec::new_in(bump);
+        let mut consensus_stream_ended = Vec::new_in(bump);
         for input in &loaded {
             if let Some(object) = input.as_object() {
-                objects.insert(input.id(), *object);
+                objects.push((input.id(), *object));
             }
             if let Some((id, entry, kind)) = mutable_with_input_kind(input) {
                 // `exclusive_mutable_inputs` leaves out non-exclusive writes.
@@ -163,7 +165,7 @@ impl<'a> ExecutionInputs<'a> {
                     _ => true,
                 };
                 if exclusive {
-                    exclusive_mutable_inputs.insert(id, entry);
+                    exclusive_mutable_inputs.push((id, entry));
                 }
             }
             if let (
@@ -174,7 +176,7 @@ impl<'a> ExecutionInputs<'a> {
                 },
             ) = (input.as_object(), input.kind)
             {
-                non_exclusive_inputs.insert(input.id());
+                non_exclusive_inputs.push((input.id(), ()));
             }
             if let InputObjectKind::SharedMoveObject {
                 id,
@@ -183,16 +185,16 @@ impl<'a> ExecutionInputs<'a> {
             } = input.kind
                 && input.is_consensus_stream_ended()
             {
-                consensus_stream_ended.insert(id, initial_shared_version);
+                consensus_stream_ended.push((id, initial_shared_version));
             }
         }
         let lamport_timestamp = lamport_timestamp(&loaded, receiving);
         ExecutionInputs {
             loaded,
-            objects,
-            exclusive_mutable_inputs,
-            non_exclusive_inputs,
-            consensus_stream_ended,
+            objects: VecMap::from_entries(objects),
+            exclusive_mutable_inputs: VecMap::from_entries(exclusive_mutable_inputs),
+            non_exclusive_inputs: VecMap::from_entries(non_exclusive_inputs),
+            consensus_stream_ended: VecMap::from_entries(consensus_stream_ended),
             receiving,
             lamport_timestamp,
             accumulator_version,
@@ -203,17 +205,17 @@ impl<'a> ExecutionInputs<'a> {
         &self.loaded
     }
 
-    pub fn objects(&self) -> &BTreeMap<'a, ObjectId, Object<'a>> {
+    pub fn objects(&self) -> &VecMap<'a, ObjectId, Object<'a>> {
         &self.objects
     }
 
-    pub fn exclusive_mutable_inputs(&self) -> &BTreeMap<'a, ObjectId, (VersionDigest, Owner<'a>)> {
+    pub fn exclusive_mutable_inputs(&self) -> &VecMap<'a, ObjectId, (VersionDigest, Owner<'a>)> {
         &self.exclusive_mutable_inputs
     }
 
     /// The non-exclusive write inputs, as they were before execution.
     pub fn non_exclusive_input_objects(&self) -> impl Iterator<Item = (&ObjectId, &Object<'a>)> {
-        self.non_exclusive_inputs.iter().map(|id| {
+        self.non_exclusive_inputs.keys().map(|id| {
             (
                 id,
                 self.objects
@@ -225,10 +227,10 @@ impl<'a> ExecutionInputs<'a> {
 
     /// Whether `id` is a non-exclusive write input.
     pub fn is_non_exclusive_input(&self, id: &ObjectId) -> bool {
-        self.non_exclusive_inputs.contains(id)
+        self.non_exclusive_inputs.contains_key(id)
     }
 
-    pub fn consensus_stream_ended_objects(&self) -> &BTreeMap<'a, ObjectId, SequenceNumber> {
+    pub fn consensus_stream_ended_objects(&self) -> &VecMap<'a, ObjectId, SequenceNumber> {
         &self.consensus_stream_ended
     }
 
@@ -263,9 +265,11 @@ impl<'a> ExecutionInputs<'a> {
         shared
     }
 
-    /// `InputObjects::transaction_dependencies`.
-    pub fn transaction_dependencies(&self, bump: &'a Bump) -> BTreeSet<'a, TransactionDigest> {
-        let mut dependencies = BTreeSet::new_in(bump);
+    /// `InputObjects::transaction_dependencies`, unsorted and with repeats: the reference's
+    /// `BTreeSet` only ever feeds the effects builder, which sorts and deduplicates.
+    pub fn transaction_dependencies(&self, bump: &'a Bump) -> Vec<'a, TransactionDigest> {
+        let mut dependencies =
+            Vec::with_capacity_in(self.loaded.len() + self.receiving.len(), bump);
         dependencies.extend(
             self.loaded
                 .iter()
