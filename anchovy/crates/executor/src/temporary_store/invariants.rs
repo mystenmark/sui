@@ -18,10 +18,35 @@
 //!
 //! [`TemporaryStore`]: crate::temporary_store::TemporaryStore
 
+use std::cmp::Ordering;
 use std::ops::Range;
+use std::sync::Arc;
 
-use containers::{BTreeMap, BTreeSet, Bump, Vec};
-use messages::base::ObjectId;
+use containers::{BTreeMap, BTreeSet, Bump, HashSet, Vec};
+use exec_types::base::SUI_FRAMEWORK_ADDRESS;
+use exec_types::execution::DynamicallyLoadedObjectMetadata;
+use exec_types::object::Object;
+use exec_types::storage::{SuiError, SuiResult};
+use exec_types::type_tags::{to_move_struct_tag_of, to_move_type_tag};
+use exec_types::{assert_invariant, invariant_violation, make_invariant_violation};
+use messages::base::{ObjectId, SequenceNumber, SuiAddress};
+use messages::effects::{AccumulatorOperation, AccumulatorValue, GasCostSummary};
+use messages::object::{Data, MoveObject, MoveObjectType, Owner, Party};
+use messages::type_tag::{StructTag, TypeTag};
+use move_core_types::annotated_value::MoveValue;
+use move_core_types::annotated_visitor::{self, StructDriver, Traversal, ValueDriver};
+use move_core_types::language_storage as move_tags;
+use move_vm_runtime::runtime::MoveRuntime;
+use sui_types::object::ObjectPermissions;
+
+use crate::accumulator_root::{is_balance_type, sui_balance_type};
+use crate::error::ExecutionError;
+use crate::execution::is_system_package;
+use crate::execution_mode::ExecutionMode;
+use crate::gas_charger::{GasCharger, PaymentLocation};
+use crate::layout_resolver::LayoutResolver;
+use crate::temporary_store::TemporaryStore;
+use crate::type_layout_resolver::TypeLayoutResolver;
 
 /// Holds invariant-check-only bookkeeping accumulated during execution and exposes the
 /// post-execution system-invariant checks (SUI conservation, balance-accumulator authorization,
@@ -109,5 +134,957 @@ impl<'a> InvariantChecker<'a> {
             Some(last) if last.end == range.start => last.end = range.end,
             _ => self.ptb_emitted_accumulator_event_ranges.push(range),
         }
+    }
+
+    /// Check that this transaction neither creates nor destroys SUI. This should hold for all txes
+    /// except the epoch change tx, which mints staking rewards equal to the gas fees burned in the
+    /// previous epoch.  Specifically, this checks two key invariants about storage
+    /// fees and storage rebate:
+    ///
+    /// 1. all SUI in storage rebate fields of input objects should flow either to the transaction
+    ///    storage rebate, or the transaction non-refundable storage rebate
+    /// 2. all SUI charged for storage should flow into the storage rebate field of some output
+    ///    object
+    ///
+    /// This function is intended to be called *after* we have charged for
+    /// gas + applied the storage rebate to the gas object, but *before* we
+    /// have updated object versions.
+    pub(crate) fn check_sui_conserved(
+        &self,
+        store: &TemporaryStore<'a>,
+        simple_conservation_checks: bool,
+        gas_summary: &GasCostSummary,
+    ) -> Result<(), ExecutionError<'a>> {
+        if !simple_conservation_checks {
+            return Ok(());
+        }
+        // total amount of SUI in storage rebate of input objects
+        let mut total_input_rebate = 0;
+        // total amount of SUI in storage rebate of output objects
+        let mut total_output_rebate = 0;
+        for (_id, input, output) in get_modified_objects(store) {
+            if let Some(input) = input {
+                total_input_rebate += input.storage_rebate;
+            }
+            if let Some(object) = output {
+                total_output_rebate += object.storage_rebate();
+            }
+        }
+
+        if gas_summary.storage_cost == 0 {
+            // this condition is usually true when the transaction went OOG and no
+            // gas is left for storage charges.
+            // The storage cost has to be there at least for the gas coin which
+            // will not be deleted even when going to 0.
+            // However if the storage cost is 0 and if there is any object touched
+            // or deleted the value in input must be equal to the output plus rebate and
+            // non refundable.
+            // Rebate and non refundable will be positive when there are object deleted
+            // (gas smashing being the primary and possibly only example).
+            // A more typical condition is for all storage charges in summary to be 0 and
+            // then input and output must be the same value
+            if total_input_rebate
+                != total_output_rebate
+                    + gas_summary.storage_rebate
+                    + gas_summary.non_refundable_storage_fee
+            {
+                return Err(ExecutionError::invariant_violation(format!(
+                    "SUI conservation failed -- no storage charges in gas summary \
+                        and total storage input rebate {} not equal  \
+                        to total storage output rebate {}",
+                    total_input_rebate, total_output_rebate,
+                )));
+            }
+        } else {
+            // all SUI in storage rebate fields of input objects should flow either to
+            // the transaction storage rebate, or the non-refundable storage rebate pool
+            if total_input_rebate
+                != gas_summary.storage_rebate + gas_summary.non_refundable_storage_fee
+            {
+                return Err(ExecutionError::invariant_violation(format!(
+                    "SUI conservation failed -- {} SUI in storage rebate field of input objects, \
+                        {} SUI in tx storage rebate or tx non-refundable storage rebate",
+                    total_input_rebate, gas_summary.non_refundable_storage_fee,
+                )));
+            }
+
+            // all SUI charged for storage should flow into the storage rebate field
+            // of some output object
+            if gas_summary.storage_cost != total_output_rebate {
+                return Err(ExecutionError::invariant_violation(format!(
+                    "SUI conservation failed -- {} SUI charged for storage, \
+                        {} SUI in storage rebate field of output objects",
+                    gas_summary.storage_cost, total_output_rebate
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Defense-in-depth invariant on funds-accumulator events. Per `(address, type)`:
+    /// - If the pair is in `input_reservations`, net withdrawal <= budget.
+    /// - Else if the PTB emitted a Split at this key, we assume there must be an object withdrawal.
+    ///   As such, any net change is acceptable.
+    /// - Else if the PTB emitted only Merges at this key, we can assume there might not be an
+    ///   object withdrawal. In any case, the net balance at the end of the transaction should be
+    ///   non-negative, since there could be additional withdrawals from gas, but they should
+    ///   not exceed the deposits.
+    /// - Else, any event is unauthorized.
+    ///
+    /// Currently the only funds-accumulator type is `Balance<T>`, so the check is scoped to
+    /// those events. As more accumulator shapes are added the filter and the integer
+    /// arithmetic in this method will need to grow with them.
+    ///
+    /// PTB-emitted events are identified via `ptb_emitted_accumulator_event_ranges`, populated
+    /// at `record_execution_results` time. They are trusted because Move enforces `&mut UID`
+    /// and the native checks the actual balance.
+    pub(crate) fn check_address_balance_changes(
+        &self,
+        store: &TemporaryStore<'a>,
+    ) -> Result<(), ExecutionError<'a>> {
+        let input_reservations = &store.post_execution_check_inputs.input_reservations;
+        let mut actual_changes: BTreeMap<(SuiAddress, TypeTag<'a>), i128> =
+            BTreeMap::new_in(store.bump);
+        let mut has_ptb_withdrawals: BTreeSet<(SuiAddress, TypeTag<'a>)> =
+            BTreeSet::new_in(store.bump);
+        let mut has_ptb_deposits: BTreeSet<(SuiAddress, TypeTag<'a>)> =
+            BTreeSet::new_in(store.bump);
+        for (idx, event) in store
+            .execution_results
+            .accumulator_events
+            .iter()
+            .enumerate()
+        {
+            // Filter on the value shape first: only `Integer` carries the funds-flow we care
+            // about. Other shapes (e.g. `EventDigest` for event-stream heads) belong to
+            // non-Balance accumulators and are out of scope here. If we ever see an `Integer`
+            // value at a non-`Balance<T>` type, the accounting invariants below don't apply
+            // -- debug_fatal so that case is surfaced instead of silently accepted.
+            let amount = match event.write.value {
+                AccumulatorValue::Integer(amount) => amount as i128,
+                AccumulatorValue::IntegerTuple(_, _) | AccumulatorValue::EventDigest(_) => {
+                    assert_invariant!(
+                        !is_balance_type(&event.write.ty),
+                        "Non-integer accumulator changes should not be balances"
+                    );
+                    continue;
+                }
+            };
+            if !is_balance_type(&event.write.ty) {
+                // The reference reports this through `debug_fatal!`.
+                debug_assert!(
+                    false,
+                    "Integer accumulator value at non-Balance type: {:?}",
+                    event.write.ty
+                );
+                continue;
+            }
+            let is_ptb_emitted = self
+                .ptb_emitted_accumulator_event_ranges
+                .iter()
+                .any(|range| range.contains(&idx));
+            let key = (*event.write.address, event.write.ty);
+            let change = match event.write.operation {
+                AccumulatorOperation::Split => {
+                    if is_ptb_emitted {
+                        has_ptb_withdrawals.insert(key);
+                    }
+                    -amount
+                }
+                AccumulatorOperation::Merge => {
+                    if is_ptb_emitted {
+                        has_ptb_deposits.insert(key);
+                    }
+                    amount
+                }
+            };
+            *actual_changes.entry(key).or_insert(0) += change;
+        }
+
+        for (key, actual) in actual_changes {
+            let (address, type_tag) = &key;
+            if let Some(budget) = input_reservations.get(&key).copied() {
+                let net_withdrawn = -actual.min(0) as u128;
+                assert_invariant!(
+                    net_withdrawn <= budget as u128,
+                    "Balance accumulator withdrawal exceeds reservation budget at address \
+                    {address} for type {}: net Split {net_withdrawn}, budget {budget}",
+                    to_move_type_tag(type_tag)
+                );
+            } else if has_ptb_withdrawals.contains(&key) {
+                // Move authorized the PTB Split against the on-chain balance, so any
+                // resulting net (including a net withdrawal beyond any PTB Merges here)
+                // is trusted.
+            } else if has_ptb_deposits.contains(&key) {
+                // PTB only deposited at this key. As such, the final net change must be
+                // non-negative, since there was no authorization for any withdrawal.
+                // We cannot compare this value to the sum of the PTB deposits due to intricacies
+                // with gas charging and storage rebate.
+                assert_invariant!(
+                    actual >= 0,
+                    "PTB-emitted Balance accumulator deposits do not cover the runtime \
+                    withdrawal at address {address} for type {}: net change {actual}",
+                    to_move_type_tag(type_tag)
+                );
+            } else {
+                invariant_violation!(
+                    "Unauthorized runtime Balance accumulator event at address {address} for \
+                    type {}: net change {actual} (no input reservation, no PTB-emitted \
+                    events)",
+                    to_move_type_tag(type_tag)
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check that this transaction neither creates nor destroys SUI.
+    /// This more expensive check will check a third invariant on top of the 2 performed
+    /// by `check_sui_conserved` above:
+    ///
+    /// * all SUI in input objects (including coins etc in the Move part of an object) should flow
+    ///   either to an output object, or be burned as part of computation fees or non-refundable
+    ///   storage rebate
+    ///
+    /// This function is intended to be called *after* we have charged for gas + applied the
+    /// storage rebate to the gas object, but *before* we have updated object versions. The
+    /// advance epoch transaction would mint `epoch_fees` amount of SUI, and burn `epoch_rebates`
+    /// amount of SUI. We need these information for this check.
+    pub(crate) fn check_sui_conserved_expensive(
+        &self,
+        store: &TemporaryStore<'a>,
+        gas_summary: &GasCostSummary,
+        layout_resolver: &mut impl LayoutResolver,
+    ) -> Result<(), ExecutionError<'a>> {
+        let advance_epoch_gas_summary = store.post_execution_check_inputs.advance_epoch_gas_summary;
+        // Accumulate in u128. The per-object SUI totals are bounded by the real supply, but the
+        // accumulator-event terms below are not: an object-sourced withdrawal/deposit (backing
+        // verified only at settlement) can contribute up to u64::MAX on each side, and a transaction
+        // can stack several across distinct keys, so a u64 running total could overflow. These
+        // amounts net out, so a u128 sum stays exact and conservation is decided correctly.
+        // total amount of SUI in input objects, including both coins and storage rebates
+        let mut total_input_sui: u128 = 0;
+        // total amount of SUI in output objects, including both coins and storage rebates
+        let mut total_output_sui: u128 = 0;
+
+        // settlement input/output sui is used by the settlement transactions to account for
+        // Sui that has been gathered from the accumulator writes of transactions which it is
+        // settling.
+        total_input_sui += store.execution_results.settlement_input_sui as u128;
+        total_output_sui += store.execution_results.settlement_output_sui as u128;
+
+        for (id, input, output) in get_modified_objects(store) {
+            if let Some(input) = input {
+                total_input_sui +=
+                    get_input_sui(store, &id, input.version, layout_resolver)? as u128;
+            }
+            if let Some(object) = output {
+                total_output_sui +=
+                    get_total_sui(object, store.bump, layout_resolver).map_err(|e| {
+                        make_invariant_violation!(
+                            "Failed looking up output SUI in SUI conservation checking for \
+                         mutated type {:?}: {e:#?}",
+                            struct_tag(object),
+                        )
+                    })? as u128;
+            }
+        }
+
+        for event in &store.execution_results.accumulator_events {
+            let (input, output) = event.total_sui_in_event();
+            total_input_sui += input as u128;
+            total_output_sui += output as u128;
+        }
+
+        // note: storage_cost flows into the storage_rebate field of the output objects, which is
+        // why it is not accounted for here.
+        // similarly, all of the storage_rebate *except* the storage_fund_rebate_inflow
+        // gets credited to the gas coin both computation costs and storage rebate inflow are
+        total_output_sui +=
+            gas_summary.computation_cost as u128 + gas_summary.non_refundable_storage_fee as u128;
+        if let Some((epoch_fees, epoch_rebates)) = advance_epoch_gas_summary {
+            total_input_sui += epoch_fees as u128;
+            total_output_sui += epoch_rebates as u128;
+        }
+        if total_input_sui != total_output_sui {
+            return Err(ExecutionError::invariant_violation(format!(
+                "SUI conservation failed: input={}, output={}, \
+                    this transaction either mints or burns SUI",
+                total_input_sui, total_output_sui,
+            )));
+        }
+        Ok(())
+    }
+}
+
+type ModifiedObjectInfo<'s, 'a> = (
+    ObjectId,
+    // old object metadata, including version, digest, owner, and storage rebate.
+    Option<DynamicallyLoadedObjectMetadata<'a>>,
+    Option<&'s Object<'a>>,
+);
+
+/// Return the list of all modified objects, for each object, returns
+/// - Object ID,
+/// - Input: If the object existed prior to this transaction, include their version and storage_rebate,
+/// - Output: If a new version of the object is written, include the new object.
+fn get_modified_objects<'s, 'a>(
+    store: &'s TemporaryStore<'a>,
+) -> Vec<'a, ModifiedObjectInfo<'s, 'a>> {
+    let results = &store.execution_results;
+    // At most one entry per modified object and one per other written object.
+    let mut modified = Vec::with_capacity_in(
+        results.modified_objects.len() + results.written_objects.len(),
+        store.bump,
+    );
+    modified.extend(
+        results
+            .modified_objects
+            .iter()
+            .map(|id| {
+                let metadata = store.get_object_modified_at(id);
+                let output = results.written_objects.get(id);
+                (*id, metadata, output)
+            })
+            .chain(results.written_objects.iter().filter_map(|(id, object)| {
+                if results.modified_objects.contains(id) {
+                    None
+                } else {
+                    Some((*id, None, Some(object)))
+                }
+            })),
+    );
+    modified
+}
+
+fn get_input_sui<'a>(
+    store: &TemporaryStore<'a>,
+    id: &ObjectId,
+    expected_version: SequenceNumber,
+    layout_resolver: &mut impl LayoutResolver,
+) -> Result<u64, ExecutionError<'a>> {
+    if let Some(obj) = store.inputs.objects().get(id) {
+        // the assumption here is that if it is in the input objects must be the right one
+        if obj.version() != expected_version {
+            invariant_violation!(
+                "Version mismatching when resolving input object to check conservation--\
+                 expected {}, got {}",
+                expected_version,
+                obj.version(),
+            );
+        }
+        get_total_sui(obj, store.bump, layout_resolver).map_err(|e| {
+            make_invariant_violation!(
+                "Failed looking up input SUI in SUI conservation checking for input with \
+                     type {:?}: {e:#?}",
+                struct_tag(obj),
+            )
+        })
+    } else {
+        // not in input objects, must be a dynamic field
+        let Some(obj) = store.store.get_object_by_key(id, expected_version) else {
+            invariant_violation!(
+                "Failed looking up dynamic field {id} in SUI conservation checking"
+            );
+        };
+        get_total_sui(&obj, store.bump, layout_resolver).map_err(|e| {
+            make_invariant_violation!(
+                "Failed looking up input SUI in SUI conservation checking for type \
+                     {:?}: {e:#?}",
+                struct_tag(&obj),
+            )
+        })
+    }
+}
+
+/// `Object::struct_tag`, as the VM's tag, for messages.
+fn struct_tag(object: &Object<'_>) -> Option<move_tags::StructTag> {
+    object.type_().map(to_move_struct_tag_of)
+}
+
+/// `Object::get_total_sui`: the SUI in the object's storage rebate and in its Move value. The
+/// balance traversal's map is in `bump`.
+fn get_total_sui(
+    object: &Object<'_>,
+    bump: &Bump,
+    layout_resolver: &mut dyn LayoutResolver,
+) -> Result<u64, SuiError> {
+    Ok(object.storage_rebate()
+        + match object.data() {
+            Data::Move(m) => move_object_get_total_sui(m, bump, layout_resolver)?,
+            Data::Package(_) => 0,
+        })
+}
+
+/// `MoveObject::get_total_sui`.
+fn move_object_get_total_sui(
+    object: &MoveObject<'_>,
+    bump: &Bump,
+    layout_resolver: &mut dyn LayoutResolver,
+) -> Result<u64, SuiError> {
+    if matches!(object.type_, MoveObjectType::GasCoin) {
+        let balance = get_coin_value_unsafe(object);
+        Ok(balance)
+    } else if matches!(
+        object.type_,
+        MoveObjectType::GasCoin | MoveObjectType::Coin(_)
+    ) {
+        // It's a coin, but its not SUI
+        Ok(0)
+    } else if matches!(object.type_, MoveObjectType::SuiBalanceAccumulatorField) {
+        let v = accumulator_value(object)?;
+        // Well behaved balance types can never have more than their total supply
+        // anywhere, which is 10B for SUI.
+        assert!(v <= u64::MAX as u128, "SUI balance cannot exceed u64::MAX");
+        Ok(v as u64)
+    } else {
+        let layout = layout_resolver.get_annotated_layout(&to_move_struct_tag_of(&object.type_))?;
+
+        let mut traversal = BalanceTraversal::new_in(bump);
+        MoveValue::visit_deserialize(object.contents, &layout.into_layout(), &mut traversal)
+            .map_err(|e| {
+                SuiError(format!(
+                    "ObjectSerializationError: Failure serializing object in the requested \
+                     format: {e}"
+                ))
+            })?;
+
+        Ok(traversal
+            .finish()
+            .get(&sui_types::gas_coin::GAS::type_tag())
+            .copied()
+            .unwrap_or(0))
+    }
+}
+
+/// `MoveObject::get_coin_value_unsafe`: the `value: u64` field of a `Coin<T>`.
+fn get_coin_value_unsafe(object: &MoveObject<'_>) -> u64 {
+    debug_assert!(matches!(
+        object.type_,
+        MoveObjectType::GasCoin | MoveObjectType::Coin(_)
+    ));
+    // 32 bytes for object ID, 8 for balance
+    debug_assert!(object.contents.len() == 40);
+
+    // unwrap safe because we checked that it is a coin
+    u64::from_le_bytes(<[u8; 8]>::try_from(&object.contents[ObjectId::LENGTH..]).unwrap())
+}
+
+/// `AccumulatorValue::try_from(&MoveObject)`: the `U128` value of a balance accumulator field.
+fn accumulator_value(object: &MoveObject<'_>) -> Result<u128, SuiError> {
+    // `Field<AccumulatorKey, U128>`: the field's UID, the key's owner, then the u128, which is
+    // every 80-byte encoding.
+    let contents = object.contents;
+    if !matches!(
+        object.type_,
+        MoveObjectType::SuiBalanceAccumulatorField | MoveObjectType::BalanceAccumulatorField(_)
+    ) || contents.len() != 80
+    {
+        return Err(SuiError(format!(
+            "DynamicFieldReadError: Dynamic field {:?} is not a AccumulatorValue",
+            object.id()
+        )));
+    }
+    Ok(u128::from_le_bytes(
+        contents[64..80].try_into().expect("sixteen bytes"),
+    ))
+}
+
+/// `sui_types::object::balance_traversal::BalanceTraversal`: the total of each `Balance<T>` in a
+/// Move value, by `T`.
+struct BalanceTraversal<'m> {
+    balances: BTreeMap<'m, move_tags::TypeTag, u64>,
+}
+
+#[derive(Default)]
+struct Accumulator {
+    total: u64,
+}
+
+impl<'m> BalanceTraversal<'m> {
+    fn new_in(bump: &'m Bump) -> Self {
+        Self {
+            balances: BTreeMap::new_in(bump),
+        }
+    }
+
+    fn finish(self) -> BTreeMap<'m, move_tags::TypeTag, u64> {
+        self.balances
+    }
+}
+
+impl<'b, 'l> Traversal<'b, 'l> for BalanceTraversal<'_> {
+    type Error = annotated_visitor::Error;
+
+    fn traverse_struct(
+        &mut self,
+        driver: &mut StructDriver<'_, 'b, 'l>,
+    ) -> Result<(), Self::Error> {
+        let Some(coin_type) = is_balance(&driver.struct_layout().type_) else {
+            while driver.next_field(self)?.is_some() {}
+            return Ok(());
+        };
+
+        let mut acc = Accumulator::default();
+        while driver.next_field(&mut acc)?.is_some() {}
+        *self.balances.entry(coin_type).or_default() += acc.total;
+        Ok(())
+    }
+}
+
+impl<'b, 'l> Traversal<'b, 'l> for Accumulator {
+    type Error = annotated_visitor::Error;
+    fn traverse_u64(
+        &mut self,
+        _driver: &ValueDriver<'_, 'b, 'l>,
+        value: u64,
+    ) -> Result<(), Self::Error> {
+        self.total += value;
+        Ok(())
+    }
+}
+
+fn is_balance(s: &move_tags::StructTag) -> Option<move_tags::TypeTag> {
+    (sui_types::balance::Balance::is_balance(s) && s.type_params.len() == 1)
+        .then(|| s.type_params[0].clone())
+}
+
+/// `sui_types::allowance::ResolvedAllowance`, without the spender, which nothing here reads.
+struct ResolvedAllowance<'a> {
+    funder: SuiAddress,
+    /// The accumulated type `T` of `Allowance<T>` (e.g. `Balance<SUI>`).
+    funds_type: TypeTag<'a>,
+}
+
+/// `sui_types::allowance::parse_allowance_object`, with the reference's
+/// `InvalidWithdrawReservation` message as the error.
+fn parse_allowance_object<'a>(object: &Object<'a>) -> Result<ResolvedAllowance<'a>, String> {
+    let id = object.id();
+    let Some(move_obj) = object.try_as_move() else {
+        return Err(format!("Specified allowance {id} is not a Move object"));
+    };
+    // The reference converts the type to a `StructTag` first; the other `MoveObjectType`s are
+    // coins, staked SUI and accumulator fields, none of them an `Allowance`.
+    let tag = match &move_obj.type_ {
+        MoveObjectType::Other(tag) if is_allowance(tag) => tag,
+        _ => {
+            return Err(format!(
+                "Specified allowance {id} is not a sui::allowance::Allowance"
+            ));
+        }
+    };
+    if !object.is_shared() {
+        return Err(format!("Allowance {id} is not a shared object"));
+    }
+    // checked by is_allowance
+    let funds_type = tag.type_params[0];
+
+    let Ok(allowance) = bcs::from_bytes::<sui_types::allowance::Allowance>(move_obj.contents)
+    else {
+        // The reference reports this through `debug_fatal!`.
+        debug_assert!(
+            false,
+            "allowance {id} did not match the `Allowance` rust type"
+        );
+        return Err(format!("Failed to read allowance {id}"));
+    };
+
+    Ok(ResolvedAllowance {
+        funder: SuiAddress(allowance.settings.funder.to_inner()),
+        funds_type,
+    })
+}
+
+/// `Allowance::is_allowance`.
+fn is_allowance(s: &StructTag<'_>) -> bool {
+    *s.address == SUI_FRAMEWORK_ADDRESS
+        && s.module == "allowance"
+        && s.name == "Allowance"
+        && s.type_params.len() == 1
+}
+
+/// `Party::permissions_for`. A stored party's members are sorted and unique, and its
+/// permissions valid, as its deserialization in the reference requires.
+fn permissions_for(party: &Party<'_>, address: &SuiAddress) -> ObjectPermissions {
+    let member = party
+        .members
+        .binary_search_by(|member| member.address.cmp(address))
+        .ok()
+        .and_then(|i| party.members.get(i));
+    let bits = member.map_or(party.default_permissions, |m| m.permissions.get());
+    ObjectPermissions::new(bits).expect("a stored party's permissions are valid")
+}
+
+/// The order of the reference's `(usize, BTreeSet<ObjectID>)`, whose sets compare by their
+/// elements in order; the arena set has equality but no order.
+fn cmp_package_shape(
+    a: &(usize, BTreeSet<'_, ObjectId>),
+    b: &(usize, BTreeSet<'_, ObjectId>),
+) -> Ordering {
+    a.0.cmp(&b.0).then_with(|| a.1.iter().cmp(b.1.iter()))
+}
+
+impl<'a> InvariantChecker<'a> {
+    /// Run the SUI-conservation and balance-accumulator invariant checks against the
+    /// (already-finalized, gas-charged) `store`. Read-only: the caller (the execution engine's
+    /// `run_conservation_checks`) owns any recovery that mutates state.
+    ///
+    /// Returns `Ok(())` when the checks are not applicable: the genesis transaction mints the SUI
+    /// supply, and dev-inspect mode is allowed to violate conservation. Immutable check inputs are
+    /// read from the store.
+    pub(crate) fn check_conservation_invariants<Mode: ExecutionMode>(
+        &self,
+        store: &TemporaryStore<'a>,
+        move_vm: &Arc<MoveRuntime>,
+        enable_expensive_checks: bool,
+        cost_summary: &GasCostSummary,
+    ) -> Result<(), ExecutionError<'a>> {
+        if store.post_execution_check_inputs.is_genesis || Mode::skip_conservation_checks() {
+            return Ok(());
+        }
+        let simple_conservation_checks = store.protocol_config().simple_conservation_checks();
+        self.check_sui_conserved(store, simple_conservation_checks, cost_summary)
+            .and_then(|()| {
+                if enable_expensive_checks {
+                    let mut layout_resolver = TypeLayoutResolver::new(
+                        store.bump,
+                        move_vm,
+                        store.protocol_config(),
+                        store,
+                    );
+                    self.check_sui_conserved_expensive(store, cost_summary, &mut layout_resolver)
+                } else {
+                    Ok(())
+                }
+            })
+            .and_then(|()| self.check_address_balance_changes(store))
+    }
+
+    /// If the transaction executed successfully, every package written by the transaction must
+    /// correspond to exactly one `Publish`/`Upgrade` command and must contain the modules that
+    /// command supplied and record the dependencies it declared as the package's dependencies.
+    ///
+    /// Compared as multisets rather than pairwise: written packages are keyed by id, so they
+    /// cannot be correlated back to their originating command by position.
+    pub(crate) fn check_published_packages(
+        &self,
+        store: &TemporaryStore<'a>,
+    ) -> Result<(), ExecutionError<'a>> {
+        if !store.protocol_config().harden_linkage_consistency() {
+            return Ok(());
+        }
+
+        let Some(declared) = &store.post_execution_check_inputs.declared_packages else {
+            return Ok(());
+        };
+
+        let bump = store.bump;
+        let mut written: Vec<(usize, BTreeSet<ObjectId>)> = Vec::new_in(bump);
+        written.extend(
+            store
+                .execution_results
+                .written_objects
+                .values()
+                .filter_map(|object| object.try_as_package())
+                .map(|package| {
+                    let mut dependencies = BTreeSet::new_in(bump);
+                    dependencies.extend(
+                        package
+                            .linkage_table
+                            .iter()
+                            .map(|upgrade_info| upgrade_info.upgraded_id),
+                    );
+                    (package.module_map.len(), dependencies)
+                }),
+        );
+        // The reference sorts a clone of `declared`; sorting borrows of its entries is enough.
+        let mut declared_sorted = Vec::with_capacity_in(declared.len(), bump);
+        declared_sorted.extend(declared.iter());
+        written.sort_by(cmp_package_shape);
+        declared_sorted.sort_by(|a, b| cmp_package_shape(a, b));
+
+        if !written.iter().eq(declared_sorted.iter().copied()) {
+            return Err(ExecutionError::invariant_violation(format!(
+                "packages written by this transaction do not correspond to its publish and upgrade \
+                 commands: commands declared {declared_sorted:?}, packages recorded {written:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    // check that every object read is owned directly or indirectly by sender, sponsor,
+    // or a shared object input
+    pub(crate) fn check_ownership_invariants(
+        &self,
+        store: &TemporaryStore<'a>,
+        sender: &SuiAddress,
+        sponsor: &Option<SuiAddress>,
+        gas_charger: &GasCharger<'a>,
+        is_epoch_change: bool,
+    ) -> SuiResult<()> {
+        let bump = store.bump;
+        // The funds-accumulator reservation budget is shared with the conservation checks; see
+        // `Self::check_address_balance_changes`.
+        let input_reservations = &store.post_execution_check_inputs.input_reservations;
+        let mut gas_objs: HashSet<&ObjectId> = containers::hash_set(bump, 0);
+        gas_objs.extend(gas_charger.used_coins().map(|g| &g.0));
+        let gas_owner = sponsor.as_ref().unwrap_or(sender);
+
+        // mark input objects as authenticated
+        let mut objects_authenticated_for_mutation: HashSet<SuiAddress> = containers::hash_set(
+            bump,
+            store.inputs.objects().len() + self.generated_runtime_ids.len(),
+        );
+        objects_authenticated_for_mutation.extend(
+            store
+                .inputs
+                .objects()
+                .iter()
+                .filter_map(|(id, obj)| {
+                    match obj.owner() {
+                        Owner::AddressOwner(a) => {
+                            if gas_objs.contains(id) {
+                                // gas object must be owned by sender or sponsor
+                                assert!(
+                                    *a == gas_owner,
+                                    "Gas object must be owned by sender or sponsor"
+                                );
+                            } else {
+                                assert!(sender == *a, "Input object must be owned by sender");
+                            }
+                            Some(id)
+                        }
+                        Owner::Shared { .. } | Owner::ConsensusAddressOwner { .. } => Some(id),
+                        Owner::Immutable => {
+                            // object is authenticated, but it cannot own other objects,
+                            // so we should not add it to `authenticated_objs`
+                            // However, we would definitely want to add immutable objects
+                            // to the set of authenticated roots if we were doing runtime
+                            // checks inside the VM instead of after-the-fact in the temporary
+                            // store. Here, we choose not to add them because this will catch a
+                            // bug where we mutate or delete an object that belongs to an immutable
+                            // object (though it will show up somewhat opaquely as an authentication
+                            // failure), whereas adding the immutable object to the roots will prevent
+                            // us from catching this.
+                            None
+                        }
+                        Owner::Party(party) => {
+                            let sender_permissions = permissions_for(party, sender);
+                            let sponsor_permissions = sponsor
+                                .as_ref()
+                                .map(|s| permissions_for(party, s))
+                                .unwrap_or(ObjectPermissions::NONE);
+                            (sender_permissions | sponsor_permissions)
+                                .can_use_mutably()
+                                .then_some(id)
+                        }
+                        Owner::ObjectOwner(_parent) => {
+                            unreachable!(
+                                "Input objects must be address owned, shared, consensus, or immutable"
+                            )
+                        }
+                    }
+                })
+                .filter(|id| {
+                    // remove any non-mutable inputs. This will remove deleted or readonly shared
+                    // objects.
+                    // The reference keys the non-exclusive inputs by id; they are few, so a scan.
+                    store.inputs.exclusive_mutable_inputs().contains_key(id)
+                        || store
+                            .inputs
+                            .non_exclusive_input_objects()
+                            .any(|(non_exclusive, _)| non_exclusive == *id)
+                })
+                .copied()
+                // Add any object IDs generated in the object runtime during execution to the
+                // authenticated set (i.e., new (non-package) objects, and possibly ephemeral UIDs).
+                .chain(self.generated_runtime_ids.iter().copied())
+                .map(|id| SuiAddress(id.0)),
+        );
+
+        // Add sender and sponsor (if present) to authenticated set
+        let mut authenticated_for_mutation = {
+            assert!(
+                !objects_authenticated_for_mutation.contains(sender),
+                "Sender cannot be an object"
+            );
+            assert!(
+                sponsor
+                    .is_none_or(|sponsor| !objects_authenticated_for_mutation.contains(&sponsor)),
+                "Sponsor cannot be an object"
+            );
+            let mut s = objects_authenticated_for_mutation.clone();
+            s.insert(*sender);
+            if let Some(sponsor) = sponsor {
+                s.insert(*sponsor);
+            }
+            s
+        };
+
+        // check all modified objects are authenticated
+        let mut objects_to_authenticate =
+            Vec::with_capacity_in(store.execution_results.modified_objects.len(), bump);
+        objects_to_authenticate.extend(store.execution_results.modified_objects.iter().copied());
+
+        while let Some(to_authenticate) = objects_to_authenticate.pop() {
+            if authenticated_for_mutation.contains(&SuiAddress(to_authenticate.0)) {
+                // object has already been authenticated
+                continue;
+            }
+
+            let parent = if let Some(container_id) =
+                self.wrapped_object_containers.get(&to_authenticate)
+            {
+                // It's a wrapped object, so check that the container is authenticated
+                *container_id
+            } else {
+                // It's non-wrapped, so check the owner -- we can load the object from the
+                // store.
+                let Some(old_obj) = store.store.get_object(&to_authenticate) else {
+                    panic!(
+                        "Failed to load object {to_authenticate:?}.\n \
+                         If it cannot be loaded, we would expect it to be in the wrapped object map: {:#?}",
+                        &self.wrapped_object_containers
+                    )
+                };
+
+                match old_obj.owner() {
+                    // We mutated a dynamic field, we can continue to trace this back to verify
+                    // proper ownership.
+                    Owner::ObjectOwner(parent) => ObjectId(parent.0),
+                    // We mutated an address owned or sequenced address owned object -- one of two cases apply:
+                    // 1) the object is owned by an object or address in the authenticated set,
+                    // 2) the object is owned by some other address, in which case we should
+                    //    continue to trace this back.
+                    Owner::AddressOwner(parent)
+                    | Owner::ConsensusAddressOwner { owner: parent, .. } => {
+                        // For Receiving<_> objects, the address owner is actually an object.
+                        // If it was actually an address, we should have caught it as an input and
+                        // it would already have been in authenticated_for_mutation
+                        ObjectId(parent.0)
+                    }
+                    // We mutated a shared object -- we checked if this object was in the
+                    // authenticated set at the top of this loop and it wasn't so this is a failure.
+                    owner @ Owner::Shared { .. } | owner @ Owner::Party(_) => {
+                        panic!(
+                            "Unauthenticated root at {to_authenticate:?} with owner {owner:?}\n\
+                             Potentially covering objects in: {authenticated_for_mutation:#?}"
+                        );
+                    }
+
+                    Owner::Immutable => {
+                        assert!(
+                            is_epoch_change,
+                            "Immutable objects cannot be written, except for \
+                             Sui Framework/Move stdlib upgrades at epoch change boundaries"
+                        );
+                        // Note: this assumes that the only immutable objects an epoch change
+                        // tx can update are system packages,
+                        // but in principle we could allow others.
+                        assert!(
+                            is_system_package(&to_authenticate),
+                            "Only system packages can be upgraded"
+                        );
+                        continue;
+                    }
+                }
+            };
+
+            // we now assume the object is authenticated and check the parent
+            authenticated_for_mutation.insert(SuiAddress(to_authenticate.0));
+            objects_to_authenticate.push(parent);
+        }
+
+        // Check that all funds accumulator splits are authorized
+        let sui_balance_type = sui_balance_type(bump);
+        let gas_payment_address_balance =
+            gas_charger
+                .gas_payment_location()
+                .and_then(|location| match location {
+                    PaymentLocation::Coin(_) => None,
+                    PaymentLocation::AddressBalance(address) => Some(address),
+                });
+        // A Split at a non-signer key requires every allowance id declared for it as a loaded,
+        // matching input.
+        let is_allowance_backed = |key: &(SuiAddress, TypeTag<'a>)| {
+            let Some(allowance_ids) = store.post_execution_check_inputs.allowance_ids.get(key)
+            else {
+                return false;
+            };
+            allowance_ids.iter().all(|id| {
+                let resolved = store.inputs.objects().get(id).map(parse_allowance_object);
+                matches!(resolved, Some(Ok(a)) if a.funder == key.0 && a.funds_type == key.1)
+            })
+        };
+        let mut funds_net_changes: BTreeMap<(SuiAddress, TypeTag<'a>), i128> =
+            BTreeMap::new_in(bump);
+        for event in store.execution_results.accumulator_events.iter() {
+            let amount = match event.write.value {
+                AccumulatorValue::Integer(a) => a as i128,
+                AccumulatorValue::IntegerTuple(_, _) | AccumulatorValue::EventDigest(_) => {
+                    assert!(
+                        !is_balance_type(&event.write.ty),
+                        "Non-integer accumulator changes should not be balances"
+                    );
+                    continue;
+                }
+            };
+            let signed = match event.write.operation {
+                AccumulatorOperation::Split => -amount,
+                AccumulatorOperation::Merge => amount,
+            };
+            let address = *event.write.address;
+            let type_tag = &event.write.ty;
+            let key = (address, *type_tag);
+            *funds_net_changes.entry(key).or_insert(0) += signed;
+            // Authorized if it is:
+            // - A merge/deposit (anyone can deposit)
+            // - A withdrawal
+            //   - with a corresponding input reservation (the signer's or allowance-backed)
+            //   - from an object authenticated for mutation
+            //   - for the gas payment (potentially from a GasCoin send_funds transfer)
+            let authorized = match event.write.operation {
+                AccumulatorOperation::Merge => true,
+                AccumulatorOperation::Split => {
+                    let is_authorized_input_reservation = input_reservations.contains_key(&key)
+                        && (address == *sender
+                            || address == *gas_owner
+                            || is_allowance_backed(&key));
+                    is_authorized_input_reservation
+                        || objects_authenticated_for_mutation.contains(&address)
+                        || (*type_tag == sui_balance_type
+                            && gas_payment_address_balance
+                                .is_some_and(|gas_addr| gas_addr == address))
+                }
+            };
+            assert!(
+                authorized,
+                "Unauthenticated funds-accumulator Split at address {address} for type \
+                 {}: no signer or allowance-backed input reservation, address is not an \
+                 authenticated object, and it is not the final gas payment address balance",
+                to_move_type_tag(type_tag)
+            );
+        }
+
+        // For all net negative changes (net withdrawals), the net changes _must_ be less than the
+        // reservation amount, or it must be from an object. This excludes the final gas payment
+        // address since the case where that withdrawal is allowed should be a net positive (or
+        // zero) since it occurs only in the case where the gas coin is transferred via send_funds
+        for (key, change) in funds_net_changes {
+            // skip if deposit or for an object
+            if change >= 0 || objects_authenticated_for_mutation.contains(&key.0) {
+                continue;
+            }
+            let reservation = input_reservations.get(&key).copied().unwrap_or(0) as u128;
+            let withdrawn = change.unsigned_abs();
+            assert!(
+                withdrawn <= reservation,
+                "Net withdrawal of {withdrawn} for {key:?} exceeds input reservation of \
+                 {reservation}"
+            );
+        }
+
+        Ok(())
     }
 }

@@ -18,6 +18,7 @@ use crate::effects::{
 };
 use crate::error::{ExecutionError, ExecutionErrorKind};
 use crate::execution::{ExecutionResultsV2, is_system_package};
+use crate::execution_mode::ExecutionMode;
 use crate::gas_charger::GasCharger;
 use crate::inputs::ExecutionInputs;
 use crate::storage::{DenyListResult, Storage, UnsettledObjectFundsRead};
@@ -42,7 +43,9 @@ use messages::transaction::{
     Command, GasData, Reservation, TransactionKind, WithdrawFrom, WithdrawalTypeArg,
 };
 use messages::type_tag::TypeTag;
+use move_vm_runtime::runtime::MoveRuntime;
 use std::cell::RefCell;
+use std::sync::Arc;
 use sui_protocol_config::ProtocolConfig;
 
 pub(crate) mod invariants;
@@ -959,6 +962,45 @@ impl<'a> TemporaryStore<'a> {
 
     pub fn protocol_config(&self) -> &'a ProtocolConfig {
         self.protocol_config
+    }
+
+    /// Run the (read-only) SUI-conservation and balance-accumulator invariant checks.
+    /// See [`invariants::InvariantChecker::check_conservation_invariants`].
+    pub(crate) fn check_conservation_invariants<Mode: ExecutionMode>(
+        &self,
+        move_vm: &Arc<MoveRuntime>,
+        enable_expensive_checks: bool,
+        cost_summary: &GasCostSummary,
+    ) -> Result<(), ExecutionError<'a>> {
+        self.invariants.check_conservation_invariants::<Mode>(
+            self,
+            move_vm,
+            enable_expensive_checks,
+            cost_summary,
+        )
+    }
+
+    /// Check that every modified object traces back to an authenticated owner.
+    /// See [`invariants::InvariantChecker::check_ownership_invariants`].
+    /// See [`invariants::InvariantChecker::check_published_packages`].
+    pub(crate) fn check_published_packages(&self) -> Result<(), ExecutionError<'a>> {
+        self.invariants.check_published_packages(self)
+    }
+
+    pub(crate) fn check_ownership_invariants(
+        &self,
+        sender: &SuiAddress,
+        sponsor: &Option<SuiAddress>,
+        gas_charger: &GasCharger<'a>,
+        is_epoch_change: bool,
+    ) -> SuiResult<()> {
+        self.invariants.check_ownership_invariants(
+            self,
+            sender,
+            sponsor,
+            gas_charger,
+            is_epoch_change,
+        )
     }
 }
 
