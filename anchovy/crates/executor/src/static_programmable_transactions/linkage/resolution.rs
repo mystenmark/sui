@@ -68,7 +68,13 @@ impl<'a> ResolutionTable<'a> {
         for id in ids {
             let pkg = get_package(id.borrow(), store)?;
             let package_id = pkg.version_id();
-            add_and_unify(&package_id, store, self, VersionConstraint::at_least)?;
+            // The reference fetches `package_id` again; when it is the ID just fetched, that
+            // fetch returns `pkg`, as nothing is published in between.
+            if package_id == *id.borrow() {
+                add_and_unify_package(&package_id, &pkg, store, self, VersionConstraint::at_least)?;
+            } else {
+                add_and_unify(&package_id, store, self, VersionConstraint::at_least)?;
+            }
             for object_id in self.config.linkage_table(&pkg).values() {
                 let object_id = ObjectId(object_id.into_bytes());
                 add_and_unify(&object_id, store, self, VersionConstraint::at_least)?;
@@ -180,8 +186,26 @@ pub(crate) fn add_and_unify<S: PackageStore + ?Sized>(
     resolution_fn: fn(&S::Package) -> Option<VersionConstraint>,
 ) -> Result<(), ExecutionError<'static>> {
     let package = get_package(object_id, store)?;
+    add_and_unify_package(object_id, &package, store, resolution_table, resolution_fn)
+}
 
-    let Some(resolution) = resolution_fn(&package) else {
+/// `add_and_unify` with `package`, already fetched by the caller as `object_id`. The reference
+/// fetches it again; no package is published or rolled back in between, so the store returns the
+/// same package for the same ID.
+pub(crate) fn add_and_unify_package<S: PackageStore + ?Sized>(
+    object_id: &ObjectId,
+    package: &S::Package,
+    store: &S,
+    resolution_table: &mut ResolutionTable<'_>,
+    resolution_fn: fn(&S::Package) -> Option<VersionConstraint>,
+) -> Result<(), ExecutionError<'static>> {
+    debug_assert!(get_package(object_id, store).is_ok_and(|p| {
+        p.version_id() == package.version_id()
+            && p.original_id() == package.original_id()
+            && p.version() == package.version()
+    }));
+
+    let Some(resolution) = resolution_fn(package) else {
         // If the resolution function returns None, we do not need to add this package to the
         // resolution table, and this does not contribute to the linkage analysis.
         return Ok(());

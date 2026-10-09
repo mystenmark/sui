@@ -122,7 +122,17 @@ impl<'a> TransactionPackageStore<'a> {
         &self,
         id: &ObjectId,
     ) -> Option<(MovePackage<'a>, Arc<VerifiedPackage>)> {
-        self.new_packages.borrow().get(id).cloned()
+        let new_packages = self.new_packages.borrow();
+        // Most transactions publish nothing: skip hashing the ID.
+        if new_packages.is_empty() {
+            return None;
+        }
+        new_packages.get(id).cloned()
+    }
+
+    /// Whether a package has been published in the current transaction (and not rolled back).
+    pub fn has_new_packages(&self) -> bool {
+        !self.new_packages.borrow().is_empty()
     }
 
     /// Return all new packages that have been added to this store in the transaction.

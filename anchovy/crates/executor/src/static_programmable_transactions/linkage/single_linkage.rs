@@ -6,7 +6,10 @@ use crate::{
     static_programmable_transactions::{
         linkage::{
             analysis::LinkageAnalyzer,
-            resolution::{ResolutionTable, VersionConstraint, add_and_unify, get_package},
+            resolution::{
+                ResolutionTable, VersionConstraint, add_and_unify, add_and_unify_package,
+                get_package,
+            },
             resolved_linkage::{ExecutableLinkage, ResolvedLinkage},
         },
         loading::ast::{
@@ -522,7 +525,7 @@ fn add_package(
 ) -> Result<(), ExecutionError<'static>> {
     let pkg = get_package(object_id, store)?;
     let transitive_deps = resolution_table.config.linkage_table(&pkg);
-    add_and_unify(object_id, store, resolution_table, self_resolution_fn)?;
+    add_and_unify_package(object_id, &pkg, store, resolution_table, self_resolution_fn)?;
     for dep_id in transitive_deps.values() {
         let dep_id = ObjectId(dep_id.into_bytes());
         add_and_unify(&dep_id, store, resolution_table, dep_resolution_fn)?;

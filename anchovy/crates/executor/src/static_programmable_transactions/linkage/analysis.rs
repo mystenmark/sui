@@ -8,7 +8,10 @@ use crate::{
     static_programmable_transactions::{
         linkage::{
             config::{LinkageConfig, ResolutionConfig},
-            resolution::{ResolutionTable, VersionConstraint, add_and_unify, get_package},
+            resolution::{
+                ResolutionTable, VersionConstraint, add_and_unify, add_and_unify_package,
+                get_package,
+            },
             resolved_linkage::{ExecutableLinkage, ResolvedLinkage},
         },
         loading::ast::Type,
@@ -117,7 +120,7 @@ impl<'a> LinkageAnalyzer<'a> {
                 let object_id = ObjectId(object_id.into_bytes());
                 add_and_unify(&object_id, store, resolution_table, dep_resolution_fn)?;
             }
-            add_and_unify(object_id, store, resolution_table, self_resolution_fn)?;
+            add_and_unify_package(object_id, &pkg, store, resolution_table, self_resolution_fn)?;
             Ok(())
         }
 
