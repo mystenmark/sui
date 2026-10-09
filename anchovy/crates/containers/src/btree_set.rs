@@ -117,3 +117,11 @@ impl<'a, T> IntoIterator for BTreeSet<'a, T> {
         self.map.into_keys()
     }
 }
+
+impl<T: Ord> PartialEq for BTreeSet<'_, T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl<T: Ord> Eq for BTreeSet<'_, T> {}
