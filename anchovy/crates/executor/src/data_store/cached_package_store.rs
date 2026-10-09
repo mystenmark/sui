@@ -82,6 +82,12 @@ impl<'state, 'runtime> CachedPackageStore<'state, 'runtime> {
         }
 
         if let Some(pkg) = self.resolved.borrow().get(id) {
+            // A hit must be the runtime's own cached package for this ID.
+            debug_assert!(matches!(
+                self.runtime
+                    .resolve_and_cache_package(&self.package_store, AccountAddress::new(id.0)),
+                Ok(ResolvedPackageResult::Found(found)) if Arc::ptr_eq(&found.verified, pkg)
+            ));
             return Ok(Some(pkg.clone()));
         }
 
