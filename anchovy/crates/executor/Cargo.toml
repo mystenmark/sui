@@ -26,6 +26,8 @@ natives.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
+bcs.workspace = true
+serde.workspace = true
 
 [lints]
 workspace = true
