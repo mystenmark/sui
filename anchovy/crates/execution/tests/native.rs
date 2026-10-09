@@ -327,3 +327,119 @@ fn object_basics_match() {
     node.call(package, "freeze_object", vec![node.owned(b)]);
     node.call(package, "delete", vec![node.owned(a)]);
 }
+
+fn build(path: &str) -> sui_move_build::CompiledPackage {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../crates/sui-core/src/unit_tests/data")
+        .join(path);
+    sui_move_build::BuildConfig::new_for_testing()
+        .build(&path)
+        .unwrap()
+}
+
+impl Node {
+    /// Calls `<package>::base::return_0`; whether it succeeded.
+    fn return_0(&self, package: ObjectID) -> bool {
+        let mut builder = ProgrammableTransactionBuilder::new();
+        builder
+            .move_call(
+                package,
+                ident_str!("base").to_owned(),
+                ident_str!("return_0").to_owned(),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        let effects = self.execute_both_and_commit(TransactionData::new_programmable(
+            self.sender,
+            vec![self.gas()],
+            builder.finish(),
+            BUDGET,
+            RGP,
+        ));
+        effects.status().is_ok()
+    }
+}
+
+/// Two versions of a package, called alternately: each ID resolves to its own version.
+#[test]
+fn upgraded_package_versions_match() {
+    use sui_types::transaction::{Argument, Command, ObjectArg};
+    let node = Node::new();
+    let base = build("move_upgrade/base");
+    let effects = node.execute_both_and_commit(TransactionData::new_module(
+        node.sender,
+        node.gas(),
+        base.get_package_bytes(false),
+        base.get_dependency_storage_package_ids(),
+        BUDGET * 10,
+        RGP,
+    ));
+    assert!(effects.status().is_ok(), "{effects:?}");
+    let created = effects.created();
+    let v1 = created
+        .iter()
+        .find(|(_, o)| *o == sui_types::object::Owner::Immutable)
+        .unwrap()
+        .0
+        .0;
+    let cap = created
+        .iter()
+        .find(|(_, o)| *o != sui_types::object::Owner::Immutable)
+        .unwrap()
+        .0
+        .0;
+    // Version 1's `return_0` aborts.
+    assert!(!node.return_0(v1));
+
+    let upgrade = build("move_upgrade/stage1_basic_compatibility_valid");
+    let mut builder = ProgrammableTransactionBuilder::new();
+    let cap_arg = builder
+        .obj(ObjectArg::ImmOrOwnedObject(node.live_ref(cap)))
+        .unwrap();
+    let policy = builder.pure(0u8).unwrap();
+    let digest = builder
+        .pure(upgrade.get_package_digest(false).to_vec())
+        .unwrap();
+    let ticket = builder.programmable_move_call(
+        sui_types::SUI_FRAMEWORK_PACKAGE_ID,
+        ident_str!("package").to_owned(),
+        ident_str!("authorize_upgrade").to_owned(),
+        vec![],
+        vec![cap_arg, policy, digest],
+    );
+    let receipt = builder.command(Command::Upgrade(
+        upgrade.get_package_bytes(false),
+        upgrade.get_dependency_storage_package_ids(),
+        v1,
+        ticket,
+    ));
+    builder.programmable_move_call(
+        sui_types::SUI_FRAMEWORK_PACKAGE_ID,
+        ident_str!("package").to_owned(),
+        ident_str!("commit_upgrade").to_owned(),
+        vec![],
+        vec![cap_arg, receipt],
+    );
+    let _: Argument = receipt;
+    let effects = node.execute_both_and_commit(TransactionData::new_programmable(
+        node.sender,
+        vec![node.gas()],
+        builder.finish(),
+        BUDGET * 10,
+        RGP,
+    ));
+    assert!(effects.status().is_ok(), "{effects:?}");
+    let v2 = effects
+        .created()
+        .into_iter()
+        .find(|(_, o)| *o == sui_types::object::Owner::Immutable)
+        .unwrap()
+        .0
+        .0;
+
+    // Version 2's returns; version 1's still aborts.
+    assert!(node.return_0(v2));
+    assert!(!node.return_0(v1));
+    assert!(node.return_0(v2));
+}
