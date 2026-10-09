@@ -7,6 +7,7 @@
 //! own views.
 
 pub mod genesis;
+pub mod reads;
 mod store_view;
 
 use std::sync::Arc;

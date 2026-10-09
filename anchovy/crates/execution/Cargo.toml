@@ -9,6 +9,7 @@ publish = false
 # keeps to its own, and converts here, at the boundary, through BCS.
 [dependencies]
 bcs.workspace = true
+exec-types.workspace = true
 messages.workspace = true
 move-core-types.workspace = true
 prometheus.workspace = true
