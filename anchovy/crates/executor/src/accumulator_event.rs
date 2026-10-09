@@ -77,3 +77,37 @@ pub fn is_gas_type(t: &TypeTag<'_>) -> bool {
             && s.name == "SUI"
             && s.type_params.is_empty())
 }
+
+/// `sui_types::balance_change::signed_balance_changes_from_events`: each `Balance<T>` integer
+/// event's address, `T` and signed amount.
+pub fn signed_balance_changes_from_events<'b, 'a>(
+    events: &'b [AccumulatorEvent<'a>],
+) -> impl Iterator<Item = (messages::base::SuiAddress, TypeTag<'a>, i128)> + 'b {
+    events.iter().filter_map(signed_balance_change_from_event)
+}
+
+/// Extract the signed balance change from a single accumulator event, if it
+/// has a `Balance<T>` type and an integer value.
+fn signed_balance_change_from_event<'a>(
+    event: &AccumulatorEvent<'a>,
+) -> Option<(messages::base::SuiAddress, TypeTag<'a>, i128)> {
+    let ty = &event.write.ty;
+    // Only process events with Balance<T> types
+    let coin_type = crate::accumulator_root::maybe_get_balance_type_param(ty)?;
+
+    let amount = match &event.write.value {
+        AccumulatorValue::Integer(v) => *v as i128,
+        // IntegerTuple and EventDigest are not balance-related
+        AccumulatorValue::IntegerTuple(_, _) | AccumulatorValue::EventDigest(_) => {
+            return None;
+        }
+    };
+
+    // Convert operation to signed amount: Split means balance decreased, Merge means increased
+    let signed_amount = match event.write.operation {
+        AccumulatorOperation::Split => -amount,
+        AccumulatorOperation::Merge => amount,
+    };
+
+    Some((*event.write.address, coin_type, signed_amount))
+}

@@ -187,7 +187,7 @@ fn run(seed: u64) {
     let port_receiving = containers::alloc_slice_copy(&bump, &port_receiving);
 
     let reference = InputObjects::new(reference);
-    let port = ExecutionInputs::new(&bump, port, port_receiving);
+    let port = ExecutionInputs::new(&bump, port, port_receiving, None);
 
     assert_eq!(
         port.lamport_timestamp(),

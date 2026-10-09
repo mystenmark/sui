@@ -131,14 +131,30 @@ pub fn from_balance_change<'a>(
     Ok(AccumulatorEvent::new(accumulator_obj, accumulator_write))
 }
 
-/// `Balance::type_tag(GAS::type_tag())`: `0x2::balance::Balance<0x2::sui::SUI>`, built once per
-/// call in `bump`.
-pub fn sui_balance_type(bump: &Bump) -> TypeTag<'_> {
+/// `Balance::type_tag(inner)`: `0x2::balance::Balance<inner>`, in `bump`.
+pub fn balance_type<'a>(bump: &'a Bump, inner: TypeTag<'a>) -> TypeTag<'a> {
     let address = containers::alloc(
         bump,
         messages::base::AccountAddress(SUI_FRAMEWORK_ADDRESS.0),
     );
-    let sui = TypeTag::Struct(messages::arena::Ref::new(containers::alloc(
+    TypeTag::Struct(messages::arena::Ref::new(containers::alloc(
+        bump,
+        messages::type_tag::StructTag {
+            address,
+            module: "balance",
+            name: "Balance",
+            type_params: containers::alloc_slice_copy(bump, &[inner]),
+        },
+    )))
+}
+
+/// `GAS::type_tag()`: `0x2::sui::SUI`, in `bump`.
+pub fn sui_type(bump: &Bump) -> TypeTag<'_> {
+    let address = containers::alloc(
+        bump,
+        messages::base::AccountAddress(SUI_FRAMEWORK_ADDRESS.0),
+    );
+    TypeTag::Struct(messages::arena::Ref::new(containers::alloc(
         bump,
         messages::type_tag::StructTag {
             address,
@@ -146,14 +162,11 @@ pub fn sui_balance_type(bump: &Bump) -> TypeTag<'_> {
             name: "SUI",
             type_params: &[],
         },
-    )));
-    TypeTag::Struct(messages::arena::Ref::new(containers::alloc(
-        bump,
-        messages::type_tag::StructTag {
-            address,
-            module: "balance",
-            name: "Balance",
-            type_params: containers::alloc_slice_copy(bump, &[sui]),
-        },
     )))
+}
+
+/// `Balance::type_tag(GAS::type_tag())`: `0x2::balance::Balance<0x2::sui::SUI>`, built once per
+/// call in `bump`.
+pub fn sui_balance_type(bump: &Bump) -> TypeTag<'_> {
+    balance_type(bump, sui_type(bump))
 }

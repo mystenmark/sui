@@ -130,6 +130,9 @@ pub struct ExecutionInputs<'a> {
     consensus_stream_ended: BTreeMap<'a, ObjectId, SequenceNumber>,
     receiving: &'a [ObjectRef],
     lamport_timestamp: SequenceNumber,
+    /// `SystemObjectVersions`: the accumulator root's version assigned to this transaction,
+    /// which execution reads implicitly.
+    accumulator_version: Option<SequenceNumber>,
 }
 
 impl<'a> ExecutionInputs<'a> {
@@ -139,6 +142,7 @@ impl<'a> ExecutionInputs<'a> {
         bump: &'a Bump,
         loaded: Vec<'a, LoadedInput<'a>>,
         receiving: &'a [ObjectRef],
+        accumulator_version: Option<SequenceNumber>,
     ) -> ExecutionInputs<'a> {
         let mut objects = BTreeMap::new_in(bump);
         let mut exclusive_mutable_inputs = BTreeMap::new_in(bump);
@@ -191,6 +195,7 @@ impl<'a> ExecutionInputs<'a> {
             consensus_stream_ended,
             receiving,
             lamport_timestamp,
+            accumulator_version,
         }
     }
 
@@ -231,6 +236,19 @@ impl<'a> ExecutionInputs<'a> {
     /// received in the transaction.
     pub fn lamport_timestamp(&self) -> SequenceNumber {
         self.lamport_timestamp
+    }
+
+    /// The version of the implicitly read system object `object_id`
+    /// (`SystemObjectVersions::get`).
+    ///
+    /// # Panics
+    /// For an object that is not implicitly read.
+    pub fn system_object_version(&self, object_id: &ObjectId) -> Option<SequenceNumber> {
+        if *object_id == exec_types::base::SUI_ACCUMULATOR_ROOT_OBJECT_ID {
+            self.accumulator_version
+        } else {
+            panic!("{object_id} is not an implicitly read system object")
+        }
     }
 
     /// `InputObjects::filter_shared_objects`.

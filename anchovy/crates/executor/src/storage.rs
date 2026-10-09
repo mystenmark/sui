@@ -7,7 +7,7 @@ use containers::{BTreeMap, BTreeSet};
 use exec_types::error::ExecutionError;
 use exec_types::execution::DynamicallyLoadedObjectMetadata;
 use exec_types::object::Object;
-use messages::base::{ObjectId, SuiAddress};
+use messages::base::{ObjectId, SequenceNumber, SuiAddress};
 use messages::type_tag::TypeTag;
 
 use crate::execution::ExecutionResultsV2;
@@ -49,4 +49,27 @@ pub trait Storage<'a> {
     ) -> DenyListResult<'a>;
 
     fn record_generated_object_ids(&mut self, generated_ids: BTreeSet<'a, ObjectId>);
+}
+
+/// `sui_types::accumulator_root::UnsettledObjectFundsRead`: withdrawals from an accumulator,
+/// in the same checkpoint, not yet settled.
+pub trait UnsettledObjectFundsRead {
+    /// `account` is the accumulator field's id (`AccumulatorObjId`).
+    fn get_unsettled_object_withdraw(
+        &self,
+        account: &ObjectId,
+        accumulator_version: SequenceNumber,
+    ) -> u128;
+}
+
+pub struct EmptyUnsettledObjectFunds;
+
+impl UnsettledObjectFundsRead for EmptyUnsettledObjectFunds {
+    fn get_unsettled_object_withdraw(
+        &self,
+        _account: &ObjectId,
+        _accumulator_version: SequenceNumber,
+    ) -> u128 {
+        0
+    }
 }
