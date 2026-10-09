@@ -35,8 +35,53 @@ pub mod metering;
 pub mod spanned;
 pub mod typing;
 
+/// Options for [`execute_with_options`]. [`execute`] uses the `Default`.
+#[derive(Clone, Copy, Debug)]
+pub struct ExecuteOptions {
+    /// Whether to save the wrapped object containers and generated object ids into the state
+    /// view. Only the ownership invariant check reads them, and it runs only with
+    /// `enable_expensive_checks`.
+    pub record_invariant_bookkeeping: bool,
+}
+
+impl Default for ExecuteOptions {
+    fn default() -> Self {
+        Self {
+            record_invariant_bookkeeping: true,
+        }
+    }
+}
+
 /// Move tracing is not ported, so the reference's `trace_builder_opt` is left out.
 pub fn execute<'a, Mode: ExecutionMode>(
+    bump: &'a Bump,
+    protocol_config: &'a ProtocolConfig,
+    metrics: Arc<ExecutionMetrics>,
+    vm: &MoveRuntime,
+    state_view: &mut dyn ExecutionState<'a>,
+    package_store: &'a dyn BackingPackageStore<'a>,
+    tx_context: Rc<RefCell<TxContext>>,
+    gas_charger: &mut GasCharger<'a>,
+    withdrawal_compatibility_inputs: Option<&[bool]>,
+    txn: messages::transaction::ProgrammableTransaction<'a>,
+) -> ResultWithTimings<'a, (), ExecutionError<'a>> {
+    execute_with_options::<Mode>(
+        bump,
+        protocol_config,
+        metrics,
+        vm,
+        state_view,
+        package_store,
+        tx_context,
+        gas_charger,
+        withdrawal_compatibility_inputs,
+        txn,
+        ExecuteOptions::default(),
+    )
+}
+
+/// [`execute`], with `options`.
+pub fn execute_with_options<'a, Mode: ExecutionMode>(
     bump: &'a Bump,
     protocol_config: &'a ProtocolConfig,
     metrics: Arc<ExecutionMetrics>,
@@ -49,6 +94,7 @@ pub fn execute<'a, Mode: ExecutionMode>(
     // which inputs are withdrawals that need to be converted to coins
     withdrawal_compatibility_inputs: Option<&[bool]>,
     txn: messages::transaction::ProgrammableTransaction<'a>,
+    options: ExecuteOptions,
 ) -> ResultWithTimings<'a, (), ExecutionError<'a>> {
     let gas_payment = gas_charger.gas_payment_amount();
     let package_store =
@@ -94,5 +140,12 @@ pub fn execute<'a, Mode: ExecutionMode>(
     };
     let txn = typing::translate_and_verify::<Mode>(&mut translation_meter, &env, txn)
         .map_err(|e| (e, Vec::new_in(bump)))?;
-    execution::interpreter::execute::<Mode>(&mut env, metrics, tx_context, gas_charger, txn)
+    execution::interpreter::execute::<Mode>(
+        &mut env,
+        metrics,
+        tx_context,
+        gas_charger,
+        txn,
+        options,
+    )
 }

@@ -11,6 +11,7 @@ use crate::{
     gas_charger::GasCharger,
     object_runtime, sp,
     static_programmable_transactions::{
+        ExecuteOptions,
         env::Env,
         execution::context::{Context, CtxValue, GasCoinTransfer},
         typing::{ast as T, verify::input_arguments::is_coin_send_funds},
@@ -37,6 +38,7 @@ pub fn execute<'env, 'a, 'pc, 'vm, 'state, 'linkage, 'extension, Mode: Execution
     tx_context: Rc<RefCell<TxContext>>,
     gas_charger: &mut GasCharger<'a>,
     ast: T::Transaction<'a>,
+    options: ExecuteOptions,
 ) -> ResultWithTimings<'a, (), ExecutionError<'a>>
 where
     'pc: 'a,
@@ -50,6 +52,7 @@ where
         tx_context,
         gas_charger,
         ast,
+        options,
     );
     let timings = indexed_timings.into_coalesced();
 
@@ -66,6 +69,7 @@ fn execute_inner<'env, 'a, 'pc, 'vm, 'state, 'linkage, 'extension, Mode: Executi
     tx_context: Rc<RefCell<TxContext>>,
     gas_charger: &mut GasCharger<'a>,
     ast: T::Transaction<'a>,
+    options: ExecuteOptions,
 ) -> Result<(), ExecutionError<'a>>
 where
     'pc: 'a,
@@ -117,22 +121,32 @@ where
     // Record the objects loaded at runtime (dynamic fields + received) for
     // storage rebate calculation.
     let loaded_runtime_objects = object_runtime!(context)?.loaded_runtime_objects();
-    // We record what objects were contained in at the start of the transaction
-    // for expensive invariant checks
-    let wrapped_object_containers = object_runtime!(context)?.wrapped_object_containers();
-    // We record the generated object IDs for expensive invariant checks
-    let generated_object_ids = object_runtime!(context)?.generated_object_ids();
+    // Only the ownership invariant check reads these, so they are left out when it does not run.
+    let invariant_bookkeeping = if options.record_invariant_bookkeeping {
+        // We record what objects were contained in at the start of the transaction
+        // for expensive invariant checks
+        let wrapped_object_containers = object_runtime!(context)?.wrapped_object_containers();
+        // We record the generated object IDs for expensive invariant checks
+        let generated_object_ids = object_runtime!(context)?.generated_object_ids();
+        Some((wrapped_object_containers, generated_object_ids))
+    } else {
+        None
+    };
 
     // apply changes
     let finished = context.finish();
     // Save loaded objects for debug. We dont want to lose the info
     env.state_view
         .save_loaded_runtime_objects(loaded_runtime_objects);
-    env.state_view
-        .save_wrapped_object_containers(wrapped_object_containers);
+    let generated_object_ids = invariant_bookkeeping.map(|(wrapped, generated)| {
+        env.state_view.save_wrapped_object_containers(wrapped);
+        generated
+    });
     env.state_view.record_execution_results(finished?)?;
-    env.state_view
-        .record_generated_object_ids(generated_object_ids);
+    if let Some(generated_object_ids) = generated_object_ids {
+        env.state_view
+            .record_generated_object_ids(generated_object_ids);
+    }
     Ok(())
 }
 
