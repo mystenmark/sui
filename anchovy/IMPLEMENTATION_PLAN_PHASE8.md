@@ -38,6 +38,9 @@ updates); phase 7 merges first.
   through the object runtime extension, whose type changes.
 - `sui-execution` itself, as the test oracle.
 
+`sui-protocol-config` is used as is: anchovy's copy carries only what
+validation reads, and the Move VM's configuration is built from sui's.
+
 `sui-types` may still be linked for leaf utilities that do not carry
 transaction or object data (constants, error codes, id derivation, nitro
 attestation); transactions, objects, effects, events and execution status
@@ -65,6 +68,11 @@ are anchovy's.
 
 ## Types
 
+`messages`' views are `Copy` with public fields and borrowed parts, so the
+executor builds them directly in its arena as its in-memory
+representation (e.g. `ExecutionErrorKind<'a>`, `Owner<'a>`), and
+`messages::fast` writes them once.
+
 - In: `TransactionKind`, `ProgrammableTransaction`, `CallArg`, `Command`,
   `GasData` as views of the transaction's `Message`; input objects as
   `Message<Object>` views from the store. Pure arguments and object
@@ -73,6 +81,10 @@ are anchovy's.
   `Identifier`, `Vec<Type>`) becomes arena references with borrowed
   identifiers; `Type` → `TypeTag` conversions, which happen per call,
   transfer and written object today, happen only at VM calls.
+- Objects: the executor's `Object<'a>`, `Copy`, holding the view's parts
+  (private, behind getters) and, while unchanged, the stored bytes. A
+  change makes a new value sharing the contents slice; no field changes
+  under bytes that no longer encode it.
 - Written objects: metadata (owner, version, type, previous transaction,
   storage rebate) and a contents slice, replacing `Object =
   Arc<ObjectInner>`, whose copy-on-write deep-copies every mutated input
@@ -106,6 +118,15 @@ are anchovy's.
   walk (UIDs reported while deserializing, or a scanner over precomputed
   UID offsets) is a redesign, left for later unless the benchmark calls
   for it.
+
+## Gas model
+
+Ported from `sui-types` for gas model 15 on (no `SuiGasStatus` V2). The
+version predicates stay whole: the unmetered `GasStatus` reports version
+11, so code consulting them branches as the reference does. Cost tables
+are static slices instead of `BTreeMap`s built and cloned per
+transaction; the per-object storage report execution never reads is not
+kept.
 
 ## Left out
 
