@@ -312,7 +312,8 @@ pub struct Kept<T: Wire> {
 impl<T: Wire> Default for Kept<T> {
     fn default() -> Self {
         Kept {
-            messages: std::cell::RefCell::new(Vec::new()),
+            // A transaction keeps a few objects: its inputs and the children it loads.
+            messages: std::cell::RefCell::new(Vec::with_capacity(8)),
         }
     }
 }
