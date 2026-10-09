@@ -25,6 +25,7 @@ pub mod gas_charger;
 pub mod gas_meter;
 pub mod gas_model;
 pub mod inputs;
+pub mod ptb_builder;
 pub mod static_programmable_transactions;
 pub mod storage;
 pub mod temporary_store;
