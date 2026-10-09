@@ -26,9 +26,11 @@ pub mod btree_map {
 
 mod btree_set;
 mod index_map;
+mod vec_map;
 
 pub use btree_set::BTreeSet;
 pub use index_map::{Entry, IndexMap, IndexSet, OccupiedEntry, VacantEntry};
+pub use vec_map::VecMap;
 
 /// `value` in the arena, for the arena's lifetime. Arena values are never
 /// dropped, so only `Copy` values go here.
