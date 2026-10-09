@@ -263,53 +263,59 @@ impl Argument__ {
 }
 
 impl<'a> Command__<'a> {
-    pub fn arguments(&self) -> std::boxed::Box<dyn Iterator<Item = &Argument<'a>> + '_> {
-        match self {
-            Command__::MoveCall(mc) => std::boxed::Box::new(mc.arguments.iter()),
-            Command__::TransferObjects(objs, addr) => {
-                std::boxed::Box::new(objs.iter().chain(std::iter::once(addr)))
-            }
-            Command__::SplitCoins(_, coin, amounts) => {
-                std::boxed::Box::new(std::iter::once(coin).chain(amounts))
-            }
-            Command__::MergeCoins(_, target, sources) => {
-                std::boxed::Box::new(std::iter::once(target).chain(sources))
-            }
-            Command__::MakeMoveVec(_, elems) => std::boxed::Box::new(elems.iter()),
-            Command__::Publish(_, _, _) => std::boxed::Box::new(std::iter::empty()),
-            Command__::Upgrade(_, _, _, arg, _) => std::boxed::Box::new(std::iter::once(arg)),
-        }
+    pub fn arguments(&self) -> impl Iterator<Item = &Argument<'a>> + '_ {
+        // (argument before the list, list, argument after the list)
+        let (before, list, after): (
+            Option<&Argument<'a>>,
+            &[Argument<'a>],
+            Option<&Argument<'a>>,
+        ) = match self {
+            Command__::MoveCall(mc) => (None, &mc.arguments, None),
+            Command__::TransferObjects(objs, addr) => (None, objs, Some(addr)),
+            Command__::SplitCoins(_, coin, amounts) => (Some(coin), amounts, None),
+            Command__::MergeCoins(_, target, sources) => (Some(target), sources, None),
+            Command__::MakeMoveVec(_, elems) => (None, elems, None),
+            Command__::Publish(_, _, _) => (None, &[], None),
+            Command__::Upgrade(_, _, _, arg, _) => (Some(arg), &[], None),
+        };
+        before.into_iter().chain(list.iter()).chain(after)
     }
 
-    pub fn types(&self) -> std::boxed::Box<dyn Iterator<Item = &Type<'a>> + '_> {
-        match self {
-            Command__::TransferObjects(args, arg) => {
-                std::boxed::Box::new(std::iter::once(arg).chain(args.iter()).map(argument_type))
-            }
+    pub fn types(&self) -> impl Iterator<Item = &Type<'a>> + '_ {
+        // The types of an optional first argument and of a list of arguments, then an optional
+        // type and three lists of types.
+        let (first_arg, args, ty, types1, types2, types3): (
+            Option<&Argument<'a>>,
+            &[Argument<'a>],
+            Option<&Type<'a>>,
+            &[Type<'a>],
+            &[Type<'a>],
+            &[Type<'a>],
+        ) = match self {
+            Command__::TransferObjects(args, arg) => (Some(arg), args, None, &[], &[], &[]),
             Command__::SplitCoins(ty, arg, args) | Command__::MergeCoins(ty, arg, args) => {
-                std::boxed::Box::new(
-                    std::iter::once(arg)
-                        .chain(args.iter())
-                        .map(argument_type)
-                        .chain(std::iter::once(ty)),
-                )
+                (Some(arg), args, Some(ty), &[], &[], &[])
             }
-            Command__::MakeMoveVec(ty, args) => {
-                std::boxed::Box::new(args.iter().map(argument_type).chain(std::iter::once(ty)))
-            }
-            Command__::MoveCall(call) => std::boxed::Box::new(
-                call.arguments
-                    .iter()
-                    .map(argument_type)
-                    .chain(call.function.type_arguments.iter())
-                    .chain(call.function.signature.parameters.iter())
-                    .chain(call.function.signature.return_.iter()),
+            Command__::MakeMoveVec(ty, args) => (None, args, Some(ty), &[], &[], &[]),
+            Command__::MoveCall(call) => (
+                None,
+                &call.arguments,
+                None,
+                &call.function.type_arguments,
+                &call.function.signature.parameters,
+                &call.function.signature.return_,
             ),
-            Command__::Upgrade(_, _, _, arg, _) => {
-                std::boxed::Box::new(std::iter::once(arg).map(argument_type))
-            }
-            Command__::Publish(_, _, _) => std::boxed::Box::new(std::iter::empty()),
-        }
+            Command__::Upgrade(_, _, _, arg, _) => (Some(arg), &[], None, &[], &[], &[]),
+            Command__::Publish(_, _, _) => (None, &[], None, &[], &[], &[]),
+        };
+        first_arg
+            .into_iter()
+            .chain(args.iter())
+            .map(argument_type)
+            .chain(ty)
+            .chain(types1.iter())
+            .chain(types2.iter())
+            .chain(types3.iter())
     }
 
     pub fn arguments_len(&self) -> usize {

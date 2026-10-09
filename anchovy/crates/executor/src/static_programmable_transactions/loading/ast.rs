@@ -358,6 +358,14 @@ impl<'a> Type<'a> {
     }
 
     pub fn all_addresses(&self, bump: &'a Bump) -> IndexSet<'a, AccountAddress> {
+        let mut addresses = IndexSet::new_in(bump);
+        self.add_addresses(&mut addresses);
+        addresses
+    }
+
+    /// Adds the addresses in this type to `addresses` in pre-order. The reference builds a set per
+    /// nested type and merges it, which adds the same addresses in the same order.
+    fn add_addresses(&self, addresses: &mut IndexSet<'_, AccountAddress>) {
         match self {
             Type::Bool
             | Type::U8
@@ -367,31 +375,27 @@ impl<'a> Type<'a> {
             | Type::U128
             | Type::U256
             | Type::Address
-            | Type::Signer => IndexSet::new_in(bump),
-            Type::Vector(v) => v.element_type.all_addresses(bump),
-            Type::Reference(_, inner) => inner.all_addresses(bump),
-            Type::Datatype(dt) => dt.all_addresses(bump),
+            | Type::Signer => (),
+            Type::Vector(v) => v.element_type.add_addresses(addresses),
+            Type::Reference(_, inner) => inner.add_addresses(addresses),
+            Type::Datatype(dt) => dt.add_addresses(addresses),
         }
     }
 
+    /// The number of nodes in the type. The reference walks it with a heap stack; this recurses,
+    /// as loading the type from the VM did to the same depth.
     pub fn node_count(&self) -> u64 {
         use Type::*;
-        let mut total = 0u64;
-        let mut stack = std::vec![*self];
-
-        while let Some(ty) = stack.pop() {
-            total = total.saturating_add(1);
-            match ty {
-                Bool | U8 | U16 | U32 | U64 | U128 | U256 | Address | Signer => {}
-                Vector(v) => stack.push(v.element_type),
-                Reference(_, inner) => stack.push(*inner),
-                Datatype(dt) => {
-                    stack.extend(dt.type_arguments);
-                }
-            }
-        }
-
-        total
+        let children = match self {
+            Bool | U8 | U16 | U32 | U64 | U128 | U256 | Address | Signer => 0u64,
+            Vector(v) => v.element_type.node_count(),
+            Reference(_, inner) => inner.node_count(),
+            Datatype(dt) => dt
+                .type_arguments
+                .iter()
+                .fold(0u64, |total, ty| total.saturating_add(ty.node_count())),
+        };
+        children.saturating_add(1)
     }
 
     pub fn is_reference(&self) -> bool {
@@ -429,49 +433,50 @@ impl<'a> Datatype<'a> {
 
     pub fn all_addresses(&self, bump: &'a Bump) -> IndexSet<'a, AccountAddress> {
         let mut addresses = IndexSet::new_in(bump);
+        self.add_addresses(&mut addresses);
+        addresses
+    }
+
+    fn add_addresses(&self, addresses: &mut IndexSet<'_, AccountAddress>) {
         addresses.insert(self.module.address);
         for arg in self.type_arguments {
-            addresses.extend(arg.all_addresses(bump));
+            arg.add_addresses(addresses);
         }
-        addresses
     }
 }
 
 impl<'a> Command<'a> {
-    pub fn arguments_mut(&mut self) -> std::boxed::Box<dyn Iterator<Item = &mut Argument> + '_> {
-        match self {
-            Command::MoveCall(mc) => std::boxed::Box::new(mc.arguments.iter_mut()),
-            Command::TransferObjects(objs, recipient) => {
-                std::boxed::Box::new(objs.iter_mut().chain(std::iter::once(recipient)))
-            }
-            Command::SplitCoins(coin, amounts) => {
-                std::boxed::Box::new(std::iter::once(coin).chain(amounts.iter_mut()))
-            }
-            Command::MergeCoins(coin, coins) => {
-                std::boxed::Box::new(std::iter::once(coin).chain(coins.iter_mut()))
-            }
-            Command::MakeMoveVec(_, elements) => std::boxed::Box::new(elements.iter_mut()),
-            Command::Publish(_, _, _) => std::boxed::Box::new(std::iter::empty()),
-            Command::Upgrade(_, _, _, obj, _) => std::boxed::Box::new(std::iter::once(obj)),
-        }
+    pub fn arguments_mut(&mut self) -> impl Iterator<Item = &mut Argument> + '_ {
+        // (argument before the list, list, argument after the list)
+        let (before, list, after): (
+            Option<&mut Argument>,
+            &mut [Argument],
+            Option<&mut Argument>,
+        ) = match self {
+            Command::MoveCall(mc) => (None, &mut mc.arguments, None),
+            Command::TransferObjects(objs, recipient) => (None, objs, Some(recipient)),
+            Command::SplitCoins(coin, amounts) => (Some(coin), amounts, None),
+            Command::MergeCoins(coin, coins) => (Some(coin), coins, None),
+            Command::MakeMoveVec(_, elements) => (None, elements, None),
+            Command::Publish(_, _, _) => (None, &mut [], None),
+            Command::Upgrade(_, _, _, obj, _) => (Some(obj), &mut [], None),
+        };
+        before.into_iter().chain(list.iter_mut()).chain(after)
     }
 
-    pub fn arguments(&self) -> std::boxed::Box<dyn Iterator<Item = &Argument> + '_> {
-        match self {
-            Command::MoveCall(mc) => std::boxed::Box::new(mc.arguments.iter()),
-            Command::TransferObjects(objs, recipient) => {
-                std::boxed::Box::new(objs.iter().chain(std::iter::once(recipient)))
-            }
-            Command::SplitCoins(coin, amounts) => {
-                std::boxed::Box::new(std::iter::once(coin).chain(amounts.iter()))
-            }
-            Command::MergeCoins(coin, coins) => {
-                std::boxed::Box::new(std::iter::once(coin).chain(coins.iter()))
-            }
-            Command::MakeMoveVec(_, elements) => std::boxed::Box::new(elements.iter()),
-            Command::Publish(_, _, _) => std::boxed::Box::new(std::iter::empty()),
-            Command::Upgrade(_, _, _, obj, _) => std::boxed::Box::new(std::iter::once(obj)),
-        }
+    pub fn arguments(&self) -> impl Iterator<Item = &Argument> + '_ {
+        // (argument before the list, list, argument after the list)
+        let (before, list, after): (Option<&Argument>, &[Argument], Option<&Argument>) = match self
+        {
+            Command::MoveCall(mc) => (None, &mc.arguments, None),
+            Command::TransferObjects(objs, recipient) => (None, objs, Some(recipient)),
+            Command::SplitCoins(coin, amounts) => (Some(coin), amounts, None),
+            Command::MergeCoins(coin, coins) => (Some(coin), coins, None),
+            Command::MakeMoveVec(_, elements) => (None, elements, None),
+            Command::Publish(_, _, _) => (None, &[], None),
+            Command::Upgrade(_, _, _, obj, _) => (Some(obj), &[], None),
+        };
+        before.into_iter().chain(list.iter()).chain(after)
     }
 }
 
