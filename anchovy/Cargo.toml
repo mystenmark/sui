@@ -6,6 +6,7 @@ members = [
     "crates/execution",
     "crates/executor",
     "crates/messages",
+    "crates/natives",
     "crates/protocol-config",
     "crates/store",
     "crates/validation",
@@ -33,11 +34,18 @@ sui-protocol-config = { path = "../crates/sui-protocol-config" }
 sui-types = { path = "../crates/sui-types" }
 move-core-types = { path = "../external-crates/move/crates/move-core-types" }
 move-binary-format = { path = "../external-crates/move/crates/move-binary-format" }
+move-vm-runtime = { path = "../external-crates/move/crates/move-vm-runtime" }
+# Linked by `natives`, as sui-move-natives links them.
+better_any = "0.1.1"
+smallvec = "1.10.0"
+rand = "0.8.5"
+fastcrypto-vdf = { git = "https://github.com/MystenLabs/fastcrypto", rev = "076bf5ad8cea140dc7cf5c5861c24a36acdf64ce", features = ["experimental"] }
 prometheus = "0.14"
 arena = { path = "crates/arena" }
 containers = { path = "crates/containers" }
 execution = { path = "crates/execution" }
 executor = { path = "crates/executor" }
+natives = { path = "crates/natives" }
 messages = { path = "crates/messages" }
 protocol-config = { path = "crates/protocol-config" }
 store = { path = "crates/store" }
