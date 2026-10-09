@@ -44,6 +44,7 @@ use sui_types::{error::VMMemoryLimitExceededSubStatusCode, metrics::ExecutionMet
 use tracing::error;
 
 pub use accumulator::*;
+pub use fingerprint::runtime_layouts_equal;
 
 type Set<'a, K> = IndexSet<'a, K>;
 

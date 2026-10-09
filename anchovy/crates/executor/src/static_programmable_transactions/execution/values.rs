@@ -187,7 +187,16 @@ impl Value {
         ty: Type<'a>,
     ) -> Result<Value, ExecutionError<'a>> {
         let layout = env.runtime_layout(&ty)?;
-        let Some(value) = VMValue::simple_deserialize(bytes, &layout) else {
+        Self::deserialize_with_layout(bytes, ty, &layout)
+    }
+
+    /// `deserialize`, with `layout` the runtime layout of `ty`.
+    pub fn deserialize_with_layout<'a>(
+        bytes: &[u8],
+        ty: Type<'a>,
+        layout: &MoveTypeLayout,
+    ) -> Result<Value, ExecutionError<'a>> {
+        let Some(value) = VMValue::simple_deserialize(bytes, layout) else {
             // we already checked the layout of pure bytes during typing
             // and objects should already be valid
             invariant_violation!("unable to deserialize value to type {ty:?}")

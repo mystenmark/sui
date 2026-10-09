@@ -398,8 +398,15 @@ where
         let mut input_object_map = BTreeMap::new_in(bump);
         let mut input_object_metadata = Vec::with_capacity_in(object_inputs.len(), bump);
         let mut object_values = Vec::with_capacity_in(object_inputs.len(), bump);
+        let mut input_layouts = InputLayouts(Vec::new_in(bump));
         for object_input in object_inputs {
-            let (i, m, v) = load_object_arg(gas_charger, env, &mut input_object_map, object_input)?;
+            let (i, m, v) = load_object_arg(
+                gas_charger,
+                env,
+                &mut input_object_map,
+                &mut input_layouts,
+                object_input,
+            )?;
             input_object_metadata.push((i, m));
             object_values.push(Some(v));
         }
@@ -452,6 +459,7 @@ where
                         gas_charger,
                         env,
                         &mut input_object_map,
+                        &mut input_layouts,
                         gas_coin_id,
                         ObjectPermissions::ALL,
                         ty,
@@ -705,16 +713,43 @@ where
         let (writeout_vm, ty_linkage) =
             Self::make_writeout_vm(env, writes.values().map(|(_, ty, _)| *ty))?;
 
-        for (id, (recipient, ty, value)) in writes {
-            let (ty, layout) = Self::load_type_and_layout_from_struct_for_writeout(
-                env,
-                &writeout_vm,
-                &ty_linkage,
-                to_move_struct_tag_of(&ty),
-            )?;
+        // The type and layout of each object type written, which the reference loads for every
+        // write. A hit is never false: equal `MoveObjectType`s are the same struct tag, and the
+        // type and layout are a deterministic function of the tag in the one write-out VM.
+        let mut writeout_types = Vec::new_in(bump);
+        for (id, (recipient, object_type, value)) in writes {
+            let (ty, layout) = match writeout_types.iter().find(|(t, _, _)| *t == object_type) {
+                Some((_, ty, layout)) => {
+                    debug_assert!(
+                        Self::load_type_and_layout_from_struct_for_writeout(
+                            env,
+                            &writeout_vm,
+                            &ty_linkage,
+                            to_move_struct_tag_of(&object_type),
+                        )
+                        .is_ok_and(
+                            |(t, l)| t == *ty && object_runtime::runtime_layouts_equal(&l, layout)
+                        )
+                    );
+                    (*ty, layout)
+                }
+                None => {
+                    let (ty, layout) = Self::load_type_and_layout_from_struct_for_writeout(
+                        env,
+                        &writeout_vm,
+                        &ty_linkage,
+                        to_move_struct_tag_of(&object_type),
+                    )?;
+                    writeout_types.push((object_type, ty, layout));
+                    let Some((_, ty, layout)) = writeout_types.last() else {
+                        invariant_violation!("just pushed");
+                    };
+                    (*ty, layout)
+                }
+            };
             let abilities = ty.abilities();
             let has_public_transfer = abilities.has_store();
-            let Some(bytes) = value.typed_serialize(&layout) else {
+            let Some(bytes) = value.typed_serialize(layout) else {
                 invariant_violation!("Failed to serialize already deserialized Move value");
             };
             // has_public_transfer has been determined by the abilities
@@ -776,12 +811,39 @@ where
             return Err(self.env.convert_linked_vm_error(err, linkage));
         }
         let mut new_events = Vec::with_capacity_in(events.len(), self.env.bump);
+        // The layout of each event type, which the reference computes for every event. A hit is
+        // never false: the layout is a deterministic function of the struct tag in `vm`.
+        let mut layouts: Vec<
+            '_,
+            (
+                StructTag<'a>,
+                move_core_types::runtime_value::MoveTypeLayout,
+            ),
+        > = Vec::new_in(self.env.bump);
         for (tag, value) in events {
-            let type_tag = move_tags::TypeTag::Struct(Box::new(to_move_struct_tag(&tag)));
-            let layout = vm
-                .runtime_type_layout(&type_tag)
-                .map_err(|e| self.env.convert_linked_vm_error(e, linkage))?;
-            let Some(bytes) = value.typed_serialize(&layout) else {
+            let layout = match layouts.iter().find(|(t, _)| *t == tag) {
+                Some((_, layout)) => {
+                    debug_assert!(
+                        vm.runtime_type_layout(&move_tags::TypeTag::Struct(Box::new(
+                            to_move_struct_tag(&tag)
+                        )))
+                        .is_ok_and(|l| object_runtime::runtime_layouts_equal(&l, layout))
+                    );
+                    layout
+                }
+                None => {
+                    let type_tag = move_tags::TypeTag::Struct(Box::new(to_move_struct_tag(&tag)));
+                    let layout = vm
+                        .runtime_type_layout(&type_tag)
+                        .map_err(|e| self.env.convert_linked_vm_error(e, linkage))?;
+                    layouts.push((tag, layout));
+                    let Some((_, layout)) = layouts.last() else {
+                        invariant_violation!("just pushed");
+                    };
+                    layout
+                }
+            };
+            let Some(bytes) = value.typed_serialize(layout) else {
                 invariant_violation!("Failed to serialize Move event");
             };
             new_events.push((version_mid, tag, alloc_slice_copy(self.env.bump, &bytes)));
@@ -1717,10 +1779,27 @@ impl CtxValue {
     }
 }
 
+/// The layouts of the input objects' types loaded so far, by adapter type, within `Context::new`.
+///
+/// A hit is never false: equal `Type`s convert to equal type tags, and both layouts are a
+/// deterministic function of the tag, the package store and the input type resolution VM, none of
+/// which change while the inputs are loaded. Only layouts computed without error are kept.
+struct InputLayouts<'a>(
+    Vec<
+        'a,
+        (
+            Type<'a>,
+            move_core_types::annotated_value::MoveTypeLayout,
+            move_core_types::runtime_value::MoveTypeLayout,
+        ),
+    >,
+);
+
 fn load_object_arg<'a, Mode: ExecutionMode>(
     meter: &mut GasCharger<'a>,
     env: &Env<'a, '_, '_, '_, '_, '_, Mode>,
     input_object_map: &mut BTreeMap<'a, ObjectId, object_runtime::InputObject<'a>>,
+    input_layouts: &mut InputLayouts<'a>,
     input: T::ObjectInput<'a>,
 ) -> Result<(T::InputIndex, InputObjectMetadata<'a>, Value), ExecutionError<'a>> {
     let id = input.arg.id();
@@ -1729,6 +1808,7 @@ fn load_object_arg<'a, Mode: ExecutionMode>(
         meter,
         env,
         input_object_map,
+        input_layouts,
         id,
         refined_permissions,
         input.ty,
@@ -1740,6 +1820,7 @@ fn load_object_arg_impl<'a, Mode: ExecutionMode>(
     meter: &mut GasCharger<'a>,
     env: &Env<'a, '_, '_, '_, '_, '_, Mode>,
     input_object_map: &mut BTreeMap<'a, ObjectId, object_runtime::InputObject<'a>>,
+    input_layouts: &mut InputLayouts<'a>,
     id: ObjectId,
     refined_permissions: ObjectPermissions,
     ty: T::Type<'a>,
@@ -1759,12 +1840,29 @@ fn load_object_arg_impl<'a, Mode: ExecutionMode>(
         invariant_violation!("Expected a Move object");
     };
     assert_expected_move_object_type(env.bump, &object_metadata.type_, &move_obj.type_)?;
-    let contained_uids = {
-        let fully_annotated_layout = env.fully_annotated_layout(&ty)?;
-        get_all_uids(env.bump, &fully_annotated_layout, move_obj.contents).map_err(|e| {
-            make_invariant_violation!("Unable to retrieve UIDs for object. Got error: {e}")
-        })?
+    // The reference computes both layouts for every object; a repeated type reuses them (see
+    // `InputLayouts`), in the same order of computations as the first time.
+    let cached = input_layouts.0.iter().find(|(t, _, _)| *t == ty);
+    if let Some((_, annotated, runtime)) = cached {
+        debug_assert!(env.fully_annotated_layout(&ty).ok().as_ref() == Some(annotated));
+        debug_assert!(
+            env.runtime_layout(&ty)
+                .is_ok_and(|l| object_runtime::runtime_layouts_equal(&l, runtime))
+        );
+    }
+    let computed_annotated = match cached {
+        Some(_) => None,
+        None => Some(env.fully_annotated_layout(&ty)?),
     };
+    let fully_annotated_layout = match (cached, &computed_annotated) {
+        (Some((_, annotated, _)), _) => annotated,
+        (None, Some(annotated)) => annotated,
+        (None, None) => invariant_violation!("layout neither cached nor computed"),
+    };
+    let contained_uids = get_all_uids(env.bump, fully_annotated_layout, move_obj.contents)
+        .map_err(|e| {
+            make_invariant_violation!("Unable to retrieve UIDs for object. Got error: {e}")
+        })?;
     input_object_map.insert(
         id,
         object_runtime::InputObject {
@@ -1774,7 +1872,18 @@ fn load_object_arg_impl<'a, Mode: ExecutionMode>(
         },
     );
 
-    let v = Value::deserialize(env, move_obj.contents, ty)?;
+    let v = match (cached, computed_annotated) {
+        (Some((_, _, runtime)), _) => {
+            Value::deserialize_with_layout(move_obj.contents, ty, runtime)?
+        }
+        (None, Some(annotated)) => {
+            let runtime = env.runtime_layout(&ty)?;
+            let v = Value::deserialize_with_layout(move_obj.contents, ty, &runtime)?;
+            input_layouts.0.push((ty, annotated, runtime));
+            v
+        }
+        (None, None) => invariant_violation!("layout neither cached nor computed"),
+    };
     charge_gas_!(meter, env, charge_copy_loc, &v)?;
     charge_gas_!(meter, env, charge_store_loc, &v)?;
     Ok((object_metadata, v))

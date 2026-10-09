@@ -8,6 +8,46 @@ use move_core_types::runtime_value as R;
 use move_core_types::vm_status::StatusCode;
 use move_vm_runtime::execution::values::Value;
 
+/// Whether `a` and `b` are the same layout. Runtime layouts do not implement `PartialEq`; values
+/// serialize identically under equal layouts.
+pub fn runtime_layouts_equal(a: &R::MoveTypeLayout, b: &R::MoveTypeLayout) -> bool {
+    use R::MoveTypeLayout as L;
+    fn all_equal(a: &[R::MoveTypeLayout], b: &[R::MoveTypeLayout]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(a, b)| runtime_layouts_equal(a, b))
+    }
+    match (a, b) {
+        (L::Bool, L::Bool)
+        | (L::U8, L::U8)
+        | (L::U16, L::U16)
+        | (L::U32, L::U32)
+        | (L::U64, L::U64)
+        | (L::U128, L::U128)
+        | (L::U256, L::U256)
+        | (L::Address, L::Address)
+        | (L::Signer, L::Signer) => true,
+        (L::Vector(a), L::Vector(b)) => runtime_layouts_equal(a, b),
+        (L::Struct(a), L::Struct(b)) => all_equal(&a.0, &b.0),
+        (L::Enum(a), L::Enum(b)) => {
+            a.0.len() == b.0.len() && a.0.iter().zip(b.0.iter()).all(|(a, b)| all_equal(a, b))
+        }
+        (
+            L::Bool
+            | L::U8
+            | L::U16
+            | L::U32
+            | L::U64
+            | L::U128
+            | L::U256
+            | L::Address
+            | L::Signer
+            | L::Vector(_)
+            | L::Struct(_)
+            | L::Enum(_),
+            _,
+        ) => false,
+    }
+}
+
 /// This type is used to track if an object has changed since it was read from storage: by its
 /// owner ID, type and BCS bytes. The reference keeps a copy of the deserialized value instead
 /// and compares values; BCS is canonical, so equal values of one layout have equal bytes and the
