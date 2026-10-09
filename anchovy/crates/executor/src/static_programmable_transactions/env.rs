@@ -43,7 +43,10 @@ use move_vm_runtime::{
     execution::{self as vm_runtime, vm::MoveVM},
     runtime::MoveRuntime,
 };
-use std::{cell::OnceCell, marker::PhantomData};
+use std::{
+    cell::{OnceCell, RefCell},
+    marker::PhantomData,
+};
 use sui_protocol_config::ProtocolConfig;
 use sui_types::{
     allowance::RESOLVED_ALLOWANCE_WITHDRAWAL_STRUCT,
@@ -71,6 +74,16 @@ where
     upgrade_receipt_type: OnceCell<Type<'a>>,
     upgrade_cap_type: OnceCell<Type<'a>>,
     tx_context_type: OnceCell<Type<'a>>,
+    /// Type linkages computed while no package was published in the transaction, by the ordered
+    /// list of package IDs they were computed for. Not in the reference, which recomputes one for
+    /// every layout and type load.
+    ///
+    /// A hit is the linkage `type_linkage` would compute: it depends only on the IDs, in order,
+    /// the resolution config, which is fixed for the transaction, and the packages the store
+    /// returns for them. With no published packages the store returns the runtime's immutable
+    /// package for an ID (see `CachedPackageStore`), so entries are made and used only while
+    /// `new_packages` is empty. Errors are not kept.
+    type_linkages: RefCell<Vec<'a, (&'a [ObjectId], ExecutableLinkage<'a>)>>,
     // The VM used for type resolution of input types (and types statically present in the PTB)
     // only. This VM should only be used for resolution of input types, but should not be used for
     // resolution around function calls, execution, or final serialization of execution values.
@@ -116,6 +129,7 @@ where
             upgrade_receipt_type: OnceCell::new(),
             upgrade_cap_type: OnceCell::new(),
             tx_context_type: OnceCell::new(),
+            type_linkages: RefCell::new(Vec::new_in(bump)),
             input_type_resolution_vm,
             _mode: PhantomData,
         }
@@ -203,13 +217,40 @@ where
             .map_err(|e| self.convert_linked_vm_error(e, &tag_linkage))
     }
 
-    /// `ExecutableLinkage::type_linkage` for `ids`.
+    /// `ExecutableLinkage::type_linkage` for `ids`, memoized (see `type_linkages`).
     fn type_linkage(&self, ids: &[ObjectId]) -> Result<ExecutableLinkage<'a>, ExecutionError<'a>> {
-        Ok(ExecutableLinkage::type_linkage(
-            *self.linkage_analysis.config(),
-            ids,
-            self.linkable_store,
-        )?)
+        let compute = || {
+            ExecutableLinkage::type_linkage(
+                *self.linkage_analysis.config(),
+                ids,
+                self.linkable_store,
+            )
+        };
+        let memoize = !self.linkable_store.package_store.has_new_packages();
+        if memoize
+            && let Some((_, linkage)) = self
+                .type_linkages
+                .borrow()
+                .iter()
+                .find(|(key, _)| *key == ids)
+        {
+            debug_assert!(compute().is_ok_and(|fresh| {
+                fresh.0.linkage.iter().eq(linkage.0.linkage.iter())
+                    && fresh
+                        .0
+                        .linkage_resolution
+                        .iter()
+                        .eq(linkage.0.linkage_resolution.iter())
+            }));
+            return Ok(*linkage);
+        }
+        let linkage = compute()?;
+        if memoize {
+            self.type_linkages
+                .borrow_mut()
+                .push((containers::alloc_slice_copy(self.bump, ids), linkage));
+        }
+        Ok(linkage)
     }
 
     pub fn load_framework_function(

@@ -25,7 +25,7 @@ pub enum VersionConstraint {
 
 /// How a specific version of a package resolves, recorded for every package version the linkage
 /// refinement touched.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackageResolution {
     /// The original id of the package.
     pub original_id: ObjectId,
