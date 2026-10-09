@@ -1088,3 +1088,6 @@ impl<'a> InvariantChecker<'a> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;
