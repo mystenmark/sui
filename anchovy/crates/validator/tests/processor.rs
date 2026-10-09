@@ -1,28 +1,27 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Requests through the processors (validation, then signature verification,
-//! on one worker thread) get `validation::check`'s verdict for their first
-//! failing transaction, and passing transactions come back with the
-//! digests parsing would have computed.
+//! Requests through the processors (validation, signature verification,
+//! input checks and execution, on one worker thread) get
+//! `validation::check`'s verdict for their first failing transaction, and
+//! passing ones a result per transaction: here, rejected, as genesis has
+//! none of their objects.
 
 mod common;
 
 use std::sync::Arc;
 
 use common::Case;
-use messages::Message;
-use messages::transaction::{DigestReady, Transaction};
 use tokio::sync::oneshot;
 use validation::ErrorKind;
 use validator::epoch::EpochState;
-use validator::processors::{Processors, Rejected, Request, Validated};
+use validator::processors::{Outcome, Processors, Rejected, Request};
 
 async fn submit(
     processors: &Processors,
     epoch: &Arc<EpochState>,
     cases: &[&Case],
-) -> Result<Validated, Rejected> {
+) -> Result<Vec<Outcome>, Rejected> {
     let (reply, verdict) = oneshot::channel();
     let transactions = cases.iter().map(|c| c.parse().unwrap()).collect();
     processors
@@ -35,21 +34,20 @@ async fn submit(
 /// Sends each request and checks its verdict; returns how many passed and
 /// how many failed.
 async fn compare(epoch: &Arc<EpochState>, requests: &[Vec<&Case>]) -> (usize, usize) {
-    let processors = Processors::start(1024);
+    let store = common::store(epoch);
+    let processors = Processors::start(1024, store.store.clone());
     let (mut passed, mut failed) = (0, 0);
     for request in requests {
         let labels: Vec<&str> = request.iter().map(|c| c.label.as_str()).collect();
         let expected = common::expected(epoch, request);
         match (submit(&processors, epoch, request).await, expected) {
-            (Ok(Validated(transactions)), Ok(())) => {
-                assert_eq!(transactions.len(), request.len(), "{labels:?}");
-                for (i, hashed) in transactions.iter().enumerate() {
-                    let expected =
-                        Message::<Transaction<DigestReady>>::parse(request[i].bytes.clone())
-                            .unwrap();
-                    let (hashed, expected) = (&hashed.get().0, &expected.get().0);
-                    assert_eq!(hashed.digest(), expected.digest(), "{labels:?}");
-                    assert_eq!(hashed.bytes(), expected.bytes(), "{labels:?}");
+            (Ok(outcomes), Ok(())) => {
+                assert_eq!(outcomes.len(), request.len(), "{labels:?}");
+                for outcome in &outcomes {
+                    assert!(
+                        matches!(outcome, Outcome::Rejected(_)),
+                        "{labels:?}: {outcome:?}"
+                    );
                 }
                 passed += 1;
             }
@@ -116,7 +114,8 @@ async fn a_bad_signature_comes_before_a_later_invalid_transaction() {
         Err(ErrorKind::InvalidSignature)
     );
     assert!(common::expected(&epoch, &[invalid]).is_err_and(|k| k != ErrorKind::InvalidSignature));
-    let processors = Processors::start(16);
+    let store = common::store(&epoch);
+    let processors = Processors::start(16, store.store.clone());
     match submit(&processors, &epoch, &[bad_signature, invalid]).await {
         Err(Rejected::Invalid(e)) => assert_eq!(e.kind, ErrorKind::InvalidSignature),
         other => panic!("{:?}", other.map(|_| ())),
@@ -134,7 +133,8 @@ async fn a_request_is_checked_in_its_own_epoch() {
     let without = common::vectors_epoch(4, vec![]);
     assert!(common::expected(&with_jwks, &[zklogin]).is_ok());
     assert!(common::expected(&without, &[zklogin]).is_err());
-    let processors = Processors::start(16);
+    let store = common::store(&with_jwks);
+    let processors = Processors::start(16, store.store.clone());
     assert!(submit(&processors, &with_jwks, &[zklogin]).await.is_ok());
     assert!(submit(&processors, &without, &[zklogin]).await.is_err());
     assert!(submit(&processors, &with_jwks, &[zklogin]).await.is_ok());

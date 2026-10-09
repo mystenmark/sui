@@ -90,7 +90,7 @@ pub(crate) fn is_gasless(tx: &TransactionData<'_, impl TxState>, ctx: &Context<'
 
 /// A one- or two-epoch window: the validator remembers what it executed
 /// for that long, so a replay is either expired or recognized.
-fn is_replay_protected(expiration: &TransactionExpiration<'_>) -> bool {
+pub(crate) fn is_replay_protected(expiration: &TransactionExpiration<'_>) -> bool {
     let (TransactionExpiration::ValidDuring(window) | TransactionExpiration::Validity(window, _)) =
         expiration
     else {

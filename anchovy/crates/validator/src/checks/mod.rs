@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The checks a transaction's type records, and the only code that records
-//! them. A transaction reaches [`Valid`] only through [`validate`], and
-//! [`Verified`] only through [`SignatureChecks::verify`]: their witnesses
-//! cannot be made anywhere else. What a `Message<Transaction<'static,
-//! Verified>>` promises rests on this module and its signature cache.
+//! them. A transaction reaches [`Valid`] only through [`validate`],
+//! [`Verified`] only through [`SignatureChecks::verify`], and
+//! [`InputsChecked`] only through [`check_inputs`]: their witnesses cannot
+//! be made anywhere else. What a `Message<Transaction<'static, Verified>>`
+//! promises rests on this module and its signature cache.
 //!
 //! ```compile_fail,E0423
 //! use std::marker::PhantomData;
@@ -20,6 +21,8 @@ use std::sync::Arc;
 
 use containers::Bump;
 use messages::Message;
+use messages::base::ObjectId;
+use messages::object::Object;
 use messages::transaction::{Attested, DigestPending, HasDigest, Transaction, TxState};
 use validation::{sender_signed, verify};
 
@@ -46,6 +49,19 @@ pub struct Valid;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Verified;
 
+/// Verified, and its input objects passed the stateful checks against the
+/// store (`validation::inputs::check`): what execution takes.
+///
+/// ```compile_fail,E0308
+/// use validator::checks::{InputsCheckedTransaction, VerifiedTransaction};
+/// fn execute(_: InputsCheckedTransaction) {}
+/// fn skip_input_checks(transaction: VerifiedTransaction) {
+///     execute(transaction);
+/// }
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct InputsChecked;
+
 /// What relabels a transaction into state `S`. Its field is private: only
 /// this module makes one, after the check `S` stands for.
 pub struct Witness<S>(PhantomData<S>);
@@ -62,9 +78,16 @@ impl Attested for Verified {
     type Witness = Witness<Verified>;
 }
 
+impl TxState for InputsChecked {}
+impl HasDigest for InputsChecked {}
+impl Attested for InputsChecked {
+    type Witness = Witness<InputsChecked>;
+}
+
 pub type Unchecked = Message<Transaction<'static, DigestPending>>;
 pub type ValidTransaction = Message<Transaction<'static, Valid>>;
 pub type VerifiedTransaction = Message<Transaction<'static, Verified>>;
+pub type InputsCheckedTransaction = Message<Transaction<'static, InputsChecked>>;
 
 /// Validates each transaction in order until one fails, then hashes those
 /// before it: they come back `Valid`, with the failure. `bump` is reset for
@@ -139,5 +162,30 @@ impl SignatureChecks {
             })?;
         }
         Ok(Message::relabel_all(transactions, &Witness(PhantomData)))
+    }
+}
+
+/// Checks a verified transaction's inputs against the store's live
+/// objects. Nothing is locked: until voting exists, another transaction
+/// may consume an input before this one executes.
+pub fn check_inputs(
+    epoch: &EpochState,
+    store: &store::Store,
+    transaction: VerifiedTransaction,
+) -> Result<InputsCheckedTransaction, validation::Error> {
+    validation::inputs::check(&transaction.get().0, &epoch.context(), &StoreObjects(store))?;
+    Ok(transaction.relabel(&Witness(PhantomData)))
+}
+
+struct StoreObjects<'a>(&'a store::Store);
+
+/// A store that cannot be read leaves nothing to check against.
+impl validation::inputs::Objects for StoreObjects<'_> {
+    fn live(&self, id: &ObjectId) -> Option<Message<Object<'static>>> {
+        self.0.live_object(id).expect("the store reads")
+    }
+
+    fn at(&self, id: &ObjectId, version: u64) -> Option<Message<Object<'static>>> {
+        self.0.object(id, version).expect("the store reads")
     }
 }

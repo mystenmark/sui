@@ -18,6 +18,9 @@ pub struct EpochState {
     pub committee_size: u32,
     /// Verifies signatures under the epoch's protocol config and JWKs.
     pub verifier: Verifier,
+    /// Sui's executor, under sui's protocol config for the same version
+    /// and chain (`config` is anchovy's copy, which validation reads).
+    pub execution: execution::Execution,
 }
 
 impl EpochState {
@@ -31,7 +34,18 @@ impl EpochState {
         jwks: impl IntoIterator<Item = (JwkId, JWK)>,
     ) -> EpochState {
         let config = ProtocolConfig::get_for_version(ProtocolVersion::new(protocol_version), chain);
+        let sui_chain = match chain {
+            Chain::Mainnet => execution::Chain::Mainnet,
+            Chain::Testnet => execution::Chain::Testnet,
+            Chain::Unknown => execution::Chain::Unknown,
+        };
+        // No epoch start time until epochs exist: what transactions read
+        // as the epoch's timestamp is 0.
+        let execution =
+            execution::Execution::new(protocol_version, sui_chain, epoch, 0, reference_gas_price)
+                .expect("sui's executor supports every protocol version anchovy does");
         EpochState {
+            execution,
             verifier: Verifier::new(&config, chain, jwks),
             config,
             chain,

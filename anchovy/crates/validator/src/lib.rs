@@ -19,15 +19,16 @@ pub mod service {
     include!(concat!(env!("OUT_DIR"), "/sui.validator.Validator.rs"));
 }
 
-/// Serves the API over TLS on `listener` until `shutdown` completes. The
-/// processors stop once the server has.
+/// Serves the API over TLS on `listener` until `shutdown` completes, over
+/// `store`. The processors stop once the server has.
 pub async fn serve(
     listener: tokio::net::TcpListener,
     key: &tls::NetworkKey,
     epoch: std::sync::Arc<epoch::EpochState>,
+    store: std::sync::Arc<store::Store>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
-    let processors = processors::Processors::start(processors::VALIDATION_QUEUE);
+    let processors = processors::Processors::start(processors::VALIDATION_QUEUE, store);
     let validator = Validator::new(epoch, processors.transactions.clone());
     let served = tonic::transport::Server::builder()
         .add_service(validator.into_service())

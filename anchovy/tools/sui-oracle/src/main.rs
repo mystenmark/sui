@@ -32,10 +32,13 @@
 //! validity verdicts of real transactions; see `validity_corpus.rs`.
 //! `sui-oracle --mutation-vectors FILE.gz` writes randomly mutated
 //! transactions with the reference's verdicts; see `mutations.rs`.
+//! `sui-oracle --input-vectors FILE.gz` writes stateful input-check vectors;
+//! see `inputs.rs`.
 
 use std::fmt::Write as _;
 
 mod depth;
+mod inputs;
 mod mutations;
 mod signatures;
 mod validity;
@@ -135,6 +138,13 @@ fn main() {
         && flag == "--mutation-vectors"
     {
         std::fs::write(path, mutations::vectors()).unwrap();
+        println!("{path}");
+        return;
+    }
+    if let [flag, path] = args.as_slice()
+        && flag == "--input-vectors"
+    {
+        std::fs::write(path, inputs::vectors()).unwrap();
         println!("{path}");
         return;
     }

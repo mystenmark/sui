@@ -272,6 +272,23 @@ impl<'a> Object<'a> {
         })
     }
 
+    /// A package's id, or the `UID` a Move object's contents begin with:
+    /// `None` only if they are too short for one, which the reference
+    /// parses too (and panics on when asked).
+    pub fn id(&self) -> Option<&'a ObjectId> {
+        match self.data {
+            Data::Package(package) => Some(package.id),
+            Data::Move(object) => crate::reader::Reader::new(object.contents).record().ok(),
+        }
+    }
+
+    pub fn version(&self) -> SequenceNumber {
+        match self.data {
+            Data::Package(package) => package.version,
+            Data::Move(object) => object.version,
+        }
+    }
+
     /// Hashed on demand: the reference does not treat an object as a
     /// message, and most objects in a checkpoint never need it.
     pub fn digest(&self) -> ObjectDigest {

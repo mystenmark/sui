@@ -36,6 +36,25 @@ pub enum ErrorKind {
     IncorrectSigner,
     InvalidAddress,
     KeyConversionError,
+    // The stateful input checks (`inputs`).
+    ObjectNotFound,
+    DependentPackageNotFound,
+    MoveObjectAsPackage,
+    MovePackageAsObject,
+    ObjectVersionUnavailableForConsumption,
+    InvalidGasObject,
+    GasBalanceTooLow,
+    MutableObjectUsedMoreThanOnce,
+    ObjectInputArityViolation,
+    InvalidSequenceNumber,
+    InvalidObjectDigest,
+    InvalidChildObjectArgument,
+    NotOwnedObjectError,
+    NotSharedObjectError,
+    ImmutableParameterExpectedError,
+    SharedObjectStartingVersionMismatch,
+    IncorrectUserSignature,
+    MutableParameterExpected,
 }
 
 impl ErrorKind {
@@ -67,6 +86,24 @@ impl ErrorKind {
         ErrorKind::IncorrectSigner,
         ErrorKind::InvalidAddress,
         ErrorKind::KeyConversionError,
+        ErrorKind::ObjectNotFound,
+        ErrorKind::DependentPackageNotFound,
+        ErrorKind::MoveObjectAsPackage,
+        ErrorKind::MovePackageAsObject,
+        ErrorKind::ObjectVersionUnavailableForConsumption,
+        ErrorKind::InvalidGasObject,
+        ErrorKind::GasBalanceTooLow,
+        ErrorKind::MutableObjectUsedMoreThanOnce,
+        ErrorKind::ObjectInputArityViolation,
+        ErrorKind::InvalidSequenceNumber,
+        ErrorKind::InvalidObjectDigest,
+        ErrorKind::InvalidChildObjectArgument,
+        ErrorKind::NotOwnedObjectError,
+        ErrorKind::NotSharedObjectError,
+        ErrorKind::ImmutableParameterExpectedError,
+        ErrorKind::SharedObjectStartingVersionMismatch,
+        ErrorKind::IncorrectUserSignature,
+        ErrorKind::MutableParameterExpected,
     ];
 
     // Adding a kind breaks this match until `ALL` lists it too.
@@ -98,7 +135,25 @@ impl ErrorKind {
             | ErrorKind::InvalidSignature
             | ErrorKind::IncorrectSigner
             | ErrorKind::InvalidAddress
-            | ErrorKind::KeyConversionError => {}
+            | ErrorKind::KeyConversionError
+            | ErrorKind::ObjectNotFound
+            | ErrorKind::DependentPackageNotFound
+            | ErrorKind::MoveObjectAsPackage
+            | ErrorKind::MovePackageAsObject
+            | ErrorKind::ObjectVersionUnavailableForConsumption
+            | ErrorKind::InvalidGasObject
+            | ErrorKind::GasBalanceTooLow
+            | ErrorKind::MutableObjectUsedMoreThanOnce
+            | ErrorKind::ObjectInputArityViolation
+            | ErrorKind::InvalidSequenceNumber
+            | ErrorKind::InvalidObjectDigest
+            | ErrorKind::InvalidChildObjectArgument
+            | ErrorKind::NotOwnedObjectError
+            | ErrorKind::NotSharedObjectError
+            | ErrorKind::ImmutableParameterExpectedError
+            | ErrorKind::SharedObjectStartingVersionMismatch
+            | ErrorKind::IncorrectUserSignature
+            | ErrorKind::MutableParameterExpected => {}
         }
     }
 }

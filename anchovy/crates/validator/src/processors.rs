@@ -5,7 +5,10 @@
 //! passes through them, each taking it in one state and emitting it in the
 //! next: `Request<DigestPending>` → [`TransactionValidator`] →
 //! `Request<Valid>` → [`SignatureVerifier`] → `Request<Verified>` →
-//! [`answer`]. For now all run on one worker thread.
+//! [`InputChecker`] → [`Checked`] → [`TransactionExecutor`], which answers.
+//! A transaction failing validation or signature verification fails its
+//! request, as in the reference; one failing the input checks fails only
+//! its own result. For now all run on one worker thread.
 
 use std::sync::Arc;
 
@@ -15,11 +18,12 @@ use messages::transaction::{DigestPending, Transaction, TxState};
 use tokio::sync::oneshot;
 use workqueue::{Inbox, Processor, Queue, Refusal, Refuse, Worker, WorkerHandle};
 
-use crate::checks::{self, SignatureChecks, Valid, Verified};
+use crate::checks::{self, InputsCheckedTransaction, SignatureChecks, Valid, Verified};
 use crate::epoch::EpochState;
 
-/// Where a request's verdict goes.
-pub type Reply = oneshot::Sender<Result<Validated, Rejected>>;
+/// Where a request's verdict goes: a result per transaction, in order, or
+/// why the request as a whole was refused.
+pub type Reply = oneshot::Sender<Result<Vec<Outcome>, Rejected>>;
 
 /// A submission's transactions, in state `S`, on their way through the
 /// processors. One per request, as a handoff costs far more than checking
@@ -52,6 +56,10 @@ impl Request<DigestPending> {
 }
 
 impl<S: TxState> Request<S> {
+    pub fn transactions(&self) -> &[Message<Transaction<'static, S>>] {
+        &self.transactions
+    }
+
     fn reject(self, why: Rejected) {
         // The handler may have given up; nothing to do then.
         let _ = self.reply.send(Err(why));
@@ -68,10 +76,18 @@ impl<S: TxState> Refuse for Request<S> {
     }
 }
 
-/// Transactions whose signatures verified, with their digests. A struct,
-/// not an alias: a future holding `Message<Transaction<'static, _>>` across
-/// an `await` fails `Send` inference, which erases the `'static`.
-pub struct Validated(pub Vec<Message<Transaction<'static, Verified>>>);
+/// What became of one transaction of a request that passed validation and
+/// signature verification.
+#[derive(Debug)]
+pub enum Outcome {
+    /// Executed, now or before.
+    Executed(Box<execution::Executed>),
+    /// Its inputs failed the checks.
+    Rejected(validation::Error),
+    /// Execution failed: the input checks passed what execution could not
+    /// run, or the store failed.
+    Failed(String),
+}
 
 /// Why a request was refused.
 #[derive(Debug)]
@@ -136,7 +152,8 @@ impl Processor for TransactionValidator {
 }
 
 /// Verifies a request's signatures (`SignatureChecks::verify`) and passes
-/// it on; a request with a bad signature ends here.
+/// it on; a request with a bad signature, or whose validation failed after
+/// these transactions, ends here. What it emits is wholly verified.
 pub struct SignatureVerifier {
     checks: SignatureChecks,
 }
@@ -176,14 +193,14 @@ impl Processor for SignatureVerifier {
             then,
             reply,
         } = request;
-        match self.checks.verify(&epoch, transactions) {
-            Ok(verified) => Some(Request {
+        match (self.checks.verify(&epoch, transactions), then) {
+            (Ok(verified), None) => Some(Request {
                 epoch,
                 transactions: verified,
-                then,
+                then: None,
                 reply,
             }),
-            Err(e) => {
+            (Err(e), _) | (Ok(_), Some(e)) => {
                 let _ = reply.send(Err(Rejected::Invalid(e)));
                 None
             }
@@ -191,14 +208,137 @@ impl Processor for SignatureVerifier {
     }
 }
 
-/// The end of the pipeline: answers the handler, with the verified
-/// transactions, or with the validation failure that followed them.
-pub fn answer(request: Request<Verified>) {
-    let result = match request.then {
-        Some(e) => Err(Rejected::Invalid(e)),
-        None => Ok(Validated(request.transactions)),
-    };
-    let _ = request.reply.send(result);
+/// A request whose inputs were checked: each transaction to execute, or
+/// already answered.
+pub struct Checked {
+    epoch: Arc<EpochState>,
+    transactions: Vec<Step>,
+    reply: Reply,
+}
+
+// Most steps are executions; boxing them would allocate for each.
+#[allow(clippy::large_enum_variant)]
+enum Step {
+    Execute(InputsCheckedTransaction),
+    Done(Outcome),
+}
+
+impl Refuse for Checked {
+    fn refuse(self, why: Refusal) {
+        let _ = self.reply.send(Err(match why {
+            Refusal::Full => Rejected::Overloaded,
+            Refusal::Closed => Rejected::ShuttingDown,
+        }));
+    }
+}
+
+/// Checks each transaction's inputs against the store (`check_inputs`); a
+/// transaction executed before is answered from the store instead, as the
+/// reference does.
+pub struct InputChecker {
+    store: Arc<store::Store>,
+}
+
+impl InputChecker {
+    pub fn new(store: Arc<store::Store>) -> InputChecker {
+        InputChecker { store }
+    }
+}
+
+impl Processor for InputChecker {
+    type Input = Request<Verified>;
+    type Output = Checked;
+
+    fn process(&mut self, request: Request<Verified>) -> Option<Checked> {
+        let Request {
+            epoch,
+            transactions,
+            then: _,
+            reply,
+        } = request;
+        let transactions = transactions
+            .into_iter()
+            .map(|transaction| {
+                let digest = transaction.get().0.digest().bytes;
+                match executed(&self.store, &digest) {
+                    Some(outcome) => Step::Done(outcome),
+                    None => match checks::check_inputs(&epoch, &self.store, transaction) {
+                        Ok(checked) => Step::Execute(checked),
+                        Err(e) => Step::Done(Outcome::Rejected(e)),
+                    },
+                }
+            })
+            .collect();
+        Some(Checked {
+            epoch,
+            transactions,
+            reply,
+        })
+    }
+}
+
+/// The transaction's results, if it executed.
+fn executed(store: &store::Store, digest: &[u8; 32]) -> Option<Outcome> {
+    match execution::executed(store, digest) {
+        Ok(executed) => executed.map(|e| Outcome::Executed(Box::new(e))),
+        Err(e) => Some(Outcome::Failed(format!("{e:?}"))),
+    }
+}
+
+/// Executes a request's transactions one at a time, each committed before
+/// the next, so each reads what those before it wrote; then answers.
+///
+/// # Panics
+/// On equivocation: an owned input consumed since its check (`Execution::
+/// execute`). Consensus will rule it out; until then nothing locks inputs.
+pub struct TransactionExecutor {
+    store: Arc<store::Store>,
+}
+
+impl TransactionExecutor {
+    pub fn new(store: Arc<store::Store>) -> TransactionExecutor {
+        TransactionExecutor { store }
+    }
+
+    fn execute(&self, epoch: &EpochState, transaction: &InputsCheckedTransaction) -> Outcome {
+        let digest = transaction.get().0.digest().bytes;
+        // `Transaction` BCS is `SenderSignedData`'s: its empty signature
+        // info has no bytes.
+        let outcome = match epoch
+            .execution
+            .execute(&self.store, transaction.wire_bytes())
+        {
+            Ok(outcome) => outcome,
+            Err(e) => return Outcome::Failed(format!("{e:?}")),
+        };
+        if let Err(e) = self.store.commit(outcome.commit) {
+            return Outcome::Failed(format!("{e:?}"));
+        }
+        executed(&self.store, &digest)
+            .unwrap_or_else(|| Outcome::Failed("committed, but not in the store".to_owned()))
+    }
+}
+
+impl Processor for TransactionExecutor {
+    type Input = Checked;
+    type Output = ();
+
+    fn process(&mut self, request: Checked) -> Option<()> {
+        let Checked {
+            epoch,
+            transactions,
+            reply,
+        } = request;
+        let outcomes = transactions
+            .into_iter()
+            .map(|step| match step {
+                Step::Execute(transaction) => self.execute(&epoch, &transaction),
+                Step::Done(outcome) => outcome,
+            })
+            .collect();
+        let _ = reply.send(Ok(outcomes));
+        None
+    }
 }
 
 /// The processors, and the queue that feeds them.
@@ -212,14 +352,14 @@ pub struct Processors {
 pub const VALIDATION_QUEUE: usize = 4096;
 
 /// Validated requests awaiting signature verification beyond which requests
-/// are refused.
+/// are refused; likewise between the later stages.
 pub const SIGNATURE_QUEUE: usize = 4096;
 
 impl Processors {
-    /// Validation and signature verification, on one thread.
-    pub fn start(validation_queue: usize) -> Processors {
+    /// The pipeline, on one thread, over `store`.
+    pub fn start(validation_queue: usize, store: Arc<store::Store>) -> Processors {
         let (transactions, validation) = workqueue::queue(validation_queue);
-        let worker = Processors::worker(validation, SIGNATURE_QUEUE).spawn();
+        let worker = Processors::worker(validation, SIGNATURE_QUEUE, store).spawn();
         Processors {
             transactions,
             _worker: worker,
@@ -227,10 +367,23 @@ impl Processors {
     }
 
     /// A worker running the pipeline, validation draining `validation`.
-    pub fn worker(validation: Inbox<Request<DigestPending>>, signature_queue: usize) -> Worker {
-        let (signatures, verification) = workqueue::queue(signature_queue);
+    pub fn worker(
+        validation: Inbox<Request<DigestPending>>,
+        queue: usize,
+        store: Arc<store::Store>,
+    ) -> Worker {
+        let (signatures, verification) = workqueue::queue(queue);
+        let (verified, input_checks) = workqueue::queue(queue);
+        let (checked, executions) = workqueue::queue(queue);
+        let checker_store = store.clone();
         Worker::new("transactions")
             .run(validation, TransactionValidator::new, signatures)
-            .run(verification, SignatureVerifier::new, answer)
+            .run(verification, SignatureVerifier::new, verified)
+            .run(
+                input_checks,
+                move || InputChecker::new(checker_store),
+                checked,
+            )
+            .run(executions, move || TransactionExecutor::new(store), |()| {})
     }
 }

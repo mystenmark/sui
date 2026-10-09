@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use tokio::sync::oneshot;
 use validator::epoch::EpochState;
-use validator::processors::{Request, SignatureVerifier, TransactionValidator, answer};
+use validator::processors::{Request, SignatureVerifier, TransactionValidator};
 use workqueue::Processor;
 
 struct Counting;
@@ -43,23 +43,22 @@ static COUNTING: Counting = Counting;
 /// Runs one transaction through the processors, each one's output the next
 /// one's input, counting their allocations; the request and its reply
 /// channel are the handler's, made before counting. Returns whether it was
-/// accepted.
+/// verified.
 fn process(
     epoch: &Arc<EpochState>,
     validator: &mut TransactionValidator,
     verifier: &mut SignatureVerifier,
     case: &common::Case,
 ) -> (bool, usize) {
-    let (reply, verdict) = oneshot::channel();
+    let (reply, _verdict) = oneshot::channel();
     let request = Request::new(epoch.clone(), vec![case.parse().unwrap()], reply);
     let before = ALLOCATIONS.with(Cell::get);
-    if let Some(valid) = validator.process(request)
-        && let Some(verified) = verifier.process(valid)
-    {
-        answer(verified);
-    }
+    let accepted = validator
+        .process(request)
+        .and_then(|valid| verifier.process(valid))
+        .is_some();
     let allocations = ALLOCATIONS.with(Cell::get) - before;
-    (verdict.blocking_recv().unwrap().is_ok(), allocations)
+    (accepted, allocations)
 }
 
 /// Whether every signature is a single Ed25519 or Secp256k1 one, by flag.

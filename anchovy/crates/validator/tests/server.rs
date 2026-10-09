@@ -38,11 +38,14 @@ async fn serve() -> SocketAddr {
         4,
         [],
     ));
-    let processors = Processors::start(64);
+    // No genesis: these requests read no objects.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(store::Store::open(dir.path()).unwrap());
+    let processors = Processors::start(64, store);
     let service = Validator::new(epoch, processors.transactions.clone()).into_service();
     tokio::spawn(async move {
-        // The processors live as long as the server.
-        let _processors = processors;
+        // The processors and their store live as long as the server.
+        let _processors = (processors, dir);
         tonic::transport::Server::builder()
             .add_service(service)
             .serve_with_incoming(TcpIncoming::from(listener))

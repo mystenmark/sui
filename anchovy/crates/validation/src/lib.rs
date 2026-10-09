@@ -9,6 +9,7 @@
 pub mod accumulator;
 pub mod error;
 pub mod gasless;
+pub mod inputs;
 pub mod kind;
 pub mod sender_signed;
 pub mod signature;
