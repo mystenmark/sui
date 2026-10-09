@@ -293,6 +293,36 @@ where
         function: &'a str,
         type_arguments: Vec<'a, Type<'a>>,
     ) -> Result<LoadedFunction<'a>, ExecutionError<'a>> {
+        self.load_function_(package, module, function, type_arguments, None)
+    }
+
+    /// `load_function` for type arguments already loaded by `load_type_input_with_vm_type`, whose
+    /// VM types are `vm_type_arguments`.
+    pub fn load_function_with_vm_type_arguments(
+        &self,
+        package: ObjectId,
+        module: &'a str,
+        function: &'a str,
+        type_arguments: Vec<'a, Type<'a>>,
+        vm_type_arguments: std::vec::Vec<vm_runtime::Type>,
+    ) -> Result<LoadedFunction<'a>, ExecutionError<'a>> {
+        self.load_function_(
+            package,
+            module,
+            function,
+            type_arguments,
+            Some(vm_type_arguments),
+        )
+    }
+
+    fn load_function_(
+        &self,
+        package: ObjectId,
+        module: &'a str,
+        function: &'a str,
+        type_arguments: Vec<'a, Type<'a>>,
+        vm_type_arguments: Option<std::vec::Vec<vm_runtime::Type>>,
+    ) -> Result<LoadedFunction<'a>, ExecutionError<'a>> {
         let module_ident = to_identifier(module)?;
         let name = to_identifier(function)?;
 
@@ -318,11 +348,28 @@ where
             address: exec_types::base::move_address(&original_id),
             name: module,
         };
-        let loaded_type_arguments = type_arguments
-            .iter()
-            .enumerate()
-            .map(|(idx, ty)| self.load_vm_type_argument_from_adapter_type(idx, ty))
-            .collect::<Result<std::vec::Vec<_>, _>>()?;
+        let loaded_type_arguments = match vm_type_arguments {
+            // The reference converts each adapter type back to a tag and loads it again, in the
+            // same VM. Each was loaded from a defining-ID tag that the adapter type converts back
+            // to, so that load (and its type linkage) succeeds and gives the same VM type.
+            Some(loaded) => {
+                debug_assert!(
+                    loaded.len() == type_arguments.len()
+                        && type_arguments.iter().zip(&loaded).enumerate().all(
+                            |(idx, (ty, vm_ty))| {
+                                self.load_vm_type_argument_from_adapter_type(idx, ty)
+                                    .is_ok_and(|reloaded| reloaded == *vm_ty)
+                            }
+                        )
+                );
+                loaded
+            }
+            None => type_arguments
+                .iter()
+                .enumerate()
+                .map(|(idx, ty)| self.load_vm_type_argument_from_adapter_type(idx, ty))
+                .collect::<Result<std::vec::Vec<_>, _>>()?,
+        };
         // NB: We cannot use the resolution VM here because the linkage for that unifies up, and if
         // this is a private entry function, it may have been removed in future versions of the
         // package.
@@ -389,8 +436,18 @@ where
         idx: usize,
         ty: TypeInput<'_>,
     ) -> Result<Type<'a>, ExecutionError<'a>> {
+        Ok(self.load_type_input_with_vm_type(idx, ty)?.0)
+    }
+
+    /// `load_type_input`, also returning the VM type it loaded.
+    pub fn load_type_input_with_vm_type(
+        &self,
+        idx: usize,
+        ty: TypeInput<'_>,
+    ) -> Result<(Type<'a>, vm_runtime::Type), ExecutionError<'a>> {
         let vm_type = self.load_vm_type_from_type_input(idx, ty)?;
-        self.adapter_type_from_vm_type(self.input_type_resolution_vm, &vm_type)
+        let ty = self.adapter_type_from_vm_type(self.input_type_resolution_vm, &vm_type)?;
+        Ok((ty, vm_type))
     }
 
     pub fn load_type_tag(&self, idx: usize, ty: &TypeTag) -> Result<Type<'a>, ExecutionError<'a>> {

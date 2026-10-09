@@ -349,10 +349,19 @@ fn command<'a, Mode: ExecutionMode>(
                 arguments,
             } = *pmc;
             let mut type_arguments = Vec::with_capacity_in(ptype_arguments.len(), bump);
+            let mut vm_type_arguments = std::vec::Vec::with_capacity(ptype_arguments.len());
             for (idx, ty) in ptype_arguments.iter().enumerate() {
-                type_arguments.push(env.load_type_input(idx, *ty)?);
+                let (ty, vm_ty) = env.load_type_input_with_vm_type(idx, *ty)?;
+                type_arguments.push(ty);
+                vm_type_arguments.push(vm_ty);
             }
-            let function = env.load_function(*package, module, name, type_arguments)?;
+            let function = env.load_function_with_vm_type_arguments(
+                *package,
+                module,
+                name,
+                type_arguments,
+                vm_type_arguments,
+            )?;
             L::Command::MoveCall(containers::Box::new_in(
                 L::MoveCall {
                     function,
