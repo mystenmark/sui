@@ -1879,6 +1879,7 @@ dependencies = [
  "blake2",
  "containers",
  "messages",
+ "move-binary-format",
  "move-core-types",
  "sui-protocol-config",
  "sui-types",
@@ -1908,10 +1909,16 @@ dependencies = [
  "exec-types",
  "messages",
  "move-binary-format",
+ "move-bytecode-verifier",
+ "move-bytecode-verifier-meter",
  "move-core-types",
+ "move-regex-borrow-graph",
+ "move-vm-config",
  "move-vm-runtime",
+ "natives",
  "sui-protocol-config",
  "sui-types",
+ "sui-verifier-latest",
 ]
 
 [[package]]

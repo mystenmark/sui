@@ -36,6 +36,11 @@ sui-types = { path = "../crates/sui-types" }
 move-core-types = { path = "../external-crates/move/crates/move-core-types" }
 move-binary-format = { path = "../external-crates/move/crates/move-binary-format" }
 move-vm-runtime = { path = "../external-crates/move/crates/move-vm-runtime" }
+move-bytecode-verifier = { path = "../external-crates/move/crates/move-bytecode-verifier" }
+move-bytecode-verifier-meter = { path = "../external-crates/move/crates/move-bytecode-verifier-meter" }
+move-vm-config = { path = "../external-crates/move/crates/move-vm-config" }
+move-regex-borrow-graph = { path = "../external-crates/move/crates/move-regex-borrow-graph" }
+sui-verifier = { path = "../sui-execution/latest/sui-verifier", package = "sui-verifier-latest" }
 # Linked by `natives`, as sui-move-natives links them.
 better_any = "0.1.1"
 smallvec = "1.10.0"
