@@ -27,6 +27,7 @@ use std::{cell::RefCell, sync::Arc};
 /// `Rc` cloned from the store's.
 #[allow(clippy::type_complexity)]
 pub struct TransactionPackageStore<'a> {
+    bump: &'a Bump,
     package_store: &'a dyn BackingPackageStore<'a>,
 
     /// Elements in this are packages that are being published or have been published in the current
@@ -42,10 +43,16 @@ pub struct TransactionPackageStore<'a> {
 impl<'a> TransactionPackageStore<'a> {
     pub fn new(bump: &'a Bump, package_store: &'a dyn BackingPackageStore<'a>) -> Self {
         Self {
+            bump,
             package_store,
             new_packages: RefCell::new(IndexMap::new_in(bump)),
             package_cache: RefCell::new(IndexMap::new_in(bump)),
         }
+    }
+
+    /// The transaction's arena.
+    pub fn bump(&self) -> &'a Bump {
+        self.bump
     }
 
     /// Push a new package into the new packages. This is used to track packages that are being

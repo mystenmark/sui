@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::data_store::{PackageStore, transaction_package_store::TransactionPackageStore};
+use containers::IndexMap;
 use exec_types::storage::{SuiError, SuiResult};
 use messages::base::ObjectId;
 use messages::object::MovePackage;
@@ -12,6 +13,7 @@ use move_vm_runtime::{
     cache::move_cache::ResolvedPackageResult, runtime::MoveRuntime,
     validation::verification::ast::Package as VerifiedPackage,
 };
+use std::cell::RefCell;
 use std::sync::Arc;
 
 /// The `CachedPackageStore` is a `PackageStore` implementation that uses a `MoveRuntime` to
@@ -26,6 +28,18 @@ pub struct CachedPackageStore<'state, 'runtime> {
     /// Underlying store to fetch packages from. Any newly published packages in the current
     /// transaction should be in the `new_packages` field of this store.
     pub package_store: TransactionPackageStore<'state>,
+
+    /// Packages the runtime resolved for this store, by package (storage) ID. Not in the
+    /// reference, which goes to the runtime on every lookup; a transaction looks up the same few
+    /// packages dozens of times, and each runtime lookup costs allocations and timers even when
+    /// it hits the runtime's cache.
+    ///
+    /// A hit is the runtime's answer for the same ID: a package ID names one immutable version
+    /// (publishing and upgrading make new IDs; system packages upgraded at an epoch change are
+    /// loaded by a new runtime, with a new store). Only packages found are kept, so a package
+    /// published later in the transaction is never shadowed; packages published in the
+    /// transaction are looked up before this, as before.
+    resolved: RefCell<IndexMap<'state, ObjectId, Arc<VerifiedPackage>>>,
 }
 
 impl<'state, 'runtime> CachedPackageStore<'state, 'runtime> {
@@ -35,6 +49,7 @@ impl<'state, 'runtime> CachedPackageStore<'state, 'runtime> {
     ) -> Self {
         Self {
             runtime,
+            resolved: RefCell::new(IndexMap::new_in(package_store.bump())),
             package_store,
         }
     }
@@ -66,6 +81,10 @@ impl<'state, 'runtime> CachedPackageStore<'state, 'runtime> {
             return Ok(Some(verified_pkg));
         }
 
+        if let Some(pkg) = self.resolved.borrow().get(id) {
+            return Ok(Some(pkg.clone()));
+        }
+
         // load the package via the Move runtime, which will cache it if found.
         match self
             .runtime
@@ -75,7 +94,10 @@ impl<'state, 'runtime> CachedPackageStore<'state, 'runtime> {
                 // execution error's.
                 SuiError(format!("VMVerificationOrDeserializationError: {e}"))
             })? {
-            ResolvedPackageResult::Found(pkg) => Ok(Some(pkg.verified.clone())),
+            ResolvedPackageResult::Found(pkg) => {
+                self.resolved.borrow_mut().insert(*id, pkg.verified.clone());
+                Ok(Some(pkg.verified.clone()))
+            }
             ResolvedPackageResult::NotFound => Ok(None),
         }
     }
