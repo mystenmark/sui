@@ -19,6 +19,11 @@ pub type HashSet<'a, K> = hashbrown::HashSet<K, foldhash::fast::RandomState, &'a
 /// support by `arena-btreemap`.
 pub type BTreeMap<'a, K, V> = arena_btreemap::BTreeMap<K, V, &'a Bump>;
 
+/// `std::collections::btree_map`'s entry types, for [`BTreeMap`].
+pub mod btree_map {
+    pub use arena_btreemap::btree::map::{Entry, OccupiedEntry, VacantEntry};
+}
+
 mod btree_set;
 mod index_map;
 

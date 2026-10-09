@@ -10,6 +10,9 @@ publish = false
 [dependencies]
 better_any.workspace = true
 bcs.workspace = true
+containers.workspace = true
+exec-types.workspace = true
+messages.workspace = true
 indexmap.workspace = true
 smallvec.workspace = true
 rand = { workspace = true, features = ["small_rng"] }

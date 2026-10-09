@@ -3964,10 +3964,13 @@ version = "0.1.0"
 dependencies = [
  "bcs",
  "better_any",
+ "containers",
+ "exec-types",
  "fastcrypto",
  "fastcrypto-vdf",
  "fastcrypto-zkp",
  "indexmap 2.14.2",
+ "messages",
  "move-binary-format",
  "move-core-types",
  "move-vm-runtime",

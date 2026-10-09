@@ -1,8 +1,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use messages::base::ObjectId;
+use messages::effects::AccumulatorOperation;
+use messages::type_tag::TypeTag;
 use move_core_types::account_address::AccountAddress;
-use sui_types::{TypeTag, base_types::ObjectID, effects::AccumulatorOperation};
 
 #[derive(Debug)]
 pub enum MoveAccumulatorAction {
@@ -27,12 +29,12 @@ pub enum MoveAccumulatorValue {
 }
 
 #[derive(Debug)]
-pub struct MoveAccumulatorEvent {
+pub struct MoveAccumulatorEvent<'a> {
     // Note: accumulator_id is derived by hashing target and ty, but we include
     // both for simplicity.
-    pub accumulator_id: ObjectID,
+    pub accumulator_id: ObjectId,
     pub action: MoveAccumulatorAction,
     pub target_addr: AccountAddress,
-    pub target_ty: TypeTag,
+    pub target_ty: TypeTag<'a>,
     pub value: MoveAccumulatorValue,
 }

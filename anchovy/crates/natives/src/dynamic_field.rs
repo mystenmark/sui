@@ -9,6 +9,8 @@ use crate::{
         object_store::{CacheInfo, ObjectResult},
     },
 };
+use exec_types::base::object_id;
+use exec_types::type_tags::move_object_type_in;
 use move_binary_format::errors::{PartialVMError, PartialVMResult};
 use move_binary_format::{partial_vm_error, safe_assert, safe_assert_eq, safe_unwrap};
 use move_core_types::{
@@ -30,7 +32,7 @@ use move_vm_runtime::{
 };
 use smallvec::smallvec;
 use std::collections::VecDeque;
-use sui_types::{base_types::MoveObjectType, dynamic_field::derive_dynamic_field_id};
+use sui_types::dynamic_field::derive_dynamic_field_id;
 use tracing::instrument;
 
 const E_KEY_DOES_NOT_EXIST: u64 = 1;
@@ -63,12 +65,13 @@ macro_rules! get_or_fetch_object {
         };
 
         let object_runtime: &mut ObjectRuntime = $crate::get_extension_mut!($context)?;
+        let child_move_type = move_object_type_in(object_runtime.bump, &tag);
         object_runtime.get_or_fetch_child_object(
             $parent,
             $child_id,
-            &layout,
+            layout,
             &annotated_layout,
-            MoveObjectType::from(tag),
+            child_move_type,
         )?
     }};
 }
@@ -191,7 +194,7 @@ pub fn add_child_object(
     );
 
     let child = safe_unwrap!(args.pop_back());
-    let parent = pop_arg!(args, AccountAddress).into();
+    let parent = object_id(&pop_arg!(args, AccountAddress));
     safe_assert!(args.is_empty());
 
     // The value already exists, the size of the value is irrelevant
@@ -205,10 +208,9 @@ pub fn add_child_object(
     );
 
     // TODO remove this copy_value, which will require VM changes
-    let child_id = safe_unwrap!(
+    let child_id = object_id(&safe_unwrap!(
         get_object_id(child.copy_value()).and_then(|v| v.value_as::<AccountAddress>())
-    )
-    .into();
+    ));
     let child_ty = safe_unwrap!(ty_args.pop());
     let child_type_size = u64::from(child_ty.size()?);
 
@@ -246,7 +248,8 @@ pub fn add_child_object(
     }
 
     let object_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
-    object_runtime.add_child_object(parent, child_id, MoveObjectType::from(tag), child)?;
+    let child_move_type = move_object_type_in(object_runtime.bump, &tag);
+    object_runtime.add_child_object(parent, child_id, child_move_type, child)?;
     Ok(NativeResult::ok(context.gas_used(), smallvec![]))
 }
 
@@ -283,14 +286,13 @@ pub fn borrow_child_object(
         dynamic_field_borrow_child_object_cost_params.dynamic_field_borrow_child_object_cost_base
     );
 
-    let child_id = pop_arg!(args, AccountAddress).into();
+    let child_id = object_id(&pop_arg!(args, AccountAddress));
 
     let parent_uid = safe_unwrap!(pop_arg!(args, StructRef).read_ref());
     // UID { id: ID { bytes: address } }
-    let parent = safe_unwrap!(
+    let parent = object_id(&safe_unwrap!(
         get_nested_struct_field(parent_uid, &[0, 0]).and_then(|v| v.value_as::<AccountAddress>())
-    )
-    .into();
+    ));
 
     safe_assert!(args.is_empty());
     let global_value_result = get_or_fetch_object!(
@@ -380,8 +382,8 @@ pub fn remove_child_object(
         dynamic_field_remove_child_object_cost_params.dynamic_field_remove_child_object_cost_base
     );
 
-    let child_id = pop_arg!(args, AccountAddress).into();
-    let parent = pop_arg!(args, AccountAddress).into();
+    let child_id = object_id(&pop_arg!(args, AccountAddress));
+    let parent = object_id(&pop_arg!(args, AccountAddress));
     safe_assert!(args.is_empty());
     let global_value_result = get_or_fetch_object!(
         context,
@@ -466,8 +468,8 @@ pub fn has_child_object(
         dynamic_field_has_child_object_cost_params.dynamic_field_has_child_object_cost_base
     );
 
-    let child_id = pop_arg!(args, AccountAddress).into();
-    let parent = pop_arg!(args, AccountAddress).into();
+    let child_id = object_id(&pop_arg!(args, AccountAddress));
+    let parent = object_id(&pop_arg!(args, AccountAddress));
     let object_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
     let (cache_info, has_child) = object_runtime.child_object_exists(parent, child_id)?;
     charge_cache_or_load_gas!(context, cache_info);
@@ -509,8 +511,8 @@ pub fn has_child_object_with_ty(
             .dynamic_field_has_child_object_with_ty_cost_base
     );
 
-    let child_id = pop_arg!(args, AccountAddress).into();
-    let parent = pop_arg!(args, AccountAddress).into();
+    let child_id = object_id(&pop_arg!(args, AccountAddress));
+    let parent = object_id(&pop_arg!(args, AccountAddress));
     safe_assert!(args.is_empty());
     let ty = safe_unwrap!(ty_args.pop());
 
@@ -539,11 +541,9 @@ pub fn has_child_object_with_ty(
     );
 
     let object_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
-    let (cache_info, has_child) = object_runtime.child_object_exists_and_has_type(
-        parent,
-        child_id,
-        &MoveObjectType::from(tag),
-    )?;
+    let child_move_type = move_object_type_in(object_runtime.bump, &tag);
+    let (cache_info, has_child) =
+        object_runtime.child_object_exists_and_has_type(parent, child_id, &child_move_type)?;
     charge_cache_or_load_gas!(context, cache_info);
     Ok(NativeResult::ok(
         context.gas_used(),

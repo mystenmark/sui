@@ -5,8 +5,11 @@ use crate::{
     NativesCostTable, abstract_size, get_extension, get_extension_mut,
     object_runtime::ObjectRuntime,
 };
+use exec_types::base::object_id;
+use exec_types::type_tags::move_object_type_in;
 use move_binary_format::errors::{PartialVMError, PartialVMResult};
 use move_binary_format::{safe_assert_eq, safe_unwrap};
+use move_core_types::language_storage::TypeTag;
 use move_core_types::{
     account_address::AccountAddress, gas_algebra::InternalGas, language_storage::StructTag,
     runtime_value as R, vm_status::StatusCode,
@@ -21,7 +24,6 @@ use move_vm_runtime::{
 };
 use smallvec::smallvec;
 use std::collections::VecDeque;
-use sui_types::{TypeTag, base_types::MoveObjectType};
 use tracing::{error, instrument};
 
 const E_BCS_SERIALIZATION_FAILURE: u64 = 2;
@@ -123,10 +125,10 @@ fn consistent_value_before_current_epoch(
     name_df_addr: AccountAddress,
     current_epoch: u64,
 ) -> PartialVMResult<Value> {
-    let field_setting_obj_ty = MoveObjectType::from(field_setting_tag);
+    let field_setting_obj_ty = move_object_type_in(object_runtime.bump, &field_setting_tag);
     let Some(field) = object_runtime.config_setting_unsequenced_read(
-        config_addr.into(),
-        name_df_addr.into(),
+        object_id(&config_addr),
+        object_id(&name_df_addr),
         field_setting_layout,
         &field_setting_obj_ty,
     ) else {

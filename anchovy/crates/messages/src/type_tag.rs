@@ -6,7 +6,9 @@ use crate::base::AccountAddress;
 use crate::error::{ParseError, Result};
 use crate::reader::Reader;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// `Ord` orders as the reference's derived one does: the same variants and
+/// fields in the same order, and identifiers compare as strings.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum TypeTag<'a> {
     Bool,
     U8,
@@ -22,7 +24,7 @@ pub enum TypeTag<'a> {
 }
 
 /// Module and name are not checked against the Move identifier grammar here.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct StructTag<'a> {
     pub address: &'a AccountAddress,
     pub module: &'a str,

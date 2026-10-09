@@ -6,6 +6,10 @@ use crate::{
     NativesCostTable, get_extension, get_extension_mut, get_receiver_object_id,
     get_tag_and_layouts, object_runtime::object_store::ObjectResult,
 };
+use exec_types::base::object_id;
+use exec_types::type_tags::move_object_type_in;
+use messages::base::SuiAddress;
+use messages::object::Owner;
 use move_binary_format::errors::{PartialVMError, PartialVMResult};
 use move_binary_format::{safe_assert, safe_unwrap};
 use move_core_types::{
@@ -19,10 +23,6 @@ use move_vm_runtime::{
 use move_vm_runtime::{native_charge_gas_early_exit, natives::functions::NativeContext};
 use smallvec::smallvec;
 use std::collections::VecDeque;
-use sui_types::{
-    base_types::{MoveObjectType, ObjectID, SequenceNumber},
-    object::Owner,
-};
 
 const E_SHARED_NON_NEW_OBJECT: u64 = 0;
 const E_BCS_SERIALIZATION_FAILURE: u64 = 1;
@@ -66,15 +66,14 @@ pub fn receive_object_internal(
             .transfer_receive_object_internal_type_cost_per_byte
             * u64::from(child_ty.size()?).into()
     );
-    let child_receiver_sequence_number: SequenceNumber = pop_arg!(args, u64).into();
+    let child_receiver_sequence_number = pop_arg!(args, u64);
     let child_receiver_object_id = safe_unwrap!(args.pop_back());
-    let parent = pop_arg!(args, AccountAddress).into();
+    let parent = object_id(&pop_arg!(args, AccountAddress));
     safe_assert!(args.is_empty());
-    let child_id: ObjectID = safe_unwrap!(
+    let child_id = object_id(&safe_unwrap!(
         get_receiver_object_id(child_receiver_object_id.copy_value())
             .and_then(|v| v.value_as::<AccountAddress>())
-    )
-    .into();
+    ));
     safe_assert!(ty_args.is_empty());
 
     let Some((tag, layout, annotated_layout)) = get_tag_and_layouts(context, &child_ty)? else {
@@ -85,13 +84,14 @@ pub fn receive_object_internal(
     };
 
     let object_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
+    let child_move_type = move_object_type_in(object_runtime.bump, &tag);
     let (_cache_info, child) = match object_runtime.receive_object(
         parent,
         child_id,
         child_receiver_sequence_number,
         &layout,
         &annotated_layout,
-        MoveObjectType::from(tag),
+        child_move_type,
     ) {
         // NB: Loaded and doesn't exist and inauthenticated read should lead to the exact same error
         Ok(None) => {
@@ -154,7 +154,7 @@ pub fn transfer_internal(
     let recipient = pop_arg!(args, AccountAddress);
     let obj = safe_unwrap!(args.pop_back());
 
-    let owner = Owner::AddressOwner(recipient.into());
+    let owner = NewOwner::AddressOwner(recipient);
     object_runtime_transfer(context, owner, ty, obj)?;
     let cost = context.gas_used();
     Ok(NativeResult::ok(cost, smallvec![]))
@@ -243,10 +243,7 @@ pub fn party_transfer_internal(
 
     // Dummy version, to be filled with the correct initial version when the effects of the
     // transaction are written to storage.
-    let owner = Owner::ConsensusAddressOwner {
-        start_version: SequenceNumber::new(),
-        owner: address.into(),
-    };
+    let owner = NewOwner::ConsensusAddressOwner(address);
     object_runtime_transfer(context, owner, ty, obj)?;
     // TODO check permissions for transfer
     let cost = context.gas_used();
@@ -282,7 +279,7 @@ pub fn freeze_object(
     let ty = safe_unwrap!(ty_args.pop());
     let obj = safe_unwrap!(args.pop_back());
 
-    object_runtime_transfer(context, Owner::Immutable, ty, obj)?;
+    object_runtime_transfer(context, NewOwner::Immutable, ty, obj)?;
     // TODO check permissions for transfer
     Ok(NativeResult::ok(context.gas_used(), smallvec![]))
 }
@@ -315,16 +312,7 @@ pub fn share_object(
 
     let ty = safe_unwrap!(ty_args.pop());
     let obj = safe_unwrap!(args.pop_back());
-    let transfer_result = object_runtime_transfer(
-        context,
-        // Dummy version, to be filled with the correct initial version when the effects of the
-        // transaction are written to storage.
-        Owner::Shared {
-            initial_shared_version: SequenceNumber::new(),
-        },
-        ty,
-        obj,
-    )?;
+    let transfer_result = object_runtime_transfer(context, NewOwner::Shared, ty, obj)?;
     // TODO check permissions for transfer
     let cost = context.gas_used();
     Ok(match transfer_result {
@@ -335,14 +323,22 @@ pub fn share_object(
     })
 }
 
+/// The owner a native transfers to, before it is an `Owner` in the runtime's arena.
+enum NewOwner {
+    AddressOwner(AccountAddress),
+    ConsensusAddressOwner(AccountAddress),
+    Immutable,
+    Shared,
+}
+
 fn object_runtime_transfer(
     context: &mut NativeContext,
-    owner: Owner,
+    owner: NewOwner,
     ty: Type,
     obj: Value,
 ) -> PartialVMResult<TransferResult> {
-    let object_type = match context.type_to_type_tag(&ty)? {
-        TypeTag::Struct(s) => MoveObjectType::from(*s),
+    let tag = match context.type_to_type_tag(&ty)? {
+        TypeTag::Struct(s) => s,
         _ => {
             return Err(
                 PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
@@ -352,5 +348,22 @@ fn object_runtime_transfer(
     };
 
     let obj_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
+    let bump = obj_runtime.bump;
+    let object_type = move_object_type_in(bump, &tag);
+    let address = |a: AccountAddress| containers::alloc(bump, SuiAddress(a.into_bytes()));
+    let owner = match owner {
+        NewOwner::AddressOwner(recipient) => Owner::AddressOwner(address(recipient)),
+        // Dummy version, to be filled with the correct initial version when the effects of the
+        // transaction are written to storage.
+        NewOwner::ConsensusAddressOwner(recipient) => Owner::ConsensusAddressOwner {
+            start_version: 0,
+            owner: address(recipient),
+        },
+        NewOwner::Immutable => Owner::Immutable,
+        // Dummy version, as above.
+        NewOwner::Shared => Owner::Shared {
+            initial_shared_version: 0,
+        },
+    };
     obj_runtime.transfer(owner, object_type, obj, /* end of transaction */ false)
 }

@@ -2,40 +2,27 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use better_any::{Tid, TidAble};
-use move_binary_format::errors::{PartialVMError, PartialVMResult};
-use move_core_types::{account_address::AccountAddress, vm_status::StatusCode};
+use exec_types::base::EpochId;
+use exec_types::tx_context::TxContext;
+use messages::base::{ObjectId, SuiAddress, TransactionDigest};
 use move_vm_runtime::natives::extensions::NativeExtensionMarker;
 use std::{cell::RefCell, rc::Rc};
-use sui_types::{
-    base_types::{ObjectID, SuiAddress, TxContext},
-    committee::EpochId,
-    digests::TransactionDigest,
-};
 
 // TransactionContext is a wrapper around TxContext that is exposed to NativeContextExtensions
 // in order to provide transaction context information to Move native functions.
 // Holds a Rc<RefCell<TxContext>> to allow for mutation of the TxContext.
+// Without the reference's test-only mode, whose `replace` serves the test
+// scenario natives anchovy leaves out.
 #[derive(Tid)]
 pub struct TransactionContext {
     pub(crate) tx_context: Rc<RefCell<TxContext>>,
-    test_only: bool,
 }
 
 impl NativeExtensionMarker<'_> for TransactionContext {}
 
 impl TransactionContext {
     pub fn new(tx_context: Rc<RefCell<TxContext>>) -> Self {
-        Self {
-            tx_context,
-            test_only: false,
-        }
-    }
-
-    pub fn new_for_testing(tx_context: Rc<RefCell<TxContext>>) -> Self {
-        Self {
-            tx_context,
-            test_only: true,
-        }
+        Self { tx_context }
     }
 
     pub fn sender(&self) -> SuiAddress {
@@ -74,42 +61,7 @@ impl TransactionContext {
         self.tx_context.borrow().ids_created()
     }
 
-    pub fn fresh_id(&self) -> ObjectID {
+    pub fn fresh_id(&self) -> ObjectId {
         self.tx_context.borrow_mut().fresh_id()
-    }
-
-    //
-    // Test only function
-    //
-    pub fn replace(
-        &self,
-        sender: AccountAddress,
-        tx_hash: Vec<u8>,
-        epoch: u64,
-        epoch_timestamp_ms: u64,
-        ids_created: u64,
-        rgp: u64,
-        gas_price: u64,
-        gas_budget: u64,
-        sponsor: Option<AccountAddress>,
-    ) -> PartialVMResult<()> {
-        if !self.test_only {
-            return Err(
-                PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
-                    .with_message("`replace` called on a non testing scenario".to_string()),
-            );
-        }
-        self.tx_context.borrow_mut().replace(
-            sender,
-            tx_hash,
-            epoch,
-            epoch_timestamp_ms,
-            ids_created,
-            rgp,
-            gas_price,
-            gas_budget,
-            sponsor,
-        );
-        Ok(())
     }
 }

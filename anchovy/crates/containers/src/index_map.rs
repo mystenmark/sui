@@ -605,6 +605,21 @@ impl<T: Hash + Eq> IndexSet<'_, T> {
     }
 }
 
+impl<T: Hash + Eq> IndexSet<'_, T> {
+    /// Whether every value here is in `other`.
+    pub fn is_subset(&self, other: &IndexSet<'_, T>) -> bool {
+        self.len() <= other.len() && self.iter().all(|v| other.contains(v))
+    }
+}
+
+impl<'m, T> IntoIterator for &'m IndexSet<'_, T> {
+    type Item = &'m T;
+    type IntoIter = core::iter::Map<Iter<'m, T, ()>, fn((&'m T, &'m ())) -> &'m T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.map.iter().map(|(k, ())| k)
+    }
+}
+
 impl<T: Hash + Eq> Extend<T> for IndexSet<'_, T> {
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
         for v in iter {

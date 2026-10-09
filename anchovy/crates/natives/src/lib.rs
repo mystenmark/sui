@@ -95,7 +95,6 @@ mod package;
 mod protocol_config;
 mod random;
 pub mod scratch;
-pub mod test_scenario;
 mod test_utils;
 pub mod transaction_context;
 mod transfer;
@@ -1205,71 +1204,6 @@ pub fn all_natives(silent: bool, protocol_config: &ProtocolConfig) -> NativeFunc
             make_native!(object::record_new_uid_from_hash),
         ),
         (
-            "test_scenario",
-            "take_from_address_by_id",
-            make_native!(test_scenario::take_from_address_by_id),
-        ),
-        (
-            "test_scenario",
-            "most_recent_id_for_address",
-            make_native!(test_scenario::most_recent_id_for_address),
-        ),
-        (
-            "test_scenario",
-            "was_taken_from_address",
-            make_native!(test_scenario::was_taken_from_address),
-        ),
-        (
-            "test_scenario",
-            "take_immutable_by_id",
-            make_native!(test_scenario::take_immutable_by_id),
-        ),
-        (
-            "test_scenario",
-            "most_recent_immutable_id",
-            make_native!(test_scenario::most_recent_immutable_id),
-        ),
-        (
-            "test_scenario",
-            "was_taken_immutable",
-            make_native!(test_scenario::was_taken_immutable),
-        ),
-        (
-            "test_scenario",
-            "take_shared_by_id",
-            make_native!(test_scenario::take_shared_by_id),
-        ),
-        (
-            "test_scenario",
-            "most_recent_id_shared",
-            make_native!(test_scenario::most_recent_id_shared),
-        ),
-        (
-            "test_scenario",
-            "was_taken_shared",
-            make_native!(test_scenario::was_taken_shared),
-        ),
-        (
-            "test_scenario",
-            "end_transaction",
-            make_native!(test_scenario::end_transaction),
-        ),
-        (
-            "test_scenario",
-            "ids_for_address",
-            make_native!(test_scenario::ids_for_address),
-        ),
-        (
-            "test_scenario",
-            "allocate_receiving_ticket_for_object",
-            make_native!(test_scenario::allocate_receiving_ticket_for_object),
-        ),
-        (
-            "test_scenario",
-            "deallocate_receiving_ticket_for_object",
-            make_native!(test_scenario::deallocate_receiving_ticket_for_object),
-        ),
-        (
             "transfer",
             "transfer_impl",
             make_native!(transfer::transfer_internal),
@@ -1341,7 +1275,6 @@ pub fn all_natives(silent: bool, protocol_config: &ProtocolConfig) -> NativeFunc
             "native_ids_created",
             make_native!(tx_context::ids_created),
         ),
-        ("tx_context", "replace", make_native!(tx_context::replace)),
         (
             "types",
             "is_one_time_witness",

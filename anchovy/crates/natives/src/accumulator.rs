@@ -5,6 +5,8 @@ use crate::{
     NativesCostTable, get_extension, get_extension_mut,
     object_runtime::{MoveAccumulatorAction, MoveAccumulatorValue, ObjectRuntime},
 };
+use exec_types::base::object_id;
+use exec_types::type_tags::type_tag_in;
 use move_binary_format::errors::PartialVMResult;
 use move_binary_format::safe_unwrap;
 use move_core_types::account_address::AccountAddress;
@@ -13,7 +15,6 @@ use move_vm_runtime::native_charge_gas_early_exit;
 use move_vm_runtime::natives::functions::{NativeContext, NativeResult};
 use smallvec::smallvec;
 use std::collections::VecDeque;
-use sui_types::base_types::ObjectID;
 
 pub fn emit_deposit_event(
     context: &mut NativeContext,
@@ -49,12 +50,14 @@ fn emit_event(
 
     let amount = safe_unwrap!(safe_unwrap!(args.pop_back()).value_as::<u64>());
     let recipient = safe_unwrap!(safe_unwrap!(args.pop_back()).value_as::<AccountAddress>());
-    let accumulator: ObjectID =
-        safe_unwrap!(safe_unwrap!(args.pop_back()).value_as::<AccountAddress>()).into();
+    let accumulator = object_id(&safe_unwrap!(
+        safe_unwrap!(args.pop_back()).value_as::<AccountAddress>()
+    ));
 
     let ty_tag = context.type_to_type_tag(&safe_unwrap!(ty_args.pop()))?;
 
     let obj_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
+    let ty_tag = type_tag_in(obj_runtime.bump, &ty_tag);
 
     obj_runtime.emit_accumulator_event(
         accumulator,

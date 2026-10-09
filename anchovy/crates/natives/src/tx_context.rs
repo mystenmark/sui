@@ -1,6 +1,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use exec_types::base::{self, move_address};
+use messages::base::Digest;
 use move_binary_format::errors::PartialVMResult;
 use move_binary_format::safe_unwrap;
 use move_core_types::{account_address::AccountAddress, gas_algebra::InternalGas};
@@ -12,7 +14,6 @@ use move_vm_runtime::{
 use move_vm_runtime::{native_charge_gas_early_exit, natives::functions::NativeContext};
 use smallvec::smallvec;
 use std::collections::VecDeque;
-use sui_types::{base_types::ObjectID, digests::TransactionDigest};
 
 use crate::{
     NativesCostTable, get_extension, get_extension_mut, object_runtime::ObjectRuntime,
@@ -47,10 +48,11 @@ pub fn derive_id(
     let ids_created = pop_arg!(args, u64);
     let tx_hash = pop_arg!(args, Vec<u8>);
 
-    let digest = safe_unwrap!(TransactionDigest::try_from(tx_hash.as_slice()));
-    let address = AccountAddress::from(ObjectID::derive_id(digest, ids_created));
+    let digest = Digest::new(safe_unwrap!(<[u8; 32]>::try_from(tx_hash.as_slice()).ok()));
+    let id = base::derive_id(&digest, ids_created);
+    let address = move_address(&id);
     let obj_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
-    obj_runtime.new_id(address.into())?;
+    obj_runtime.new_id(id)?;
 
     Ok(NativeResult::ok(
         context.gas_used(),
@@ -88,7 +90,7 @@ pub fn fresh_id(
 
     Ok(NativeResult::ok(
         context.gas_used(),
-        smallvec![Value::address(fresh_id.into())],
+        smallvec![Value::address(move_address(&fresh_id))],
     ))
 }
 
@@ -121,7 +123,7 @@ pub fn sender(
 
     Ok(NativeResult::ok(
         context.gas_used(),
-        smallvec![Value::address(sender.into())],
+        smallvec![Value::address(AccountAddress::new(sender.0))],
     ))
 }
 
@@ -218,7 +220,7 @@ pub fn sponsor(
     let transaction_context: &mut TransactionContext = get_extension_mut!(context)?;
     let sponsor = transaction_context
         .sponsor()
-        .map(|addr| addr.into())
+        .map(|addr| AccountAddress::new(addr.0))
         .into_iter();
     let sponsor = Value::vector_address(sponsor);
     Ok(NativeResult::ok(context.gas_used(), smallvec![sponsor]))
@@ -352,77 +354,11 @@ pub fn ids_created(
     ))
 }
 
-// //
-// // Test only function
-// //
+/// The test-only `replace` native's costs: the native is left out with the test scenario, but
+/// the cost table still reads them from the protocol config.
 #[derive(Clone)]
 pub struct TxContextReplaceCostParams {
     pub tx_context_replace_cost_base: InternalGas,
-}
-/***************************************************************************************************
- * native fun replace
- * Implementation of the Move native function
- * ```
- * native fun replace(
- *     sender: address,
- *     tx_hash: vector<u8>,
- *     epoch: u64,
- *     epoch_timestamp_ms: u64,
- *     ids_created: u64,
- *     rgp: u64,
- *     gas_price: u64,
- *     gas_budget: u64,
- *     sponsor: vector<address>,
- * )
- * ```
- * Used by all testing functions that have to change a value in the `TransactionContext`.
- **************************************************************************************************/
-pub fn replace(
-    context: &mut NativeContext,
-    ty_args: Vec<Type>,
-    mut args: VecDeque<Value>,
-) -> PartialVMResult<NativeResult> {
-    debug_assert!(ty_args.is_empty());
-    let args_len = args.len();
-    debug_assert!(args_len == 8 || args_len == 9);
-
-    // use the `TxContextReplaceCostParams` for the cost of this function
-    let tx_context_replace_cost_params: TxContextReplaceCostParams =
-        get_extension!(context, NativesCostTable)?
-            .tx_context_replace_cost_params
-            .clone();
-    native_charge_gas_early_exit!(
-        context,
-        tx_context_replace_cost_params.tx_context_replace_cost_base
-    );
-
-    let transaction_context: &mut TransactionContext = get_extension_mut!(context)?;
-    let mut sponsor: Vec<AccountAddress> = pop_arg!(args, Vec<AccountAddress>);
-    let gas_budget: u64 = pop_arg!(args, u64);
-    let gas_price: u64 = pop_arg!(args, u64);
-    let rgp: u64 = if args_len == 9 {
-        pop_arg!(args, u64)
-    } else {
-        transaction_context.rgp()
-    };
-    let ids_created: u64 = pop_arg!(args, u64);
-    let epoch_timestamp_ms: u64 = pop_arg!(args, u64);
-    let epoch: u64 = pop_arg!(args, u64);
-    let tx_hash: Vec<u8> = pop_arg!(args, Vec<u8>);
-    let sender: AccountAddress = pop_arg!(args, AccountAddress);
-    transaction_context.replace(
-        sender,
-        tx_hash,
-        epoch,
-        epoch_timestamp_ms,
-        ids_created,
-        rgp,
-        gas_price,
-        gas_budget,
-        sponsor.pop(),
-    )?;
-
-    Ok(NativeResult::ok(context.gas_used(), smallvec![]))
 }
 
 // Attempt to get the most recent created object ID when none has been created.
@@ -457,9 +393,10 @@ pub fn last_created_id(
     }
     ids_created -= 1;
     let digest = transaction_context.digest();
-    let address = AccountAddress::from(ObjectID::derive_id(digest, ids_created));
+    let id = base::derive_id(&digest, ids_created);
+    let address = move_address(&id);
     let obj_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
-    obj_runtime.new_id(address.into())?;
+    obj_runtime.new_id(id)?;
 
     Ok(NativeResult::ok(
         context.gas_used(),

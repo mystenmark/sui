@@ -5,6 +5,8 @@ use crate::{
     NativesCostTable, abstract_size, get_extension, get_extension_mut, legacy_test_cost,
     object_runtime::{MoveAccumulatorAction, MoveAccumulatorValue, ObjectRuntime},
 };
+use exec_types::base::object_id;
+use exec_types::type_tags::{struct_tag_in, to_move_struct_tag, type_tag_in};
 use move_binary_format::errors::{PartialVMError, PartialVMResult};
 use move_binary_format::{safe_assert, safe_assert_eq, safe_unwrap};
 use move_core_types::{
@@ -21,7 +23,7 @@ use move_vm_runtime::{
 use move_vm_runtime::{native_charge_gas_early_exit, natives::functions::NativeContext};
 use smallvec::smallvec;
 use std::collections::VecDeque;
-use sui_types::{base_types::ObjectID, error::VMMemoryLimitExceededSubStatusCode};
+use sui_types::error::VMMemoryLimitExceededSubStatusCode;
 
 pub const NOT_SUPPORTED: u64 = 0;
 
@@ -197,8 +199,9 @@ fn emit_impl(
     );
 
     let obj_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
+    let tag = struct_tag_in(obj_runtime.bump, &tag);
 
-    obj_runtime.emit_event(*tag, event_value)?;
+    obj_runtime.emit_event(tag, event_value)?;
 
     if let Some(StreamRef {
         accumulator_id,
@@ -207,8 +210,7 @@ fn emit_impl(
     }) = stream_ref
     {
         let stream_id_addr: AccountAddress = safe_unwrap!(stream_id.value_as::<AccountAddress>());
-        let accumulator_id: ObjectID =
-            safe_unwrap!(accumulator_id.value_as::<AccountAddress>()).into();
+        let accumulator_id = object_id(&safe_unwrap!(accumulator_id.value_as::<AccountAddress>()));
         let event_idx = obj_runtime
             .state
             .total_events_emitted()
@@ -221,7 +223,7 @@ fn emit_impl(
             accumulator_id,
             MoveAccumulatorAction::Merge,
             stream_id_addr,
-            safe_unwrap!(stream_head_type_tag),
+            type_tag_in(obj_runtime.bump, &safe_unwrap!(stream_head_type_tag)),
             MoveAccumulatorValue::EventRef(event_idx),
         )?;
     }
@@ -265,7 +267,7 @@ pub fn get_events_by_type(
         .events()
         .iter()
         .filter_map(|(tag, event)| {
-            if &specified_type_tag == tag {
+            if specified_type_tag == to_move_struct_tag(tag) {
                 Some(event.copy_value())
             } else {
                 None

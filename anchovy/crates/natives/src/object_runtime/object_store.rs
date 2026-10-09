@@ -2,30 +2,25 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::object_runtime::{fingerprint::ObjectFingerprint, get_all_uids};
+use containers::{BTreeMap, Bump, btree_map};
+use exec_types::base::EpochId;
+use exec_types::execution::DynamicallyLoadedObjectMetadata;
+use exec_types::object::Object;
+use exec_types::storage::RuntimeObjectResolver;
+use messages::base::{ObjectId, SequenceNumber};
+use messages::object::{Data, MoveObject, MoveObjectType, Owner};
 use move_binary_format::errors::{PartialVMError, PartialVMResult};
 use move_core_types::{annotated_value as A, runtime_value as R, vm_status::StatusCode};
-use move_vm_runtime::execution::values::{GlobalValue, StructRef, Value};
-use std::{
-    collections::{BTreeMap, btree_map},
-    sync::Arc,
-};
+use move_vm_runtime::execution::values::{GlobalValue, Value};
+use std::sync::Arc;
 use sui_protocol_config::{LimitThresholdCrossed, ProtocolConfig, check_limit_by_meter};
-use sui_types::{
-    base_types::{MoveObjectType, ObjectID, SequenceNumber},
-    committee::EpochId,
-    error::VMMemoryLimitExceededSubStatusCode,
-    execution::DynamicallyLoadedObjectMetadata,
-    metrics::ExecutionMetrics,
-    move_package::MovePackage,
-    object::{Data, MoveObject, Object, Owner},
-    storage::RuntimeObjectResolver,
-};
+use sui_types::{error::VMMemoryLimitExceededSubStatusCode, metrics::ExecutionMetrics};
 
-pub(super) struct ChildObject {
-    pub(super) owner: ObjectID,
-    pub(super) ty: MoveObjectType,
+pub(super) struct ChildObject<'a> {
+    pub(super) owner: ObjectId,
+    pub(super) ty: MoveObjectType<'a>,
     pub(super) value: GlobalValue,
-    pub(super) fingerprint: ObjectFingerprint,
+    pub(super) fingerprint: ObjectFingerprint<'a>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -41,44 +36,38 @@ pub(crate) enum CacheInfo {
 
 pub(crate) type CacheMetadata<T> = (CacheInfo, T);
 
-pub(crate) struct ActiveChildObject<'a> {
-    pub(crate) id: &'a ObjectID,
-    pub(crate) owner: &'a ObjectID,
-    pub(crate) ty: &'a MoveObjectType,
-    pub(crate) copied_value: Option<Value>,
-}
-
 #[derive(Debug)]
-struct ConfigSetting {
-    config: ObjectID,
-    ty: MoveObjectType,
+struct ConfigSetting<'a> {
+    config: ObjectId,
+    ty: MoveObjectType<'a>,
     value: Value,
 }
 
 #[derive(Debug)]
-pub(crate) struct ChildObjectEffect {
-    pub(super) owner: ObjectID,
-    pub(super) ty: MoveObjectType,
+pub(crate) struct ChildObjectEffect<'a> {
+    pub(super) owner: ObjectId,
+    pub(super) ty: MoveObjectType<'a>,
     pub(super) final_value: Option<Value>,
     // True if the value or the owner has changed
     pub(super) object_changed: bool,
 }
 
-pub(crate) type ChildObjectEffects = BTreeMap<ObjectID, ChildObjectEffect>;
+pub(crate) type ChildObjectEffects<'a> = BTreeMap<'a, ObjectId, ChildObjectEffect<'a>>;
 
 struct Inner<'a> {
+    bump: &'a Bump,
     // used for loading child objects
-    resolver: &'a dyn RuntimeObjectResolver,
+    resolver: &'a dyn RuntimeObjectResolver<'a>,
     // The version of the root object in ownership at the beginning of the transaction.
     // If it was a child object, it resolves to the root parent's sequence number.
     // Otherwise, it is just the sequence number at the beginning of the transaction.
-    root_version: BTreeMap<ObjectID, SequenceNumber>,
+    root_version: BTreeMap<'a, ObjectId, SequenceNumber>,
     // A map from a wrapped object to the object it was contained in at the
     // beginning of the transaction.
-    wrapped_object_containers: BTreeMap<ObjectID, ObjectID>,
+    wrapped_object_containers: BTreeMap<'a, ObjectId, ObjectId>,
     // cached objects from the resolver. An object might be in this map but not in the store
     // if it's existence was queried, but the value was not used.
-    cached_objects: BTreeMap<ObjectID, Option<Object>>,
+    cached_objects: BTreeMap<'a, ObjectId, Option<Object<'a>>>,
     // whether or not this TX is gas metered
     is_metered: bool,
     // Protocol config used to enforce limits
@@ -98,8 +87,8 @@ pub(super) struct ChildObjectStore<'a> {
     inner: Inner<'a>,
     // Maps of populated GlobalValues, meaning the child object has been accessed in this
     // transaction
-    store: BTreeMap<ObjectID, ChildObject>,
-    config_setting_cache: BTreeMap<ObjectID, ConfigSetting>,
+    store: BTreeMap<'a, ObjectId, ChildObject<'a>>,
+    config_setting_cache: BTreeMap<'a, ObjectId, ConfigSetting<'a>>,
     // whether or not this TX is gas metered
     is_metered: bool,
 }
@@ -110,7 +99,7 @@ pub(crate) enum ObjectResult<V> {
     Loaded(V),
 }
 
-type LoadedWithMetadataResult<V> = Option<(V, DynamicallyLoadedObjectMetadata)>;
+type LoadedWithMetadataResult<'a, V> = Option<(V, DynamicallyLoadedObjectMetadata<'a>)>;
 
 macro_rules! fetch_child_object_unbounded {
     ($inner:ident, $parent:ident, $child:ident, $parents_root_version:expr, $had_parent_root_version:expr) => {{
@@ -133,9 +122,9 @@ macro_rules! fetch_child_object_unbounded {
             }
             // guard against bugs in `read_child_object`: if it returns a child object such that
             // C.parent != parent, we raise an invariant violation
-            match &object.owner {
+            match object.owner() {
                 Owner::ObjectOwner(id) => {
-                    if ObjectID::from(*id) != $parent {
+                    if id.0 != $parent.0 {
                         return Err(PartialVMError::new(StatusCode::STORAGE_ERROR).with_message(
                             format!(
                                 "Bad owner for {}. Expected owner {} but found owner {}",
@@ -148,7 +137,7 @@ macro_rules! fetch_child_object_unbounded {
                 | Owner::Immutable
                 | Owner::Shared { .. }
                 | Owner::ConsensusAddressOwner { .. }
-                | Owner::Party { .. } => {
+                | Owner::Party(_) => {
                     return Err(PartialVMError::new(StatusCode::STORAGE_ERROR).with_message(
                         format!(
                             "Bad owner for {}. \
@@ -159,7 +148,7 @@ macro_rules! fetch_child_object_unbounded {
                     ));
                 }
             };
-            match &object.data {
+            match object.data() {
                 Data::Package(_) => {
                     return Err(PartialVMError::new(StatusCode::STORAGE_ERROR).with_message(
                         format!(
@@ -177,13 +166,13 @@ macro_rules! fetch_child_object_unbounded {
     }};
 }
 
-impl Inner<'_> {
+impl<'a> Inner<'a> {
     fn receive_object_from_store(
         &self,
-        owner: ObjectID,
-        child: ObjectID,
+        owner: ObjectId,
+        child: ObjectId,
         version: SequenceNumber,
-    ) -> PartialVMResult<CacheMetadata<LoadedWithMetadataResult<MoveObject>>> {
+    ) -> PartialVMResult<CacheMetadata<LoadedWithMetadataResult<'a, MoveObject<'a>>>> {
         let child_opt = self
             .resolver
             .get_object_received_at_version(&owner, &child, version, self.current_epoch_id)
@@ -194,21 +183,21 @@ impl Inner<'_> {
             // guard against bugs in `receive_object_at_version`: if it returns a child object such that
             // C.parent != parent, we raise an invariant violation since that should be checked by
             // `receive_object_at_version`.
-            if object.owner != Owner::AddressOwner(owner.into()) {
+            if !matches!(object.owner(), Owner::AddressOwner(a) if a.0 == owner.0) {
                 return Err(
                     PartialVMError::new(StatusCode::STORAGE_ERROR).with_message(format!(
                         "Bad owner for {child}. \
-                        Expected owner {owner} but found owner {}",
-                        object.owner
+                        Expected owner {owner} but found owner {:?}",
+                        object.owner()
                     )),
                 );
             }
             let loaded_metadata = DynamicallyLoadedObjectMetadata {
                 version,
                 digest: object.digest(),
-                storage_rebate: object.storage_rebate,
-                owner: object.owner.clone(),
-                previous_transaction: object.previous_transaction,
+                storage_rebate: object.storage_rebate(),
+                owner: *object.owner(),
+                previous_transaction: object.previous_transaction(),
             };
 
             // `RuntimeObjectResolver::receive_object_at_version` should return the object at the
@@ -224,7 +213,7 @@ impl Inner<'_> {
                     )),
                 );
             }
-            match object.into_inner().data {
+            match *object.data() {
                 Data::Package(_) => {
                     return Err(PartialVMError::new(StatusCode::STORAGE_ERROR).with_message(
                         format!(
@@ -233,8 +222,8 @@ impl Inner<'_> {
                         ),
                     ));
                 }
-                Data::Move(mo @ MoveObject { .. }) => (
-                    CacheInfo::Loaded(Some(mo.contents().len())),
+                Data::Move(mo) => (
+                    CacheInfo::Loaded(Some(mo.contents.len())),
                     Some((mo, loaded_metadata)),
                 ),
             }
@@ -244,18 +233,17 @@ impl Inner<'_> {
         Ok((cache_info, obj_opt))
     }
 
-    #[allow(clippy::map_entry)]
     fn get_or_fetch_object_from_store(
         &mut self,
-        parent: ObjectID,
-        child: ObjectID,
-    ) -> PartialVMResult<CacheMetadata<Option<&MoveObject>>> {
+        parent: ObjectId,
+        child: ObjectId,
+    ) -> PartialVMResult<CacheMetadata<Option<MoveObject<'a>>>> {
         let cached_objects_count = self.cached_objects.len() as u64;
         let parents_root_version = self.root_version.get(&parent).copied();
         let had_parent_root_version = parents_root_version.is_some();
         // if not found, it must be new so it won't have any child objects, thus
         // we can return SequenceNumber(0) as no child object will be found
-        let parents_root_version = parents_root_version.unwrap_or(SequenceNumber::new());
+        let parents_root_version = parents_root_version.unwrap_or(0);
         let cache_info = if let btree_map::Entry::Vacant(e) = self.cached_objects.entry(child) {
             let obj_opt = fetch_child_object_unbounded!(
                 self,
@@ -288,8 +276,8 @@ impl Inner<'_> {
             let num_bytes_opt = match &obj_opt {
                 Some(obj) => {
                     // unwrap safe because we only insert Move objects
-                    let move_obj = obj.data.try_as_move().unwrap();
-                    Some(move_obj.contents().len())
+                    let move_obj = obj.try_as_move().unwrap();
+                    Some(move_obj.contents.len())
                 }
                 None => None,
             };
@@ -305,19 +293,19 @@ impl Inner<'_> {
             .get(&child)
             .unwrap()
             .as_ref()
-            .map(|obj| obj.data.try_as_move().unwrap());
+            .map(|obj| *obj.try_as_move().unwrap());
         Ok((cache_info, move_obj_opt))
     }
 
     fn fetch_object_impl(
         &mut self,
-        parent: ObjectID,
-        child: ObjectID,
-        child_ty_layout: &R::MoveTypeLayout,
+        parent: ObjectId,
+        child: ObjectId,
+        child_ty_layout: R::MoveTypeLayout,
         child_ty_fully_annotated_layout: &A::MoveTypeLayout,
-        child_move_type: &MoveObjectType,
+        child_move_type: &MoveObjectType<'a>,
     ) -> PartialVMResult<
-        ObjectResult<CacheMetadata<(MoveObjectType, GlobalValue, ObjectFingerprint)>>,
+        ObjectResult<CacheMetadata<(MoveObjectType<'a>, GlobalValue, ObjectFingerprint<'a>)>>,
     > {
         // retrieve the object from storage if it exists
         let (cache_info, obj_opt) = self.get_or_fetch_object_from_store(parent, child)?;
@@ -325,33 +313,31 @@ impl Inner<'_> {
             return Ok(ObjectResult::Loaded((
                 cache_info,
                 (
-                    child_move_type.clone(),
+                    *child_move_type,
                     GlobalValue::empty(),
                     ObjectFingerprint::none(),
                 ),
             )));
         };
         // object exists, but the type does not match
-        if obj.type_() != child_move_type {
+        if obj.type_ != *child_move_type {
             return Ok(ObjectResult::MismatchedType);
         }
         // deserialize the value
-        let obj_contents = obj.contents();
-        let v = match Value::simple_deserialize(obj_contents, child_ty_layout) {
-            Some(v) => v,
-            None => return Err(
-                PartialVMError::new(StatusCode::FAILED_TO_DESERIALIZE_RESOURCE).with_message(
-                    format!("Failed to deserialize object {child} with type {child_move_type}",),
-                ),
-            ),
-        };
+        let obj_contents = obj.contents;
+        let v =
+            match Value::simple_deserialize(obj_contents, &child_ty_layout) {
+                Some(v) => v,
+                None => return Err(PartialVMError::new(
+                    StatusCode::FAILED_TO_DESERIALIZE_RESOURCE,
+                )
+                .with_message(format!(
+                    "Failed to deserialize object {child} with type {child_move_type:?}",
+                ))),
+            };
         // save a fingerprint
         let fingerprint =
-            ObjectFingerprint::preexisting(&parent, child_move_type, &v).map_err(|e| {
-                PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR).with_message(
-                    format!("Failed to fingerprint value for object {child}. Error: {e}"),
-                )
-            })?;
+            ObjectFingerprint::preexisting(&parent, child_move_type, obj_contents, child_ty_layout);
         // generate a global value
         let global_value =
             match GlobalValue::create(v) {
@@ -363,8 +349,8 @@ impl Inner<'_> {
                 }
             };
         // Find all UIDs inside of the value and update the object parent maps
-        let contained_uids =
-            get_all_uids(child_ty_fully_annotated_layout, obj_contents).map_err(|e| {
+        let contained_uids = get_all_uids(self.bump, child_ty_fully_annotated_layout, obj_contents)
+            .map_err(|e| {
                 PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
                     .with_message(format!("Failed to find UIDs. ERROR: {e}"))
             })?;
@@ -381,27 +367,29 @@ impl Inner<'_> {
         }
         Ok(ObjectResult::Loaded((
             cache_info,
-            (child_move_type.clone(), global_value, fingerprint),
+            (*child_move_type, global_value, fingerprint),
         )))
     }
 }
 
-fn deserialize_move_object(
-    obj: &MoveObject,
+fn deserialize_move_object<'a>(
+    obj: &MoveObject<'a>,
     child_ty_layout: &R::MoveTypeLayout,
-    child_move_type: MoveObjectType,
-) -> PartialVMResult<ObjectResult<(MoveObjectType, Value)>> {
+    child_move_type: MoveObjectType<'a>,
+) -> PartialVMResult<ObjectResult<(MoveObjectType<'a>, Value)>> {
     let child_id = obj.id();
     // object exists, but the type does not match
-    if obj.type_() != &child_move_type {
+    if obj.type_ != child_move_type {
         return Ok(ObjectResult::MismatchedType);
     }
-    let value = match Value::simple_deserialize(obj.contents(), child_ty_layout) {
+    let value = match Value::simple_deserialize(obj.contents, child_ty_layout) {
         Some(v) => v,
         None => {
             return Err(
                 PartialVMError::new(StatusCode::FAILED_TO_DESERIALIZE_RESOURCE).with_message(
-                    format!("Failed to deserialize object {child_id} with type {child_move_type}",),
+                    format!(
+                        "Failed to deserialize object {child_id} with type {child_move_type:?}",
+                    ),
                 ),
             );
         }
@@ -411,9 +399,10 @@ fn deserialize_move_object(
 
 impl<'a> ChildObjectStore<'a> {
     pub(super) fn new(
-        resolver: &'a dyn RuntimeObjectResolver,
-        root_version: BTreeMap<ObjectID, SequenceNumber>,
-        wrapped_object_containers: BTreeMap<ObjectID, ObjectID>,
+        bump: &'a Bump,
+        resolver: &'a dyn RuntimeObjectResolver<'a>,
+        root_version: BTreeMap<'a, ObjectId, SequenceNumber>,
+        wrapped_object_containers: BTreeMap<'a, ObjectId, ObjectId>,
         is_metered: bool,
         protocol_config: &'a ProtocolConfig,
         metrics: Arc<ExecutionMetrics>,
@@ -421,17 +410,18 @@ impl<'a> ChildObjectStore<'a> {
     ) -> Self {
         Self {
             inner: Inner {
+                bump,
                 resolver,
                 root_version,
                 wrapped_object_containers,
-                cached_objects: BTreeMap::new(),
+                cached_objects: BTreeMap::new_in(bump),
                 is_metered,
                 protocol_config,
                 metrics,
                 current_epoch_id,
             },
-            store: BTreeMap::new(),
-            config_setting_cache: BTreeMap::new(),
+            store: BTreeMap::new_in(bump),
+            config_setting_cache: BTreeMap::new_in(bump),
             is_metered,
         }
     }
@@ -441,8 +431,8 @@ impl<'a> ChildObjectStore<'a> {
     /// re-creation of derived objects, or if we grant access to the `id: UID` of a dynamic field.
     pub(super) fn inherit_root_version_from_parent(
         &mut self,
-        parent: ObjectID,
-        id: ObjectID,
+        parent: ObjectId,
+        id: ObjectId,
     ) -> PartialVMResult<()> {
         if let Some(v) = self.inner.root_version.get(&parent).copied() {
             let prev_v_opt = self.inner.root_version.insert(id, v);
@@ -462,13 +452,13 @@ impl<'a> ChildObjectStore<'a> {
 
     pub(super) fn receive_object(
         &mut self,
-        parent: ObjectID,
-        child: ObjectID,
+        parent: ObjectId,
+        child: ObjectId,
         child_version: SequenceNumber,
         child_layout: &R::MoveTypeLayout,
         child_fully_annotated_layout: &A::MoveTypeLayout,
-        child_move_type: MoveObjectType,
-    ) -> PartialVMResult<LoadedWithMetadataResult<ObjectResult<CacheMetadata<Value>>>> {
+        child_move_type: MoveObjectType<'a>,
+    ) -> PartialVMResult<LoadedWithMetadataResult<'a, ObjectResult<CacheMetadata<Value>>>> {
         let (cache_info, Some((obj, obj_meta))) =
             self.inner
                 .receive_object_from_store(parent, child, child_version)?
@@ -483,8 +473,9 @@ impl<'a> ChildObjectStore<'a> {
                     // Find all UIDs inside of the value and update the object parent maps with the contained
                     // UIDs in the received value. They should all have an upper bound version as the receiving object.
                     // Only do this if we successfully load the object though.
-                    let contained_uids = get_all_uids(child_fully_annotated_layout, obj.contents())
-                        .map_err(|e| {
+                    let contained_uids =
+                        get_all_uids(self.inner.bump, child_fully_annotated_layout, obj.contents)
+                            .map_err(|e| {
                             PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
                                 .with_message(format!(
                                     "Failed to find UIDs for receiving object. ERROR: {e}"
@@ -505,8 +496,8 @@ impl<'a> ChildObjectStore<'a> {
 
     pub(super) fn object_exists(
         &mut self,
-        parent: ObjectID,
-        child: ObjectID,
+        parent: ObjectId,
+        child: ObjectId,
     ) -> PartialVMResult<CacheMetadata<bool>> {
         if let Some(child_object) = self.store.get(&child) {
             return child_object
@@ -520,32 +511,34 @@ impl<'a> ChildObjectStore<'a> {
 
     pub(super) fn object_exists_and_has_type(
         &mut self,
-        parent: ObjectID,
-        child: ObjectID,
-        child_move_type: &MoveObjectType,
+        parent: ObjectId,
+        child: ObjectId,
+        child_move_type: &MoveObjectType<'_>,
     ) -> PartialVMResult<CacheMetadata<bool>> {
         if let Some(child_object) = self.store.get(&child) {
             // exists and has same type
             return Ok((
                 CacheInfo::CachedValue,
-                child_object.value.exists()? && &child_object.ty == child_move_type,
+                child_object.value.exists()? && child_object.ty == *child_move_type,
             ));
         }
         let (cache_info, obj_opt) = self.inner.get_or_fetch_object_from_store(parent, child)?;
         Ok((
             cache_info,
-            obj_opt.is_some_and(|obj| obj.type_() == child_move_type),
+            obj_opt.is_some_and(|obj| obj.type_ == *child_move_type),
         ))
     }
 
+    /// The child's runtime layout is taken by value: on a load from storage it becomes the
+    /// fingerprint's, to serialize the final value with.
     pub(super) fn get_or_fetch_object(
         &mut self,
-        parent: ObjectID,
-        child: ObjectID,
-        child_layout: &R::MoveTypeLayout,
+        parent: ObjectId,
+        child: ObjectId,
+        child_layout: R::MoveTypeLayout,
         child_fully_annotated_layout: &A::MoveTypeLayout,
-        child_move_type: MoveObjectType,
-    ) -> PartialVMResult<ObjectResult<CacheMetadata<&mut ChildObject>>> {
+        child_move_type: MoveObjectType<'a>,
+    ) -> PartialVMResult<ObjectResult<CacheMetadata<&mut ChildObject<'a>>>> {
         let store_entries_count = self.store.len() as u64;
         let (cache_info, child_object) = match self.store.entry(child) {
             btree_map::Entry::Vacant(e) => {
@@ -588,7 +581,7 @@ impl<'a> ChildObjectStore<'a> {
                 debug_assert_eq!(
                     ty, child_move_type,
                     "Child object type mismatch. \
-                    Expected {child_move_type} but found {ty}"
+                    Expected {child_move_type:?} but found {ty:?}"
                 );
                 (
                     cache_info,
@@ -613,9 +606,9 @@ impl<'a> ChildObjectStore<'a> {
 
     pub(super) fn add_object(
         &mut self,
-        parent: ObjectID,
-        child: ObjectID,
-        child_move_type: MoveObjectType,
+        parent: ObjectId,
+        child: ObjectId,
+        child_move_type: MoveObjectType<'a>,
         child_value: Value,
     ) -> PartialVMResult<()> {
         if let LimitThresholdCrossed::Hard(_, lim) = check_limit_by_meter!(
@@ -682,10 +675,10 @@ impl<'a> ChildObjectStore<'a> {
 
     pub(super) fn config_setting_unsequenced_read(
         &mut self,
-        config_id: ObjectID,
-        name_df_id: ObjectID,
+        config_id: ObjectId,
+        name_df_id: ObjectId,
         field_setting_layout: &R::MoveTypeLayout,
-        field_setting_object_type: &MoveObjectType,
+        field_setting_object_type: &MoveObjectType<'a>,
     ) -> PartialVMResult<ObjectResult<Option<Value>>> {
         let parent = config_id;
         let child = name_df_id;
@@ -694,14 +687,12 @@ impl<'a> ChildObjectStore<'a> {
             btree_map::Entry::Vacant(e) => {
                 let child_move_type = field_setting_object_type;
                 let inner = &self.inner;
-                let obj_opt =
-                    fetch_child_object_unbounded!(inner, parent, child, SequenceNumber::MAX, true);
-                let Some(move_obj) = obj_opt.as_ref().map(|obj| obj.data.try_as_move().unwrap())
-                else {
+                let obj_opt = fetch_child_object_unbounded!(inner, parent, child, u64::MAX, true);
+                let Some(move_obj) = obj_opt.as_ref().map(|obj| *obj.try_as_move().unwrap()) else {
                     return Ok(ObjectResult::Loaded(None));
                 };
                 let Some(value) =
-                    Value::simple_deserialize(move_obj.contents(), field_setting_layout)
+                    Value::simple_deserialize(move_obj.contents, field_setting_layout)
                 else {
                     return Err(
                         PartialVMError::new(StatusCode::FAILED_TO_DESERIALIZE_RESOURCE)
@@ -712,7 +703,7 @@ impl<'a> ChildObjectStore<'a> {
                 };
                 e.insert(ConfigSetting {
                     config: parent,
-                    ty: child_move_type.clone(),
+                    ty: *child_move_type,
                     value,
                 })
             }
@@ -728,7 +719,7 @@ impl<'a> ChildObjectStore<'a> {
                                 "Parent for config setting changed. Potential hash collision?
                                 parent: {parent},
                                 child: {child},
-                                setting_value_object_type: {field_setting_object_type},
+                                setting_value_object_type: {field_setting_object_type:?},
                                 setting: {setting:#?}"
                             )),
                     );
@@ -740,96 +731,46 @@ impl<'a> ChildObjectStore<'a> {
         Ok(ObjectResult::Loaded(Some(value)))
     }
 
-    /// Used by test scenario to insert a config setting into the cache, which replicates the
-    /// behavior of a config already being in the object store.
-    pub(super) fn config_setting_cache_update(
-        &mut self,
-        config_id: ObjectID,
-        name_df_id: ObjectID,
-        setting_value_object_type: MoveObjectType,
-        value: Option<Value>,
-    ) {
-        let child_move_type = setting_value_object_type;
-        match value {
-            Some(value) => {
-                let setting = ConfigSetting {
-                    config: config_id,
-                    ty: child_move_type,
-                    value,
-                };
-                self.config_setting_cache.insert(name_df_id, setting);
-            }
-            None => {
-                self.config_setting_cache.remove(&name_df_id);
-            }
-        }
-    }
-
     pub(super) fn get_package_at_version(
         &self,
-        package_id: ObjectID,
+        package_id: ObjectId,
         package_version: SequenceNumber,
-    ) -> Option<MovePackage> {
+    ) -> Option<Object<'a>> {
         self.inner
             .resolver
             .get_package_at_version(&package_id, package_version)
     }
 
-    pub(super) fn cached_objects(&self) -> &BTreeMap<ObjectID, Option<Object>> {
+    pub(super) fn cached_objects(&self) -> &BTreeMap<'a, ObjectId, Option<Object<'a>>> {
         &self.inner.cached_objects
     }
 
-    pub(super) fn wrapped_object_containers(&self) -> &BTreeMap<ObjectID, ObjectID> {
+    pub(super) fn wrapped_object_containers(&self) -> &BTreeMap<'a, ObjectId, ObjectId> {
         &self.inner.wrapped_object_containers
     }
 
     // retrieve the effects for the child objects
-    pub(super) fn take_effects(&mut self) -> PartialVMResult<ChildObjectEffects> {
-        let effects = std::mem::take(&mut self.store)
-            .into_iter()
-            .map(|(id, child_object)| {
-                let ChildObject {
-                    owner,
-                    ty,
-                    value,
-                    fingerprint,
-                } = child_object;
-                let final_value = value.into_value()?;
-                let object_changed = fingerprint.object_has_changed(&owner, &ty, &final_value)?;
-                let child_effect = ChildObjectEffect {
-                    owner,
-                    ty,
-                    final_value,
-                    object_changed,
-                };
-                Ok((id, child_effect))
-            })
-            .collect::<PartialVMResult<_>>()?;
-        Ok(effects)
-    }
-
-    pub(super) fn all_active_objects(&self) -> impl Iterator<Item = ActiveChildObject<'_>> {
-        self.store.iter().map(|(id, child_object)| {
-            let copied_child_value = if child_object.value.exists().unwrap() {
-                Some(
-                    child_object
-                        .value
-                        .borrow_global()
-                        .unwrap()
-                        .value_as::<StructRef>()
-                        .unwrap()
-                        .read_ref()
-                        .unwrap(),
-                )
-            } else {
-                None
+    pub(super) fn take_effects(&mut self) -> PartialVMResult<ChildObjectEffects<'a>> {
+        let bump = self.inner.bump;
+        let store = std::mem::replace(&mut self.store, BTreeMap::new_in(bump));
+        let mut effects = BTreeMap::new_in(bump);
+        for (id, child_object) in store {
+            let ChildObject {
+                owner,
+                ty,
+                value,
+                fingerprint,
+            } = child_object;
+            let final_value = value.into_value()?;
+            let object_changed = fingerprint.object_has_changed(&owner, &ty, &final_value)?;
+            let child_effect = ChildObjectEffect {
+                owner,
+                ty,
+                final_value,
+                object_changed,
             };
-            ActiveChildObject {
-                id,
-                owner: &child_object.owner,
-                ty: &child_object.ty,
-                copied_value: copied_child_value,
-            }
-        })
+            effects.insert(id, child_effect);
+        }
+        Ok(effects)
     }
 }

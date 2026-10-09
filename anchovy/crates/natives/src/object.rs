@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{NativesCostTable, get_extension, get_extension_mut, object_runtime::ObjectRuntime};
+use exec_types::base::object_id;
 use move_binary_format::safe_unwrap;
 use move_binary_format::{errors::PartialVMResult, safe_assert};
 use move_core_types::{account_address::AccountAddress, gas_algebra::InternalGas};
@@ -78,7 +79,7 @@ pub fn delete_impl(
     let uid_bytes = pop_arg!(args, AccountAddress);
 
     let obj_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
-    obj_runtime.delete_id(uid_bytes.into())?;
+    obj_runtime.delete_id(object_id(&uid_bytes))?;
     Ok(NativeResult::ok(context.gas_used(), smallvec![]))
 }
 
@@ -114,7 +115,7 @@ pub fn record_new_uid(
     let uid_bytes = pop_arg!(args, AccountAddress);
 
     let obj_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
-    obj_runtime.new_id(uid_bytes.into())?;
+    obj_runtime.new_id(object_id(&uid_bytes))?;
     Ok(NativeResult::ok(context.gas_used(), smallvec![]))
 }
 
@@ -146,6 +147,6 @@ pub fn record_new_uid_from_hash(
     let parent = pop_arg!(args, AccountAddress);
 
     let obj_runtime: &mut ObjectRuntime = get_extension_mut!(context)?;
-    obj_runtime.new_id_from_hash(parent.into(), uid_bytes.into())?;
+    obj_runtime.new_id_from_hash(object_id(&parent), object_id(&uid_bytes))?;
     Ok(NativeResult::ok(context.gas_used(), smallvec![]))
 }

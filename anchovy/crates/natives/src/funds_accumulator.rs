@@ -3,6 +3,10 @@
 
 use std::collections::VecDeque;
 
+use exec_types::base::object_id;
+use exec_types::storage::ObjectFundsSufficiency;
+use exec_types::type_tags::type_tag_in;
+use messages::base::SuiAddress;
 use move_binary_format::{
     errors::{PartialVMError, PartialVMResult},
     safe_assert_eq, safe_unwrap,
@@ -20,10 +24,7 @@ use move_vm_runtime::{
 };
 use smallvec::smallvec;
 use sui_types::{
-    accumulator_root::check_accumulator_type_bounds,
-    base_types::{ObjectID, SuiAddress},
-    funds_accumulator::E_OBJECT_FUNDS_INSUFFICIENT,
-    storage::ObjectFundsSufficiency,
+    accumulator_root::check_accumulator_type_bounds, funds_accumulator::E_OBJECT_FUNDS_INSUFFICIENT,
 };
 
 use crate::{
@@ -69,8 +70,9 @@ pub fn add_to_accumulator_address(
         );
     };
     let recipient = safe_unwrap!(safe_unwrap!(args.pop_back()).value_as::<AccountAddress>());
-    let accumulator: ObjectID =
-        safe_unwrap!(safe_unwrap!(args.pop_back()).value_as::<AccountAddress>()).into();
+    let accumulator = object_id(&safe_unwrap!(
+        safe_unwrap!(args.pop_back()).value_as::<AccountAddress>()
+    ));
 
     // TODO this will need to look at the layout of T when this is not guaranteed to be a Balance
     let Some([amount]): Option<[Value; 1]> = value.unpack().collect::<Vec<_>>().try_into().ok()
@@ -103,6 +105,7 @@ pub fn add_to_accumulator_address(
         return Ok(NativeResult::err(cost, E_ACCUMULATOR_TYPE_TOO_LARGE));
     }
 
+    let ty_tag = type_tag_in(obj_runtime.bump, &ty_tag);
     obj_runtime.emit_accumulator_event(
         accumulator,
         MoveAccumulatorAction::Merge,
@@ -134,8 +137,9 @@ pub fn withdraw_from_accumulator_address(
 
     let value = safe_unwrap!(safe_unwrap!(args.pop_back()).value_as::<U256>());
     let recipient = safe_unwrap!(safe_unwrap!(args.pop_back()).value_as::<AccountAddress>());
-    let accumulator: ObjectID =
-        safe_unwrap!(safe_unwrap!(args.pop_back()).value_as::<AccountAddress>()).into();
+    let accumulator = object_id(&safe_unwrap!(
+        safe_unwrap!(args.pop_back()).value_as::<AccountAddress>()
+    ));
 
     // TODO this will need to look at the layout of T when this is not guaranteed to be a Balance
     let Ok(amount): Result<u64, _> = value.try_into() else {
@@ -150,6 +154,7 @@ pub fn withdraw_from_accumulator_address(
         return Ok(NativeResult::err(cost, E_ACCUMULATOR_TYPE_TOO_LARGE));
     }
 
+    let ty_tag = type_tag_in(obj_runtime.bump, &ty_tag);
     obj_runtime.emit_accumulator_event(
         accumulator,
         MoveAccumulatorAction::Split,
@@ -193,10 +198,14 @@ pub fn reserve_object_funds_for_withdrawal(
         })?;
         native_charge_gas_early_exit!(context, base_cost);
 
-        let ty_tag = context.type_to_type_tag(&safe_unwrap!(ty_args.pop()))?;
+        let ty_tag = type_tag_in(
+            obj_runtime.bump,
+            &context.type_to_type_tag(&safe_unwrap!(ty_args.pop()))?,
+        );
         let limit = safe_unwrap!(safe_unwrap!(args.pop_back()).value_as::<U256>());
-        let owner: SuiAddress =
-            safe_unwrap!(safe_unwrap!(args.pop_back()).value_as::<AccountAddress>()).into();
+        let owner = SuiAddress(
+            safe_unwrap!(safe_unwrap!(args.pop_back()).value_as::<AccountAddress>()).into_bytes(),
+        );
 
         // We want to charge extra gas if we need to read the object available funds from storage.
         // This should only need to be done once per account.
