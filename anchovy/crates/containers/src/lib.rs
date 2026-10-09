@@ -44,9 +44,14 @@ pub fn leak<T>(bump: &Bump, value: T) -> &T {
 
 /// A copy of `slice` in the arena.
 pub fn alloc_slice_copy<'a, T: Copy>(bump: &'a Bump, slice: &[T]) -> &'a [T] {
+    vec_from_slice(bump, slice).leak()
+}
+
+/// A copy of `slice` as an arena vector.
+pub fn vec_from_slice<'a, T: Copy>(bump: &'a Bump, slice: &[T]) -> Vec<'a, T> {
     let mut v = Vec::with_capacity_in(slice.len(), bump);
     v.extend_from_slice(slice);
-    v.leak()
+    v
 }
 
 /// A copy of `s` in the arena.

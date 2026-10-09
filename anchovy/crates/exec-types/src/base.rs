@@ -10,6 +10,11 @@ use messages::base::{AccountAddress, ObjectDigest, ObjectId, SequenceNumber, Tra
 
 pub type ObjectRef = (ObjectId, SequenceNumber, ObjectDigest);
 
+/// A wire object reference as the reference's tuple.
+pub fn object_ref(r: &messages::base::ObjectRef) -> ObjectRef {
+    (r.id, r.version.get(), r.digest)
+}
+
 pub type EpochId = u64;
 
 pub const MOVE_STDLIB_ADDRESS: AccountAddress = address(0x1);
