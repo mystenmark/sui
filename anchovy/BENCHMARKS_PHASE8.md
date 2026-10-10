@@ -128,3 +128,19 @@ hit allocates nothing:
 
 Native execution is now ~2.1× the reference's speed with a quarter to a third of its
 allocations. Commit is unchanged by this work (18–24 µs per transaction, varying run to run).
+
+## After the second profile
+
+The profile after the type cache put linkage resolution at ~15% of a transfer (most of it the
+runtime's package lookup and its timers), store reads ~12.5%, and still 2% in the gas coin's
+type (building and SipHash-hashing its tag on every hit). Fixes: the runtime's resolved packages
+kept for the epoch (`PackageCache`), named slots for the framework types, foldhash for the
+cache tables. Native only, 20,000 transactions:
+
+| workload | execute | allocs |
+|---|---|---|
+| transfer | 17.9 µs | 184 |
+| create | 24.4 µs | 270 |
+
+Remaining at the top: store reads (tidehunter), computing the input type resolution linkage,
+PTB memory-safety verification (as in the reference) and the VM's own heap hashing.
