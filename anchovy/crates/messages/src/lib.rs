@@ -28,7 +28,7 @@ pub mod tx_index;
 pub mod type_tag;
 
 pub use error::{ParseError, Result};
-pub use message::{Message, Parse, Wire, WireBuf};
+pub use message::{Kept, Message, Parse, Wire, WireBuf};
 
 /// Implements [`Wire`] and [`message::Parse`] for a view type with an
 /// inherent `parse(r, a)`. `guess = N` sets the single-pass arena guess to

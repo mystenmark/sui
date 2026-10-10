@@ -87,6 +87,19 @@ pub enum MoveObjectType<'a> {
     BalanceAccumulatorField(TypeTag<'a>),
 }
 
+impl MoveObjectType<'_> {
+    /// The length of its BCS encoding, without encoding it.
+    pub fn bcs_size(&self) -> usize {
+        1 + match self {
+            MoveObjectType::Other(s) => s.bcs_size(),
+            MoveObjectType::Coin(t) | MoveObjectType::BalanceAccumulatorField(t) => t.bcs_size(),
+            MoveObjectType::GasCoin
+            | MoveObjectType::StakedSui
+            | MoveObjectType::SuiBalanceAccumulatorField => 0,
+        }
+    }
+}
+
 impl<'a> MoveObjectType<'a> {
     pub fn parse<A: Alloc<'a>>(r: &mut Reader<'a>, a: &mut A) -> Result<MoveObjectType<'a>> {
         // A newtype struct around an enum.
@@ -118,6 +131,20 @@ pub struct MoveObject<'a> {
     pub has_public_transfer: bool,
     pub version: SequenceNumber,
     pub contents: &'a [u8],
+}
+
+impl MoveObject<'_> {
+    /// The `UID` its contents begin with, as the reference's `MoveObject::id`.
+    ///
+    /// # Panics
+    /// If the contents are shorter than an id, as the reference does.
+    pub fn id(&self) -> ObjectId {
+        ObjectId(
+            self.contents[..ObjectId::LENGTH]
+                .try_into()
+                .expect("a Move object begins with its id"),
+        )
+    }
 }
 
 impl<'a> MoveObject<'a> {

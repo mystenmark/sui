@@ -116,6 +116,24 @@ impl<T: PartialEq> PartialEq for Ref<'_, T> {
 
 impl<T: Eq> Eq for Ref<'_, T> {}
 
+impl<T: PartialOrd> PartialOrd for Ref<'_, T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        (**self).partial_cmp(&**other)
+    }
+}
+
+impl<T: Ord> Ord for Ref<'_, T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (**self).cmp(&**other)
+    }
+}
+
+impl<T: std::hash::Hash> std::hash::Hash for Ref<'_, T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (**self).hash(state);
+    }
+}
+
 /// A reserved, partly filled slice. Dropping it without `finish` leaks
 /// nothing, since arena values are `Copy`.
 pub struct SliceWriter<'a, T> {

@@ -90,7 +90,9 @@ impl<'a> EffectsBuilder<'a> {
         operation: IdOperation,
     ) -> &mut Self {
         debug_assert!(self.changed.last().is_none_or(|c| c.id < id));
-        self.bytes += 32 + 1 + 42 + 1 + 34 + 1;
+        // An id, an existing input (version, digest, owner), a written output (digest, owner) and
+        // the operation: the common change, so most effects fit the first buffer.
+        self.bytes += 32 + (1 + 8 + 33 + 33) + (1 + 33 + 33) + 1;
         self.changed.push(Change {
             id,
             input,
