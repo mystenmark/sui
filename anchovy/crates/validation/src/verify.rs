@@ -107,10 +107,206 @@ pub fn verify_signatures(
     verifier: &Verifier,
     aliases: &[(SuiAddress, &[SuiAddress])],
     bump: &Bump,
-) -> Result<(), Error> {
-    let data = &tx.data();
+) -> Result<SignerIndices, Error> {
+    let Some(by_signer) = signer_mapping(tx, signatures, verifier, aliases, true, bump)? else {
+        return Ok(SignerIndices::all(tx));
+    };
+    // The intent message is the intent's three bytes, then the data.
+    let digest = blake2b(&[&[0, 0, 0], tx.data().bytes()]);
+    for (address, i, key) in &by_signer {
+        verify_authenticator(
+            &signatures[*i],
+            address,
+            epoch,
+            &digest,
+            verifier,
+            key.as_ref(),
+        )?;
+    }
+    Ok(SignerIndices::of(tx, &by_signer, aliases))
+}
+
+/// A simple Ed25519 signature whose verification was left for a batch: its
+/// key and signature as given, unparsed.
+pub struct Ed25519Check {
+    key: [u8; 32],
+    signature: [u8; 64],
+    digest: [u8; 32],
+}
+
+/// `verify_signatures`, except that simple Ed25519 signatures are pushed
+/// onto `deferred` instead of verified, their keys not even parsed: the
+/// transaction's signatures are valid if this passes and every check it
+/// pushed verifies. An Ed25519 key's encoding is its bytes as given, so
+/// they hash to the signer's address unparsed; a key that does not parse
+/// fails its check. Errors may come in another order than
+/// `verify_signatures` gives them, but there is one if and only if it gives
+/// one or a pushed check fails.
+pub fn verify_signatures_deferring_ed25519(
+    tx: &SenderSignedData<'_, impl TxState>,
+    signatures: &[ParsedSignature<'_>],
+    epoch: u64,
+    verifier: &Verifier,
+    aliases: &[(SuiAddress, &[SuiAddress])],
+    bump: &Bump,
+    deferred: &mut Vec<Ed25519Check>,
+) -> Result<SignerIndices, Error> {
+    let Some(by_signer) = signer_mapping(tx, signatures, verifier, aliases, false, bump)? else {
+        return Ok(SignerIndices::all(tx));
+    };
+    let digest = blake2b(&[&[0, 0, 0], tx.data().bytes()]);
+    for (address, i, key) in &by_signer {
+        match (&signatures[*i], key) {
+            (ParsedSignature::Simple(bytes), None) if bytes[0] == 0 => {
+                deferred.push(Ed25519Check {
+                    key: bytes[65..97]
+                        .try_into()
+                        .expect("an Ed25519 key is 32 bytes"),
+                    signature: bytes[1..65].try_into().expect("a signature is 64 bytes"),
+                    digest,
+                });
+            }
+            (signature, key) => {
+                verify_authenticator(signature, address, epoch, &digest, verifier, key.as_ref())?;
+            }
+        }
+    }
+    Ok(SignerIndices::of(tx, &by_signer, aliases))
+}
+
+/// Whether every check verifies, as each would alone: ed25519-consensus
+/// batch verification (ZIP 215) accepts exactly the batches whose
+/// signatures each verify, as fastcrypto's single verification (the same
+/// library) verifies them. Its random coefficients come from a generator
+/// seeded once per batch from the OS.
+pub fn verify_ed25519_batch(checks: &[Ed25519Check]) -> bool {
+    use rand::SeedableRng as _;
+    if checks.is_empty() {
+        return true;
+    }
+    let mut batch = ed25519_consensus::batch::Verifier::new();
+    for check in checks {
+        batch.queue((
+            ed25519_consensus::VerificationKeyBytes::from(check.key),
+            ed25519_consensus::Signature::from(check.signature),
+            &check.digest[..],
+        ));
+    }
+    batch.verify(rand::rngs::StdRng::from_entropy()).is_ok()
+}
+
+/// Whether `check` verifies, as `verify_simple` verifies it.
+pub fn verify_ed25519(check: &Ed25519Check) -> bool {
+    let Ok(key) = Ed25519PublicKey::from_bytes(&check.key) else {
+        return false;
+    };
+    let Ok(signature) = Ed25519Signature::from_bytes(&check.signature) else {
+        return false;
+    };
+    key.verify(&check.digest, &signature).is_ok()
+}
+
+/// Each required signer's signature index, in signer order: the sender's,
+/// then a sponsor's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SignerIndices {
+    len: u8,
+    indices: [u8; 2],
+}
+
+impl SignerIndices {
+    pub fn as_slice(&self) -> &[u8] {
+        &self.indices[..usize::from(self.len)]
+    }
+
+    /// A system transaction's: it uses all of its dummy signatures.
+    fn all(tx: &SenderSignedData<'_, impl TxState>) -> SignerIndices {
+        let len = required_signers(tx).iter().flatten().count() as u8;
+        SignerIndices {
+            len,
+            indices: [0, 1],
+        }
+    }
+
+    fn of(
+        tx: &SenderSignedData<'_, impl TxState>,
+        by_signer: &[SignerEntry],
+        aliases: &[(SuiAddress, &[SuiAddress])],
+    ) -> SignerIndices {
+        let mut indices = SignerIndices::default();
+        for signer in required_signers(tx).iter().flatten() {
+            let index = accepted_signers(signer, aliases)
+                .iter()
+                .find_map(|a| {
+                    by_signer
+                        .iter()
+                        .find(|(s, _, _)| s == a)
+                        .map(|(_, i, _)| *i)
+                })
+                .expect("signer_mapping found a signature for every required signer");
+            indices.indices[usize::from(indices.len)] = index as u8;
+            indices.len += 1;
+        }
+        indices
+    }
+}
+
+/// For each required signer (the sender, then a sponsor), the index of the
+/// signature that signs for it or for one of its `aliases`: what the
+/// reference's `verify_sender_signed_data_message_signatures` returns, and
+/// what a consensus transaction's alias claim must match. Checks what
+/// `verify_signatures` checks before verifying signatures, and no more.
+pub fn signer_signature_indices(
+    tx: &SenderSignedData<'_, impl TxState>,
+    signatures: &[ParsedSignature<'_>],
+    verifier: &Verifier,
+    aliases: &[(SuiAddress, &[SuiAddress])],
+    bump: &Bump,
+) -> Result<SignerIndices, Error> {
+    Ok(
+        match signer_mapping(tx, signatures, verifier, aliases, true, bump)? {
+            Some(by_signer) => SignerIndices::of(tx, &by_signer, aliases),
+            None => SignerIndices::all(tx),
+        },
+    )
+}
+
+/// The sender, then the gas owner if it differs: the reference's
+/// `required_signers`.
+fn required_signers(tx: &SenderSignedData<'_, impl TxState>) -> [Option<SuiAddress>; 2] {
+    let data = tx.data();
     let sponsor = (data.gas_data().owner != data.sender()).then_some(*data.gas_data().owner);
-    let required = [Some(*data.sender()), sponsor];
+    [Some(*data.sender()), sponsor]
+}
+
+/// The addresses `signer` may sign as.
+fn accepted_signers<'s>(
+    signer: &'s SuiAddress,
+    aliases: &[(SuiAddress, &'s [SuiAddress])],
+) -> &'s [SuiAddress] {
+    aliases
+        .iter()
+        .find(|(a, _)| a == signer)
+        .map_or(std::slice::from_ref(signer), |(_, alias)| alias)
+}
+
+/// A signer, the index of its signature, and the signature's key if simple.
+type SignerEntry = (SuiAddress, usize, Option<SimpleKey>);
+
+/// Each signature's signer, in address order, with a later signature for an
+/// address replacing an earlier one, as the reference's `BTreeMap`; after
+/// checking the signature count and that every required signer signed.
+/// A simple signature's key comes parsed, to verify with. `None` for a
+/// system transaction, whose signatures are not checked.
+fn signer_mapping<'b>(
+    tx: &SenderSignedData<'_, impl TxState>,
+    signatures: &[ParsedSignature<'_>],
+    verifier: &Verifier,
+    aliases: &[(SuiAddress, &[SuiAddress])],
+    parse_ed25519: bool,
+    bump: &'b Bump,
+) -> Result<Option<containers::Vec<'b, SignerEntry>>, Error> {
+    let required = required_signers(tx);
     let required_count = required.iter().flatten().count();
     if signatures.len() != required_count {
         return Err(Error::new(
@@ -122,38 +318,37 @@ pub fn verify_signatures(
         ));
     }
     // User transactions were checked not to be system transactions.
-    if !matches!(data.kind(), TransactionKind::ProgrammableTransaction(_)) {
-        return Ok(());
+    if !matches!(
+        tx.data().kind(),
+        TransactionKind::ProgrammableTransaction(_)
+    ) {
+        return Ok(None);
     }
 
-    // Signer by address, later signatures replacing earlier ones for the
-    // same address, then walked in address order, as the reference's
-    // `BTreeMap`.
     let mut by_signer = containers::Vec::with_capacity_in(2 * signatures.len(), bump);
-    let mut insert =
-        |address: SuiAddress, sig: usize| match by_signer.iter_mut().find(|(a, _)| *a == address) {
-            Some(entry) => *entry = (address, sig),
-            None => by_signer.push((address, sig)),
-        };
+    let mut insert = |address: SuiAddress, sig: usize, key: Option<SimpleKey>| match by_signer
+        .iter_mut()
+        .find(|(a, _, _)| *a == address)
+    {
+        Some(entry) => *entry = (address, sig, key),
+        None => by_signer.push((address, sig, key)),
+    };
     for (i, sig) in signatures.iter().enumerate() {
         if verifier.verify_legacy_zklogin_address
             && let ParsedSignature::ZkLogin(bytes) = sig
         {
             let zk = zklogin(&bytes[1..]).expect("parsed before");
-            insert(zklogin_padded_address(&zk.inputs), i);
+            insert(zklogin_padded_address(&zk.inputs), i, None);
         }
-        insert(signer_address(sig)?, i);
+        let (address, key) = signer_address(sig, parse_ed25519)?;
+        insert(address, i, key);
     }
-    by_signer.sort_unstable_by_key(|(address, _)| address.0);
+    by_signer.sort_unstable_by_key(|(address, _, _)| address.0);
 
     for signer in required.iter().flatten() {
-        let accepted = aliases
+        if !accepted_signers(signer, aliases)
             .iter()
-            .find(|(a, _)| a == signer)
-            .map_or(std::slice::from_ref(signer), |(_, alias)| alias);
-        if !accepted
-            .iter()
-            .any(|a| by_signer.iter().any(|(s, _)| s == a))
+            .any(|a| by_signer.iter().any(|(s, _, _)| s == a))
         {
             return Err(Error::new(
                 ErrorKind::SignerSignatureAbsent,
@@ -161,51 +356,75 @@ pub fn verify_signatures(
             ));
         }
     }
-
-    // The intent message is the intent's three bytes, then the data.
-    let digest = blake2b(&[&[0, 0, 0], data.bytes()]);
-    for (address, i) in &by_signer {
-        verify_authenticator(&signatures[*i], address, epoch, &digest, verifier)?;
-    }
-    Ok(())
+    Ok(Some(by_signer))
 }
 
-/// The address a signature signs for.
-fn signer_address(sig: &ParsedSignature<'_>) -> Result<SuiAddress, Error> {
+/// The address a signature signs for, and a simple signature's parsed key:
+/// unparsed for Ed25519 unless `parse_ed25519`.
+fn signer_address(
+    sig: &ParsedSignature<'_>,
+    parse_ed25519: bool,
+) -> Result<(SuiAddress, Option<SimpleKey>), Error> {
     Ok(match sig {
+        // An Ed25519 key's encoding is its bytes as given.
+        ParsedSignature::Simple(bytes) if bytes[0] == 0 && !parse_ed25519 => {
+            (SuiAddress(blake2b(&[&[0], &bytes[65..]])), None)
+        }
         ParsedSignature::Simple(bytes) => {
-            let (pk, len) = canonical_key(bytes[0], &bytes[65..])
+            let key = SimpleKey::parse(bytes[0], &bytes[65..])
                 .ok_or_else(|| invalid("cannot parse public key"))?;
-            SuiAddress(blake2b(&[&[bytes[0]], &pk[..len]]))
+            let address = SuiAddress(blake2b(&[&[bytes[0]], key.as_bytes()]));
+            (address, Some(key))
         }
         ParsedSignature::MultiSig(m) | ParsedSignature::MultiSigLegacy { multisig: m, .. } => {
-            multisig_address(m)
+            (multisig_address(m), None)
         }
         ParsedSignature::ZkLogin(bytes) => {
             let zk = zklogin(&bytes[1..]).expect("parsed before");
-            zklogin_address(&zk.inputs)
+            (zklogin_address(&zk.inputs), None)
         }
-        ParsedSignature::Passkey(p) => passkey_address(p),
+        ParsedSignature::Passkey(p) => (passkey_address(p), None),
     })
+}
+
+/// A simple signature's public key, parsed: decompressing it is most of the
+/// cost of parsing, so it is parsed once, both to hash into the signer's
+/// address and to verify with.
+enum SimpleKey {
+    Ed25519(Ed25519PublicKey),
+    Secp256k1(Secp256k1PublicKey),
+    Secp256r1(Secp256r1PublicKey),
+}
+
+impl SimpleKey {
+    fn parse(flag: u8, key: &[u8]) -> Option<SimpleKey> {
+        Some(match flag {
+            0 => SimpleKey::Ed25519(Ed25519PublicKey::from_bytes(key).ok()?),
+            1 => SimpleKey::Secp256k1(Secp256k1PublicKey::from_bytes(key).ok()?),
+            2 => SimpleKey::Secp256r1(Secp256r1PublicKey::from_bytes(key).ok()?),
+            _ => return None,
+        })
+    }
+
+    /// The key as fastcrypto re-encodes it, which is what addresses hash.
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            SimpleKey::Ed25519(k) => k.as_bytes(),
+            SimpleKey::Secp256k1(k) => k.as_bytes(),
+            SimpleKey::Secp256r1(k) => k.as_bytes(),
+        }
+    }
 }
 
 /// A key as fastcrypto re-encodes it once parsed, which is what addresses
 /// hash: a Secp256r1 key given in SEC1's compact form hashes compressed.
 /// The key is the first `len` bytes.
 fn canonical_key(flag: u8, key: &[u8]) -> Option<([u8; 33], usize)> {
-    fn reencode<K: ToFromBytes>(key: &[u8]) -> Option<([u8; 33], usize)> {
-        let key = K::from_bytes(key).ok()?;
-        let bytes = key.as_bytes();
-        let mut out = [0u8; 33];
-        out.get_mut(..bytes.len())?.copy_from_slice(bytes);
-        Some((out, bytes.len()))
-    }
-    match flag {
-        0 => reencode::<Ed25519PublicKey>(key),
-        1 => reencode::<Secp256k1PublicKey>(key),
-        2 => reencode::<Secp256r1PublicKey>(key),
-        _ => None,
-    }
+    let key = SimpleKey::parse(flag, key)?;
+    let bytes = key.as_bytes();
+    let mut out = [0u8; 33];
+    out.get_mut(..bytes.len())?.copy_from_slice(bytes);
+    Some((out, bytes.len()))
 }
 
 fn key_flag_and_bytes<'k>(pk: &PublicKey<'k>) -> (u8, &'k [u8]) {
@@ -266,9 +485,10 @@ fn verify_authenticator(
     epoch: u64,
     digest: &[u8; 32],
     verifier: &Verifier,
+    key: Option<&SimpleKey>,
 ) -> Result<(), Error> {
     match sig {
-        ParsedSignature::Simple(bytes) => verify_simple(bytes, Some(author), digest),
+        ParsedSignature::Simple(bytes) => verify_simple(bytes, Some(author), digest, key),
         ParsedSignature::MultiSig(m) | ParsedSignature::MultiSigLegacy { multisig: m, .. } => {
             for s in m.sigs {
                 if let CompressedSignature::ZkLogin(z) = s {
@@ -288,18 +508,27 @@ fn verify_authenticator(
 }
 
 /// `Signature::verify_secure`. `author` is `None` for a zkLogin's ephemeral
-/// signature, which does not sign for its own key's address.
+/// signature, which does not sign for its own key's address. `parsed` is
+/// the signature's key if parsed already.
 fn verify_simple(
     bytes: &[u8],
     author: Option<&SuiAddress>,
     digest: &[u8; 32],
+    parsed: Option<&SimpleKey>,
 ) -> Result<(), Error> {
     let (flag, sig, pk) = (bytes[0], &bytes[1..65], &bytes[65..]);
     let key_error = || Error::new(ErrorKind::KeyConversionError, "invalid public key");
     let sig_error = || invalid("cannot parse signature");
     macro_rules! check {
-        ($pk:ty, $sig:ty) => {{
-            let pk = <$pk>::from_bytes(pk).map_err(|_| key_error())?;
+        ($variant:ident, $pk:ty, $sig:ty) => {{
+            let owned;
+            let pk = match parsed {
+                Some(SimpleKey::$variant(pk)) => pk,
+                _ => {
+                    owned = <$pk>::from_bytes(pk).map_err(|_| key_error())?;
+                    &owned
+                }
+            };
             let sig = <$sig>::from_bytes(sig).map_err(|_| sig_error())?;
             if let Some(author) = author
                 && SuiAddress(blake2b(&[&[flag], pk.as_bytes()])) != *author
@@ -311,9 +540,9 @@ fn verify_simple(
         }};
     }
     match flag {
-        0 => check!(Ed25519PublicKey, Ed25519Signature),
-        1 => check!(Secp256k1PublicKey, Secp256k1Signature),
-        _ => check!(Secp256r1PublicKey, Secp256r1Signature),
+        0 => check!(Ed25519, Ed25519PublicKey, Ed25519Signature),
+        1 => check!(Secp256k1, Secp256k1PublicKey, Secp256k1Signature),
+        _ => check!(Secp256r1, Secp256r1PublicKey, Secp256r1Signature),
     }
 }
 
@@ -484,7 +713,7 @@ fn verify_zklogin(
             return Err(invalid("provider not supported"));
         }
     }
-    verify_simple(&zk.user_signature, None, digest)?;
+    verify_simple(&zk.user_signature, None, digest, None)?;
 
     let mut extended_pk = Vec::with_capacity(34);
     extended_pk.push(zk.user_signature[0]);

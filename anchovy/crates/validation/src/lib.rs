@@ -7,6 +7,7 @@
 //! first failure, and so the error, is the same.
 
 pub mod accumulator;
+pub mod consensus;
 pub mod error;
 pub mod gasless;
 pub mod inputs;

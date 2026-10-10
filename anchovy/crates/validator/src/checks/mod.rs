@@ -21,13 +21,14 @@ use std::sync::Arc;
 
 use containers::Bump;
 use messages::Message;
-use messages::base::ObjectId;
+use messages::base::{Digest, ObjectId};
 use messages::object::Object;
 use messages::transaction::{Attested, DigestPending, HasDigest, Transaction, TxState};
 use validation::{sender_signed, verify};
 
 pub use signature_cache::GENERATION;
 use signature_cache::SignatureCache;
+use validation::verify::SignerIndices;
 
 use crate::epoch::EpochState;
 
@@ -114,6 +115,17 @@ pub fn validate(
     (Message::relabel_all(hashed, &Witness(PhantomData)), failure)
 }
 
+/// `validate` for one transaction.
+pub fn validate_one(
+    transaction: Unchecked,
+    context: &validation::Context<'_>,
+    bump: &mut Bump,
+) -> Result<ValidTransaction, validation::Error> {
+    bump.reset();
+    sender_signed::validity_check(&transaction.get().0, context, bump)?;
+    Ok(transaction.with_digest().relabel(&Witness(PhantomData)))
+}
+
 /// Signature verification, remembering what verified in the current epoch.
 pub struct SignatureChecks {
     cache: SignatureCache,
@@ -145,23 +157,130 @@ impl SignatureChecks {
         epoch: &Arc<EpochState>,
         transactions: Vec<ValidTransaction>,
     ) -> Result<Vec<VerifiedTransaction>, validation::Error> {
-        let bump = &mut self.bump;
         for transaction in &transactions {
-            self.cache.verify(epoch, transaction, |signed| {
-                bump.reset();
-                let (signatures, _) = sender_signed::deserialization_checks(signed, bump)?;
-                // No aliases: they are object state, which does not exist yet.
-                verify::verify_signatures(
-                    signed,
-                    signatures,
-                    epoch.epoch,
-                    &epoch.verifier,
-                    &[],
-                    bump,
-                )
-            })?;
+            self.verify_signatures(epoch, transaction)?;
         }
         Ok(Message::relabel_all(transactions, &Witness(PhantomData)))
+    }
+
+    /// `verify` for one transaction, also giving each required signer's
+    /// signature index, with no aliases: what a consensus transaction's alias
+    /// claim must name.
+    pub fn verify_one(
+        &mut self,
+        epoch: &Arc<EpochState>,
+        transaction: ValidTransaction,
+    ) -> Result<(VerifiedTransaction, SignerIndices), validation::Error> {
+        let indices = self.verify_signatures(epoch, &transaction)?;
+        Ok((transaction.relabel(&Witness(PhantomData)), indices))
+    }
+
+    /// `verify_one` for each transaction, verifying their simple Ed25519
+    /// signatures in one batch, which costs less than verifying each. Each
+    /// transaction verifies exactly when it would alone: if the batch fails,
+    /// each transaction's Ed25519 signatures are verified on their own.
+    pub fn verify_batch(
+        &mut self,
+        epoch: &Arc<EpochState>,
+        transactions: Vec<ValidTransaction>,
+    ) -> Vec<Result<(VerifiedTransaction, SignerIndices), validation::Error>> {
+        enum Prepared {
+            Cached(SignerIndices),
+            /// Verified but for its Ed25519 checks, `deferred[checks]`.
+            Pending {
+                key: Digest,
+                indices: SignerIndices,
+                checks: std::ops::Range<usize>,
+            },
+            Failed(validation::Error),
+        }
+        // 1. Cache hits stand; the rest are checked, but for their Ed25519
+        //    signatures' verification.
+        let mut deferred = Vec::new();
+        let prepared: Vec<Prepared> = transactions
+            .iter()
+            .map(|transaction| {
+                let (key, cached) = self.cache.lookup(epoch, transaction);
+                if let Some(indices) = cached {
+                    return Prepared::Cached(indices);
+                }
+                self.bump.reset();
+                let signed = &transaction.get().0;
+                let start = deferred.len();
+                let prepared = sender_signed::deserialization_checks(signed, &self.bump).and_then(
+                    |(signatures, _)| {
+                        verify::verify_signatures_deferring_ed25519(
+                            signed,
+                            signatures,
+                            epoch.epoch,
+                            &epoch.verifier,
+                            &[],
+                            &self.bump,
+                            &mut deferred,
+                        )
+                    },
+                );
+                match prepared {
+                    Ok(indices) => Prepared::Pending {
+                        key,
+                        indices,
+                        checks: start..deferred.len(),
+                    },
+                    Err(e) => {
+                        deferred.truncate(start);
+                        Prepared::Failed(e)
+                    }
+                }
+            })
+            .collect();
+
+        // 2. One batch; if it fails, each transaction's checks alone.
+        let batch_verified = verify::verify_ed25519_batch(&deferred);
+
+        // 3. The verified enter the cache. `prepared` has an entry per
+        // transaction.
+        #[allow(clippy::disallowed_methods)]
+        transactions
+            .into_iter()
+            .zip(prepared)
+            .map(|(transaction, prepared)| {
+                let indices = match prepared {
+                    Prepared::Cached(indices) => indices,
+                    Prepared::Pending {
+                        key,
+                        indices,
+                        checks,
+                    } => {
+                        let verified =
+                            batch_verified || deferred[checks].iter().all(verify::verify_ed25519);
+                        if !verified {
+                            return Err(validation::Error::new(
+                                validation::ErrorKind::InvalidSignature,
+                                "signature does not verify",
+                            ));
+                        }
+                        self.cache.insert(key, indices);
+                        indices
+                    }
+                    Prepared::Failed(e) => return Err(e),
+                };
+                Ok((transaction.relabel(&Witness(PhantomData)), indices))
+            })
+            .collect()
+    }
+
+    fn verify_signatures(
+        &mut self,
+        epoch: &Arc<EpochState>,
+        transaction: &ValidTransaction,
+    ) -> Result<SignerIndices, validation::Error> {
+        let bump = &mut self.bump;
+        self.cache.verify(epoch, transaction, |signed| {
+            bump.reset();
+            let (signatures, _) = sender_signed::deserialization_checks(signed, bump)?;
+            // No aliases: they are object state, which does not exist yet.
+            verify::verify_signatures(signed, signatures, epoch.epoch, &epoch.verifier, &[], bump)
+        })
     }
 }
 
@@ -177,6 +296,25 @@ pub fn check_inputs(
     Ok(transaction.relabel(&Witness(PhantomData)))
 }
 
+/// A transaction consensus committed that this validator did not verify:
+/// its signatures are taken as verified, as the reference's
+/// `VerifiedExecutableTransaction::new_from_consensus` takes them. A quorum
+/// accepted it, so at least one honest validator verified it. Only the commit
+/// handler may call this, and only for a transaction it took from a commit.
+pub fn sequenced_by_consensus(transaction: Unchecked) -> VerifiedTransaction {
+    transaction.with_digest().relabel(&Witness(PhantomData))
+}
+
+/// `check_inputs`, keeping the transaction: voting checks the inputs of a
+/// transaction it caches either way.
+pub fn inputs_pass(
+    epoch: &EpochState,
+    store: &store::Store,
+    transaction: &VerifiedTransaction,
+) -> Result<(), validation::Error> {
+    validation::inputs::check(&transaction.get().0, &epoch.context(), &StoreObjects(store))
+}
+
 struct StoreObjects<'a>(&'a store::Store);
 
 /// A store that cannot be read leaves nothing to check against.
@@ -187,5 +325,10 @@ impl validation::inputs::Objects for StoreObjects<'_> {
 
     fn at(&self, id: &ObjectId, version: u64) -> Option<Message<Object<'static>>> {
         self.0.object(id, version).expect("the store reads")
+    }
+
+    fn live_ref(&self, id: &ObjectId) -> Option<(u64, messages::base::ObjectDigest)> {
+        let live = self.0.live(id).expect("the store reads")?;
+        Some((live.version, live.digest))
     }
 }

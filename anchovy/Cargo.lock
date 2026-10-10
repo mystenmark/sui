@@ -1427,6 +1427,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e8ccc4ea9f6acc32d102c0f6d471d11d913ad15f20c04de743374861fa1d414"
 
 [[package]]
+name = "consensus"
+version = "0.1.0"
+
+[[package]]
 name = "consensus-config"
 version = "0.1.0"
 dependencies = [
@@ -4350,6 +4354,7 @@ dependencies = [
  "bcs",
  "blake2",
  "containers",
+ "flate2",
  "serde",
  "serde-reflection",
  "serde_bytes",
@@ -9946,12 +9951,14 @@ dependencies = [
  "bcs",
  "blake2",
  "containers",
+ "ed25519-consensus",
  "fastcrypto",
  "fastcrypto-zkp",
  "flate2",
  "imbl",
  "messages",
  "protocol-config",
+ "rand 0.8.8",
  "roaring",
  "serde",
  "serde_json",
@@ -9966,6 +9973,7 @@ dependencies = [
  "blake2",
  "bytes",
  "clap",
+ "consensus",
  "containers",
  "execution",
  "hashbrown 0.17.1",

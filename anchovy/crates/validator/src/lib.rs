@@ -5,6 +5,7 @@
 
 pub mod checks;
 pub mod codec;
+pub mod consensus;
 pub mod epoch;
 pub mod processors;
 pub mod proto;
