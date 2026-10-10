@@ -13,6 +13,7 @@ pub mod arena;
 pub mod base;
 pub mod build;
 pub mod checkpoint;
+pub mod consensus;
 pub mod effects;
 pub mod error;
 pub mod execution_status;
