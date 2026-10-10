@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/arena",
+    "crates/consensus",
     "crates/containers",
     "crates/exec-types",
     "crates/execution",
@@ -51,6 +52,7 @@ rand = "0.8.5"
 fastcrypto-vdf = { git = "https://github.com/MystenLabs/fastcrypto", rev = "076bf5ad8cea140dc7cf5c5861c24a36acdf64ce", features = ["experimental"] }
 prometheus = "0.14"
 arena = { path = "crates/arena" }
+consensus = { path = "crates/consensus" }
 containers = { path = "crates/containers" }
 execution = { path = "crates/execution" }
 executor = { path = "crates/executor" }

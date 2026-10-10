@@ -1427,6 +1427,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e8ccc4ea9f6acc32d102c0f6d471d11d913ad15f20c04de743374861fa1d414"
 
 [[package]]
+name = "consensus"
+version = "0.1.0"
+
+[[package]]
 name = "consensus-config"
 version = "0.1.0"
 dependencies = [
