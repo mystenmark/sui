@@ -177,6 +177,28 @@ pub fn check_inputs(
     Ok(transaction.relabel(&Witness(PhantomData)))
 }
 
+/// `check_inputs`, keeping the transaction: voting checks the inputs of a
+/// transaction it caches either way.
+pub fn inputs_pass(
+    epoch: &EpochState,
+    store: &store::Store,
+    transaction: &VerifiedTransaction,
+) -> Result<(), validation::Error> {
+    validation::inputs::check(&transaction.get().0, &epoch.context(), &StoreObjects(store))
+}
+
+/// For each required signer, the index of the signature that signs for it,
+/// with no aliases: what a consensus transaction's alias claim must name.
+pub fn signer_signature_indices<'b>(
+    epoch: &EpochState,
+    transaction: &VerifiedTransaction,
+    bump: &'b Bump,
+) -> Result<containers::Vec<'b, u8>, validation::Error> {
+    let signed = &transaction.get().0;
+    let (signatures, _) = sender_signed::deserialization_checks(signed, bump)?;
+    verify::signer_signature_indices(signed, signatures, &epoch.verifier, &[], bump)
+}
+
 struct StoreObjects<'a>(&'a store::Store);
 
 /// A store that cannot be read leaves nothing to check against.

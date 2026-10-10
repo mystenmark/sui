@@ -4,3 +4,4 @@
 //! The processors consensus feeds: voting on blocks, and handling commits.
 
 pub mod cache;
+pub mod vote;
