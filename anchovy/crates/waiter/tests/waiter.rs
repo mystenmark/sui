@@ -223,3 +223,40 @@ fn matches_the_model() {
         assert_eq!(waiter.waiting(), waiting, "seed {seed}");
     }
 }
+
+/// On a worker thread: commands through a queue, ready batches to a sink.
+#[test]
+fn the_processor_hands_out_ready_batches() {
+    use std::sync::{Arc, Mutex, mpsc};
+    use waiter::{Command, WaiterProcessor};
+
+    let visible = Arc::new(Mutex::new(HashSet::from([1u32])));
+    let check = visible.clone();
+    let (commands, inbox) = workqueue::queue(16);
+    let (ready, received) = mpsc::channel();
+    let _worker = workqueue::Worker::new("waiter")
+        .run(
+            inbox,
+            move || WaiterProcessor::new(move |key: &u32| check.lock().unwrap().contains(key)),
+            move |batch: Vec<u32>| ready.send(batch).unwrap(),
+        )
+        .spawn();
+    let mut batch = WaitBatch::new();
+    batch.push(10, [1]);
+    batch.push(11, [1, 2]);
+    batch.push(12, [2, 3]);
+    let push = |command| {
+        commands
+            .try_push(command)
+            .unwrap_or_else(|_| panic!("queue refused"));
+    };
+    push(Command::Wait(batch));
+    let timeout = std::time::Duration::from_secs(10);
+    assert_eq!(received.recv_timeout(timeout).unwrap(), [10]);
+    // Producers make a key visible before notifying it.
+    visible.lock().unwrap().extend([2, 3]);
+    push(Command::Notify(vec![2]));
+    assert_eq!(received.recv_timeout(timeout).unwrap(), [11]);
+    push(Command::Notify(vec![3]));
+    assert_eq!(received.recv_timeout(timeout).unwrap(), [12]);
+}
