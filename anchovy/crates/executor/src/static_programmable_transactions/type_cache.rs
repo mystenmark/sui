@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 /// Entries kept before the cache is emptied, which bounds its memory however many linkages and
 /// types an epoch's transactions name.
-const MAX_ENTRIES: usize = 16 * 1024;
+pub const MAX_ENTRIES: usize = 16 * 1024;
 
 type LinkageTable = [(AccountAddress, AccountAddress)];
 
