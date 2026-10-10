@@ -108,7 +108,7 @@ pub fn verify_signatures(
     aliases: &[(SuiAddress, &[SuiAddress])],
     bump: &Bump,
 ) -> Result<SignerIndices, Error> {
-    let Some(by_signer) = signer_mapping(tx, signatures, verifier, aliases, bump)? else {
+    let Some(by_signer) = signer_mapping(tx, signatures, verifier, aliases, true, bump)? else {
         return Ok(SignerIndices::all(tx));
     };
     // The intent message is the intent's three bytes, then the data.
@@ -126,19 +126,22 @@ pub fn verify_signatures(
     Ok(SignerIndices::of(tx, &by_signer, aliases))
 }
 
-/// A simple Ed25519 signature whose verification was left for a batch.
+/// A simple Ed25519 signature whose verification was left for a batch: its
+/// key and signature as given, unparsed.
 pub struct Ed25519Check {
-    key: Ed25519PublicKey,
-    signature: Ed25519Signature,
+    key: [u8; 32],
+    signature: [u8; 64],
     digest: [u8; 32],
 }
 
-/// `verify_signatures`, except that simple Ed25519 signatures are only
-/// parsed and checked to be the signer's, and their verification is pushed
-/// onto `deferred`: the transaction's signatures are valid if this passes
-/// and every check it pushed verifies. Errors may come in another order
-/// than `verify_signatures` gives them, but there is one if and only if it
-/// gives one or a pushed check fails.
+/// `verify_signatures`, except that simple Ed25519 signatures are pushed
+/// onto `deferred` instead of verified, their keys not even parsed: the
+/// transaction's signatures are valid if this passes and every check it
+/// pushed verifies. An Ed25519 key's encoding is its bytes as given, so
+/// they hash to the signer's address unparsed; a key that does not parse
+/// fails its check. Errors may come in another order than
+/// `verify_signatures` gives them, but there is one if and only if it gives
+/// one or a pushed check fails.
 pub fn verify_signatures_deferring_ed25519(
     tx: &SenderSignedData<'_, impl TxState>,
     signatures: &[ParsedSignature<'_>],
@@ -148,22 +151,18 @@ pub fn verify_signatures_deferring_ed25519(
     bump: &Bump,
     deferred: &mut Vec<Ed25519Check>,
 ) -> Result<SignerIndices, Error> {
-    let Some(by_signer) = signer_mapping(tx, signatures, verifier, aliases, bump)? else {
+    let Some(by_signer) = signer_mapping(tx, signatures, verifier, aliases, false, bump)? else {
         return Ok(SignerIndices::all(tx));
     };
     let digest = blake2b(&[&[0, 0, 0], tx.data().bytes()]);
     for (address, i, key) in &by_signer {
         match (&signatures[*i], key) {
-            (ParsedSignature::Simple(bytes), Some(SimpleKey::Ed25519(key))) => {
-                // `verify_simple`, up to verifying.
-                let signature = Ed25519Signature::from_bytes(&bytes[1..65])
-                    .map_err(|_| invalid("cannot parse signature"))?;
-                if SuiAddress(blake2b(&[&[0], key.as_bytes()])) != *address {
-                    return Err(Error::new(ErrorKind::IncorrectSigner, "incorrect signer"));
-                }
+            (ParsedSignature::Simple(bytes), None) if bytes[0] == 0 => {
                 deferred.push(Ed25519Check {
-                    key: key.clone(),
-                    signature,
+                    key: bytes[65..97]
+                        .try_into()
+                        .expect("an Ed25519 key is 32 bytes"),
+                    signature: bytes[1..65].try_into().expect("a signature is 64 bytes"),
                     digest,
                 });
             }
@@ -175,22 +174,36 @@ pub fn verify_signatures_deferring_ed25519(
     Ok(SignerIndices::of(tx, &by_signer, aliases))
 }
 
-/// Whether every check verifies, as each would alone: Ed25519 batch
-/// verification (ed25519-consensus, ZIP 215) accepts exactly the batches
-/// whose signatures each verify.
+/// Whether every check verifies, as each would alone: ed25519-consensus
+/// batch verification (ZIP 215) accepts exactly the batches whose
+/// signatures each verify, as fastcrypto's single verification (the same
+/// library) verifies them. Its random coefficients come from a generator
+/// seeded once per batch from the OS.
 pub fn verify_ed25519_batch(checks: &[Ed25519Check]) -> bool {
+    use rand::SeedableRng as _;
     if checks.is_empty() {
         return true;
     }
-    let digests: Vec<&[u8]> = checks.iter().map(|c| &c.digest[..]).collect();
-    let keys: Vec<Ed25519PublicKey> = checks.iter().map(|c| c.key.clone()).collect();
-    let signatures: Vec<Ed25519Signature> = checks.iter().map(|c| c.signature.clone()).collect();
-    Ed25519PublicKey::verify_batch_empty_fail_different_msg(&digests, &keys, &signatures).is_ok()
+    let mut batch = ed25519_consensus::batch::Verifier::new();
+    for check in checks {
+        batch.queue((
+            ed25519_consensus::VerificationKeyBytes::from(check.key),
+            ed25519_consensus::Signature::from(check.signature),
+            &check.digest[..],
+        ));
+    }
+    batch.verify(rand::rngs::StdRng::from_entropy()).is_ok()
 }
 
-/// Whether `check` verifies.
+/// Whether `check` verifies, as `verify_simple` verifies it.
 pub fn verify_ed25519(check: &Ed25519Check) -> bool {
-    check.key.verify(&check.digest, &check.signature).is_ok()
+    let Ok(key) = Ed25519PublicKey::from_bytes(&check.key) else {
+        return false;
+    };
+    let Ok(signature) = Ed25519Signature::from_bytes(&check.signature) else {
+        return false;
+    };
+    key.verify(&check.digest, &signature).is_ok()
 }
 
 /// Each required signer's signature index, in signer order: the sender's,
@@ -251,7 +264,7 @@ pub fn signer_signature_indices(
     bump: &Bump,
 ) -> Result<SignerIndices, Error> {
     Ok(
-        match signer_mapping(tx, signatures, verifier, aliases, bump)? {
+        match signer_mapping(tx, signatures, verifier, aliases, true, bump)? {
             Some(by_signer) => SignerIndices::of(tx, &by_signer, aliases),
             None => SignerIndices::all(tx),
         },
@@ -290,6 +303,7 @@ fn signer_mapping<'b>(
     signatures: &[ParsedSignature<'_>],
     verifier: &Verifier,
     aliases: &[(SuiAddress, &[SuiAddress])],
+    parse_ed25519: bool,
     bump: &'b Bump,
 ) -> Result<Option<containers::Vec<'b, SignerEntry>>, Error> {
     let required = required_signers(tx);
@@ -326,7 +340,7 @@ fn signer_mapping<'b>(
             let zk = zklogin(&bytes[1..]).expect("parsed before");
             insert(zklogin_padded_address(&zk.inputs), i, None);
         }
-        let (address, key) = signer_address(sig)?;
+        let (address, key) = signer_address(sig, parse_ed25519)?;
         insert(address, i, key);
     }
     by_signer.sort_unstable_by_key(|(address, _, _)| address.0);
@@ -345,9 +359,17 @@ fn signer_mapping<'b>(
     Ok(Some(by_signer))
 }
 
-/// The address a signature signs for.
-fn signer_address(sig: &ParsedSignature<'_>) -> Result<(SuiAddress, Option<SimpleKey>), Error> {
+/// The address a signature signs for, and a simple signature's parsed key:
+/// unparsed for Ed25519 unless `parse_ed25519`.
+fn signer_address(
+    sig: &ParsedSignature<'_>,
+    parse_ed25519: bool,
+) -> Result<(SuiAddress, Option<SimpleKey>), Error> {
     Ok(match sig {
+        // An Ed25519 key's encoding is its bytes as given.
+        ParsedSignature::Simple(bytes) if bytes[0] == 0 && !parse_ed25519 => {
+            (SuiAddress(blake2b(&[&[0], &bytes[65..]])), None)
+        }
         ParsedSignature::Simple(bytes) => {
             let key = SimpleKey::parse(bytes[0], &bytes[65..])
                 .ok_or_else(|| invalid("cannot parse public key"))?;

@@ -84,6 +84,9 @@ bs58 = "0.5"
 # Crypto is fastcrypto's (PRD), at sui's revision; base64ct and roaring at
 # the versions sui decodes signatures with.
 fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "076bf5ad8cea140dc7cf5c5861c24a36acdf64ce" }
+# The Ed25519 fastcrypto wraps, at its version: batch verification with an RNG of
+# our choosing.
+ed25519-consensus = "=2.1.0"
 base64ct = { version = "=1.8.0", features = ["alloc"] }
 fastcrypto-zkp = { git = "https://github.com/MystenLabs/fastcrypto", rev = "076bf5ad8cea140dc7cf5c5861c24a36acdf64ce", package = "fastcrypto-zkp" }
 roaring = "=0.11.4"
