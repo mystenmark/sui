@@ -46,6 +46,10 @@ into `anchovy-main`.
   loaded early, they would miss earlier transactions' writes.
 - System transactions: epoch change, end-of-epoch kinds, authenticator state
   update, safe mode.
+- TODO (deferred as too risky for now): reuse the input type resolution
+  linkage across transactions, keyed on the transaction's package IDs. It is
+  ~7% of a transfer after the epoch caches, but its result depends on the whole
+  PTB's analysis, so a key that provably determines it needs care.
 
 3. Static PTBs and the engine path for user PTBs; differential harness.
 4. System transactions and genesis.
