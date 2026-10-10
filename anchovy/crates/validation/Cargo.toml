@@ -8,8 +8,7 @@ publish = false
 [dependencies]
 base64ct.workspace = true
 bcs.workspace = true
-# `experimental` adds Ed25519 batch verification (and other APIs), changing nothing else.
-fastcrypto = { workspace = true, features = ["experimental"] }
+fastcrypto.workspace = true
 fastcrypto-zkp.workspace = true
 ed25519-consensus.workspace = true
 rand.workspace = true
