@@ -4354,6 +4354,7 @@ dependencies = [
  "bcs",
  "blake2",
  "containers",
+ "flate2",
  "serde",
  "serde-reflection",
  "serde_bytes",

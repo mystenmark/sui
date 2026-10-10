@@ -13,6 +13,7 @@ serde.workspace = true
 serde_bytes.workspace = true
 
 [dev-dependencies]
+flate2 = "1"
 serde-reflection.workspace = true
 serde_yaml.workspace = true
 
