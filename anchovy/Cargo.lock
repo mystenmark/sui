@@ -10047,6 +10047,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "waiter"
+version = "0.1.0"
+dependencies = [
+ "foldhash 0.2.0",
+ "hashbrown 0.17.1",
+ "workqueue",
+]
+
+[[package]]
 name = "walkdir"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
