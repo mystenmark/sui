@@ -12,7 +12,7 @@ use std::sync::Arc;
 use ::consensus::{Block, BlockRef, TransactionIndex};
 use containers::Bump;
 use messages::Message;
-use messages::base::ObjectId;
+use messages::base::{ObjectId, SuiAddress};
 use messages::consensus::{
     ConsensusTransaction, ConsensusTransactionKind, PlainTransactionWithClaims, TransactionClaim,
     TransactionDenyRules,
@@ -24,7 +24,7 @@ use validation::inputs::{InputKind, input_objects};
 use validation::verify::SignerIndices;
 use workqueue::{Processor, Refusal, Refuse};
 
-use crate::checks::{self, SignatureChecks, VerifiedTransaction};
+use crate::checks::{self, SignatureChecks, Unchecked, VerifiedTransaction};
 use crate::consensus::cache::{BlockEntries, ConsensusTxCache};
 use crate::epoch::EpochState;
 
@@ -127,12 +127,16 @@ impl BlockVoter {
         // 3. A vote on each user transaction; other kinds are accepted.
         let mut rejects = Vec::new();
         let mut entries: BlockEntries = Vec::with_capacity(decoded.len());
-        for (index, transaction) in decoded.iter().enumerate() {
+        for (index, transaction) in decoded.into_iter().enumerate() {
             let ConsensusTransactionKind::UserTransactionV2(user) = transaction.get().kind() else {
                 entries.push(None);
                 continue;
             };
-            let (entry, vote) = self.vote_transaction(epoch, user);
+            let claims = Claims::of(user).copied();
+            let transaction = transaction
+                .into_user_transaction()
+                .expect("a user transaction");
+            let (entry, vote) = self.vote_transaction(epoch, transaction, &claims);
             if vote.is_err() {
                 rejects.push(index as TransactionIndex);
             }
@@ -149,13 +153,9 @@ impl BlockVoter {
     fn vote_transaction(
         &mut self,
         epoch: &Arc<EpochState>,
-        user: &PlainTransactionWithClaims<'_>,
+        transaction: Unchecked,
+        claims: &CopiedClaims,
     ) -> (Option<VerifiedTransaction>, Result<(), RejectReason>) {
-        let claims = Claims::of(user);
-        let transaction = Message::parse(user.transaction_bytes().to_vec())
-            .map_err(|_| ())
-            .expect("the transaction parsed within the consensus transaction");
-
         let (mut valid, failure) =
             checks::validate(vec![transaction], &epoch.context(), &mut self.bump);
         if let Some(e) = failure {
@@ -166,7 +166,7 @@ impl BlockVoter {
             Ok(verified) => verified,
             Err(e) => return (None, Err(e.into())),
         };
-        let vote = self.vote_verified(epoch, &verified, indices, &claims);
+        let vote = self.vote_verified(epoch, &verified, indices, claims);
         (Some(verified), vote)
     }
 
@@ -177,30 +177,32 @@ impl BlockVoter {
         epoch: &EpochState,
         transaction: &VerifiedTransaction,
         indices: SignerIndices,
-        claims: &Claims<'_>,
+        claims: &CopiedClaims,
     ) -> Result<(), RejectReason> {
         if epoch.config.address_aliases() {
             let indices = indices.as_slice();
             // No signer has an alias: aliases are object state anchovy does
             // not read yet, so each signer's alias version is `None`.
             let matches = if epoch.config.fix_checkpoint_signature_mapping() {
-                let claimed = claims.aliases_v2.ok_or(RejectReason::MissingAliasClaim)?;
-                claimed
-                    .iter()
-                    .copied()
-                    .eq(indices.iter().map(|index| (*index, None)))
+                let claimed = claims
+                    .aliases_v2
+                    .as_ref()
+                    .ok_or(RejectReason::MissingAliasClaim)?;
+                claimed.matches(indices.iter().map(|index| (*index, None)))
             } else {
-                let claimed = claims.aliases_v1.ok_or(RejectReason::MissingAliasClaim)?;
+                let claimed = claims
+                    .aliases_v1
+                    .as_ref()
+                    .ok_or(RejectReason::MissingAliasClaim)?;
                 let data = transaction.get().0.data();
                 let sponsor =
                     (data.gas_data().owner != data.sender()).then_some(data.gas_data().owner);
-                claimed
-                    .iter()
-                    .map(|(address, version)| (**address, *version))
-                    .eq([Some(data.sender()), sponsor]
+                claimed.matches(
+                    [Some(data.sender()), sponsor]
                         .into_iter()
                         .flatten()
-                        .map(|signer| (*signer, None)))
+                        .map(|signer| (*signer, None)),
+                )
             };
             if !matches {
                 return Err(RejectReason::AliasesChanged);
@@ -218,7 +220,7 @@ impl BlockVoter {
         checks::inputs_pass(epoch, &self.store, transaction)?;
 
         if !claims.immutable.is_empty() {
-            verify_immutable_object_claims(&self.store, transaction, claims.immutable)?;
+            verify_immutable_object_claims(&self.store, transaction, &claims.immutable)?;
         }
         Ok(())
     }
@@ -269,6 +271,55 @@ impl<'a> Claims<'a> {
                 })
                 .unwrap_or(&[]),
         }
+    }
+}
+
+impl Claims<'_> {
+    /// The claims voting reads, copied out of the consensus transaction so
+    /// that its transaction can take over its buffers.
+    fn copied(&self) -> CopiedClaims {
+        CopiedClaims {
+            aliases_v2: self.aliases_v2.map(|a| ShortList::of(a.iter().copied())),
+            aliases_v1: self
+                .aliases_v1
+                .map(|a| ShortList::of(a.iter().map(|(s, v)| (**s, *v)))),
+            immutable: self.immutable.to_vec(),
+        }
+    }
+}
+
+/// `Claims`, owned.
+struct CopiedClaims {
+    aliases_v2: Option<ShortList<(u8, Option<u64>)>>,
+    aliases_v1: Option<ShortList<(SuiAddress, Option<u64>)>>,
+    immutable: Vec<ObjectId>,
+}
+
+/// A list kept only as far as it can match a transaction's signers (a
+/// sender and a sponsor): its first two entries and its length.
+struct ShortList<T> {
+    len: usize,
+    items: [Option<T>; 2],
+}
+
+impl<T: Copy + PartialEq> ShortList<T> {
+    fn of(mut items: impl ExactSizeIterator<Item = T>) -> ShortList<T> {
+        ShortList {
+            len: items.len(),
+            items: [items.next(), items.next()],
+        }
+    }
+
+    /// Whether the list is exactly `expected`.
+    fn matches(&self, expected: impl Iterator<Item = T>) -> bool {
+        let mut n = 0;
+        for item in expected {
+            if self.items.get(n).copied().flatten() != Some(item) {
+                return false;
+            }
+            n += 1;
+        }
+        n == self.len
     }
 }
 

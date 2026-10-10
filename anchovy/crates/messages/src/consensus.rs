@@ -560,3 +560,39 @@ impl<'a> ConsensusTransaction<'a> {
 crate::impl_wire!(ConsensusTransaction, guess = 34);
 
 crate::base::assert_wire_layout!(ProtocolVersionDigest = 41);
+
+/// A `UserTransactionV2`'s transaction, over its consensus transaction's
+/// buffers.
+struct UserTransactionOf;
+
+impl crate::message::ViewMap<ConsensusTransaction<'static>, Transaction<'static, DigestPending>>
+    for UserTransactionOf
+{
+    // The bound makes `'x` early-bound, as it is in the trait.
+    fn apply<'x>(self, view: ConsensusTransaction<'x>) -> Transaction<'x, DigestPending>
+    where
+        'x: 'x,
+    {
+        match view.kind {
+            ConsensusTransactionKind::UserTransactionV2(user) => user.transaction,
+            _ => unreachable!("checked to be a user transaction"),
+        }
+    }
+}
+
+impl crate::Message<ConsensusTransaction<'static>> {
+    /// A `UserTransactionV2`'s transaction as a message of its own, keeping
+    /// this one's buffers: neither copied nor parsed again. Its claims are
+    /// lost, so read them first. The message's `wire_bytes` are the
+    /// consensus transaction's; the transaction's own are `get().0.bytes()`.
+    /// `None` for any other kind.
+    pub fn into_user_transaction(
+        self,
+    ) -> Option<crate::Message<Transaction<'static, DigestPending>>> {
+        matches!(
+            self.get().kind(),
+            ConsensusTransactionKind::UserTransactionV2(_)
+        )
+        .then(|| self.map(UserTransactionOf))
+    }
+}

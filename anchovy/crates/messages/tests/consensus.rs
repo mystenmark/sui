@@ -70,6 +70,16 @@ fn matches_reference() {
             assert_eq!(bcs::to_bytes(&mirror).unwrap(), span, "{label}");
             let at = 9;
             assert_eq!(&bytes[at..at + span.len()], span, "{label}");
+            // The same transaction, taken over from the consensus transaction.
+            let projected = Message::<ConsensusTransaction>::parse(bytes.clone())
+                .unwrap_or_else(|(e, _)| panic!("{label}: {e}"))
+                .into_user_transaction()
+                .unwrap();
+            assert_eq!(projected.get(), tx.get(), "{label}");
+            assert_eq!(projected.get().0.bytes(), span, "{label}");
+        } else {
+            let message = Message::<ConsensusTransaction>::parse(bytes.clone()).unwrap();
+            assert!(message.into_user_transaction().is_none(), "{label}");
         }
     }
     assert_eq!(kinds, [true; 14], "every kind has an accepted vector");

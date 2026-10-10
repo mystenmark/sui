@@ -314,8 +314,9 @@ pub(crate) fn execute_and_commit(
 ) -> Outcome {
     let digest = transaction.get().0.digest().bytes;
     // `Transaction` BCS is `SenderSignedData`'s: its empty signature
-    // info has no bytes.
-    let outcome = match epoch.execution.execute(store, transaction.wire_bytes()) {
+    // info has no bytes. Not the message's wire bytes, which for a
+    // transaction from consensus are its consensus transaction's.
+    let outcome = match epoch.execution.execute(store, transaction.get().0.bytes()) {
         Ok(outcome) => outcome,
         Err(e) => return Outcome::Failed(format!("{e:?}")),
     };

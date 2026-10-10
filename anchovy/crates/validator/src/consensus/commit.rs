@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use ::consensus::{BlockRef, CommittedSubDag, TransactionIndex};
 use messages::Message;
-use messages::consensus::{ConsensusTransaction, ConsensusTransactionKind};
+use messages::consensus::ConsensusTransaction;
 use workqueue::{Processor, Refusal, Refuse};
 
 use crate::checks::{self, VerifiedTransaction};
@@ -177,12 +177,7 @@ fn decode_user_transaction(bytes: Vec<u8>) -> Option<VerifiedTransaction> {
     let transaction = Message::<ConsensusTransaction<'static>>::parse(bytes)
         .map_err(|(e, _)| e)
         .expect("a committed transaction decodes");
-    let ConsensusTransactionKind::UserTransactionV2(user) = transaction.get().kind() else {
-        return None;
-    };
-    let unchecked = Message::parse(user.transaction_bytes().to_vec())
-        .map_err(|(e, _)| e)
-        .expect("the transaction parsed within the consensus transaction");
+    let unchecked = transaction.into_user_transaction()?;
     Some(checks::sequenced_by_consensus(unchecked))
 }
 
