@@ -18,7 +18,7 @@
 use std::collections::BTreeSet;
 
 use messages::Message;
-use messages::base::{ObjectId, ObjectRef, SuiAddress};
+use messages::base::{ObjectDigest, ObjectId, ObjectRef, SuiAddress};
 use messages::object::{Data, MoveObjectType, Object, Owner};
 use messages::transaction::{
     CallArg, Command, ObjectArg, SenderSignedData, SharedObjectArg, SharedObjectMutability,
@@ -36,6 +36,11 @@ pub trait Objects {
 
     /// The object at exactly `version`, live or not.
     fn at(&self, id: &ObjectId, version: u64) -> Option<Message<Object<'static>>>;
+
+    /// The live version's number and digest, without reading the object.
+    fn live_ref(&self, id: &ObjectId) -> Option<(u64, ObjectDigest)> {
+        self.live(id).map(|o| (o.get().version(), o.get().digest()))
+    }
 }
 
 /// One input object, as the reference's `InputObjectKind`.
@@ -155,11 +160,22 @@ pub fn receiving_objects<'a>(data: &TransactionData<'a, impl TxState>) -> Vec<&'
 struct Input<'a> {
     kind: InputKind<'a>,
     object: Message<Object<'static>>,
+    /// An owned input's live version and digest, read when it was loaded.
+    live: Option<(u64, ObjectDigest)>,
 }
 
 impl Input<'_> {
     fn object(&self) -> &Object<'_> {
         self.object.get()
+    }
+
+    /// The object's digest: the live one's if it is live, which spares
+    /// hashing it.
+    fn digest(&self) -> ObjectDigest {
+        match self.live {
+            Some((version, digest)) if version == self.object().version() => digest,
+            _ => self.object().digest(),
+        }
     }
 
     /// The reference's `ObjectReadResult::is_mutable`.
@@ -198,7 +214,7 @@ pub fn check(
     check_objects(data, &inputs)?;
     check_replay_protection(data, &inputs)?;
     check_receiving_objects(&inputs, &receiving, &received)?;
-    check_owned_objects_live(&inputs, objects)
+    check_owned_objects_live(&inputs)
 }
 
 /// Address balances are not kept yet, so nothing that draws on them can be
@@ -276,6 +292,7 @@ fn load<'a>(kinds: &[InputKind<'a>], objects: &impl Objects) -> Result<Vec<Input
         loaded[i] = Some(Input {
             kind: *kind,
             object,
+            live: None,
         });
     }
     for (i, kind) in kinds.iter().enumerate() {
@@ -283,11 +300,11 @@ fn load<'a>(kinds: &[InputKind<'a>], objects: &impl Objects) -> Result<Vec<Input
             continue;
         };
         let version = r.version.get();
+        let live = objects.live_ref(&r.id);
         let Some(object) = objects.at(&r.id, version) else {
-            let Some(live) = objects.live(&r.id) else {
+            let Some((current, _)) = live else {
                 return Err(not_found(&r.id, None));
             };
-            let current = live.get().version();
             return Err(if current >= version {
                 error(
                     ErrorKind::ObjectVersionUnavailableForConsumption,
@@ -300,6 +317,7 @@ fn load<'a>(kinds: &[InputKind<'a>], objects: &impl Objects) -> Result<Vec<Input
         loaded[i] = Some(Input {
             kind: *kind,
             object,
+            live,
         });
     }
     Ok(loaded
@@ -451,7 +469,7 @@ fn check_one_object(owner: &SuiAddress, input: &Input<'_>) -> Result<(), Error> 
             if r.version.get() == u64::MAX {
                 return Err(error(ErrorKind::InvalidSequenceNumber, "version u64::MAX"));
             }
-            if object.digest() != r.digest {
+            if input.digest() != r.digest {
                 return Err(error(
                     ErrorKind::InvalidObjectDigest,
                     format!("{id:?}: digest mismatch"),
@@ -662,28 +680,30 @@ fn check_receiving_objects(
 }
 
 /// `validate_owned_object_versions`: every address-owned input is live at
-/// the version and digest given. (Owned-object locks would come here; they
-/// come with voting.)
-fn check_owned_objects_live(inputs: &[Input<'_>], objects: &impl Objects) -> Result<(), Error> {
-    let owned: Vec<&ObjectRef> = inputs.iter().filter_map(Input::address_owned).collect();
-    let mut live = Vec::with_capacity(owned.len());
-    for r in &owned {
-        live.push(objects.live(&r.id).ok_or_else(|| not_found(&r.id, None))?);
+/// the version and digest given, as read when it was loaded. (Owned-object
+/// locks are taken after consensus.)
+fn check_owned_objects_live(inputs: &[Input<'_>]) -> Result<(), Error> {
+    let owned = || {
+        inputs
+            .iter()
+            .filter_map(|input| input.address_owned().map(|r| (r, input.live)))
+    };
+    if let Some((r, _)) = owned().find(|(_, live)| live.is_none()) {
+        return Err(not_found(&r.id, None));
     }
-    for (i, r) in owned.iter().enumerate() {
-        let object = live[i].get();
-        if object.version() != r.version.get() {
+    for (r, live) in owned() {
+        let (version, digest) = live.expect("checked above");
+        if version != r.version.get() {
             return Err(error(
                 ErrorKind::ObjectVersionUnavailableForConsumption,
                 format!(
-                    "{:?} at {}: current version {}",
+                    "{:?} at {}: current version {version}",
                     r.id,
                     r.version.get(),
-                    object.version()
                 ),
             ));
         }
-        if object.digest() != r.digest {
+        if digest != r.digest {
             return Err(error(
                 ErrorKind::InvalidObjectDigest,
                 format!("{:?}: digest mismatch", r.id),

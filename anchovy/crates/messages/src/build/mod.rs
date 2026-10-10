@@ -13,6 +13,7 @@
 
 pub mod base;
 pub mod checkpoint;
+pub mod consensus;
 pub mod effects;
 pub mod execution_status;
 pub mod object;

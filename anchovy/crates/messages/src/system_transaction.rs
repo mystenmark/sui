@@ -239,6 +239,26 @@ pub struct Jwk<'a> {
     pub alg: &'a str,
 }
 
+impl<'a> JwkId<'a> {
+    pub fn parse(r: &mut Reader<'a>) -> Result<JwkId<'a>> {
+        Ok(JwkId {
+            iss: r.str()?,
+            kid: r.str()?,
+        })
+    }
+}
+
+impl<'a> Jwk<'a> {
+    pub fn parse(r: &mut Reader<'a>) -> Result<Jwk<'a>> {
+        Ok(Jwk {
+            kty: r.str()?,
+            e: r.str()?,
+            n: r.str()?,
+            alg: r.str()?,
+        })
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ActiveJwk<'a> {
     pub jwk_id: JwkId<'a>,
@@ -268,16 +288,8 @@ impl<'a> AuthenticatorStateUpdate<'a> {
         let mut new_active_jwks = a.slice(n)?;
         for _ in 0..n {
             new_active_jwks.push(ActiveJwk {
-                jwk_id: JwkId {
-                    iss: r.str()?,
-                    kid: r.str()?,
-                },
-                jwk: Jwk {
-                    kty: r.str()?,
-                    e: r.str()?,
-                    n: r.str()?,
-                    alg: r.str()?,
-                },
+                jwk_id: JwkId::parse(r)?,
+                jwk: Jwk::parse(r)?,
                 epoch: r.u64()?,
             });
         }
