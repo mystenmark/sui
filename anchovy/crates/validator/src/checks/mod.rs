@@ -28,6 +28,7 @@ use validation::{sender_signed, verify};
 
 pub use signature_cache::GENERATION;
 use signature_cache::SignatureCache;
+use validation::verify::SignerIndices;
 
 use crate::epoch::EpochState;
 
@@ -145,23 +146,36 @@ impl SignatureChecks {
         epoch: &Arc<EpochState>,
         transactions: Vec<ValidTransaction>,
     ) -> Result<Vec<VerifiedTransaction>, validation::Error> {
-        let bump = &mut self.bump;
         for transaction in &transactions {
-            self.cache.verify(epoch, transaction, |signed| {
-                bump.reset();
-                let (signatures, _) = sender_signed::deserialization_checks(signed, bump)?;
-                // No aliases: they are object state, which does not exist yet.
-                verify::verify_signatures(
-                    signed,
-                    signatures,
-                    epoch.epoch,
-                    &epoch.verifier,
-                    &[],
-                    bump,
-                )
-            })?;
+            self.verify_signatures(epoch, transaction)?;
         }
         Ok(Message::relabel_all(transactions, &Witness(PhantomData)))
+    }
+
+    /// `verify` for one transaction, also giving each required signer's
+    /// signature index, with no aliases: what a consensus transaction's alias
+    /// claim must name.
+    pub fn verify_one(
+        &mut self,
+        epoch: &Arc<EpochState>,
+        transaction: ValidTransaction,
+    ) -> Result<(VerifiedTransaction, SignerIndices), validation::Error> {
+        let indices = self.verify_signatures(epoch, &transaction)?;
+        Ok((transaction.relabel(&Witness(PhantomData)), indices))
+    }
+
+    fn verify_signatures(
+        &mut self,
+        epoch: &Arc<EpochState>,
+        transaction: &ValidTransaction,
+    ) -> Result<SignerIndices, validation::Error> {
+        let bump = &mut self.bump;
+        self.cache.verify(epoch, transaction, |signed| {
+            bump.reset();
+            let (signatures, _) = sender_signed::deserialization_checks(signed, bump)?;
+            // No aliases: they are object state, which does not exist yet.
+            verify::verify_signatures(signed, signatures, epoch.epoch, &epoch.verifier, &[], bump)
+        })
     }
 }
 
@@ -194,18 +208,6 @@ pub fn inputs_pass(
     transaction: &VerifiedTransaction,
 ) -> Result<(), validation::Error> {
     validation::inputs::check(&transaction.get().0, &epoch.context(), &StoreObjects(store))
-}
-
-/// For each required signer, the index of the signature that signs for it,
-/// with no aliases: what a consensus transaction's alias claim must name.
-pub fn signer_signature_indices<'b>(
-    epoch: &EpochState,
-    transaction: &VerifiedTransaction,
-    bump: &'b Bump,
-) -> Result<containers::Vec<'b, u8>, validation::Error> {
-    let signed = &transaction.get().0;
-    let (signatures, _) = sender_signed::deserialization_checks(signed, bump)?;
-    verify::signer_signature_indices(signed, signatures, &epoch.verifier, &[], bump)
 }
 
 struct StoreObjects<'a>(&'a store::Store);

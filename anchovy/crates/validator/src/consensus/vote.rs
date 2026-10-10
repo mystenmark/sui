@@ -21,6 +21,7 @@ use messages::object::Owner;
 use messages::transaction::TransactionExpiration;
 use tokio::sync::oneshot;
 use validation::inputs::{InputKind, input_objects};
+use validation::verify::SignerIndices;
 use workqueue::{Processor, Refusal, Refuse};
 
 use crate::checks::{self, SignatureChecks, VerifiedTransaction};
@@ -161,11 +162,11 @@ impl BlockVoter {
             return (None, Err(e.into()));
         }
         let valid = valid.pop().expect("one transaction validated");
-        let verified = match self.signatures.verify(epoch, vec![valid]) {
-            Ok(mut verified) => verified.pop().expect("one transaction verified"),
+        let (verified, indices) = match self.signatures.verify_one(epoch, valid) {
+            Ok(verified) => verified,
             Err(e) => return (None, Err(e.into())),
         };
-        let vote = self.vote_verified(epoch, &verified, &claims);
+        let vote = self.vote_verified(epoch, &verified, indices, &claims);
         (Some(verified), vote)
     }
 
@@ -175,11 +176,11 @@ impl BlockVoter {
         &mut self,
         epoch: &EpochState,
         transaction: &VerifiedTransaction,
+        indices: SignerIndices,
         claims: &Claims<'_>,
     ) -> Result<(), RejectReason> {
         if epoch.config.address_aliases() {
-            self.bump.reset();
-            let indices = checks::signer_signature_indices(epoch, transaction, &self.bump)?;
+            let indices = indices.as_slice();
             // No signer has an alias: aliases are object state anchovy does
             // not read yet, so each signer's alias version is `None`.
             let matches = if epoch.config.fix_checkpoint_signature_mapping() {

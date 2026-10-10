@@ -69,7 +69,7 @@ fn check(chk: &Path, verdicts: &Path, mismatches: &mut Vec<String>) -> usize {
                     &bump,
                 )
             })
-            .map_or_else(|e| format!("{:?}", e.kind), |()| "ok".to_owned());
+            .map_or_else(|e| format!("{:?}", e.kind), |_| "ok".to_owned());
         let ours = format!("{i} {validity} {verification}");
         if ours != line {
             mismatches.push(format!(

@@ -3,7 +3,8 @@
 
 //! The signature index of each required signer, which a consensus
 //! transaction's alias claim must match, against the reference's
-//! `verify_sender_signed_data_message_signatures` over the validity vectors'
+//! `verify_sender_signed_data_message_signatures`, before verifying and as
+//! verification returns them, over the validity vectors'
 //! signed transactions. Compared where the reference's validity check passes
 //! and it verifies the signatures, with no aliases.
 
@@ -94,16 +95,21 @@ fn signer_indices_match_the_reference() {
             continue;
         };
         let signed = &transaction.get().0;
-        let ours = sender_signed::deserialization_checks(signed, &bump).and_then(|(sigs, _)| {
-            verify::signer_signature_indices(signed, sigs, &epoch.verifier, &[], &bump)
-                .map(|indices| indices.to_vec())
-        });
+        // Both before verifying and as verification returns them.
+        let (sigs, _) = sender_signed::deserialization_checks(signed, &bump).unwrap();
+        let before = verify::signer_signature_indices(signed, sigs, &epoch.verifier, &[], &bump)
+            .map(|indices| indices.as_slice().to_vec());
+        let verified =
+            verify::verify_signatures(signed, sigs, epoch.epoch, &epoch.verifier, &[], &bump)
+                .map(|indices| indices.as_slice().to_vec());
         compared += 1;
-        if ours.as_ref().ok() != Some(&reference) {
-            mismatches.push(format!(
-                "{}: reference {reference:?}, ours {ours:?}",
-                case.label
-            ));
+        for ours in [before, verified] {
+            if ours.as_ref().ok() != Some(&reference) {
+                mismatches.push(format!(
+                    "{}: reference {reference:?}, ours {ours:?}",
+                    case.label
+                ));
+            }
         }
     }
     assert!(compared >= 12, "only {compared} compared");

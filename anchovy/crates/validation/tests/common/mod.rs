@@ -111,6 +111,7 @@ fn run(tx: &Tx, ctx: &Context<'_>, verifier: &Verifier) -> String {
                 &[],
                 &bump,
             )
+            .map(|_| ())
         }
         "full" => {
             let Some(signed) = tx.signed() else {

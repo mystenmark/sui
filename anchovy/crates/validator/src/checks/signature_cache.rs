@@ -11,13 +11,14 @@ use std::sync::Arc;
 use blake2::Blake2b;
 use blake2::digest::consts::U32;
 use containers::DigestHasher;
-use hashbrown::HashSet;
+use hashbrown::HashMap;
 use messages::Message;
 use messages::base::Digest;
 use messages::transaction::{GenericSignature, Intent, SenderSignedData, Transaction};
 
 use super::Valid;
 use crate::epoch::EpochState;
+use validation::verify::SignerIndices;
 
 /// Entries per generation. An entry survives at least this many later
 /// insertions: the reference keeps 100,000.
@@ -30,8 +31,9 @@ pub(crate) struct SignatureCache {
     /// What the entries were verified under, once there are any.
     /// Verification reads the epoch number, protocol config and JWKs from it.
     epoch: Option<Arc<EpochState>>,
-    current: HashSet<Digest, DigestHasher>,
-    previous: HashSet<Digest, DigestHasher>,
+    /// Each verified transaction's signer indices, by key.
+    current: HashMap<Digest, SignerIndices, DigestHasher>,
+    previous: HashMap<Digest, SignerIndices, DigestHasher>,
     generation: usize,
     hits: u64,
     misses: u64,
@@ -40,7 +42,7 @@ pub(crate) struct SignatureCache {
 impl SignatureCache {
     /// Holds up to `2 * generation` entries, allocated here and never grown.
     pub(crate) fn new(generation: usize) -> SignatureCache {
-        let table = || HashSet::with_capacity_and_hasher(generation, DigestHasher::new());
+        let table = || HashMap::with_capacity_and_hasher(generation, DigestHasher::new());
         SignatureCache {
             epoch: None,
             current: table(),
@@ -65,8 +67,8 @@ impl SignatureCache {
         &mut self,
         epoch: &Arc<EpochState>,
         transaction: &Message<Transaction<'static, Valid>>,
-        verify: impl FnOnce(&SenderSignedData<'_, Valid>) -> Result<(), validation::Error>,
-    ) -> Result<(), validation::Error> {
+        verify: impl FnOnce(&SenderSignedData<'_, Valid>) -> Result<SignerIndices, validation::Error>,
+    ) -> Result<SignerIndices, validation::Error> {
         if !self.epoch.as_ref().is_some_and(|e| Arc::ptr_eq(e, epoch)) {
             self.epoch = Some(epoch.clone());
             self.current.clear();
@@ -74,14 +76,14 @@ impl SignatureCache {
         }
         let signed = &transaction.get().0;
         let key = key(epoch.epoch, signed);
-        if self.current.contains(&key) || self.previous.contains(&key) {
+        if let Some(indices) = self.current.get(&key).or_else(|| self.previous.get(&key)) {
             self.hits += 1;
-            return Ok(());
+            return Ok(*indices);
         }
         self.misses += 1;
-        verify(signed)?;
-        self.insert(key);
-        Ok(())
+        let indices = verify(signed)?;
+        self.insert(key, indices);
+        Ok(indices)
     }
 
     /// Lookups answered from the cache, and lookups not.
@@ -91,13 +93,13 @@ impl SignatureCache {
 
     /// Only a verification inserts, never a hit: resubmitting what is cached
     /// cannot push anything else out.
-    fn insert(&mut self, key: Digest) {
+    fn insert(&mut self, key: Digest, indices: SignerIndices) {
         if self.current.len() >= self.generation {
             std::mem::swap(&mut self.current, &mut self.previous);
             // Keeps its table: no allocation after construction.
             self.current.clear();
         }
-        self.current.insert(key);
+        self.current.insert(key, indices);
     }
 }
 
@@ -191,7 +193,7 @@ mod tests {
         cache
             .verify(epoch, transaction, |_| {
                 ran.set(true);
-                Ok(())
+                Ok(SignerIndices::default())
             })
             .unwrap();
         ran.get()
