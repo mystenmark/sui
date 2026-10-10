@@ -443,3 +443,137 @@ fn upgraded_package_versions_match() {
     assert!(!node.return_0(v1));
     assert!(node.return_0(v2));
 }
+
+/// Move calls with type arguments, including ones that fail in loading or typing.
+#[test]
+#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
+fn generic_calls_match() {
+    use move_core_types::language_storage::{StructTag, TypeTag};
+    use sui_types::transaction::{Argument, Command};
+    let node = Node::new();
+    let sui = sui_types::gas_coin::GAS::type_tag();
+    let framework = sui_types::SUI_FRAMEWORK_PACKAGE_ID;
+    let stdlib = sui_types::MOVE_STDLIB_PACKAGE_ID;
+    let run = |builder: ProgrammableTransactionBuilder| {
+        node.execute_both_and_commit(TransactionData::new_programmable(
+            node.sender,
+            vec![node.gas()],
+            builder.finish(),
+            BUDGET,
+            RGP,
+        ))
+    };
+
+    // A zero coin, made and destroyed.
+    let mut b = ProgrammableTransactionBuilder::new();
+    let coin = b.programmable_move_call(
+        framework,
+        ident_str!("coin").to_owned(),
+        ident_str!("zero").to_owned(),
+        vec![sui.clone()],
+        vec![],
+    );
+    b.programmable_move_call(
+        framework,
+        ident_str!("coin").to_owned(),
+        ident_str!("destroy_zero").to_owned(),
+        vec![sui.clone()],
+        vec![coin],
+    );
+    assert!(run(b).status().is_ok());
+
+    // Options and vectors of primitives, and a typed vector.
+    let mut b = ProgrammableTransactionBuilder::new();
+    let t = b.pure(true).unwrap();
+    b.programmable_move_call(
+        stdlib,
+        ident_str!("option").to_owned(),
+        ident_str!("some").to_owned(),
+        vec![TypeTag::Bool],
+        vec![t],
+    );
+    let bytes = b.pure(vec![1u8, 2, 3]).unwrap();
+    b.programmable_move_call(
+        stdlib,
+        ident_str!("vector").to_owned(),
+        ident_str!("length").to_owned(),
+        vec![TypeTag::U8],
+        vec![bytes],
+    );
+    let addresses = b.pure(vec![node.sender]).unwrap();
+    b.programmable_move_call(
+        stdlib,
+        ident_str!("option").to_owned(),
+        ident_str!("some").to_owned(),
+        vec![TypeTag::Vector(Box::new(TypeTag::Address))],
+        vec![addresses],
+    );
+    let (x, y) = (b.pure(1u64).unwrap(), b.pure(2u64).unwrap());
+    b.command(Command::MakeMoveVec(Some(TypeTag::U64.into()), vec![x, y]));
+    assert!(run(b).status().is_ok());
+
+    // A type argument naming a type that does not exist.
+    let mut b = ProgrammableTransactionBuilder::new();
+    b.programmable_move_call(
+        framework,
+        ident_str!("coin").to_owned(),
+        ident_str!("zero").to_owned(),
+        vec![TypeTag::Struct(Box::new(StructTag {
+            address: sui_types::SUI_FRAMEWORK_ADDRESS,
+            module: ident_str!("coin").to_owned(),
+            name: ident_str!("NoSuchType").to_owned(),
+            type_params: vec![],
+        }))],
+        vec![],
+    );
+    assert!(!run(b).status().is_ok());
+
+    // The wrong number of type arguments.
+    let mut b = ProgrammableTransactionBuilder::new();
+    b.programmable_move_call(
+        framework,
+        ident_str!("coin").to_owned(),
+        ident_str!("zero").to_owned(),
+        vec![sui.clone(), sui.clone()],
+        vec![],
+    );
+    assert!(!run(b).status().is_ok());
+
+    // A type argument without the abilities the function requires (`key + store`).
+    let mut b = ProgrammableTransactionBuilder::new();
+    let (v, to) = (b.pure(7u64).unwrap(), b.pure(node.sender).unwrap());
+    b.programmable_move_call(
+        framework,
+        ident_str!("transfer").to_owned(),
+        ident_str!("public_transfer").to_owned(),
+        vec![TypeTag::U64],
+        vec![v, to],
+    );
+    assert!(!run(b).status().is_ok());
+
+    // Two coins of one type merged: object inputs of the same type.
+    let mut b = ProgrammableTransactionBuilder::new();
+    let (a1, a2) = (b.pure(SUI).unwrap(), b.pure(SUI).unwrap());
+    let split = b.command(Command::SplitCoins(Argument::GasCoin, vec![a1, a2]));
+    let Argument::Result(i) = split else {
+        unreachable!()
+    };
+    b.transfer_arg(node.sender, Argument::NestedResult(i, 0));
+    b.transfer_arg(node.sender, Argument::NestedResult(i, 1));
+    let effects = run(b);
+    assert!(effects.status().is_ok());
+    let coins: Vec<ObjectID> = effects.created().into_iter().map(|(r, _)| r.0).collect();
+    let mut b = ProgrammableTransactionBuilder::new();
+    let first = b
+        .obj(sui_types::transaction::ObjectArg::ImmOrOwnedObject(
+            node.live_ref(coins[0]),
+        ))
+        .unwrap();
+    let second = b
+        .obj(sui_types::transaction::ObjectArg::ImmOrOwnedObject(
+            node.live_ref(coins[1]),
+        ))
+        .unwrap();
+    b.command(Command::MergeCoins(first, vec![second]));
+    assert!(run(b).status().is_ok());
+}
