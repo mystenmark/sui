@@ -34,6 +34,7 @@ pub mod linkage;
 pub mod loading;
 pub mod metering;
 pub mod spanned;
+pub mod type_cache;
 pub mod typing;
 
 /// Options for [`execute_with_options`]. [`execute`] uses the `Default`.
@@ -46,6 +47,9 @@ pub struct ExecuteOptions<'t> {
     /// The epoch's natives cost table, which must have been built from this `protocol_config`
     /// by `NativesCostTable::from_protocol_config`. `None` builds it for this transaction.
     pub natives_cost_table: Option<&'t NativesCostTable>,
+    /// The epoch's types and layouts. `None` asks the VM for all of them. A system transaction
+    /// must not use one (see `TypeCache`).
+    pub type_cache: Option<&'t Arc<type_cache::TypeCache>>,
 }
 
 impl Default for ExecuteOptions<'_> {
@@ -53,6 +57,7 @@ impl Default for ExecuteOptions<'_> {
         Self {
             record_invariant_bookkeeping: true,
             natives_cost_table: None,
+            type_cache: None,
         }
     }
 }
@@ -127,6 +132,7 @@ pub fn execute_with_options<'a, Mode: ExecutionMode>(
         &package_store,
         &linkage_analysis,
         &resolution_vm,
+        options.type_cache,
     );
     let mut translation_meter =
         translation_meter::TranslationMeter::new(protocol_config, gas_charger);

@@ -13,6 +13,7 @@ use executor::execution_mode::Normal;
 use executor::execution_params::ExecutionOrEarlyError;
 use executor::gas::SuiGasStatus;
 use executor::inputs::{ExecutionInputs, InputObjectKind, InputState, LoadedInput};
+use executor::static_programmable_transactions::type_cache::TypeCache;
 use executor::storage::EmptyUnsettledObjectFunds;
 use messages::Kept;
 use messages::base::TransactionDigest;
@@ -35,6 +36,9 @@ pub struct NativeExecution {
     arena: std::sync::Mutex<Bump>,
     /// Built once from `config`: the natives' costs are fixed for the epoch.
     natives_cost_table: natives::NativesCostTable,
+    /// The types and layouts the VM computed in the epoch. It must not outlive the epoch, at
+    /// whose end the system packages change in place.
+    type_cache: Arc<TypeCache>,
     config: ProtocolConfig,
     move_vm: Arc<MoveRuntime>,
     metrics: Arc<ExecutionMetrics>,
@@ -59,6 +63,7 @@ impl NativeExecution {
         Ok(NativeExecution {
             arena: std::sync::Mutex::new(Bump::with_capacity(ARENA_CAPACITY)),
             natives_cost_table: natives::NativesCostTable::from_protocol_config(&config),
+            type_cache: Arc::new(TypeCache::new()),
             config,
             move_vm: Arc::new(move_vm),
             metrics,
@@ -163,6 +168,7 @@ impl NativeExecution {
             false,
             ExecutionOrEarlyError::ok(None),
             Some(&self.natives_cost_table),
+            Some(&self.type_cache),
         );
 
         let written = inner_store.written.values().map(written).collect();

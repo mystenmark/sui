@@ -19,6 +19,7 @@ use crate::{
         execution::values::{Local, Locals, UpgradeCap, UpgradeReceipt, UpgradeTicket, Value},
         linkage::resolved_linkage::{ExecutableLinkage, ResolvedLinkage},
         loading::ast::{Datatype, DeserializedPackage, ModuleId, PackagePayload},
+        type_cache::{CachedLinkage, OwnedType},
         typing::ast::{self as T, Type},
     },
     storage::DenyListResult,
@@ -718,11 +719,19 @@ where
 
         let (writeout_vm, ty_linkage) =
             Self::make_writeout_vm(env, writes.values().map(|(_, ty, _)| *ty))?;
+        let writeout_cache = env.cache_for(&writeout_vm);
 
         // The type and layout of each object type written, which the reference loads for every
         // write. A hit is never false: equal `MoveObjectType`s are the same struct tag, and the
         // type and layout are a deterministic function of the tag in the one write-out VM.
-        let mut writeout_types = Vec::new_in(bump);
+        let mut writeout_types: Vec<
+            '_,
+            (
+                MoveObjectType<'a>,
+                Type<'a>,
+                Arc<move_core_types::runtime_value::MoveTypeLayout>,
+            ),
+        > = Vec::new_in(bump);
         for (id, (recipient, object_type, value)) in writes {
             let (ty, layout) = match writeout_types.iter().find(|(t, _, _)| *t == object_type) {
                 Some((_, ty, layout)) => {
@@ -731,6 +740,7 @@ where
                             env,
                             &writeout_vm,
                             &ty_linkage,
+                            None,
                             to_move_struct_tag_of(&object_type),
                         )
                         .is_ok_and(
@@ -744,6 +754,7 @@ where
                         env,
                         &writeout_vm,
                         &ty_linkage,
+                        writeout_cache.as_ref(),
                         to_move_struct_tag_of(&object_type),
                     )?;
                     writeout_types.push((object_type, ty, layout));
@@ -840,9 +851,10 @@ where
             '_,
             (
                 StructTag<'a>,
-                move_core_types::runtime_value::MoveTypeLayout,
+                Arc<move_core_types::runtime_value::MoveTypeLayout>,
             ),
         > = Vec::new_in(self.env.bump);
+        let mut cache = None;
         for (tag, value) in events {
             let layout = match layouts.iter().find(|(t, _)| *t == tag) {
                 Some((_, layout)) => {
@@ -856,9 +868,30 @@ where
                 }
                 None => {
                     let type_tag = move_tags::TypeTag::Struct(Box::new(to_move_struct_tag(&tag)));
-                    let layout = vm
-                        .runtime_type_layout(&type_tag)
-                        .map_err(|e| self.env.convert_linked_vm_error(e, linkage))?;
+                    let cache = cache.get_or_insert_with(|| self.env.cache_for(vm));
+                    let cached = cache
+                        .as_ref()
+                        .and_then(|c| c.get(|b| b.events.get(&type_tag).cloned()));
+                    let layout = match cached {
+                        Some(layout) => {
+                            debug_assert!(vm.runtime_type_layout(&type_tag).is_ok_and(|l| {
+                                object_runtime::runtime_layouts_equal(&l, &layout)
+                            }));
+                            layout
+                        }
+                        None => {
+                            let layout = Arc::new(
+                                vm.runtime_type_layout(&type_tag)
+                                    .map_err(|e| self.env.convert_linked_vm_error(e, linkage))?,
+                            );
+                            if let Some(cache) = cache {
+                                cache.insert(|b| {
+                                    b.events.insert(type_tag, Arc::clone(&layout));
+                                });
+                            }
+                            layout
+                        }
+                    };
                     layouts.push((tag, layout));
                     let Some((_, layout)) = layouts.last() else {
                         invariant_violation!("just pushed");
@@ -916,22 +949,58 @@ where
     /// It is important that this use the VM passed in, and not the `resolution_vm` in the `env` as
     /// the types requested may have only been created during the execution of the transaction and
     /// therefore will not be present in the `resolution_vm`.
+    ///
+    /// `cache` is the epoch's bucket for `vm`, if the transaction may use it.
     fn load_type_and_layout_from_struct_for_writeout(
         env: &Env<'a, 'pc, 'vm, 'state, 'linkage, 'extension, Mode>,
         vm: &MoveVM,
         linkage: &ExecutableLinkage<'_>,
+        cache: Option<&CachedLinkage>,
         tag: move_tags::StructTag,
-    ) -> Result<(Type<'a>, move_core_types::runtime_value::MoveTypeLayout), ExecutionError<'a>>
-    {
+    ) -> Result<
+        (
+            Type<'a>,
+            Arc<move_core_types::runtime_value::MoveTypeLayout>,
+        ),
+        ExecutionError<'a>,
+    > {
         let type_tag = move_tags::TypeTag::Struct(Box::new(tag));
+        let cached = cache.and_then(|c| {
+            c.get(|b| {
+                b.writeout
+                    .get(&type_tag)
+                    .map(|(ty, layout)| (ty.in_arena(env.bump), Arc::clone(layout)))
+            })
+        });
+        if let Some((ty, layout)) = cached {
+            debug_assert!(matches!(
+                &type_tag,
+                move_tags::TypeTag::Struct(tag) if Self::load_type_and_layout_from_struct_for_writeout(
+                    env,
+                    vm,
+                    linkage,
+                    None,
+                    (**tag).clone(),
+                )
+                .is_ok_and(|(t, l)| t == ty && object_runtime::runtime_layouts_equal(&l, &layout))
+            ));
+            return Ok((ty, layout));
+        }
         let vm_type = vm
             .load_type(&type_tag)
             .map_err(|e| env.convert_linked_vm_error(e, linkage))?;
-        let layout = vm
-            .runtime_type_layout(&type_tag)
-            .map_err(|e| env.convert_vm_error(e))?;
-        env.adapter_type_from_vm_type(vm, &vm_type)
-            .map(|ty| (ty, layout))
+        let layout = Arc::new(
+            vm.runtime_type_layout(&type_tag)
+                .map_err(|e| env.convert_vm_error(e))?,
+        );
+        let ty = env.adapter_type_from_vm_type(vm, &vm_type)?;
+        if let Some(cache) = cache {
+            cache.insert(|b| {
+                b.writeout
+                    .insert(type_tag, (OwnedType::new(&ty), Arc::clone(&layout)));
+            });
+        }
+        Ok((ty, layout))
     }
 
     //
@@ -1812,8 +1881,8 @@ struct InputLayouts<'a>(
         'a,
         (
             Type<'a>,
-            move_core_types::annotated_value::MoveTypeLayout,
-            move_core_types::runtime_value::MoveTypeLayout,
+            Arc<move_core_types::annotated_value::MoveTypeLayout>,
+            Arc<move_core_types::runtime_value::MoveTypeLayout>,
         ),
     >,
 );

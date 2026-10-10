@@ -172,11 +172,14 @@ pub fn execute_transaction_to_effects<'a, Mode: ExecutionMode>(
     // The epoch's natives cost table, built from `protocol_config`; `None` builds one for this
     // transaction.
     natives_cost_table: Option<&natives::NativesCostTable>,
+    // The epoch's types and layouts, which only user transactions use; `None` asks the VM for all.
+    type_cache: Option<&Arc<SPT::type_cache::TypeCache>>,
 ) -> ExecutionOutput<'a> {
     let options = SPT::ExecuteOptions {
         // Only the ownership invariant check, run with the expensive checks, reads it.
         record_invariant_bookkeeping: enable_expensive_checks,
         natives_cost_table,
+        type_cache,
     };
     let shared_object_refs = inputs.filter_shared_objects(bump);
     let mut transaction_dependencies = if protocol_config.disable_effects_tx_dependencies() {
@@ -922,7 +925,10 @@ fn execution_loop<'a, Mode: ExecutionMode>(
                 gas_charger,
                 None,
                 pt,
-                options,
+                SPT::ExecuteOptions {
+                    type_cache: None,
+                    ..options
+                },
             )
             .map_err(|(e, _)| (e, no_timings()))?;
             Ok(((), no_timings()))
@@ -1006,7 +1012,10 @@ fn setup_consensus_commit<'a>(
         gas_charger,
         None,
         pt,
-        options,
+        SPT::ExecuteOptions {
+            type_cache: None,
+            ..options
+        },
     )
     .map_err(|(e, _)| e)?;
     Ok(())
@@ -1064,7 +1073,10 @@ fn setup_randomness_state_update<'a>(
         gas_charger,
         None,
         pt,
-        options,
+        SPT::ExecuteOptions {
+            type_cache: None,
+            ..options
+        },
     )
     .map_err(|(e, _)| e)?;
     Ok(())

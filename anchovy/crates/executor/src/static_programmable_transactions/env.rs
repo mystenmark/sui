@@ -16,6 +16,7 @@ use crate::{
             self as L, Datatype, DeserializedPackage, LoadedFunction, LoadedFunctionInstantiation,
             ModuleId, Type,
         },
+        type_cache::{CachedLinkage, OwnedType, TypeCache},
     },
 };
 use containers::{Bump, Vec};
@@ -47,6 +48,7 @@ use move_vm_runtime::{
 use std::{
     cell::{OnceCell, RefCell},
     marker::PhantomData,
+    sync::{Arc, LazyLock},
 };
 use sui_protocol_config::ProtocolConfig;
 use sui_types::{
@@ -89,6 +91,10 @@ where
     // only. This VM should only be used for resolution of input types, but should not be used for
     // resolution around function calls, execution, or final serialization of execution values.
     input_type_resolution_vm: &'linkage MoveVM<'extensions>,
+    /// The epoch's types and layouts, if this transaction may use them (see `TypeCache`).
+    type_cache: Option<Arc<TypeCache>>,
+    /// `type_cache`'s bucket for `input_type_resolution_vm`.
+    resolution_cache: Option<CachedLinkage>,
     _mode: PhantomData<fn() -> Mode>,
 }
 
@@ -117,7 +123,15 @@ where
         linkable_store: &'linkage CachedPackageStore<'a, 'vm>,
         linkage_analysis: &'linkage LinkageAnalyzer<'a>,
         input_type_resolution_vm: &'linkage MoveVM<'extensions>,
+        type_cache: Option<&Arc<TypeCache>>,
     ) -> Self {
+        let resolution_cache = type_cache.map(|cache| {
+            cache.bucket(
+                bump,
+                Mode::packages_are_predefined(),
+                input_type_resolution_vm.linkage_context(),
+            )
+        });
         Self {
             bump,
             protocol_config,
@@ -132,6 +146,8 @@ where
             tx_context_type: OnceCell::new(),
             type_linkages: RefCell::new(Vec::new_in(bump)),
             input_type_resolution_vm,
+            type_cache: type_cache.cloned(),
+            resolution_cache,
             _mode: PhantomData,
         }
     }
@@ -190,24 +206,67 @@ where
         }
     }
 
+    /// The reference returns the layout itself; it is shared here, to be kept across
+    /// transactions.
     pub fn fully_annotated_layout(
         &self,
         ty: &Type<'a>,
-    ) -> Result<annotated_value::MoveTypeLayout, ExecutionError<'a>> {
+    ) -> Result<Arc<annotated_value::MoveTypeLayout>, ExecutionError<'a>> {
         let tag: TypeTag = (*ty).try_into().map_err(|s| {
             ExecutionError::new_with_source(ExecutionErrorKind::VMInvariantViolation, s)
         })?;
-        let objects = tag_addresses(self.bump, &tag);
+        let cache = self.resolution_cache();
+        if let Some(layout) = cache.and_then(|c| c.get(|b| b.annotated.get(&tag).cloned())) {
+            debug_assert!(self.vm_annotated_layout(&tag).is_ok_and(|l| l == *layout));
+            return Ok(layout);
+        }
+        let layout = Arc::new(self.vm_annotated_layout(&tag)?);
+        if let Some(cache) = cache {
+            cache.insert(|b| {
+                b.annotated.insert(tag, Arc::clone(&layout));
+            });
+        }
+        Ok(layout)
+    }
+
+    fn vm_annotated_layout(
+        &self,
+        tag: &TypeTag,
+    ) -> Result<annotated_value::MoveTypeLayout, ExecutionError<'a>> {
+        let objects = tag_addresses(self.bump, tag);
         let tag_linkage = self.type_linkage(&objects)?;
         self.input_type_resolution_vm
-            .annotated_type_layout(&tag)
+            .annotated_type_layout(tag)
             .map_err(|e| self.convert_linked_vm_error(e, &tag_linkage))
     }
 
+    /// The bucket of `vm`'s linkage, if the transaction may use the epoch's cache now.
+    pub(crate) fn cache_for(&self, vm: &MoveVM<'_>) -> Option<CachedLinkage> {
+        if self.linkable_store.package_store.has_new_packages() {
+            return None;
+        }
+        let cache = self.type_cache.as_ref()?;
+        Some(cache.bucket(
+            self.bump,
+            Mode::packages_are_predefined(),
+            vm.linkage_context(),
+        ))
+    }
+
+    /// The bucket of `input_type_resolution_vm`, if the transaction may use the epoch's cache now.
+    fn resolution_cache(&self) -> Option<&CachedLinkage> {
+        if self.linkable_store.package_store.has_new_packages() {
+            return None;
+        }
+        self.resolution_cache.as_ref()
+    }
+
+    /// The reference returns the layout itself; it is shared here, to be kept across
+    /// transactions.
     pub fn runtime_layout(
         &self,
         ty: &Type<'a>,
-    ) -> Result<runtime_value::MoveTypeLayout, ExecutionError<'a>> {
+    ) -> Result<Arc<runtime_value::MoveTypeLayout>, ExecutionError<'a>> {
         if let Some(layout) = self.scalar_runtime_layout(ty) {
             debug_assert_eq!(
                 Some(format!("{layout:?}")),
@@ -226,27 +285,44 @@ where
     /// (at most 2), within the type traversal limits (`TYPE_DEPTH_MAX`,
     /// `MAX_TYPE_INSTANTIATION_NODES`) and, as checked here, within the VM's value depth and
     /// layout node limits.
-    fn scalar_runtime_layout(&self, ty: &Type<'a>) -> Option<runtime_value::MoveTypeLayout> {
+    fn scalar_runtime_layout(&self, ty: &Type<'a>) -> Option<Arc<runtime_value::MoveTypeLayout>> {
         use runtime_value::MoveTypeLayout as R;
-        fn scalar(ty: &Type<'_>) -> Option<R> {
+        const SCALARS: usize = 8;
+        /// Each scalar's layout, then each vector of one's, shared to hand out without allocating.
+        static LAYOUTS: LazyLock<std::vec::Vec<Arc<R>>> = LazyLock::new(|| {
+            let scalars = [
+                R::Bool,
+                R::U8,
+                R::U16,
+                R::U32,
+                R::U64,
+                R::U128,
+                R::U256,
+                R::Address,
+            ];
+            let vectors = scalars.clone().map(|s| R::Vector(Box::new(s)));
+            scalars.into_iter().chain(vectors).map(Arc::new).collect()
+        });
+        fn scalar(ty: &Type<'_>) -> Option<usize> {
             Some(match ty {
-                Type::Bool => R::Bool,
-                Type::U8 => R::U8,
-                Type::U16 => R::U16,
-                Type::U32 => R::U32,
-                Type::U64 => R::U64,
-                Type::U128 => R::U128,
-                Type::U256 => R::U256,
-                Type::Address => R::Address,
+                Type::Bool => 0,
+                Type::U8 => 1,
+                Type::U16 => 2,
+                Type::U32 => 3,
+                Type::U64 => 4,
+                Type::U128 => 5,
+                Type::U256 => 6,
+                Type::Address => 7,
                 Type::Signer | Type::Vector(_) | Type::Datatype(_) | Type::Reference(_, _) => {
                     return None;
                 }
             })
         }
-        let (layout, depth) = match ty {
-            Type::Vector(v) => (R::Vector(Box::new(scalar(&v.element_type)?)), 2),
+        let (index, depth) = match ty {
+            Type::Vector(v) => (SCALARS.checked_add(scalar(&v.element_type)?)?, 2),
             ty => (scalar(ty)?, 1),
         };
+        let layout = Arc::clone(LAYOUTS.get(index)?);
         let config = self.input_type_resolution_vm.vm_config();
         let max_depth = config
             .runtime_limits_config
@@ -258,18 +334,39 @@ where
         (depth <= max_depth && depth <= max_nodes).then_some(layout)
     }
 
-    /// `runtime_layout`, from the VM.
+    /// `runtime_layout`, from the VM or the epoch's cache.
     fn vm_runtime_layout(
         &self,
         ty: &Type<'a>,
-    ) -> Result<runtime_value::MoveTypeLayout, ExecutionError<'a>> {
+    ) -> Result<Arc<runtime_value::MoveTypeLayout>, ExecutionError<'a>> {
         let tag: TypeTag = (*ty).try_into().map_err(|s| {
             ExecutionError::new_with_source(ExecutionErrorKind::VMInvariantViolation, s)
         })?;
-        let objects = tag_addresses(self.bump, &tag);
+        let cache = self.resolution_cache();
+        if let Some(layout) = cache.and_then(|c| c.get(|b| b.runtime.get(&tag).cloned())) {
+            debug_assert!(
+                self.uncached_runtime_layout(&tag)
+                    .is_ok_and(|l| natives::object_runtime::runtime_layouts_equal(&l, &layout))
+            );
+            return Ok(layout);
+        }
+        let layout = Arc::new(self.uncached_runtime_layout(&tag)?);
+        if let Some(cache) = cache {
+            cache.insert(|b| {
+                b.runtime.insert(tag, Arc::clone(&layout));
+            });
+        }
+        Ok(layout)
+    }
+
+    fn uncached_runtime_layout(
+        &self,
+        tag: &TypeTag,
+    ) -> Result<runtime_value::MoveTypeLayout, ExecutionError<'a>> {
+        let objects = tag_addresses(self.bump, tag);
         let tag_linkage = self.type_linkage(&objects)?;
         self.input_type_resolution_vm
-            .runtime_type_layout(&tag)
+            .runtime_type_layout(tag)
             .map_err(|e| self.convert_linked_vm_error(e, &tag_linkage))
     }
 
@@ -513,14 +610,32 @@ where
     ///
     /// The reference borrows the tag and clones it; every caller has an owned tag to give.
     pub fn load_type_from_struct(&self, tag: StructTag) -> Result<Type<'a>, ExecutionError<'a>> {
-        let vm_type = self.load_vm_type_from_type_tag(None, &TypeTag::Struct(Box::new(tag)))?;
+        let tag = TypeTag::Struct(Box::new(tag));
+        let cache = self.resolution_cache();
+        if let Some(ty) =
+            cache.and_then(|c| c.get(|b| b.types.get(&tag).map(|t| t.in_arena(self.bump))))
+        {
+            debug_assert!(self.uncached_type_from_struct(&tag).is_ok_and(|t| t == ty));
+            return Ok(ty);
+        }
+        let ty = self.uncached_type_from_struct(&tag)?;
+        if let Some(cache) = cache {
+            cache.insert(|b| {
+                b.types.insert(tag, OwnedType::new(&ty));
+            });
+        }
+        Ok(ty)
+    }
+
+    fn uncached_type_from_struct(&self, tag: &TypeTag) -> Result<Type<'a>, ExecutionError<'a>> {
+        let vm_type = self.load_vm_type_from_type_tag(None, tag)?;
         self.adapter_type_from_vm_type(self.input_type_resolution_vm, &vm_type)
     }
 
     pub fn type_layout_for_struct(
         &self,
         tag: StructTag,
-    ) -> Result<MoveTypeLayout, ExecutionError<'a>> {
+    ) -> Result<Arc<MoveTypeLayout>, ExecutionError<'a>> {
         let ty: Type = self.load_type_from_struct(tag)?;
         self.runtime_layout(&ty)
     }
