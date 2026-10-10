@@ -1,7 +1,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::object_runtime::{fingerprint::ObjectFingerprint, get_all_uids};
+use crate::object_runtime::{
+    fingerprint::{ObjectFingerprint, SerializedChild},
+    get_all_uids,
+};
 use containers::{BTreeMap, Bump, btree_map};
 use exec_types::base::EpochId;
 use exec_types::execution::DynamicallyLoadedObjectMetadata;
@@ -50,6 +53,8 @@ pub(crate) struct ChildObjectEffect<'a> {
     pub(super) final_value: Option<Value>,
     // True if the value or the owner has changed
     pub(super) object_changed: bool,
+    // The final value's bytes, if they were serialized to tell that it changed.
+    pub(super) serialized: Option<SerializedChild>,
 }
 
 pub(crate) type ChildObjectEffects<'a> = BTreeMap<'a, ObjectId, ChildObjectEffect<'a>>;
@@ -762,12 +767,14 @@ impl<'a> ChildObjectStore<'a> {
                 fingerprint,
             } = child_object;
             let final_value = value.into_value()?;
-            let object_changed = fingerprint.object_has_changed(&owner, &ty, &final_value)?;
+            let (object_changed, serialized) =
+                fingerprint.object_has_changed(&owner, &ty, &final_value)?;
             let child_effect = ChildObjectEffect {
                 owner,
                 ty,
                 final_value,
                 object_changed,
+                serialized,
             };
             effects.insert(id, child_effect);
         }

@@ -666,6 +666,7 @@ where
             mut accumulator_events,
             settlement_input_sui,
             settlement_output_sui,
+            mut serialized_children,
         } = object_runtime.finish(child_loaded_runtime_objects)?;
         assert_invariant!(
             loaded_runtime_objects
@@ -693,6 +694,8 @@ where
             let Some(gas_payment_location) = gas_payment_location else {
                 invariant_violation!("Gas payment should be specified if gas ID is present");
             };
+            // The refund changes the gas coin's value, so earlier bytes would be stale.
+            serialized_children.remove(&gas_id);
             finish_gas_coin(
                 bump,
                 gas_charger,
@@ -749,8 +752,25 @@ where
             };
             let abilities = ty.abilities();
             let has_public_transfer = abilities.has_store();
-            let Some(bytes) = value.typed_serialize(layout) else {
-                invariant_violation!("Failed to serialize already deserialized Move value");
+            // A changed child was serialized already to tell that it changed; with an equal
+            // layout, serializing again gives the same bytes. The reference serializes again.
+            let bytes = match serialized_children.remove(&id) {
+                Some(serialized)
+                    if object_runtime::runtime_layouts_equal(&serialized.layout, layout) =>
+                {
+                    debug_assert_eq!(
+                        value.typed_serialize(layout).as_ref(),
+                        Some(&serialized.bytes),
+                        "a child's bytes are not its final value's"
+                    );
+                    serialized.bytes
+                }
+                _ => {
+                    let Some(bytes) = value.typed_serialize(layout) else {
+                        invariant_violation!("Failed to serialize already deserialized Move value");
+                    };
+                    bytes
+                }
             };
             // has_public_transfer has been determined by the abilities
             let move_object = create_written_object::<Mode>(

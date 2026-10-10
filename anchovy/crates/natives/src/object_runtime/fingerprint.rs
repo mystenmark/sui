@@ -48,6 +48,14 @@ pub fn runtime_layouts_equal(a: &R::MoveTypeLayout, b: &R::MoveTypeLayout) -> bo
     }
 }
 
+/// A changed child's final value, serialized with the layout it was loaded with to compare it
+/// with its stored bytes. The write-out reuses the bytes when its layout is equal.
+#[derive(Debug)]
+pub struct SerializedChild {
+    pub layout: R::MoveTypeLayout,
+    pub bytes: std::vec::Vec<u8>,
+}
+
 /// This type is used to track if an object has changed since it was read from storage: by its
 /// owner ID, type and BCS bytes. The reference keeps a copy of the deserialized value instead
 /// and compares values; BCS is canonical, so equal values of one layout have equal bytes and the
@@ -88,17 +96,18 @@ impl<'a> ObjectFingerprint<'a> {
         }))
     }
 
-    /// Checks if the object has changed since it was read from storage.
+    /// Checks if the object has changed since it was read from storage, and if its value was
+    /// serialized to tell, and differs, the serialization.
     /// Gives an invariant violation if the fingerprint is disabled, or if the final value cannot
     /// be serialized with the layout it was read with although owner and type are the same.
     pub fn object_has_changed(
-        &self,
+        self,
         final_owner: &ObjectId,
         final_type: &MoveObjectType<'_>,
         final_value: &Option<Value>,
-    ) -> PartialVMResult<bool> {
+    ) -> PartialVMResult<(bool, Option<SerializedChild>)> {
         use ObjectFingerprint_ as F;
-        let Some(inner) = &self.0 else {
+        let Some(inner) = self.0 else {
             return Err(
                 PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR).with_message(
                     "Object fingerprint not enabled, yet we were asked for the changes".to_string(),
@@ -106,8 +115,8 @@ impl<'a> ObjectFingerprint<'a> {
             );
         };
         Ok(match (inner, final_value) {
-            (F::Empty, None) => false,
-            (F::Empty, Some(_)) | (F::Preexisting { .. }, None) => true,
+            (F::Empty, None) => (false, None),
+            (F::Empty, Some(_)) | (F::Preexisting { .. }, None) => (true, None),
             (
                 F::Preexisting {
                     owner: preexisting_owner,
@@ -120,10 +129,10 @@ impl<'a> ObjectFingerprint<'a> {
                 // owner changed or value changed.
                 // For the value, we must first check if the types are the same before comparing the
                 // values
-                if preexisting_owner != final_owner || preexisting_type != final_type {
-                    return Ok(true);
+                if preexisting_owner != *final_owner || preexisting_type != *final_type {
+                    return Ok((true, None));
                 }
-                let Some(final_bytes) = final_value.typed_serialize(layout) else {
+                let Some(final_bytes) = final_value.typed_serialize(&layout) else {
                     return Err(
                         PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
                             .with_message(
@@ -131,7 +140,15 @@ impl<'a> ObjectFingerprint<'a> {
                             ),
                     );
                 };
-                final_bytes != *preexisting_bytes
+                if final_bytes == preexisting_bytes {
+                    (false, None)
+                } else {
+                    let serialized = SerializedChild {
+                        layout,
+                        bytes: final_bytes,
+                    };
+                    (true, Some(serialized))
+                }
             }
         })
     }

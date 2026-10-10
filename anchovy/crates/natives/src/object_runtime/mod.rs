@@ -12,7 +12,7 @@ use crate::object_runtime::object_store::{CacheMetadata, ChildObjectEffect};
 use self::object_store::{ChildObjectEffects, ObjectResult};
 use super::get_object_id;
 use better_any::{Tid, TidAble};
-use containers::{BTreeMap, BTreeSet, Bump, IndexMap, IndexSet, Vec};
+use containers::{BTreeMap, BTreeSet, Bump, HashMap, IndexMap, IndexSet, Vec};
 use exec_types::base::{
     EpochId, SUI_ACCUMULATOR_ROOT_OBJECT_ID, SUI_ADDRESS_ALIAS_STATE_OBJECT_ID,
     SUI_AUTHENTICATOR_STATE_OBJECT_ID, SUI_BRIDGE_OBJECT_ID, SUI_CLOCK_OBJECT_ID,
@@ -44,7 +44,7 @@ use sui_types::{error::VMMemoryLimitExceededSubStatusCode, metrics::ExecutionMet
 use tracing::error;
 
 pub use accumulator::*;
-pub use fingerprint::runtime_layouts_equal;
+pub use fingerprint::{SerializedChild, runtime_layouts_equal};
 
 type Set<'a, K> = IndexSet<'a, K>;
 
@@ -64,6 +64,10 @@ pub struct RuntimeResults<'a> {
     pub deleted_object_ids: Set<'a, ObjectId>,
     pub settlement_input_sui: u64,
     pub settlement_output_sui: u64,
+    /// For child objects in `writes` whose value changed: the value serialized with the layout
+    /// the child was loaded with (see `ObjectFingerprint`). It is the bytes of the value in
+    /// `writes` as long as that value is not changed.
+    pub serialized_children: HashMap<'a, ObjectId, SerializedChild>,
 }
 
 #[derive(Clone, Copy)]
@@ -812,7 +816,13 @@ impl<'a> ObjectRuntimeState<'a> {
             )
         }));
         let mut loaded_child_objects = loaded_child_objects_;
-        self.apply_child_object_effects(bump, &mut loaded_child_objects, child_object_effects);
+        let mut serialized_children = containers::hash_map(bump, 0);
+        self.apply_child_object_effects(
+            bump,
+            &mut loaded_child_objects,
+            &mut serialized_children,
+            child_object_effects,
+        );
         let ObjectRuntimeState {
             input_objects: _,
             new_ids,
@@ -884,6 +894,7 @@ impl<'a> ObjectRuntimeState<'a> {
             deleted_object_ids: deleted_ids,
             settlement_input_sui,
             settlement_output_sui,
+            serialized_children,
         })
     }
 
@@ -907,6 +918,7 @@ impl<'a> ObjectRuntimeState<'a> {
         &mut self,
         bump: &'a Bump,
         loaded_child_objects: &mut BTreeMap<'a, ObjectId, LoadedRuntimeObject>,
+        serialized_children: &mut HashMap<'a, ObjectId, SerializedChild>,
         child_object_effects: ChildObjectEffects<'a>,
     ) {
         for (child, child_object_effect) in child_object_effects {
@@ -915,6 +927,7 @@ impl<'a> ObjectRuntimeState<'a> {
                 ty,
                 final_value,
                 object_changed,
+                serialized,
             } = child_object_effect;
 
             if object_changed {
@@ -962,6 +975,9 @@ impl<'a> ObjectRuntimeState<'a> {
                         let parent = containers::alloc(bump, SuiAddress(parent.0));
                         self.transfers
                             .insert(child, (Owner::ObjectOwner(parent), ty, v));
+                        if let Some(serialized) = serialized {
+                            serialized_children.insert(child, serialized);
+                        }
                     }
                 }
             } else {
