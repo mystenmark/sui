@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Voting on blocks of signed transfers against a funded genesis, each
-//! transfer paying with its own gas coin: time and allocations per
+//! transfer from its own sender, paying with its own gas coin: time and allocations per
 //! transaction, with signatures not yet verified (a peer's transactions) and
 //! verified before (the signature cache warm). Run with
 //! `cargo bench -p validator --bench vote`; `TXS` sets the transaction count,
@@ -73,7 +73,9 @@ fn main() {
         .ok()
         .and_then(|n| n.parse().ok())
         .unwrap_or(2_000);
-    let (sender, key) = get_key_pair::<AccountKeyPair>();
+    let senders: Vec<(SuiAddress, AccountKeyPair)> = (0..count)
+        .map(|_| get_key_pair::<AccountKeyPair>())
+        .collect();
     let epoch = Arc::new(EpochState::new(
         Chain::Unknown,
         ProtocolVersion::MAX.as_u64(),
@@ -85,7 +87,10 @@ fn main() {
     ));
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(store::Store::open(dir.path()).unwrap());
-    let funded = vec![(sender.to_inner(), 10 * SUI); count];
+    let funded: Vec<_> = senders
+        .iter()
+        .map(|(sender, _)| (sender.to_inner(), 10 * SUI))
+        .collect();
     assert!(execution::genesis::init(&epoch.execution, &store, &funded).unwrap());
 
     let transactions: Vec<Vec<u8>> = (0..count)
@@ -98,16 +103,17 @@ fn main() {
             let gas = bcs::from_bytes::<Object>(coin.wire_bytes())
                 .unwrap()
                 .compute_object_reference();
+            let (sender, key) = &senders[i];
             let data = TransactionData::new_transfer_sui(
                 SuiAddress::random_for_testing_only(),
-                sender,
+                *sender,
                 Some(SUI),
                 gas,
                 BUDGET,
                 RGP,
             );
             user_transaction(
-                &bcs::to_bytes(&Transaction::from_data_and_signer(data, vec![&key])).unwrap(),
+                &bcs::to_bytes(&Transaction::from_data_and_signer(data, vec![key])).unwrap(),
             )
         })
         .collect();
