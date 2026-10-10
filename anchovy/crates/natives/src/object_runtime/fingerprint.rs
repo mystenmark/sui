@@ -10,8 +10,11 @@ use move_vm_runtime::execution::values::Value;
 
 /// Whether `a` and `b` are the same layout. Runtime layouts do not implement `PartialEq`; values
 /// serialize identically under equal layouts.
+// Each `zip` follows a check that the lengths are equal.
+#[allow(clippy::disallowed_methods)]
 pub fn runtime_layouts_equal(a: &R::MoveTypeLayout, b: &R::MoveTypeLayout) -> bool {
     use R::MoveTypeLayout as L;
+    #[allow(clippy::disallowed_methods)]
     fn all_equal(a: &[R::MoveTypeLayout], b: &[R::MoveTypeLayout]) -> bool {
         a.len() == b.len() && a.iter().zip(b).all(|(a, b)| runtime_layouts_equal(a, b))
     }

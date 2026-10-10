@@ -578,7 +578,6 @@ fn generic_calls_match() {
     assert!(run(b).status().is_ok());
 }
 
-
 // Dynamic fields through the framework's collections: children added, borrowed mutably (a linked
 // table's push and pop relink neighbouring nodes), mutated and removed, within one transaction and
 // across transactions, and re-added with the same or a different value.
