@@ -33,10 +33,12 @@
 //! `sui-oracle --mutation-vectors FILE.gz` writes randomly mutated
 //! transactions with the reference's verdicts; see `mutations.rs`.
 //! `sui-oracle --input-vectors FILE.gz` writes stateful input-check vectors;
-//! see `inputs.rs`.
+//! see `inputs.rs`. `sui-oracle --consensus-vectors FILE.gz` writes
+//! `ConsensusTransaction` decoding vectors; see `consensus.rs`.
 
 use std::fmt::Write as _;
 
+mod consensus;
 mod depth;
 mod inputs;
 mod mutations;
@@ -138,6 +140,13 @@ fn main() {
         && flag == "--mutation-vectors"
     {
         std::fs::write(path, mutations::vectors()).unwrap();
+        println!("{path}");
+        return;
+    }
+    if let [flag, path] = args.as_slice()
+        && flag == "--consensus-vectors"
+    {
+        std::fs::write(path, consensus::vectors()).unwrap();
         println!("{path}");
         return;
     }
