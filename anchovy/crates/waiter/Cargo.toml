@@ -12,3 +12,7 @@ workqueue.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "waiter"
+harness = false

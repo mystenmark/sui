@@ -10,13 +10,11 @@ use std::rc::Rc;
 
 use waiter::{Availability, WaitBatch, Waiter};
 
-/// A waiter whose check asks `visible`, counting the keys it is asked about.
-fn waiter(
-    visible: &[u32],
-) -> (
-    Waiter<u32, &'static str, impl Availability<u32>>,
-    Rc<RefCell<Vec<u32>>>,
-) {
+/// The keys a check was asked about.
+type Asked = Rc<RefCell<Vec<u32>>>;
+
+/// A waiter whose check asks `visible`, logging the keys it is asked about.
+fn waiter(visible: &[u32]) -> (Waiter<u32, &'static str, impl Availability<u32>>, Asked) {
     let visible: HashSet<u32> = visible.iter().copied().collect();
     let asked = Rc::new(RefCell::new(Vec::new()));
     let log = asked.clone();
@@ -45,7 +43,9 @@ fn ready(waiter: &mut Waiter<u32, &'static str, impl Availability<u32>>) -> Vec<
 fn an_item_whose_keys_are_available_is_ready_at_once() {
     let (mut w, _) = waiter(&[1, 2]);
     w.wait_for(&mut batch(&[("a", &[1, 2]), ("b", &[])]));
-    assert_eq!(ready(&mut w), ["a", "b"]);
+    // `b` waits on nothing; `a`'s keys are found available by the check,
+    // which runs after the batch is registered.
+    assert_eq!(ready(&mut w), ["b", "a"]);
     assert_eq!(w.waiting(), 0);
     assert_eq!(w.pending_keys(), 0);
 }
