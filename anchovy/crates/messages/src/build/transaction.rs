@@ -441,8 +441,8 @@ impl From<&view::TransactionExpiration<'_>> for TransactionExpiration {
     }
 }
 
-impl From<&view::TransactionData<'_>> for TransactionDataV1 {
-    fn from(v: &view::TransactionData<'_>) -> Self {
+impl<S: view::TxState> From<&view::TransactionData<'_, S>> for TransactionDataV1 {
+    fn from(v: &view::TransactionData<'_, S>) -> Self {
         TransactionDataV1 {
             kind: TransactionKind::from(v.kind()),
             sender: SuiAddress::from(v.sender()),
@@ -452,8 +452,8 @@ impl From<&view::TransactionData<'_>> for TransactionDataV1 {
     }
 }
 
-impl From<&view::TransactionData<'_>> for TransactionData {
-    fn from(v: &view::TransactionData<'_>) -> Self {
+impl<S: view::TxState> From<&view::TransactionData<'_, S>> for TransactionData {
+    fn from(v: &view::TransactionData<'_, S>) -> Self {
         TransactionData::V1(TransactionDataV1::from(v))
     }
 }
@@ -468,8 +468,8 @@ impl From<&view::Intent> for Intent {
     }
 }
 
-impl From<&view::SenderSignedData<'_>> for SenderSignedData {
-    fn from(v: &view::SenderSignedData<'_>) -> Self {
+impl<S: view::TxState> From<&view::SenderSignedData<'_, S>> for SenderSignedData {
+    fn from(v: &view::SenderSignedData<'_, S>) -> Self {
         SenderSignedData(SenderSignedTransaction {
             intent_message: IntentMessage {
                 intent: Intent::from(v.intent()),
@@ -484,8 +484,8 @@ impl From<&view::SenderSignedData<'_>> for SenderSignedData {
     }
 }
 
-impl From<&view::SenderSignedData<'_>> for Transaction {
-    fn from(v: &view::SenderSignedData<'_>) -> Self {
+impl<S: view::TxState> From<&view::SenderSignedData<'_, S>> for Transaction {
+    fn from(v: &view::SenderSignedData<'_, S>) -> Self {
         Transaction {
             data: SenderSignedData::from(v),
             auth_signature: EmptySignInfo {},
