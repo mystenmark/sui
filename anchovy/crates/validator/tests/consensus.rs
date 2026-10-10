@@ -423,3 +423,39 @@ fn blocks_below_the_gc_round_are_evicted() {
     assert!(node.cache.take(&old.reference).is_none());
     assert!(node.cache.take(&recent.reference).is_some());
 }
+
+#[test]
+fn the_processors_vote_and_commit_on_their_threads() {
+    let node = Node::new();
+    let (outcomes, received) = std::sync::mpsc::channel();
+    let processors =
+        validator::consensus::ConsensusProcessors::start(node.store.clone(), move |outcome| {
+            outcomes.send(outcome).unwrap();
+        });
+    let block = block(
+        1,
+        vec![user_transaction(&node.transfer(node.gas()), &[no_alias()])],
+    );
+    let (reply, verdict) = tokio::sync::oneshot::channel();
+    processors
+        .votes
+        .try_push(validator::consensus::vote::VoteRequest {
+            epoch: node.epoch.clone(),
+            block: block.clone(),
+            reply,
+        })
+        .unwrap_or_else(|_| panic!("vote queue refused"));
+    assert_eq!(verdict.blocking_recv().unwrap(), Ok(vec![]));
+    processors
+        .commits
+        .try_push(validator::consensus::commit::CommitRequest {
+            epoch: node.epoch.clone(),
+            commit: commit(1, 1, vec![block], vec![]),
+        })
+        .unwrap_or_else(|_| panic!("commit queue refused"));
+    let outcome = received
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap();
+    assert_eq!(outcome.cache_hits, 1);
+    assert!(succeeded(&outcome, 0));
+}
