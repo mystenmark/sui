@@ -24,7 +24,7 @@ use validation::inputs::{InputKind, input_objects};
 use validation::verify::SignerIndices;
 use workqueue::{Processor, Refusal, Refuse};
 
-use crate::checks::{self, SignatureChecks, Unchecked, VerifiedTransaction};
+use crate::checks::{self, SignatureChecks, VerifiedTransaction};
 use crate::consensus::cache::{BlockEntries, ConsensusTxCache};
 use crate::epoch::EpochState;
 
@@ -125,49 +125,49 @@ impl BlockVoter {
         validate_transactions(epoch, &reference, &decoded, &self.bump)?;
 
         // 3. A vote on each user transaction; other kinds are accepted.
+        //    First the validity checks, then the signatures, the block's in
+        //    one batch, then the rest of `vote_transaction`.
         let mut rejects = Vec::new();
-        let mut entries: BlockEntries = Vec::with_capacity(decoded.len());
+        let mut entries: BlockEntries = (0..decoded.len()).map(|_| None).collect();
+        let mut valid = Vec::new();
+        let mut pending = Vec::new();
         for (index, transaction) in decoded.into_iter().enumerate() {
             let ConsensusTransactionKind::UserTransactionV2(user) = transaction.get().kind() else {
-                entries.push(None);
                 continue;
             };
             let claims = Claims::of(user).copied();
             let transaction = transaction
                 .into_user_transaction()
                 .expect("a user transaction");
-            let (entry, vote) = self.vote_transaction(epoch, transaction, &claims);
-            if vote.is_err() {
-                rejects.push(index as TransactionIndex);
+            match checks::validate_one(transaction, &epoch.context(), &mut self.bump) {
+                Ok(transaction) => {
+                    valid.push(transaction);
+                    pending.push((index, claims));
+                }
+                Err(_) => rejects.push(index as TransactionIndex),
             }
-            entries.push(entry);
         }
+        let verified = self.signatures.verify_batch(epoch, valid);
+        for (i, verified) in verified.into_iter().enumerate() {
+            let (index, claims) = &pending[i];
+            match verified {
+                Ok((transaction, indices)) => {
+                    if self
+                        .vote_verified(epoch, &transaction, indices, claims)
+                        .is_err()
+                    {
+                        rejects.push(*index as TransactionIndex);
+                    }
+                    entries[*index] = Some(transaction);
+                }
+                Err(_) => rejects.push(*index as TransactionIndex),
+            }
+        }
+        rejects.sort_unstable();
 
         // 4. Keep the decoded transactions for the block's commit.
         self.cache.insert(reference, entries);
         Ok(rejects)
-    }
-
-    /// `vote_transaction`: the transaction once its validity and signatures
-    /// passed, whatever the vote, and the vote.
-    fn vote_transaction(
-        &mut self,
-        epoch: &Arc<EpochState>,
-        transaction: Unchecked,
-        claims: &CopiedClaims,
-    ) -> (Option<VerifiedTransaction>, Result<(), RejectReason>) {
-        let (mut valid, failure) =
-            checks::validate(vec![transaction], &epoch.context(), &mut self.bump);
-        if let Some(e) = failure {
-            return (None, Err(e.into()));
-        }
-        let valid = valid.pop().expect("one transaction validated");
-        let (verified, indices) = match self.signatures.verify_one(epoch, valid) {
-            Ok(verified) => verified,
-            Err(e) => return (None, Err(e.into())),
-        };
-        let vote = self.vote_verified(epoch, &verified, indices, claims);
-        (Some(verified), vote)
     }
 
     /// The checks after signatures: the alias claim, then

@@ -169,6 +169,32 @@ fn a_valid_transfer_is_accepted_and_cached() {
 }
 
 #[test]
+fn a_signature_that_does_not_verify_fails_alone() {
+    let node = Node::new();
+    let gas = node.gas();
+    let mut corrupt = node.transfer(gas);
+    // The signature's `R`: it still parses, but does not verify, so the
+    // block's batch fails and each transaction is verified on its own.
+    let at = corrupt.len() - 96;
+    corrupt[at] ^= 1;
+    let block = block(
+        8,
+        vec![
+            user_transaction(&node.transfer(gas), &[no_alias()]),
+            user_transaction(&corrupt, &[no_alias()]),
+            user_transaction(&node.transfer(gas), &[no_alias()]),
+        ],
+    );
+    let reference = block.reference;
+    let mut voter = node.voter();
+    assert_eq!(voter.vote(&node.epoch, block.clone()), Ok(vec![1]));
+    let entries = node.cache.take(&reference).unwrap();
+    assert!(entries[0].is_some() && entries[1].is_none() && entries[2].is_some());
+    // Again, the valid two from the signature cache.
+    assert_eq!(voter.vote(&node.epoch, block), Ok(vec![1]));
+}
+
+#[test]
 fn bad_signatures_and_spent_inputs_are_rejected() {
     let node = Node::new();
     let gas = node.gas();

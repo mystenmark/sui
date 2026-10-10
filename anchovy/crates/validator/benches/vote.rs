@@ -68,6 +68,38 @@ fn user_transaction(transaction: &[u8]) -> Vec<u8> {
     bytes
 }
 
+/// A transfer from each sender, paying with the gas coin genesis gave it, as
+/// `UserTransactionV2`s.
+fn signed_transfers(
+    store: &store::Store,
+    senders: &[(SuiAddress, AccountKeyPair)],
+) -> Vec<Vec<u8>> {
+    (0..senders.len())
+        .map(|i| {
+            let id = ObjectID::derive_id(TransactionDigest::genesis_marker(), i as u64);
+            let coin = store
+                .live_object(&ObjectId(id.into_bytes()))
+                .unwrap()
+                .unwrap();
+            let gas = bcs::from_bytes::<Object>(coin.wire_bytes())
+                .unwrap()
+                .compute_object_reference();
+            let (sender, key) = &senders[i];
+            let data = TransactionData::new_transfer_sui(
+                SuiAddress::random_for_testing_only(),
+                *sender,
+                Some(SUI),
+                gas,
+                BUDGET,
+                RGP,
+            );
+            user_transaction(
+                &bcs::to_bytes(&Transaction::from_data_and_signer(data, vec![key])).unwrap(),
+            )
+        })
+        .collect()
+}
+
 fn main() {
     let count: usize = std::env::var("TXS")
         .ok()
@@ -93,30 +125,7 @@ fn main() {
         .collect();
     assert!(execution::genesis::init(&epoch.execution, &store, &funded).unwrap());
 
-    let transactions: Vec<Vec<u8>> = (0..count)
-        .map(|i| {
-            let id = ObjectID::derive_id(TransactionDigest::genesis_marker(), i as u64);
-            let coin = store
-                .live_object(&ObjectId(id.into_bytes()))
-                .unwrap()
-                .unwrap();
-            let gas = bcs::from_bytes::<Object>(coin.wire_bytes())
-                .unwrap()
-                .compute_object_reference();
-            let (sender, key) = &senders[i];
-            let data = TransactionData::new_transfer_sui(
-                SuiAddress::random_for_testing_only(),
-                *sender,
-                Some(SUI),
-                gas,
-                BUDGET,
-                RGP,
-            );
-            user_transaction(
-                &bcs::to_bytes(&Transaction::from_data_and_signer(data, vec![key])).unwrap(),
-            )
-        })
-        .collect();
+    let transactions = signed_transfers(&store, &senders);
     let blocks: Vec<Block> = transactions
         .chunks(BLOCK_SIZE)
         .enumerate()

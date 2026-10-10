@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use containers::Bump;
 use messages::Message;
-use messages::base::ObjectId;
+use messages::base::{Digest, ObjectId};
 use messages::object::Object;
 use messages::transaction::{Attested, DigestPending, HasDigest, Transaction, TxState};
 use validation::{sender_signed, verify};
@@ -115,6 +115,17 @@ pub fn validate(
     (Message::relabel_all(hashed, &Witness(PhantomData)), failure)
 }
 
+/// `validate` for one transaction.
+pub fn validate_one(
+    transaction: Unchecked,
+    context: &validation::Context<'_>,
+    bump: &mut Bump,
+) -> Result<ValidTransaction, validation::Error> {
+    bump.reset();
+    sender_signed::validity_check(&transaction.get().0, context, bump)?;
+    Ok(transaction.with_digest().relabel(&Witness(PhantomData)))
+}
+
 /// Signature verification, remembering what verified in the current epoch.
 pub struct SignatureChecks {
     cache: SignatureCache,
@@ -162,6 +173,100 @@ impl SignatureChecks {
     ) -> Result<(VerifiedTransaction, SignerIndices), validation::Error> {
         let indices = self.verify_signatures(epoch, &transaction)?;
         Ok((transaction.relabel(&Witness(PhantomData)), indices))
+    }
+
+    /// `verify_one` for each transaction, verifying their simple Ed25519
+    /// signatures in one batch, which costs less than verifying each. Each
+    /// transaction verifies exactly when it would alone: if the batch fails,
+    /// each transaction's Ed25519 signatures are verified on their own.
+    pub fn verify_batch(
+        &mut self,
+        epoch: &Arc<EpochState>,
+        transactions: Vec<ValidTransaction>,
+    ) -> Vec<Result<(VerifiedTransaction, SignerIndices), validation::Error>> {
+        enum Prepared {
+            Cached(SignerIndices),
+            /// Verified but for its Ed25519 checks, `deferred[checks]`.
+            Pending {
+                key: Digest,
+                indices: SignerIndices,
+                checks: std::ops::Range<usize>,
+            },
+            Failed(validation::Error),
+        }
+        // 1. Cache hits stand; the rest are checked, but for their Ed25519
+        //    signatures' verification.
+        let mut deferred = Vec::new();
+        let prepared: Vec<Prepared> = transactions
+            .iter()
+            .map(|transaction| {
+                let (key, cached) = self.cache.lookup(epoch, transaction);
+                if let Some(indices) = cached {
+                    return Prepared::Cached(indices);
+                }
+                self.bump.reset();
+                let signed = &transaction.get().0;
+                let start = deferred.len();
+                let prepared = sender_signed::deserialization_checks(signed, &self.bump).and_then(
+                    |(signatures, _)| {
+                        verify::verify_signatures_deferring_ed25519(
+                            signed,
+                            signatures,
+                            epoch.epoch,
+                            &epoch.verifier,
+                            &[],
+                            &self.bump,
+                            &mut deferred,
+                        )
+                    },
+                );
+                match prepared {
+                    Ok(indices) => Prepared::Pending {
+                        key,
+                        indices,
+                        checks: start..deferred.len(),
+                    },
+                    Err(e) => {
+                        deferred.truncate(start);
+                        Prepared::Failed(e)
+                    }
+                }
+            })
+            .collect();
+
+        // 2. One batch; if it fails, each transaction's checks alone.
+        let batch_verified = verify::verify_ed25519_batch(&deferred);
+
+        // 3. The verified enter the cache. `prepared` has an entry per
+        // transaction.
+        #[allow(clippy::disallowed_methods)]
+        transactions
+            .into_iter()
+            .zip(prepared)
+            .map(|(transaction, prepared)| {
+                let indices = match prepared {
+                    Prepared::Cached(indices) => indices,
+                    Prepared::Pending {
+                        key,
+                        indices,
+                        checks,
+                    } => {
+                        let verified =
+                            batch_verified || deferred[checks].iter().all(verify::verify_ed25519);
+                        if !verified {
+                            return Err(validation::Error::new(
+                                validation::ErrorKind::InvalidSignature,
+                                "signature does not verify",
+                            ));
+                        }
+                        self.cache.insert(key, indices);
+                        indices
+                    }
+                    Prepared::Failed(e) => return Err(e),
+                };
+                Ok((transaction.relabel(&Witness(PhantomData)), indices))
+            })
+            .collect()
     }
 
     fn verify_signatures(

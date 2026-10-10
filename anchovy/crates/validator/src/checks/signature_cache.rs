@@ -69,21 +69,40 @@ impl SignatureCache {
         transaction: &Message<Transaction<'static, Valid>>,
         verify: impl FnOnce(&SenderSignedData<'_, Valid>) -> Result<SignerIndices, validation::Error>,
     ) -> Result<SignerIndices, validation::Error> {
+        let (key, cached) = self.lookup(epoch, transaction);
+        if let Some(indices) = cached {
+            return Ok(indices);
+        }
+        let indices = verify(&transaction.get().0)?;
+        self.insert(key, indices);
+        Ok(indices)
+    }
+
+    /// The transaction's key, and its signer indices if it verified before
+    /// in `epoch`. For verifying outside `verify`, as a batch does: what
+    /// verifies then goes in with `insert`.
+    pub(crate) fn lookup(
+        &mut self,
+        epoch: &Arc<EpochState>,
+        transaction: &Message<Transaction<'static, Valid>>,
+    ) -> (Digest, Option<SignerIndices>) {
         if !self.epoch.as_ref().is_some_and(|e| Arc::ptr_eq(e, epoch)) {
             self.epoch = Some(epoch.clone());
             self.current.clear();
             self.previous.clear();
         }
-        let signed = &transaction.get().0;
-        let key = key(epoch.epoch, signed);
-        if let Some(indices) = self.current.get(&key).or_else(|| self.previous.get(&key)) {
+        let key = key(epoch.epoch, &transaction.get().0);
+        let cached = self
+            .current
+            .get(&key)
+            .or_else(|| self.previous.get(&key))
+            .copied();
+        if cached.is_some() {
             self.hits += 1;
-            return Ok(*indices);
+        } else {
+            self.misses += 1;
         }
-        self.misses += 1;
-        let indices = verify(signed)?;
-        self.insert(key, indices);
-        Ok(indices)
+        (key, cached)
     }
 
     /// Lookups answered from the cache, and lookups not.
@@ -93,7 +112,7 @@ impl SignatureCache {
 
     /// Only a verification inserts, never a hit: resubmitting what is cached
     /// cannot push anything else out.
-    fn insert(&mut self, key: Digest, indices: SignerIndices) {
+    pub(crate) fn insert(&mut self, key: Digest, indices: SignerIndices) {
         if self.current.len() >= self.generation {
             std::mem::swap(&mut self.current, &mut self.previous);
             // Keeps its table: no allocation after construction.
