@@ -5,6 +5,7 @@
 //! path is left out). Execution takes the transaction and its loaded inputs
 //! (`ExecutionInputs`); effects come out as `messages::fast` bytes.
 
+use crate::data_store::cached_package_store::PackageCache;
 use crate::error::{ExecutionError, ExecutionErrorKind};
 use crate::execution::{ExecutionTiming, ResultWithTimings};
 use crate::execution_mode::{self, ExecutionMode};
@@ -174,12 +175,15 @@ pub fn execute_transaction_to_effects<'a, Mode: ExecutionMode>(
     natives_cost_table: Option<&natives::NativesCostTable>,
     // The epoch's types and layouts, which only user transactions use; `None` asks the VM for all.
     type_cache: Option<&Arc<SPT::type_cache::TypeCache>>,
+    // The packages `move_vm` resolved in earlier transactions.
+    package_cache: Option<&Arc<PackageCache>>,
 ) -> ExecutionOutput<'a> {
     let options = SPT::ExecuteOptions {
         // Only the ownership invariant check, run with the expensive checks, reads it.
         record_invariant_bookkeeping: enable_expensive_checks,
         natives_cost_table,
         type_cache,
+        package_cache,
     };
     let shared_object_refs = inputs.filter_shared_objects(bump);
     let mut transaction_dependencies = if protocol_config.disable_effects_tx_dependencies() {

@@ -7,7 +7,7 @@
 
 use crate::{
     data_store::{
-        cached_package_store::CachedPackageStore,
+        cached_package_store::{CachedPackageStore, PackageCache},
         transaction_package_store::TransactionPackageStore,
     },
     error::{ExecutionError, ExecutionErrorKind},
@@ -50,6 +50,9 @@ pub struct ExecuteOptions<'t> {
     /// The epoch's types and layouts. `None` asks the VM for all of them. A system transaction
     /// must not use one (see `TypeCache`).
     pub type_cache: Option<&'t Arc<type_cache::TypeCache>>,
+    /// The packages `vm` resolved in earlier transactions; it must have been filled from `vm`
+    /// only (see `PackageCache`).
+    pub package_cache: Option<&'t Arc<PackageCache>>,
 }
 
 impl Default for ExecuteOptions<'_> {
@@ -58,6 +61,7 @@ impl Default for ExecuteOptions<'_> {
             record_invariant_bookkeeping: true,
             natives_cost_table: None,
             type_cache: None,
+            package_cache: None,
         }
     }
 }
@@ -107,8 +111,11 @@ pub fn execute_with_options<'a, Mode: ExecutionMode>(
     options: ExecuteOptions<'_>,
 ) -> ResultWithTimings<'a, (), ExecutionError<'a>> {
     let gas_payment = gas_charger.gas_payment_amount();
-    let package_store =
-        CachedPackageStore::new(vm, TransactionPackageStore::new(bump, package_store));
+    let package_store = CachedPackageStore::new(
+        vm,
+        TransactionPackageStore::new(bump, package_store),
+        options.package_cache.cloned(),
+    );
     let linkage_analysis =
         LinkageAnalyzer::new::<Mode>(bump, protocol_config).map_err(|e| (e, Vec::new_in(bump)))?;
     let ptb_type_linkage = linkage_analysis

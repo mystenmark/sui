@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use containers::Bump;
 use exec_types::object::Object;
+use executor::data_store::cached_package_store::PackageCache;
 use executor::execution_engine::{ExecutionOutput, execute_transaction_to_effects};
 use executor::execution_mode::Normal;
 use executor::execution_params::ExecutionOrEarlyError;
@@ -39,6 +40,8 @@ pub struct NativeExecution {
     /// The types and layouts the VM computed in the epoch. It must not outlive the epoch, at
     /// whose end the system packages change in place.
     type_cache: Arc<TypeCache>,
+    /// The packages `move_vm` resolved, filled from it only.
+    package_cache: Arc<PackageCache>,
     config: ProtocolConfig,
     move_vm: Arc<MoveRuntime>,
     metrics: Arc<ExecutionMetrics>,
@@ -64,6 +67,7 @@ impl NativeExecution {
             arena: std::sync::Mutex::new(Bump::with_capacity(ARENA_CAPACITY)),
             natives_cost_table: natives::NativesCostTable::from_protocol_config(&config),
             type_cache: Arc::new(TypeCache::new()),
+            package_cache: Arc::new(PackageCache::new()),
             config,
             move_vm: Arc::new(move_vm),
             metrics,
@@ -169,6 +173,7 @@ impl NativeExecution {
             ExecutionOrEarlyError::ok(None),
             Some(&self.natives_cost_table),
             Some(&self.type_cache),
+            Some(&self.package_cache),
         );
 
         let written = inner_store.written.values().map(written).collect();

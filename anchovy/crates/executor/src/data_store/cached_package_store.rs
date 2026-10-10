@@ -14,7 +14,32 @@ use move_vm_runtime::{
     validation::verification::ast::Package as VerifiedPackage,
 };
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+
+/// Packages one `MoveRuntime` resolved, by package (storage) ID, kept across transactions. Not
+/// in the reference.
+///
+/// A hit is that runtime's answer for the ID, for the same reason as `CachedPackageStore`'s
+/// `resolved`: the runtime keeps every package it resolves and answers with it from then on. So
+/// it must only be used with the runtime it was filled from, and only packages found are kept.
+#[derive(Default)]
+pub struct PackageCache(Mutex<containers::HeapHashMap<ObjectId, Arc<VerifiedPackage>>>);
+
+impl PackageCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(&self, id: &ObjectId) -> Option<Arc<VerifiedPackage>> {
+        let packages = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        packages.get(id).cloned()
+    }
+
+    fn insert(&self, id: ObjectId, package: Arc<VerifiedPackage>) {
+        let mut packages = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        packages.insert(id, package);
+    }
+}
 
 /// The `CachedPackageStore` is a `PackageStore` implementation that uses a `MoveRuntime` to
 /// fetch and cache packages. It also uses an underlying `TransactionPackageStore` to fetch packages
@@ -41,6 +66,9 @@ pub struct CachedPackageStore<'state, 'runtime> {
     /// transaction are looked up before this, as before.
     resolved: RefCell<IndexMap<'state, ObjectId, Arc<VerifiedPackage>>>,
 
+    /// The packages `runtime` resolved in earlier transactions, if kept.
+    epoch_packages: Option<Arc<PackageCache>>,
+
     /// Types resolved to their defining ID while no package was published in the transaction:
     /// (package ID, module, type, defining ID). Not in the reference, which builds an owned
     /// `IntraPackageName` for every lookup; the transaction's few types are looked up repeatedly.
@@ -53,13 +81,16 @@ pub struct CachedPackageStore<'state, 'runtime> {
 }
 
 impl<'state, 'runtime> CachedPackageStore<'state, 'runtime> {
+    /// `epoch_packages` must have been filled from `runtime` only.
     pub fn new(
         runtime: &'runtime MoveRuntime,
         package_store: TransactionPackageStore<'state>,
+        epoch_packages: Option<Arc<PackageCache>>,
     ) -> Self {
         Self {
             runtime,
             resolved: RefCell::new(IndexMap::new_in(package_store.bump())),
+            epoch_packages,
             defining_ids: RefCell::new(containers::Vec::new_in(package_store.bump())),
             package_store,
         }
@@ -102,6 +133,16 @@ impl<'state, 'runtime> CachedPackageStore<'state, 'runtime> {
             return Ok(Some(pkg.clone()));
         }
 
+        if let Some(pkg) = self.epoch_packages.as_ref().and_then(|e| e.get(id)) {
+            debug_assert!(matches!(
+                self.runtime
+                    .resolve_and_cache_package(&self.package_store, AccountAddress::new(id.0)),
+                Ok(ResolvedPackageResult::Found(found)) if Arc::ptr_eq(&found.verified, &pkg)
+            ));
+            self.resolved.borrow_mut().insert(*id, pkg.clone());
+            return Ok(Some(pkg));
+        }
+
         // load the package via the Move runtime, which will cache it if found.
         match self
             .runtime
@@ -113,6 +154,9 @@ impl<'state, 'runtime> CachedPackageStore<'state, 'runtime> {
             })? {
             ResolvedPackageResult::Found(pkg) => {
                 self.resolved.borrow_mut().insert(*id, pkg.verified.clone());
+                if let Some(epoch_packages) = &self.epoch_packages {
+                    epoch_packages.insert(*id, pkg.verified.clone());
+                }
                 Ok(Some(pkg.verified.clone()))
             }
             ResolvedPackageResult::NotFound => Ok(None),

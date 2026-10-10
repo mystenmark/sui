@@ -61,6 +61,7 @@ impl LayoutResolver for TypeLayoutResolver<'_, '_, '_> {
         let resolver = CachedPackageStore::new(
             self.vm,
             TransactionPackageStore::new(self.bump, &null_resolver),
+            None,
         );
         let config = ResolutionConfig::new(
             self.bump,
