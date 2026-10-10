@@ -42,7 +42,7 @@ fn rebuild_effects<'a>(bump: &'a Bump, effects: &TransactionEffects<'a>) -> Buil
     b.finish()
 }
 
-fn check(path: &Path, counts: &mut (usize, usize, usize)) {
+fn check(path: &Path, counts: &mut (usize, usize, usize, usize)) {
     let mut bytes = std::fs::read(path).unwrap();
     bytes.remove(0);
     let checkpoint = Message::<CheckpointData>::parse(bytes).unwrap();
@@ -79,6 +79,23 @@ fn check(path: &Path, counts: &mut (usize, usize, usize)) {
     let bump = Bump::with_capacity(4 << 20);
 
     for tx in view.transactions {
+        for object in tx.input_objects.iter().chain(tx.output_objects) {
+            let mut w = messages::fast::Writer::new_in(&bump, object.bytes.len());
+            w.object(
+                &object.data,
+                &object.owner,
+                object.previous_transaction,
+                object.storage_rebate,
+            );
+            assert_eq!(w.finish_bytes(), object.bytes, "{}", path.display());
+            if let messages::object::Data::Move(m) = &object.data {
+                let mut w = messages::fast::Writer::new_in(&bump, 64);
+                w.move_object_type(&m.type_);
+                assert_eq!(w.len(), m.type_.bcs_size());
+            }
+            counts.3 += 1;
+        }
+
         let built = rebuild_effects(&bump, &tx.effects);
         assert_eq!(built.bytes, tx.effects.bytes, "{}", path.display());
         assert_eq!(built.digest, tx.effects.digest);
@@ -134,7 +151,7 @@ fn check(path: &Path, counts: &mut (usize, usize, usize)) {
 #[test]
 fn rebuilds_the_corpus_byte_for_byte() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut counts = (0, 0, 0);
+    let mut counts = (0, 0, 0, 0);
     check(
         &manifest.join("tests/data/mainnet-325300367.chk"),
         &mut counts,
@@ -148,8 +165,8 @@ fn rebuilds_the_corpus_byte_for_byte() {
         }
     }
     eprintln!(
-        "{} effects, {} event sets, {} summaries rebuilt",
-        counts.0, counts.1, counts.2
+        "{} effects, {} event sets, {} summaries, {} objects rebuilt",
+        counts.0, counts.1, counts.2, counts.3
     );
-    assert!(counts.0 > 0);
+    assert!(counts.0 > 0 && counts.3 > 0);
 }

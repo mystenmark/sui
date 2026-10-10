@@ -6,7 +6,9 @@ use crate::base::AccountAddress;
 use crate::error::{ParseError, Result};
 use crate::reader::Reader;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// `Ord` orders as the reference's derived one does: the same variants and
+/// fields in the same order, and identifiers compare as strings.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum TypeTag<'a> {
     Bool,
     U8,
@@ -22,7 +24,7 @@ pub enum TypeTag<'a> {
 }
 
 /// Module and name are not checked against the Move identifier grammar here.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct StructTag<'a> {
     pub address: &'a AccountAddress,
     pub module: &'a str,
@@ -35,6 +37,45 @@ pub struct StructTag<'a> {
 /// identifiers while deserializing, which this crate never does.
 pub type TypeInput<'a> = TypeTag<'a>;
 pub type StructInput<'a> = StructTag<'a>;
+
+/// The length of a ULEB128-encoded `n`.
+pub(crate) fn uleb128_len(n: usize) -> usize {
+    let mut len = 1;
+    let mut n = n >> 7;
+    while n != 0 {
+        len += 1;
+        n >>= 7;
+    }
+    len
+}
+
+impl TypeTag<'_> {
+    /// The length of its BCS encoding, without encoding it.
+    pub fn bcs_size(&self) -> usize {
+        1 + match self {
+            TypeTag::Vector(inner) => inner.bcs_size(),
+            TypeTag::Struct(s) => s.bcs_size(),
+            _ => 0,
+        }
+    }
+}
+
+impl StructTag<'_> {
+    /// The length of its BCS encoding, without encoding it.
+    pub fn bcs_size(&self) -> usize {
+        AccountAddress::LENGTH
+            + uleb128_len(self.module.len())
+            + self.module.len()
+            + uleb128_len(self.name.len())
+            + self.name.len()
+            + uleb128_len(self.type_params.len())
+            + self
+                .type_params
+                .iter()
+                .map(TypeTag::bcs_size)
+                .sum::<usize>()
+    }
+}
 
 impl<'a> TypeTag<'a> {
     pub const MIN_WIRE_SIZE: usize = 1;

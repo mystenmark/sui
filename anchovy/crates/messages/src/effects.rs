@@ -12,7 +12,7 @@ use crate::object::Owner;
 use crate::reader::{Reader, WireRecord};
 use crate::type_tag::{StructTag, TypeTag};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct GasCostSummary {
     pub computation_cost: u64,
     pub storage_cost: u64,
@@ -21,6 +21,18 @@ pub struct GasCostSummary {
 }
 
 impl GasCostSummary {
+    /// Computation plus storage.
+    pub fn gas_used(&self) -> u64 {
+        self.computation_cost + self.storage_cost
+    }
+
+    /// What the payer is charged, net of the rebate: negative for a refund.
+    // The reference casts with `as`.
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn net_gas_usage(&self) -> i64 {
+        self.gas_used() as i64 - self.storage_rebate as i64
+    }
+
     pub fn parse(r: &mut Reader<'_>) -> Result<GasCostSummary> {
         Ok(GasCostSummary {
             computation_cost: r.u64()?,

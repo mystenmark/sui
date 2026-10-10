@@ -65,15 +65,39 @@ pub struct Executed {
     pub events: Option<Vec<u8>>,
 }
 
+/// Why an object has no live version any more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Removal {
+    /// The effects' `deleted` and `unwrapped_then_deleted`.
+    Deleted,
+    /// The effects' `wrapped`: it may come back, at a later version.
+    Wrapped,
+}
+
+/// An object the transaction leaves without a live version, at the version the effects give
+/// it (the transaction's lamport version).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Removed {
+    pub id: ObjectId,
+    pub version: u64,
+    pub removal: Removal,
+}
+
 /// What one transaction changes, applied atomically.
 #[derive(Default)]
 pub struct Commit {
     /// New object versions, each becoming its object's live version.
     pub written: Vec<Written>,
-    /// Objects with no live version any more: deleted or wrapped.
-    pub removed: Vec<ObjectId>,
+    /// Objects with no live version any more: each gets a tombstone at its version, as sui's
+    /// store writes `StoreObject::Deleted`/`Wrapped`, so that reading at or below a later
+    /// version finds the tombstone rather than the last version before it.
+    pub removed: Vec<Removed>,
     pub executed: Option<Executed>,
 }
+
+/// A tombstone's value in `objects`: one byte, where an object's encoding is always longer.
+const DELETED: &[u8] = &[0];
+const WRAPPED: &[u8] = &[1];
 
 pub struct Store {
     db: Arc<Db>,
@@ -148,8 +172,12 @@ impl Store {
         Ok(batch.commit()?)
     }
 
+    /// The object at exactly `version`; none if there is none, or a tombstone.
     pub fn object(&self, id: &ObjectId, version: u64) -> Result<Option<Message<Object<'static>>>> {
-        self.get(self.objects, &object_key(id, version), "objects")
+        match self.db.get(self.objects, &object_key(id, version))? {
+            Some(value) => parse_object(value.to_vec()),
+            None => Ok(None),
+        }
     }
 
     pub fn live(&self, id: &ObjectId) -> Result<Option<Live>> {
@@ -160,8 +188,8 @@ impl Store {
         }))
     }
 
-    /// The object's highest version at or below `bound`, live or not.
-    /// Version `u64::MAX` is never found.
+    /// The object's highest version at or below `bound`, live or not; none if that is a
+    /// tombstone (sui's `find_object_lt_or_eq_version`). Version `u64::MAX` is never found.
     pub fn object_at_or_before(
         &self,
         id: &ObjectId,
@@ -179,12 +207,8 @@ impl Store {
                 if key[..ID] != id.0 {
                     return Ok(None);
                 }
-                Message::parse(value.to_vec())
-                    .map(Some)
-                    .map_err(|(error, _)| Error::Corrupt {
-                        table: "objects",
-                        error,
-                    })
+                // A tombstone: the object was deleted or wrapped at or below `bound`.
+                parse_object(value.to_vec())
             }
             None => Ok(None),
         }
@@ -240,8 +264,17 @@ impl Store {
             live.extend_from_slice(&written.digest.bytes);
             batch.write(self.live, written.id.0.to_vec(), live);
         }
-        for id in commit.removed {
-            batch.delete(self.live, id.0.to_vec());
+        for removed in commit.removed {
+            let tombstone = match removed.removal {
+                Removal::Deleted => DELETED,
+                Removal::Wrapped => WRAPPED,
+            };
+            batch.write(
+                self.objects,
+                object_key(&removed.id, removed.version).to_vec(),
+                tombstone.to_vec(),
+            );
+            batch.delete(self.live, removed.id.0.to_vec());
         }
         if let Some(executed) = commit.executed {
             let digest = executed.digest.bytes.to_vec();
@@ -276,6 +309,19 @@ impl Store {
             None => Ok(None),
         }
     }
+}
+
+/// An `objects` value: an object, or none for a tombstone.
+fn parse_object(value: Vec<u8>) -> Result<Option<Message<Object<'static>>>> {
+    if value.as_slice() == DELETED || value.as_slice() == WRAPPED {
+        return Ok(None);
+    }
+    Message::parse(value)
+        .map(Some)
+        .map_err(|(error, _)| Error::Corrupt {
+            table: "objects",
+            error,
+        })
 }
 
 /// Big-endian, so that an object's versions are in order.

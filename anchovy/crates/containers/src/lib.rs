@@ -15,9 +15,56 @@ pub type Box<'a, T> = allocator_api2::boxed::Box<T, &'a Bump>;
 pub type HashMap<'a, K, V> = hashbrown::HashMap<K, V, foldhash::fast::RandomState, &'a Bump>;
 pub type HashSet<'a, K> = hashbrown::HashSet<K, foldhash::fast::RandomState, &'a Bump>;
 
+/// [`HashMap`] on the heap, for tables that outlive an arena.
+pub type HeapHashMap<K, V> = std::collections::HashMap<K, V, foldhash::fast::RandomState>;
+
 /// The standard library's `BTreeMap`, ported to stable with allocator
 /// support by `arena-btreemap`.
 pub type BTreeMap<'a, K, V> = arena_btreemap::BTreeMap<K, V, &'a Bump>;
+
+/// `std::collections::btree_map`'s entry types, for [`BTreeMap`].
+pub mod btree_map {
+    pub use arena_btreemap::btree::map::{Entry, OccupiedEntry, VacantEntry};
+}
+
+mod btree_set;
+mod index_map;
+mod vec_map;
+
+pub use btree_set::BTreeSet;
+pub use index_map::{Entry, IndexMap, IndexSet, OccupiedEntry, VacantEntry};
+pub use vec_map::VecMap;
+
+/// `value` in the arena, for the arena's lifetime. Arena values are never
+/// dropped, so only `Copy` values go here.
+pub fn alloc<T: Copy>(bump: &Bump, value: T) -> &T {
+    Box::leak(Box::new_in(value, bump))
+}
+
+/// `value` in the arena, for the arena's lifetime, never dropped: only for values whose drop
+/// would just free memory in this same arena (arena containers of `Copy` data).
+pub fn leak<T>(bump: &Bump, value: T) -> &T {
+    Box::leak(Box::new_in(value, bump))
+}
+
+/// A copy of `slice` in the arena.
+pub fn alloc_slice_copy<'a, T: Copy>(bump: &'a Bump, slice: &[T]) -> &'a [T] {
+    vec_from_slice(bump, slice).leak()
+}
+
+/// A copy of `slice` as an arena vector.
+pub fn vec_from_slice<'a, T: Copy>(bump: &'a Bump, slice: &[T]) -> Vec<'a, T> {
+    let mut v = Vec::with_capacity_in(slice.len(), bump);
+    v.extend_from_slice(slice);
+    v
+}
+
+/// A copy of `s` in the arena.
+pub fn alloc_str<'a>(bump: &'a Bump, s: &str) -> &'a str {
+    let bytes = alloc_slice_copy(bump, s.as_bytes());
+    // SAFETY: a copy of a `str`'s bytes is UTF-8.
+    unsafe { core::str::from_utf8_unchecked(bytes) }
+}
 
 pub fn hash_map<K, V>(bump: &Bump, capacity: usize) -> HashMap<'_, K, V> {
     HashMap::with_capacity_and_hasher_in(capacity, foldhash::fast::RandomState::default(), bump)

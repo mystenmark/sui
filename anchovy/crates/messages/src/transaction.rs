@@ -69,7 +69,7 @@ pub struct SharedObjectArg {
 // `mutability` is not an invalid value, and `mutability()` does not trust it.
 unsafe impl WireRecord for SharedObjectArg {}
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum SharedObjectMutability {
     Immutable,
     Mutable,

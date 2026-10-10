@@ -12,5 +12,8 @@ arena-btreemap.workspace = true
 foldhash.workspace = true
 hashbrown.workspace = true
 
+[dev-dependencies]
+indexmap.workspace = true
+
 [lints]
 workspace = true

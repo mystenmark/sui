@@ -7,6 +7,8 @@
 //! own views.
 
 pub mod genesis;
+pub mod native;
+pub mod reads;
 mod store_view;
 
 use std::sync::Arc;
@@ -43,6 +45,10 @@ pub enum Error {
     Missing(ObjectID),
     /// An executed transaction's effects or events are not in the store.
     MissingEffects(messages::base::Digest),
+    /// Anchovy's executor failed outside the transaction.
+    Native(String),
+    /// An input the input checks found is gone, read by anchovy's executor.
+    MissingNative(messages::base::ObjectId),
 }
 
 impl From<store::Error> for Error {
@@ -318,14 +324,25 @@ fn written(object: &Object) -> Result<store::Written> {
     })
 }
 
-/// Objects the transaction leaves without a live version.
-fn removed(effects: &TransactionEffects) -> Vec<messages::base::ObjectId> {
+/// Objects the transaction leaves without a live version, at the versions the effects give
+/// them, as sui's store records its tombstones.
+fn removed(effects: &TransactionEffects) -> Vec<store::Removed> {
+    let removed = |(id, version, _): sui_types::base_types::ObjectRef, removal| store::Removed {
+        id: messages::base::ObjectId(id.into_bytes()),
+        version: version.value(),
+        removal,
+    };
     effects
         .deleted()
         .into_iter()
-        .chain(effects.wrapped())
         .chain(effects.unwrapped_then_deleted())
-        .map(|(id, _, _)| messages::base::ObjectId(id.into_bytes()))
+        .map(|r| removed(r, store::Removal::Deleted))
+        .chain(
+            effects
+                .wrapped()
+                .into_iter()
+                .map(|r| removed(r, store::Removal::Wrapped)),
+        )
         .collect()
 }
 

@@ -40,6 +40,13 @@ macro_rules! bytes32 {
                 fmt_hex(&self.0, f)
             }
         }
+
+        /// As the reference displays addresses and ids: `0x` and 64 hex digits.
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt_hex(&self.0, f)
+            }
+        }
     };
 }
 

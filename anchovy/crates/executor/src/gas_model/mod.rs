@@ -1,0 +1,11 @@
+// Copyright (c) Mysten Labs, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+//! `sui_types::gas_model`, without the legacy `gas_v2` (gas models below
+//! 15).
+
+pub mod gas_common;
+pub mod gas_predicates;
+pub mod gas_v3;
+pub mod tables;
+pub mod units_types;

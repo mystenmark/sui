@@ -8,7 +8,7 @@
 use messages::Message;
 use messages::base::Digest;
 use messages::checkpoint::CheckpointData;
-use store::{Commit, Executed, Live, Store, Written};
+use store::{Commit, Executed, Live, Removal, Removed, Store, Written};
 
 fn checkpoint() -> Message<CheckpointData<'static>> {
     let mut bytes = include_bytes!("../../messages/tests/data/mainnet-325300367.chk").to_vec();
@@ -68,17 +68,68 @@ fn objects_round_trip_and_follow_their_live_version() {
         }
         assert!(store.object(id, version + 1_000_000).unwrap().is_none());
     }
-    // Removed: no live version, every version still readable.
-    let (id, version) = (ids[0], expected[0].1);
+    // Removed: no live version and a tombstone at the removal's version; earlier versions stay
+    // readable at their exact versions, but not at or below a bound past the tombstone.
+    // The object's highest version, which the removal follows.
+    let id = ids[0];
+    let version = (0..ids.len())
+        .filter(|&i| ids[i] == id)
+        .map(|i| expected[i].1)
+        .max()
+        .unwrap();
     store
         .commit(Commit {
-            removed: vec![id],
+            removed: vec![Removed {
+                id,
+                version: version + 1,
+                removal: Removal::Wrapped,
+            }],
             ..Commit::default()
         })
         .unwrap();
     assert_eq!(store.live(&id).unwrap(), None);
     assert!(store.live_object(&id).unwrap().is_none());
     assert!(store.object(&id, version).unwrap().is_some());
+    assert!(store.object(&id, version + 1).unwrap().is_none());
+    assert!(store.object_at_or_before(&id, version).unwrap().is_some());
+    assert!(
+        store
+            .object_at_or_before(&id, version + 1)
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.object_at_or_before(&id, u64::MAX).unwrap().is_none());
+    // Unwrapped at a later version: visible again from there.
+    let bytes = store
+        .object(&id, version)
+        .unwrap()
+        .unwrap()
+        .get()
+        .bytes
+        .to_vec();
+    store
+        .commit(Commit {
+            written: vec![Written {
+                id,
+                version: version + 2,
+                digest: Digest::new([9; 32]),
+                bytes,
+            }],
+            ..Commit::default()
+        })
+        .unwrap();
+    assert!(
+        store
+            .object_at_or_before(&id, version + 1)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .object_at_or_before(&id, version + 2)
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]
