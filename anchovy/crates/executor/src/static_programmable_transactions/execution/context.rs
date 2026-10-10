@@ -397,7 +397,8 @@ where
         let bump = env.bump;
         // The reference's is a `BTreeMap`, only iterated to make the object runtime, for which
         // the order does not matter (see `ObjectRuntime::new`).
-        let mut input_object_map = Vec::with_capacity_in(object_inputs.len().saturating_add(1), bump);
+        let mut input_object_map =
+            Vec::with_capacity_in(object_inputs.len().saturating_add(1), bump);
         let mut input_object_metadata = Vec::with_capacity_in(object_inputs.len(), bump);
         let mut object_values = Vec::with_capacity_in(object_inputs.len(), bump);
         let mut input_layouts = InputLayouts(Vec::new_in(bump));
