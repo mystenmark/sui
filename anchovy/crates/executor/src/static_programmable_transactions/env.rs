@@ -16,7 +16,7 @@ use crate::{
             self as L, Datatype, DeserializedPackage, LoadedFunction, LoadedFunctionInstantiation,
             ModuleId, Type,
         },
-        type_cache::{CachedLinkage, OwnedType, TypeCache},
+        type_cache::{CachedLinkage, FrameworkType, OwnedType, TypeCache},
     },
 };
 use containers::{Bump, Vec};
@@ -99,11 +99,10 @@ where
 }
 
 macro_rules! get_or_init_ty {
-    ($env:expr, $ident:ident, $tag:expr) => {{
+    ($env:expr, $ident:ident, $framework:expr, $tag:expr) => {{
         let env = $env;
         if env.$ident.get().is_none() {
-            let tag = $tag;
-            let ty = env.load_type_from_struct(tag)?;
+            let ty = env.framework_type($framework, || $tag)?;
             env.$ident.set(ty).unwrap();
         }
         Ok(*env.$ident.get().unwrap())
@@ -627,6 +626,29 @@ where
         Ok(ty)
     }
 
+    /// `load_type_from_struct` for a framework type, whose tag is `tag()`.
+    fn framework_type(
+        &self,
+        framework: FrameworkType,
+        tag: impl Fn() -> StructTag,
+    ) -> Result<Type<'a>, ExecutionError<'a>> {
+        let cache = self.resolution_cache();
+        let cached = cache
+            .and_then(|c| c.get(|b| b.framework.get(framework).map(|t| t.in_arena(self.bump))));
+        if let Some(ty) = cached {
+            debug_assert!(
+                self.uncached_type_from_struct(&TypeTag::Struct(Box::new(tag())))
+                    .is_ok_and(|t| t == ty)
+            );
+            return Ok(ty);
+        }
+        let ty = self.load_type_from_struct(tag())?;
+        if let Some(cache) = cache {
+            cache.insert(|b| b.framework.set(framework, OwnedType::new(&ty)));
+        }
+        Ok(ty)
+    }
+
     fn uncached_type_from_struct(&self, tag: &TypeTag) -> Result<Type<'a>, ExecutionError<'a>> {
         let vm_type = self.load_vm_type_from_type_tag(None, tag)?;
         self.adapter_type_from_vm_type(self.input_type_resolution_vm, &vm_type)
@@ -641,23 +663,48 @@ where
     }
 
     pub fn gas_coin_type(&self) -> Result<Type<'a>, ExecutionError<'a>> {
-        get_or_init_ty!(self, gas_coin_type, GasCoin::type_())
+        get_or_init_ty!(
+            self,
+            gas_coin_type,
+            FrameworkType::GasCoin,
+            GasCoin::type_()
+        )
     }
 
     pub fn upgrade_ticket_type(&self) -> Result<Type<'a>, ExecutionError<'a>> {
-        get_or_init_ty!(self, upgrade_ticket_type, UpgradeTicket::type_())
+        get_or_init_ty!(
+            self,
+            upgrade_ticket_type,
+            FrameworkType::UpgradeTicket,
+            UpgradeTicket::type_()
+        )
     }
 
     pub fn upgrade_receipt_type(&self) -> Result<Type<'a>, ExecutionError<'a>> {
-        get_or_init_ty!(self, upgrade_receipt_type, UpgradeReceipt::type_())
+        get_or_init_ty!(
+            self,
+            upgrade_receipt_type,
+            FrameworkType::UpgradeReceipt,
+            UpgradeReceipt::type_()
+        )
     }
 
     pub fn upgrade_cap_type(&self) -> Result<Type<'a>, ExecutionError<'a>> {
-        get_or_init_ty!(self, upgrade_cap_type, UpgradeCap::type_())
+        get_or_init_ty!(
+            self,
+            upgrade_cap_type,
+            FrameworkType::UpgradeCap,
+            UpgradeCap::type_()
+        )
     }
 
     pub fn tx_context_type(&self) -> Result<Type<'a>, ExecutionError<'a>> {
-        get_or_init_ty!(self, tx_context_type, TxContext::type_())
+        get_or_init_ty!(
+            self,
+            tx_context_type,
+            FrameworkType::TxContext,
+            TxContext::type_()
+        )
     }
 
     /// One of the framework's datatypes with one type argument, from its `RESOLVED_*` name: the

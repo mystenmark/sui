@@ -15,6 +15,9 @@ pub type Box<'a, T> = allocator_api2::boxed::Box<T, &'a Bump>;
 pub type HashMap<'a, K, V> = hashbrown::HashMap<K, V, foldhash::fast::RandomState, &'a Bump>;
 pub type HashSet<'a, K> = hashbrown::HashSet<K, foldhash::fast::RandomState, &'a Bump>;
 
+/// [`HashMap`] on the heap, for tables that outlive an arena.
+pub type HeapHashMap<K, V> = std::collections::HashMap<K, V, foldhash::fast::RandomState>;
+
 /// The standard library's `BTreeMap`, ported to stable with allocator
 /// support by `arena-btreemap`.
 pub type BTreeMap<'a, K, V> = arena_btreemap::BTreeMap<K, V, &'a Bump>;

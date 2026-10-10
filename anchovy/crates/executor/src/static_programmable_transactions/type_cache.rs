@@ -5,13 +5,12 @@
 //! reference, which asks the VM again in every transaction.
 
 use crate::static_programmable_transactions::loading::ast::{Datatype, ModuleId, Type, Vector};
-use containers::Bump;
+use containers::{Bump, HeapHashMap as HashMap};
 use move_binary_format::file_format::AbilitySet;
 use move_core_types::{
     account_address::AccountAddress, annotated_value, language_storage::TypeTag, runtime_value,
 };
 use move_vm_runtime::shared::linkage_context::LinkageContext;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -57,10 +56,55 @@ pub struct Bucket {
     pub runtime: HashMap<TypeTag, Arc<runtime_value::MoveTypeLayout>>,
     /// `Env::load_type_from_struct`.
     pub types: HashMap<TypeTag, OwnedType>,
+    /// `Env::load_type_from_struct` for the framework types `Env` names, without building and
+    /// hashing their tags: each slot is for one constant tag.
+    pub framework: FrameworkTypes,
     /// The type and layout of a written object's type, in the write-out VM.
     pub writeout: HashMap<TypeTag, (OwnedType, Arc<runtime_value::MoveTypeLayout>)>,
     /// The layout of an event's type, in the emitting function's VM.
     pub events: HashMap<TypeTag, Arc<runtime_value::MoveTypeLayout>>,
+}
+
+/// A framework type `Env` loads by name.
+#[derive(Clone, Copy, Debug)]
+pub enum FrameworkType {
+    GasCoin,
+    TxContext,
+    UpgradeTicket,
+    UpgradeReceipt,
+    UpgradeCap,
+}
+
+#[derive(Default)]
+pub struct FrameworkTypes {
+    gas_coin: Option<OwnedType>,
+    tx_context: Option<OwnedType>,
+    upgrade_ticket: Option<OwnedType>,
+    upgrade_receipt: Option<OwnedType>,
+    upgrade_cap: Option<OwnedType>,
+}
+
+impl FrameworkTypes {
+    pub fn get(&self, ty: FrameworkType) -> Option<&OwnedType> {
+        match ty {
+            FrameworkType::GasCoin => &self.gas_coin,
+            FrameworkType::TxContext => &self.tx_context,
+            FrameworkType::UpgradeTicket => &self.upgrade_ticket,
+            FrameworkType::UpgradeReceipt => &self.upgrade_receipt,
+            FrameworkType::UpgradeCap => &self.upgrade_cap,
+        }
+        .as_ref()
+    }
+
+    pub fn set(&mut self, ty: FrameworkType, owned: OwnedType) {
+        *match ty {
+            FrameworkType::GasCoin => &mut self.gas_coin,
+            FrameworkType::TxContext => &mut self.tx_context,
+            FrameworkType::UpgradeTicket => &mut self.upgrade_ticket,
+            FrameworkType::UpgradeReceipt => &mut self.upgrade_receipt,
+            FrameworkType::UpgradeCap => &mut self.upgrade_cap,
+        } = Some(owned);
+    }
 }
 
 /// The bucket of one VM's linkage.
