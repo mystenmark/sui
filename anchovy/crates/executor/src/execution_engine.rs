@@ -169,7 +169,15 @@ pub fn execute_transaction_to_effects<'a, Mode: ExecutionMode>(
     metrics: Arc<ExecutionMetrics>,
     enable_expensive_checks: bool,
     execution_params: ExecutionOrEarlyError<'a>,
+    // The epoch's natives cost table, built from `protocol_config`; `None` builds one for this
+    // transaction.
+    natives_cost_table: Option<&natives::NativesCostTable>,
 ) -> ExecutionOutput<'a> {
+    let options = SPT::ExecuteOptions {
+        // Only the ownership invariant check, run with the expensive checks, reads it.
+        record_invariant_bookkeeping: enable_expensive_checks,
+        natives_cost_table,
+    };
     let shared_object_refs = inputs.filter_shared_objects(bump);
     let mut transaction_dependencies = if protocol_config.disable_effects_tx_dependencies() {
         Vec::new_in(bump)
@@ -216,6 +224,7 @@ pub fn execute_transaction_to_effects<'a, Mode: ExecutionMode>(
         metrics,
         enable_expensive_checks,
         execution_params,
+        options,
     ) {
         Outcome::Proceed {
             gas_charger,
@@ -484,6 +493,7 @@ fn execute_transaction_to_outcome<'a, Mode: ExecutionMode>(
     metrics: Arc<ExecutionMetrics>,
     enable_expensive_checks: bool,
     execution_params: ExecutionOrEarlyError<'a>,
+    options: SPT::ExecuteOptions<'_>,
 ) -> Outcome<'a> {
     // Short-circuit insufficient_funds. No execution, `Outcome::BumpOnly`
     if should_short_circuit_insufficient_funds(&execution_params) {
@@ -553,6 +563,7 @@ fn execute_transaction_to_outcome<'a, Mode: ExecutionMode>(
         protocol_config,
         metrics,
         execution_params,
+        options,
     ) {
         Err((error, reason)) => {
             return Outcome::BumpOnly {
@@ -603,6 +614,7 @@ fn execute_transaction<'a, Mode: ExecutionMode>(
     protocol_config: &'a ProtocolConfig,
     metrics: Arc<ExecutionMetrics>,
     execution_params: ExecutionOrEarlyError<'a>,
+    options: SPT::ExecuteOptions<'_>,
 ) -> Result<ExecutionOutcome<'a>, (ExecutionError<'a>, BumpOnlyReason)> {
     debug_assert!(
         gas_charger.no_charges(),
@@ -628,6 +640,7 @@ fn execute_transaction<'a, Mode: ExecutionMode>(
                 protocol_config,
                 metrics.clone(),
                 &mut timings,
+                options,
             ),
         })
         .and_then(|v| gas_charger.meter_storage(temporary_store).map(|_| v));
@@ -663,6 +676,7 @@ fn execute_ptb<'a, Mode: ExecutionMode>(
     protocol_config: &'a ProtocolConfig,
     metrics: Arc<ExecutionMetrics>,
     timings_out: &mut Vec<'a, ExecutionTiming>,
+    options: SPT::ExecuteOptions<'_>,
 ) -> Result<(), ExecutionError<'a>> {
     let result = match execution_loop::<Mode>(
         bump,
@@ -675,6 +689,7 @@ fn execute_ptb<'a, Mode: ExecutionMode>(
         gas_charger,
         protocol_config,
         metrics,
+        options,
     ) {
         Ok((v, t)) => {
             *timings_out = t;
@@ -799,6 +814,7 @@ fn execution_loop<'a, Mode: ExecutionMode>(
     gas_charger: &mut GasCharger<'a>,
     protocol_config: &'a ProtocolConfig,
     metrics: Arc<ExecutionMetrics>,
+    options: SPT::ExecuteOptions<'_>,
 ) -> ResultWithTimings<'a, (), ExecutionError<'a>> {
     let no_timings = || Vec::new_in(bump);
     let result = match transaction_kind {
@@ -828,6 +844,7 @@ fn execution_loop<'a, Mode: ExecutionMode>(
                 gas_charger,
                 protocol_config,
                 metrics,
+                options,
             )
             .expect("ConsensusCommitPrologue cannot fail");
             Ok(((), no_timings()))
@@ -843,6 +860,7 @@ fn execution_loop<'a, Mode: ExecutionMode>(
                 gas_charger,
                 protocol_config,
                 metrics,
+                options,
             )
             .expect("ConsensusCommitPrologueV2 cannot fail");
             Ok(((), no_timings()))
@@ -858,6 +876,7 @@ fn execution_loop<'a, Mode: ExecutionMode>(
                 gas_charger,
                 protocol_config,
                 metrics,
+                options,
             )
             .expect("ConsensusCommitPrologueV3 cannot fail");
             Ok(((), no_timings()))
@@ -873,11 +892,12 @@ fn execution_loop<'a, Mode: ExecutionMode>(
                 gas_charger,
                 protocol_config,
                 metrics,
+                options,
             )
             .expect("ConsensusCommitPrologue cannot fail");
             Ok(((), no_timings()))
         }
-        TransactionKind::ProgrammableTransaction(pt) => SPT::execute::<Mode>(
+        TransactionKind::ProgrammableTransaction(pt) => SPT::execute_with_options::<Mode>(
             bump,
             protocol_config,
             metrics,
@@ -888,9 +908,10 @@ fn execution_loop<'a, Mode: ExecutionMode>(
             gas_charger,
             rewritten_inputs,
             pt,
+            options,
         ),
         TransactionKind::ProgrammableSystemTransaction(pt) => {
-            SPT::execute::<execution_mode::System>(
+            SPT::execute_with_options::<execution_mode::System>(
                 bump,
                 protocol_config,
                 metrics,
@@ -901,6 +922,7 @@ fn execution_loop<'a, Mode: ExecutionMode>(
                 gas_charger,
                 None,
                 pt,
+                options,
             )
             .map_err(|(e, _)| (e, no_timings()))?;
             Ok(((), no_timings()))
@@ -916,6 +938,7 @@ fn execution_loop<'a, Mode: ExecutionMode>(
                 gas_charger,
                 protocol_config,
                 metrics,
+                options,
             )
             .map_err(|e| (e, no_timings()))?;
             Ok(((), no_timings()))
@@ -951,6 +974,7 @@ fn setup_consensus_commit<'a>(
     gas_charger: &mut GasCharger<'a>,
     protocol_config: &'a ProtocolConfig,
     metrics: Arc<ExecutionMetrics>,
+    options: SPT::ExecuteOptions<'_>,
 ) -> Result<(), ExecutionError<'a>> {
     let pt = {
         let mut builder = ProgrammableTransactionBuilder::new(bump);
@@ -971,7 +995,7 @@ fn setup_consensus_commit<'a>(
         );
         builder.finish()
     };
-    SPT::execute::<execution_mode::System>(
+    SPT::execute_with_options::<execution_mode::System>(
         bump,
         protocol_config,
         metrics,
@@ -982,6 +1006,7 @@ fn setup_consensus_commit<'a>(
         gas_charger,
         None,
         pt,
+        options,
     )
     .map_err(|(e, _)| e)?;
     Ok(())
@@ -997,6 +1022,7 @@ fn setup_randomness_state_update<'a>(
     gas_charger: &mut GasCharger<'a>,
     protocol_config: &'a ProtocolConfig,
     metrics: Arc<ExecutionMetrics>,
+    options: SPT::ExecuteOptions<'_>,
 ) -> Result<(), ExecutionError<'a>> {
     let pt = {
         let mut builder = ProgrammableTransactionBuilder::new(bump);
@@ -1027,7 +1053,7 @@ fn setup_randomness_state_update<'a>(
         );
         builder.finish()
     };
-    SPT::execute::<execution_mode::System>(
+    SPT::execute_with_options::<execution_mode::System>(
         bump,
         protocol_config,
         metrics,
@@ -1038,6 +1064,7 @@ fn setup_randomness_state_update<'a>(
         gas_charger,
         None,
         pt,
+        options,
     )
     .map_err(|(e, _)| e)?;
     Ok(())

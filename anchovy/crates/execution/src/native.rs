@@ -33,6 +33,8 @@ pub struct NativeExecution {
     /// The transactions' arena, reset after each: execution is serial, so the lock is
     /// uncontended.
     arena: std::sync::Mutex<Bump>,
+    /// Built once from `config`: the natives' costs are fixed for the epoch.
+    natives_cost_table: natives::NativesCostTable,
     config: ProtocolConfig,
     move_vm: Arc<MoveRuntime>,
     metrics: Arc<ExecutionMetrics>,
@@ -56,6 +58,7 @@ impl NativeExecution {
         .map_err(|e| Error::Native(e.0))?;
         Ok(NativeExecution {
             arena: std::sync::Mutex::new(Bump::with_capacity(ARENA_CAPACITY)),
+            natives_cost_table: natives::NativesCostTable::from_protocol_config(&config),
             config,
             move_vm: Arc::new(move_vm),
             metrics,
@@ -159,6 +162,7 @@ impl NativeExecution {
             self.metrics.clone(),
             false,
             ExecutionOrEarlyError::ok(None),
+            Some(&self.natives_cost_table),
         );
 
         let written = inner_store.written.values().map(written).collect();
