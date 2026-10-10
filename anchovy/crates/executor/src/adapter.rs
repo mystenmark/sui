@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use containers::{BTreeMap, Bump};
+use containers::{Bump, Vec};
 use exec_types::base::{EpochId, move_address};
 use exec_types::error::{ExecutionError, ExecutionErrorKind};
 use exec_types::make_invariant_violation;
@@ -76,7 +76,7 @@ pub fn new_native_extensions<'a>(
     bump: &'a Bump,
     child_resolver: &'a dyn RuntimeObjectResolver<'a>,
     object_funds_resolver: &'a dyn ObjectFundsResolver,
-    input_objects: BTreeMap<'a, ObjectId, object_runtime::InputObject<'a>>,
+    input_objects: Vec<'a, (ObjectId, object_runtime::InputObject<'a>)>,
     is_metered: bool,
     protocol_config: &'a ProtocolConfig,
     // Built from `protocol_config` when `None`; when given, it must have been.

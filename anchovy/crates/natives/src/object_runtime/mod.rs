@@ -81,8 +81,13 @@ struct ObjectFundsAvailable {
 }
 
 pub(crate) struct ObjectRuntimeState<'a> {
-    pub(crate) input_objects: BTreeMap<'a, ObjectId, Owner<'a>>,
+    // Only looked up (the reference's is a `BTreeMap`).
+    pub(crate) input_objects: HashMap<'a, ObjectId, Owner<'a>>,
     // new ids from object::new. This does not contain any new-and-subsequently-deleted ids
+    //
+    // The order of `new_ids`, `generated_ids` and `deleted_ids` is never observed: they are only
+    // looked up and counted here, and their consumers only look them up or collect them into
+    // `BTreeSet`s. So removals swap rather than shift.
     new_ids: Set<'a, ObjectId>,
     // contains all ids generated in the txn including any new-and-subsequently-deleted ids
     generated_ids: Set<'a, ObjectId>,
@@ -104,9 +109,10 @@ pub(crate) struct ObjectRuntimeState<'a> {
     // is correct.
     settlement_input_sui: u64,
     settlement_output_sui: u64,
-    accumulator_merge_totals: BTreeMap<'a, (AccountAddress, TypeTag<'a>), u128>,
-    accumulator_split_totals: BTreeMap<'a, (AccountAddress, TypeTag<'a>), u128>,
-    object_funds_available: BTreeMap<'a, (AccountAddress, TypeTag<'a>), ObjectFundsAvailable>,
+    // These three are only looked up (the reference's are `BTreeMap`s).
+    accumulator_merge_totals: HashMap<'a, (AccountAddress, TypeTag<'a>), u128>,
+    accumulator_split_totals: HashMap<'a, (AccountAddress, TypeTag<'a>), u128>,
+    object_funds_available: HashMap<'a, (AccountAddress, TypeTag<'a>), ObjectFundsAvailable>,
 }
 
 /// The reference's, without the test scenario's inventories: its natives,
@@ -136,7 +142,9 @@ pub enum TransferResult {
 }
 
 pub struct InputObject<'a> {
-    pub contained_uids: BTreeSet<'a, ObjectId>,
+    /// The reference's is a `BTreeSet`; its ids are only inserted into maps, with the same value
+    /// for each, so their order does not matter.
+    pub contained_uids: Vec<'a, ObjectId>,
     pub version: SequenceNumber,
     pub owner: Owner<'a>,
 }
@@ -160,14 +168,16 @@ impl<'a> ObjectRuntime<'a> {
         bump: &'a Bump,
         object_resolver: &'a dyn RuntimeObjectResolver<'a>,
         object_funds_resolver: &'a dyn ObjectFundsResolver,
-        input_objects: BTreeMap<'a, ObjectId, InputObject<'a>>,
+        // The reference's is a `BTreeMap`. The order does not matter: no two inputs share an id
+        // or a contained UID (a UID is in one object), so each entry below is made once.
+        input_objects: Vec<'a, (ObjectId, InputObject<'a>)>,
         is_metered: bool,
         protocol_config: &'a ProtocolConfig,
         metrics: Arc<ExecutionMetrics>,
         epoch_id: EpochId,
     ) -> Self {
-        let mut input_object_owners = BTreeMap::new_in(bump);
-        let mut root_version = BTreeMap::new_in(bump);
+        let mut input_object_owners = containers::hash_map(bump, input_objects.len());
+        let mut root_version = containers::hash_map(bump, 0);
         let mut wrapped_object_containers = BTreeMap::new_in(bump);
         for (id, input_object) in input_objects {
             let InputObject {
@@ -175,10 +185,12 @@ impl<'a> ObjectRuntime<'a> {
                 version,
                 owner,
             } = input_object;
-            input_object_owners.insert(id, owner);
+            let prev = input_object_owners.insert(id, owner);
+            debug_assert!(prev.is_none());
             debug_assert!(contained_uids.contains(&id));
             for contained_uid in contained_uids {
-                root_version.insert(contained_uid, version);
+                let prev = root_version.insert(contained_uid, version);
+                debug_assert!(prev.is_none());
                 if contained_uid != id {
                     let prev = wrapped_object_containers.insert(contained_uid, id);
                     debug_assert!(prev.is_none());
@@ -211,9 +223,9 @@ impl<'a> ObjectRuntime<'a> {
                 received: IndexMap::new_in(bump),
                 settlement_input_sui: 0,
                 settlement_output_sui: 0,
-                accumulator_merge_totals: BTreeMap::new_in(bump),
-                accumulator_split_totals: BTreeMap::new_in(bump),
-                object_funds_available: BTreeMap::new_in(bump),
+                accumulator_merge_totals: containers::hash_map(bump, 0),
+                accumulator_split_totals: containers::hash_map(bump, 0),
+                object_funds_available: containers::hash_map(bump, 0),
             },
             is_metered,
             protocol_config,
@@ -291,7 +303,7 @@ impl<'a> ObjectRuntime<'a> {
         // remove from deleted_ids for the case in dynamic fields where the Field object was deleted
         // and then re-added in a single transaction. In that case, we also skip adding it
         // to new_ids.
-        let was_present = self.state.deleted_ids.shift_remove(&id);
+        let was_present = self.state.deleted_ids.swap_remove(&id);
         if !was_present {
             // mark the id as new
             self.state.generated_ids.insert(id);
@@ -332,7 +344,7 @@ impl<'a> ObjectRuntime<'a> {
                 ));
         };
 
-        let was_new = self.state.new_ids.shift_remove(&id);
+        let was_new = self.state.new_ids.swap_remove(&id);
         if !was_new {
             self.state.deleted_ids.insert(id);
         }
@@ -1018,7 +1030,8 @@ fn check_circular_ownership<'a>(
     bump: &'a Bump,
     transfers: impl IntoIterator<Item = (ObjectId, Owner<'a>)>,
 ) -> Result<(), ExecutionError<'a>> {
-    let mut object_owner_map = BTreeMap::new_in(bump);
+    // Only looked up (the reference's is a `BTreeMap`); `transfers` decides the order of checks.
+    let mut object_owner_map = containers::hash_map(bump, 0);
     for (id, recipient) in transfers {
         object_owner_map.remove(&id);
         match recipient {
@@ -1060,10 +1073,12 @@ pub fn get_all_uids<'a>(
     bump: &'a Bump,
     fully_annotated_layout: &MoveTypeLayout,
     bcs_bytes: &[u8],
-) -> Result<BTreeSet<'a, ObjectId>, /* invariant violation */ String> {
-    let mut ids = BTreeSet::new_in(bump);
-    struct UIDTraversal<'i, 'a>(&'i mut BTreeSet<'a, ObjectId>);
-    struct UIDCollector<'i, 'a>(&'i mut BTreeSet<'a, ObjectId>);
+) -> Result<Vec<'a, ObjectId>, /* invariant violation */ String> {
+    // In the order found, where the reference's is a `BTreeSet`: a valid object holds each UID
+    // once, and consumers only insert the ids into maps.
+    let mut ids = Vec::new_in(bump);
+    struct UIDTraversal<'i, 'a>(&'i mut Vec<'a, ObjectId>);
+    struct UIDCollector<'i, 'a>(&'i mut Vec<'a, ObjectId>);
 
     impl<'b, 'l> AV::Traversal<'b, 'l> for UIDTraversal<'_, '_> {
         type Error = AV::Error;
@@ -1088,7 +1103,7 @@ pub fn get_all_uids<'a>(
             _driver: &AV::ValueDriver<'_, 'b, 'l>,
             value: AccountAddress,
         ) -> Result<(), Self::Error> {
-            self.0.insert(ObjectId(value.into_bytes()));
+            self.0.push(ObjectId(value.into_bytes()));
             Ok(())
         }
     }

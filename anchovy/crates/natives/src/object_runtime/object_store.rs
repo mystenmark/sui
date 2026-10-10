@@ -5,7 +5,7 @@ use crate::object_runtime::{
     fingerprint::{ObjectFingerprint, SerializedChild},
     get_all_uids,
 };
-use containers::{BTreeMap, Bump, btree_map};
+use containers::{BTreeMap, Bump, HashMap, Vec, btree_map};
 use exec_types::base::EpochId;
 use exec_types::execution::DynamicallyLoadedObjectMetadata;
 use exec_types::object::Object;
@@ -57,7 +57,9 @@ pub(crate) struct ChildObjectEffect<'a> {
     pub(super) serialized: Option<SerializedChild>,
 }
 
-pub(crate) type ChildObjectEffects<'a> = BTreeMap<'a, ObjectId, ChildObjectEffect<'a>>;
+/// In ascending id order, as the reference's `BTreeMap` iterates: the order decides the order of
+/// the children's writes.
+pub(crate) type ChildObjectEffects<'a> = Vec<'a, (ObjectId, ChildObjectEffect<'a>)>;
 
 struct Inner<'a> {
     bump: &'a Bump,
@@ -66,13 +68,16 @@ struct Inner<'a> {
     // The version of the root object in ownership at the beginning of the transaction.
     // If it was a child object, it resolves to the root parent's sequence number.
     // Otherwise, it is just the sequence number at the beginning of the transaction.
-    root_version: BTreeMap<'a, ObjectId, SequenceNumber>,
+    // Only looked up (the reference's is a `BTreeMap`).
+    root_version: HashMap<'a, ObjectId, SequenceNumber>,
     // A map from a wrapped object to the object it was contained in at the
     // beginning of the transaction.
     wrapped_object_containers: BTreeMap<'a, ObjectId, ObjectId>,
     // cached objects from the resolver. An object might be in this map but not in the store
     // if it's existence was queried, but the value was not used.
-    cached_objects: BTreeMap<'a, ObjectId, Option<Object<'a>>>,
+    // The reference's is a `BTreeMap`; it is iterated only to fill a `BTreeMap`
+    // (`ObjectRuntime::loaded_runtime_objects`), so its order is never observed.
+    cached_objects: HashMap<'a, ObjectId, Option<Object<'a>>>,
     // whether or not this TX is gas metered
     is_metered: bool,
     // Protocol config used to enforce limits
@@ -93,7 +98,8 @@ pub(super) struct ChildObjectStore<'a> {
     // Maps of populated GlobalValues, meaning the child object has been accessed in this
     // transaction
     store: BTreeMap<'a, ObjectId, ChildObject<'a>>,
-    config_setting_cache: BTreeMap<'a, ObjectId, ConfigSetting<'a>>,
+    // Only looked up (the reference's is a `BTreeMap`).
+    config_setting_cache: HashMap<'a, ObjectId, ConfigSetting<'a>>,
     // whether or not this TX is gas metered
     is_metered: bool,
 }
@@ -249,57 +255,46 @@ impl<'a> Inner<'a> {
         // if not found, it must be new so it won't have any child objects, thus
         // we can return SequenceNumber(0) as no child object will be found
         let parents_root_version = parents_root_version.unwrap_or(0);
-        let cache_info = if let btree_map::Entry::Vacant(e) = self.cached_objects.entry(child) {
-            let obj_opt = fetch_child_object_unbounded!(
-                self,
-                parent,
-                child,
-                parents_root_version,
-                had_parent_root_version
-            );
+        // The reference looks the object up again after caching it; objects are `Copy`, so the
+        // fetched one is returned as is.
+        if let Some(obj_opt) = self.cached_objects.get(&child) {
+            // unwrap safe because we only insert Move objects
+            let move_obj_opt = obj_opt.as_ref().map(|obj| *obj.try_as_move().unwrap());
+            return Ok((CacheInfo::CachedObject, move_obj_opt));
+        }
+        let obj_opt = fetch_child_object_unbounded!(
+            self,
+            parent,
+            child,
+            parents_root_version,
+            had_parent_root_version
+        );
 
-            if let LimitThresholdCrossed::Hard(_, lim) = check_limit_by_meter!(
-                self.is_metered,
-                cached_objects_count,
-                self.protocol_config.object_runtime_max_num_cached_objects(),
-                self.protocol_config
-                    .object_runtime_max_num_cached_objects_system_tx(),
-                self.metrics
-                    .limits_metrics
-                    .excessive_object_runtime_cached_objects
-            ) {
-                return Err(PartialVMError::new(StatusCode::MEMORY_LIMIT_EXCEEDED)
-                    .with_message(format!(
-                        "Object runtime cached objects limit ({} entries) reached",
-                        lim
-                    ))
-                    .with_sub_status(
-                        VMMemoryLimitExceededSubStatusCode::OBJECT_RUNTIME_CACHE_LIMIT_EXCEEDED
-                            as u64,
-                    ));
-            };
-            let num_bytes_opt = match &obj_opt {
-                Some(obj) => {
-                    // unwrap safe because we only insert Move objects
-                    let move_obj = obj.try_as_move().unwrap();
-                    Some(move_obj.contents.len())
-                }
-                None => None,
-            };
-
-            e.insert(obj_opt);
-            CacheInfo::Loaded(num_bytes_opt)
-        } else {
-            CacheInfo::CachedObject
+        if let LimitThresholdCrossed::Hard(_, lim) = check_limit_by_meter!(
+            self.is_metered,
+            cached_objects_count,
+            self.protocol_config.object_runtime_max_num_cached_objects(),
+            self.protocol_config
+                .object_runtime_max_num_cached_objects_system_tx(),
+            self.metrics
+                .limits_metrics
+                .excessive_object_runtime_cached_objects
+        ) {
+            return Err(PartialVMError::new(StatusCode::MEMORY_LIMIT_EXCEEDED)
+                .with_message(format!(
+                    "Object runtime cached objects limit ({} entries) reached",
+                    lim
+                ))
+                .with_sub_status(
+                    VMMemoryLimitExceededSubStatusCode::OBJECT_RUNTIME_CACHE_LIMIT_EXCEEDED as u64,
+                ));
         };
-        // unwraps are safe because it must be inserted and we only insert Move objects
-        let move_obj_opt = self
-            .cached_objects
-            .get(&child)
-            .unwrap()
-            .as_ref()
-            .map(|obj| *obj.try_as_move().unwrap());
-        Ok((cache_info, move_obj_opt))
+        // unwrap safe because we only insert Move objects
+        let move_obj_opt = obj_opt.as_ref().map(|obj| *obj.try_as_move().unwrap());
+        let num_bytes_opt = move_obj_opt.map(|move_obj| move_obj.contents.len());
+
+        self.cached_objects.insert(child, obj_opt);
+        Ok((CacheInfo::Loaded(num_bytes_opt), move_obj_opt))
     }
 
     fn fetch_object_impl(
@@ -406,7 +401,7 @@ impl<'a> ChildObjectStore<'a> {
     pub(super) fn new(
         bump: &'a Bump,
         resolver: &'a dyn RuntimeObjectResolver<'a>,
-        root_version: BTreeMap<'a, ObjectId, SequenceNumber>,
+        root_version: HashMap<'a, ObjectId, SequenceNumber>,
         wrapped_object_containers: BTreeMap<'a, ObjectId, ObjectId>,
         is_metered: bool,
         protocol_config: &'a ProtocolConfig,
@@ -419,14 +414,14 @@ impl<'a> ChildObjectStore<'a> {
                 resolver,
                 root_version,
                 wrapped_object_containers,
-                cached_objects: BTreeMap::new_in(bump),
+                cached_objects: containers::hash_map(bump, 0),
                 is_metered,
                 protocol_config,
                 metrics,
                 current_epoch_id,
             },
             store: BTreeMap::new_in(bump),
-            config_setting_cache: BTreeMap::new_in(bump),
+            config_setting_cache: containers::hash_map(bump, 0),
             is_metered,
         }
     }
@@ -688,8 +683,8 @@ impl<'a> ChildObjectStore<'a> {
         let parent = config_id;
         let child = name_df_id;
 
-        let setting = match self.config_setting_cache.entry(child) {
-            btree_map::Entry::Vacant(e) => {
+        let value = match self.config_setting_cache.get(&child) {
+            None => {
                 let child_move_type = field_setting_object_type;
                 let inner = &self.inner;
                 let obj_opt = fetch_child_object_unbounded!(inner, parent, child, u64::MAX, true);
@@ -706,14 +701,19 @@ impl<'a> ChildObjectStore<'a> {
                         )),
                     );
                 };
-                e.insert(ConfigSetting {
-                    config: parent,
-                    ty: *child_move_type,
-                    value,
-                })
+                // The copy the reference takes of the cached value, taken before caching it.
+                let copy = value.copy_value();
+                self.config_setting_cache.insert(
+                    child,
+                    ConfigSetting {
+                        config: parent,
+                        ty: *child_move_type,
+                        value,
+                    },
+                );
+                copy
             }
-            btree_map::Entry::Occupied(e) => {
-                let setting = e.into_mut();
+            Some(setting) => {
                 if setting.ty != *field_setting_object_type {
                     return Ok(ObjectResult::MismatchedType);
                 }
@@ -729,10 +729,9 @@ impl<'a> ChildObjectStore<'a> {
                             )),
                     );
                 }
-                setting
+                setting.value.copy_value()
             }
         };
-        let value = setting.value.copy_value();
         Ok(ObjectResult::Loaded(Some(value)))
     }
 
@@ -746,7 +745,7 @@ impl<'a> ChildObjectStore<'a> {
             .get_package_at_version(&package_id, package_version)
     }
 
-    pub(super) fn cached_objects(&self) -> &BTreeMap<'a, ObjectId, Option<Object<'a>>> {
+    pub(super) fn cached_objects(&self) -> &HashMap<'a, ObjectId, Option<Object<'a>>> {
         &self.inner.cached_objects
     }
 
@@ -758,7 +757,7 @@ impl<'a> ChildObjectStore<'a> {
     pub(super) fn take_effects(&mut self) -> PartialVMResult<ChildObjectEffects<'a>> {
         let bump = self.inner.bump;
         let store = std::mem::replace(&mut self.store, BTreeMap::new_in(bump));
-        let mut effects = BTreeMap::new_in(bump);
+        let mut effects = Vec::with_capacity_in(store.len(), bump);
         for (id, child_object) in store {
             let ChildObject {
                 owner,
@@ -776,7 +775,7 @@ impl<'a> ChildObjectStore<'a> {
                 object_changed,
                 serialized,
             };
-            effects.insert(id, child_effect);
+            effects.push((id, child_effect));
         }
         Ok(effects)
     }

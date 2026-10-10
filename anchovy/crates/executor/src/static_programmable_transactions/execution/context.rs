@@ -395,7 +395,9 @@ where
         'pc: 'a,
     {
         let bump = env.bump;
-        let mut input_object_map = BTreeMap::new_in(bump);
+        // The reference's is a `BTreeMap`, only iterated to make the object runtime, for which
+        // the order does not matter (see `ObjectRuntime::new`).
+        let mut input_object_map = Vec::with_capacity_in(object_inputs.len() + 1, bump);
         let mut input_object_metadata = Vec::with_capacity_in(object_inputs.len(), bump);
         let mut object_values = Vec::with_capacity_in(object_inputs.len(), bump);
         let mut input_layouts = InputLayouts(Vec::new_in(bump));
@@ -1818,7 +1820,7 @@ struct InputLayouts<'a>(
 fn load_object_arg<'a, Mode: ExecutionMode>(
     meter: &mut GasCharger<'a>,
     env: &Env<'a, '_, '_, '_, '_, '_, Mode>,
-    input_object_map: &mut BTreeMap<'a, ObjectId, object_runtime::InputObject<'a>>,
+    input_object_map: &mut Vec<'a, (ObjectId, object_runtime::InputObject<'a>)>,
     input_layouts: &mut InputLayouts<'a>,
     input: T::ObjectInput<'a>,
 ) -> Result<(T::InputIndex, InputObjectMetadata<'a>, Value), ExecutionError<'a>> {
@@ -1839,7 +1841,7 @@ fn load_object_arg<'a, Mode: ExecutionMode>(
 fn load_object_arg_impl<'a, Mode: ExecutionMode>(
     meter: &mut GasCharger<'a>,
     env: &Env<'a, '_, '_, '_, '_, '_, Mode>,
-    input_object_map: &mut BTreeMap<'a, ObjectId, object_runtime::InputObject<'a>>,
+    input_object_map: &mut Vec<'a, (ObjectId, object_runtime::InputObject<'a>)>,
     input_layouts: &mut InputLayouts<'a>,
     id: ObjectId,
     refined_permissions: ObjectPermissions,
@@ -1883,14 +1885,14 @@ fn load_object_arg_impl<'a, Mode: ExecutionMode>(
         .map_err(|e| {
             make_invariant_violation!("Unable to retrieve UIDs for object. Got error: {e}")
         })?;
-    input_object_map.insert(
+    input_object_map.push((
         id,
         object_runtime::InputObject {
             contained_uids,
             version,
             owner,
         },
-    );
+    ));
 
     let v = match (cached, computed_annotated) {
         (Some((_, _, runtime)), _) => {
