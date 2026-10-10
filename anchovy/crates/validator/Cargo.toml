@@ -50,3 +50,7 @@ tonic-build.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "vote"
+harness = false
