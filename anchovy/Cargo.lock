@@ -9970,6 +9970,7 @@ dependencies = [
  "blake2",
  "bytes",
  "clap",
+ "consensus",
  "containers",
  "execution",
  "hashbrown 0.17.1",

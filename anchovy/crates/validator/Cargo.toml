@@ -14,6 +14,7 @@ base64.workspace = true
 blake2.workspace = true
 bytes.workspace = true
 clap.workspace = true
+consensus.workspace = true
 containers.workspace = true
 execution.workspace = true
 hashbrown.workspace = true
