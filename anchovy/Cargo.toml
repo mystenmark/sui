@@ -13,6 +13,7 @@ members = [
     "crates/store",
     "crates/validation",
     "crates/validator",
+    "crates/waiter",
     "crates/workqueue",
 ]
 exclude = ["tools/sui-oracle", "tools/validator-client"]
@@ -62,6 +63,7 @@ messages = { path = "crates/messages" }
 protocol-config = { path = "crates/protocol-config" }
 store = { path = "crates/store" }
 validation = { path = "crates/validation" }
+waiter = { path = "crates/waiter" }
 workqueue = { path = "crates/workqueue" }
 # Two versions of the allocator trait: hashbrown and its Vec use 0.2,
 # arena-btreemap uses 0.4. The arena implements both.
