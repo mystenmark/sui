@@ -221,4 +221,9 @@ impl validation::inputs::Objects for StoreObjects<'_> {
     fn at(&self, id: &ObjectId, version: u64) -> Option<Message<Object<'static>>> {
         self.0.object(id, version).expect("the store reads")
     }
+
+    fn live_ref(&self, id: &ObjectId) -> Option<(u64, messages::base::ObjectDigest)> {
+        let live = self.0.live(id).expect("the store reads")?;
+        Some((live.version, live.digest))
+    }
 }
