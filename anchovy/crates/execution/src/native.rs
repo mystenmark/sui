@@ -171,7 +171,19 @@ impl NativeExecution {
             effects: effects_bytes.clone(),
             commit: store::Commit {
                 written,
-                removed: inner_store.removed.iter().copied().collect(),
+                removed: inner_store
+                    .removed
+                    .iter()
+                    .map(|&(id, wrapped)| store::Removed {
+                        id,
+                        version: inner_store.lamport_version,
+                        removal: if wrapped {
+                            store::Removal::Wrapped
+                        } else {
+                            store::Removal::Deleted
+                        },
+                    })
+                    .collect(),
                 executed: Some(store::Executed {
                     digest: digest_of(digest),
                     transaction: transaction.to_vec(),

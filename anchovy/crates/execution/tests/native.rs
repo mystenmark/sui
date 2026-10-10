@@ -98,7 +98,7 @@ fn assert_same(reference: &Outcome, native: &Outcome, effects: &TransactionEffec
     assert_eq!(written(native), written(reference), "written objects");
     let removed = |o: &Outcome| {
         let mut r = o.commit.removed.clone();
-        r.sort_by_key(|id| id.0);
+        r.sort_by_key(|removed| removed.id.0);
         r
     };
     assert_eq!(removed(native), removed(reference), "removed objects");
@@ -718,6 +718,21 @@ fn dynamic_fields_match() {
         framework(b, "linked_table", "push_front", u64s(), args);
         let args = ckv(b, lt, 5, 50);
         framework(b, "linked_table", "push_back", u64s(), args);
+    });
+    assert!(effects.status().is_ok(), "{effects:?}");
+
+    // A stored child removed, then its key added again in a later transaction: the removal's
+    // tombstone hides the old version from the bounded child read.
+    let effects = node.ptb(|b| {
+        let t = node.owned_arg(b, t);
+        let three = b.pure(3u64).unwrap();
+        framework(b, "table", "remove", u64s(), vec![t, three]);
+    });
+    assert!(effects.status().is_ok(), "{effects:?}");
+    let effects = node.ptb(|b| {
+        let t = node.owned_arg(b, t);
+        let args = ckv(b, t, 3, 3333);
+        framework(b, "table", "add", u64s(), args);
     });
     assert!(effects.status().is_ok(), "{effects:?}");
 

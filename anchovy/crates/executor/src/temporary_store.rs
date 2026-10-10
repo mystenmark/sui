@@ -154,8 +154,9 @@ pub struct InnerTemporaryStore<'a> {
     pub encoded_events: Option<messages::fast::Built<'a>>,
     /// Not in the reference, whose caller reads them back from the effects: the objects left
     /// without a live version, as the effects' `deleted`, `wrapped` and
-    /// `unwrapped_then_deleted` classify them.
-    pub removed: Vec<'a, ObjectId>,
+    /// `unwrapped_then_deleted` classify them, and whether each was wrapped. All at
+    /// `lamport_version`, as the effects give them.
+    pub removed: Vec<'a, (ObjectId, /* wrapped */ bool)>,
 }
 
 impl<'a> TemporaryStore<'a> {
@@ -577,10 +578,9 @@ impl<'a> TemporaryStore<'a> {
         let bump = self.bump;
         let mut inner = self.into_inner(accumulator_running_max_withdraws);
         inner.removed.extend(
-            object_changes
-                .iter()
-                .filter(|(_, change)| removes_live_version(change))
-                .map(|(id, _)| *id),
+            object_changes.iter().filter_map(|(id, change)| {
+                removes_live_version(change).map(|wrapped| (*id, wrapped))
+            }),
         );
 
         inner.encoded_events =
@@ -1204,27 +1204,21 @@ impl ObjectFundsResolver for TemporaryStore<'_> {
     }
 }
 
-/// Whether the change leaves the object without a live version: the effects' `deleted`
-/// (`Exist → NotExist`, `Deleted`), `wrapped` (`Exist → NotExist`, `None`) and
-/// `unwrapped_then_deleted` (`NotExist → NotExist`, `Deleted`).
-fn removes_live_version(change: &EffectsObjectChange<'_>) -> bool {
+/// Whether the change leaves the object without a live version, and if so whether it was
+/// wrapped: the effects' `deleted` (`Exist → NotExist`, `Deleted`), `wrapped`
+/// (`Exist → NotExist`, `None`) and `unwrapped_then_deleted` (`NotExist → NotExist`, `Deleted`).
+fn removes_live_version(change: &EffectsObjectChange<'_>) -> Option</* wrapped */ bool> {
     use messages::effects::{IdOperation, ObjectIn, ObjectOut};
-    matches!(
-        (
-            &change.input_state,
-            &change.output_state,
-            change.id_operation
-        ),
-        (
-            ObjectIn::Exist { .. },
-            ObjectOut::NotExist,
-            IdOperation::Deleted | IdOperation::None
-        ) | (
-            ObjectIn::NotExist,
-            ObjectOut::NotExist,
-            IdOperation::Deleted
-        )
-    )
+    match (
+        &change.input_state,
+        &change.output_state,
+        change.id_operation,
+    ) {
+        (ObjectIn::Exist { .. }, ObjectOut::NotExist, IdOperation::Deleted)
+        | (ObjectIn::NotExist, ObjectOut::NotExist, IdOperation::Deleted) => Some(false),
+        (ObjectIn::Exist { .. }, ObjectOut::NotExist, IdOperation::None) => Some(true),
+        _ => None,
+    }
 }
 
 /// `MoveObjectType::coin_type_maybe(..).is_some()` for the object's type.
