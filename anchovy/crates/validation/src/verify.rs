@@ -108,9 +108,77 @@ pub fn verify_signatures(
     aliases: &[(SuiAddress, &[SuiAddress])],
     bump: &Bump,
 ) -> Result<(), Error> {
-    let data = &tx.data();
+    let Some(by_signer) = signer_mapping(tx, signatures, verifier, aliases, bump)? else {
+        return Ok(());
+    };
+    // The intent message is the intent's three bytes, then the data.
+    let digest = blake2b(&[&[0, 0, 0], tx.data().bytes()]);
+    for (address, i) in &by_signer {
+        verify_authenticator(&signatures[*i], address, epoch, &digest, verifier)?;
+    }
+    Ok(())
+}
+
+/// For each required signer (the sender, then a sponsor), the index of the
+/// signature that signs for it or for one of its `aliases`: what the
+/// reference's `verify_sender_signed_data_message_signatures` returns, and
+/// what a consensus transaction's alias claim must match. Checks what
+/// `verify_signatures` checks before verifying signatures, and no more.
+pub fn signer_signature_indices<'b>(
+    tx: &SenderSignedData<'_, impl TxState>,
+    signatures: &[ParsedSignature<'_>],
+    verifier: &Verifier,
+    aliases: &[(SuiAddress, &[SuiAddress])],
+    bump: &'b Bump,
+) -> Result<containers::Vec<'b, u8>, Error> {
+    let required = required_signers(tx);
+    let mut indices = containers::Vec::with_capacity_in(2, bump);
+    let Some(by_signer) = signer_mapping(tx, signatures, verifier, aliases, bump)? else {
+        // System transactions use all of their dummy signatures.
+        indices.extend(0..required.iter().flatten().count() as u8);
+        return Ok(indices);
+    };
+    for signer in required.iter().flatten() {
+        let index = accepted_signers(signer, aliases)
+            .iter()
+            .find_map(|a| by_signer.iter().find(|(s, _)| s == a).map(|(_, i)| *i))
+            .expect("signer_mapping found a signature for every required signer");
+        indices.push(index as u8);
+    }
+    Ok(indices)
+}
+
+/// The sender, then the gas owner if it differs: the reference's
+/// `required_signers`.
+fn required_signers(tx: &SenderSignedData<'_, impl TxState>) -> [Option<SuiAddress>; 2] {
+    let data = tx.data();
     let sponsor = (data.gas_data().owner != data.sender()).then_some(*data.gas_data().owner);
-    let required = [Some(*data.sender()), sponsor];
+    [Some(*data.sender()), sponsor]
+}
+
+/// The addresses `signer` may sign as.
+fn accepted_signers<'s>(
+    signer: &'s SuiAddress,
+    aliases: &[(SuiAddress, &'s [SuiAddress])],
+) -> &'s [SuiAddress] {
+    aliases
+        .iter()
+        .find(|(a, _)| a == signer)
+        .map_or(std::slice::from_ref(signer), |(_, alias)| alias)
+}
+
+/// Each signature's signer, in address order, with a later signature for an
+/// address replacing an earlier one, as the reference's `BTreeMap`; after
+/// checking the signature count and that every required signer signed.
+/// `None` for a system transaction, whose signatures are not checked.
+fn signer_mapping<'b>(
+    tx: &SenderSignedData<'_, impl TxState>,
+    signatures: &[ParsedSignature<'_>],
+    verifier: &Verifier,
+    aliases: &[(SuiAddress, &[SuiAddress])],
+    bump: &'b Bump,
+) -> Result<Option<containers::Vec<'b, (SuiAddress, usize)>>, Error> {
+    let required = required_signers(tx);
     let required_count = required.iter().flatten().count();
     if signatures.len() != required_count {
         return Err(Error::new(
@@ -122,13 +190,13 @@ pub fn verify_signatures(
         ));
     }
     // User transactions were checked not to be system transactions.
-    if !matches!(data.kind(), TransactionKind::ProgrammableTransaction(_)) {
-        return Ok(());
+    if !matches!(
+        tx.data().kind(),
+        TransactionKind::ProgrammableTransaction(_)
+    ) {
+        return Ok(None);
     }
 
-    // Signer by address, later signatures replacing earlier ones for the
-    // same address, then walked in address order, as the reference's
-    // `BTreeMap`.
     let mut by_signer = containers::Vec::with_capacity_in(2 * signatures.len(), bump);
     let mut insert =
         |address: SuiAddress, sig: usize| match by_signer.iter_mut().find(|(a, _)| *a == address) {
@@ -147,11 +215,7 @@ pub fn verify_signatures(
     by_signer.sort_unstable_by_key(|(address, _)| address.0);
 
     for signer in required.iter().flatten() {
-        let accepted = aliases
-            .iter()
-            .find(|(a, _)| a == signer)
-            .map_or(std::slice::from_ref(signer), |(_, alias)| alias);
-        if !accepted
+        if !accepted_signers(signer, aliases)
             .iter()
             .any(|a| by_signer.iter().any(|(s, _)| s == a))
         {
@@ -161,13 +225,7 @@ pub fn verify_signatures(
             ));
         }
     }
-
-    // The intent message is the intent's three bytes, then the data.
-    let digest = blake2b(&[&[0, 0, 0], data.bytes()]);
-    for (address, i) in &by_signer {
-        verify_authenticator(&signatures[*i], address, epoch, &digest, verifier)?;
-    }
-    Ok(())
+    Ok(Some(by_signer))
 }
 
 /// The address a signature signs for.
