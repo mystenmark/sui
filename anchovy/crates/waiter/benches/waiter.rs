@@ -5,9 +5,11 @@
 //! (an id and a version), keys shared between items; then every key
 //! notified, in shuffled batches. Time per item waited on and per key
 //! notified, and allocations, over rounds after a first that sizes the
-//! tables. Run with `cargo bench -p waiter`; `ITEMS` sets the item count,
-//! `BATCH` the batch size, and `VISIBLE` the percentage of keys the check
-//! finds available already.
+//! tables. Then a matrix of fan-in (keys per item) by fan-out (items per
+//! key) at the same number of item-key edges. Run with
+//! `cargo bench -p waiter`; `ITEMS` sets the mixed run's item count, `EDGES`
+//! the matrix's edges, `BATCH` the batch size, and `VISIBLE` the percentage
+//! of keys the mixed run's check finds available already.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -74,28 +76,35 @@ fn env(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn main() {
-    let items = env("ITEMS", 1_000_000);
-    let batch_size = env("BATCH", 1_000);
-    let visible_percent = env("VISIBLE", 0);
-    // About two items per key.
-    let key_count = items;
-    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
-
-    // Each item's keys, by key index.
-    let item_keys: Vec<Vec<usize>> = (0..items)
-        .map(|_| (0..=rng.below(4)).map(|_| rng.below(key_count)).collect())
-        .collect();
-    let mut order: Vec<usize> = (0..key_count).collect();
-    for i in (1..order.len()).rev() {
-        order.swap(i, rng.below(i + 1));
+/// A shuffle, in place.
+fn shuffle<T>(items: &mut [T], rng: &mut Rng) {
+    for i in (1..items.len()).rev() {
+        items.swap(i, rng.below(i + 1));
     }
-    let visible: Vec<bool> = (0..key_count)
-        .map(|_| rng.below(100) < visible_percent)
-        .collect();
-    let key_waits: usize = item_keys.iter().map(Vec::len).sum();
+}
 
-    println!("round  wait ns/item  notify ns/key  allocs/item  keys/item");
+/// Times `item_keys` (each item's keys, by index below `key_count`) waited
+/// on, then every key notified in shuffled batches, over three rounds; the
+/// last round's numbers, once the tables are sized.
+struct Measured {
+    wait_per_item: f64,
+    wait_per_edge: f64,
+    notify_per_key: f64,
+    notify_per_edge: f64,
+    allocs_per_item: f64,
+}
+
+fn measure(
+    item_keys: &[Vec<usize>],
+    key_count: usize,
+    visible: &[bool],
+    batch_size: usize,
+    rng: &mut Rng,
+) -> Measured {
+    let items = item_keys.len();
+    let edges: usize = item_keys.iter().map(Vec::len).sum();
+    let mut order: Vec<usize> = (0..key_count).collect();
+    shuffle(&mut order, rng);
     // The check finds a key visible by its index, which the id holds.
     let mut waiter: Waiter<Key, u32, _> = Waiter::new(|key: &Key| {
         let i = u64::from_le_bytes(key.0[8..16].try_into().unwrap()) as usize;
@@ -104,6 +113,7 @@ fn main() {
     let mut batch = WaitBatch::with_capacity(batch_size, batch_size * 4);
     let mut notified = Vec::with_capacity(batch_size);
     let mut ready = Vec::with_capacity(items);
+    let mut measured = None;
     for round in 0..3u64 {
         let before = ALLOCATIONS.load(Ordering::Relaxed);
         let mut waiting = Duration::ZERO;
@@ -131,12 +141,67 @@ fn main() {
         assert_eq!(waiter.waiting(), 0);
         ready.clear();
         let allocations = ALLOCATIONS.load(Ordering::Relaxed) - before;
-        println!(
-            "{round:<5}  {:>12.1}  {:>13.1}  {:>11.3}  {:>9.2}",
-            waiting.as_nanos() as f64 / items as f64,
-            notifying.as_nanos() as f64 / key_count as f64,
-            allocations as f64 / items as f64,
-            key_waits as f64 / items as f64,
-        );
+        measured = Some(Measured {
+            wait_per_item: waiting.as_nanos() as f64 / items as f64,
+            wait_per_edge: waiting.as_nanos() as f64 / edges as f64,
+            notify_per_key: notifying.as_nanos() as f64 / key_count as f64,
+            notify_per_edge: notifying.as_nanos() as f64 / edges as f64,
+            allocs_per_item: allocations as f64 / items as f64,
+        });
+    }
+    measured.expect("three rounds")
+}
+
+fn main() {
+    let items = env("ITEMS", 1_000_000);
+    let batch_size = env("BATCH", 1_000);
+    let visible_percent = env("VISIBLE", 0);
+    let edges = env("EDGES", 2_000_000);
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+
+    // Mixed: one to four keys per item, about two items per key.
+    let key_count = items;
+    let item_keys: Vec<Vec<usize>> = (0..items)
+        .map(|_| (0..=rng.below(4)).map(|_| rng.below(key_count)).collect())
+        .collect();
+    let visible: Vec<bool> = (0..key_count)
+        .map(|_| rng.below(100) < visible_percent)
+        .collect();
+    let m = measure(&item_keys, key_count, &visible, batch_size, &mut rng);
+    println!(
+        "mixed: {items} items, 1-4 keys each, about 2 items per key, {visible_percent}% visible"
+    );
+    println!(
+        "  wait {:.1} ns/item, notify {:.1} ns/key, {:.3} allocs/item\n",
+        m.wait_per_item, m.notify_per_key, m.allocs_per_item
+    );
+
+    // Fan-in (keys per item) by fan-out (items per key), the same number of
+    // item-key edges each: every key used by exactly `fan_out` items, dealt
+    // out at random, nothing visible.
+    println!("{edges} edges, nothing visible");
+    println!(
+        "fan-in  fan-out  items     keys      wait ns/item  wait ns/edge  notify ns/key  notify ns/edge  allocs/item"
+    );
+    for fan_in in [1, 8, 64, 512] {
+        for fan_out in [1, 8, 64, 512] {
+            let key_count = edges / fan_out;
+            let mut slots: Vec<usize> = (0..key_count)
+                .flat_map(|k| std::iter::repeat_n(k, fan_out))
+                .collect();
+            shuffle(&mut slots, &mut rng);
+            let item_keys: Vec<Vec<usize>> = slots.chunks(fan_in).map(<[usize]>::to_vec).collect();
+            let visible = vec![false; key_count];
+            let m = measure(&item_keys, key_count, &visible, batch_size, &mut rng);
+            println!(
+                "{fan_in:<6}  {fan_out:<7}  {:<8}  {key_count:<8}  {:>12.1}  {:>12.1}  {:>13.1}  {:>14.1}  {:>11.3}",
+                item_keys.len(),
+                m.wait_per_item,
+                m.wait_per_edge,
+                m.notify_per_key,
+                m.notify_per_edge,
+                m.allocs_per_item,
+            );
+        }
     }
 }
