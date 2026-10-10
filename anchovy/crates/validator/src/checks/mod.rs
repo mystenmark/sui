@@ -177,6 +177,15 @@ pub fn check_inputs(
     Ok(transaction.relabel(&Witness(PhantomData)))
 }
 
+/// A transaction consensus committed that this validator did not verify:
+/// its signatures are taken as verified, as the reference's
+/// `VerifiedExecutableTransaction::new_from_consensus` takes them. A quorum
+/// accepted it, so at least one honest validator verified it. Only the commit
+/// handler may call this, and only for a transaction it took from a commit.
+pub fn sequenced_by_consensus(transaction: Unchecked) -> VerifiedTransaction {
+    transaction.with_digest().relabel(&Witness(PhantomData))
+}
+
 /// `check_inputs`, keeping the transaction: voting checks the inputs of a
 /// transaction it caches either way.
 pub fn inputs_pass(

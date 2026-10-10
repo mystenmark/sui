@@ -2,22 +2,25 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Voting on hand-built blocks of signed transactions against a funded
-//! genesis.
+//! genesis, and handling hand-built commits of them.
 
 use std::sync::Arc;
 
-use consensus::{Block, BlockRef};
+use consensus::{Block, BlockRef, CommittedSubDag, TransactionIndex};
 use messages::base::Digest;
 use protocol_config::{Chain, ProtocolVersion};
 use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
 use sui_types::crypto::{AccountKeyPair, AuthorityPublicKeyBytes, get_key_pair};
 use sui_types::digests::TransactionDigest;
+use sui_types::effects::{TransactionEffects, TransactionEffectsAPI};
 use sui_types::messages_consensus::ConsensusTransaction;
 use sui_types::object::Object;
 use sui_types::transaction::{PlainTransactionWithClaims, Transaction, TransactionData};
 use validator::consensus::cache::ConsensusTxCache;
+use validator::consensus::commit::{CommitHandler, CommitOutcome, Fate};
 use validator::consensus::vote::BlockVoter;
 use validator::epoch::EpochState;
+use validator::processors::Outcome;
 
 const RGP: u64 = 1000;
 const BUDGET: u64 = 50_000_000;
@@ -252,4 +255,171 @@ fn other_kinds_are_accepted_and_not_cached() {
     let reference = block.reference;
     assert_eq!(node.voter().vote(&node.epoch, block), Ok(vec![]));
     assert_eq!(node.cache.take(&reference).unwrap().len(), 1);
+}
+
+fn commit(
+    index: u32,
+    leader_round: u32,
+    blocks: Vec<Block>,
+    rejected: Vec<(BlockRef, Vec<TransactionIndex>)>,
+) -> CommittedSubDag {
+    CommittedSubDag {
+        commit_index: index,
+        leader: blocks.last().map_or(
+            BlockRef {
+                round: leader_round,
+                author: 0,
+                digest: [0; 32],
+            },
+            |b| BlockRef {
+                round: leader_round,
+                ..b.reference
+            },
+        ),
+        timestamp_ms: 0,
+        blocks,
+        rejected,
+    }
+}
+
+fn handler(node: &Node) -> CommitHandler {
+    CommitHandler::new(node.store.clone(), node.cache.clone())
+}
+
+/// Whether the transaction at `i` executed successfully.
+fn succeeded(outcome: &CommitOutcome, i: usize) -> bool {
+    let Fate::Executed(Outcome::Executed(executed)) = &outcome.transactions[i].fate else {
+        return false;
+    };
+    let effects: TransactionEffects = bcs::from_bytes(&executed.effects).unwrap();
+    effects.status().is_ok()
+}
+
+#[test]
+fn a_voted_block_s_transactions_come_from_the_cache() {
+    let node = Node::new();
+    let block = block(
+        1,
+        vec![user_transaction(&node.transfer(node.gas()), &[no_alias()])],
+    );
+    assert_eq!(node.voter().vote(&node.epoch, block.clone()), Ok(vec![]));
+    let outcome = handler(&node)
+        .handle(&node.epoch, commit(1, 1, vec![block], vec![]))
+        .unwrap();
+    assert_eq!((outcome.cache_hits, outcome.cache_misses), (1, 0));
+    assert!(succeeded(&outcome, 0));
+    assert!(node.cache.is_empty());
+}
+
+#[test]
+fn an_unvoted_block_s_transactions_are_decoded() {
+    let node = Node::new();
+    let end_of_publish = bcs::to_bytes(&ConsensusTransaction::new_end_of_publish(
+        AuthorityPublicKeyBytes::ZERO,
+    ))
+    .unwrap();
+    let block = block(
+        1,
+        vec![
+            end_of_publish,
+            user_transaction(&node.transfer(node.gas()), &[no_alias()]),
+        ],
+    );
+    let outcome = handler(&node)
+        .handle(&node.epoch, commit(1, 1, vec![block], vec![]))
+        .unwrap();
+    assert_eq!((outcome.cache_hits, outcome.cache_misses), (0, 1));
+    assert_eq!(outcome.transactions.len(), 1);
+    assert_eq!(outcome.transactions[0].index, 1);
+    assert!(succeeded(&outcome, 0));
+}
+
+#[test]
+fn rejected_transactions_are_skipped() {
+    let node = Node::new();
+    let block = block(
+        1,
+        vec![user_transaction(&node.transfer(node.gas()), &[no_alias()])],
+    );
+    let rejected = vec![(block.reference, vec![0])];
+    let outcome = handler(&node)
+        .handle(&node.epoch, commit(1, 1, vec![block], rejected))
+        .unwrap();
+    assert!(outcome.transactions.is_empty());
+}
+
+#[test]
+fn transactions_and_commits_are_handled_once() {
+    let node = Node::new();
+    let transaction = user_transaction(&node.transfer(node.gas()), &[no_alias()]);
+    let first = block(1, vec![transaction.clone()]);
+    let second = Block {
+        reference: BlockRef {
+            author: 2,
+            ..first.reference
+        },
+        ..first.clone()
+    };
+    let mut handler = handler(&node);
+    let outcome = handler
+        .handle(
+            &node.epoch,
+            commit(1, 1, vec![first.clone(), second], vec![]),
+        )
+        .unwrap();
+    assert!(succeeded(&outcome, 0));
+    assert!(matches!(outcome.transactions[1].fate, Fate::Duplicate));
+    // Replayed: nothing to do.
+    assert!(
+        handler
+            .handle(&node.epoch, commit(1, 1, vec![first.clone()], vec![]))
+            .is_none()
+    );
+    // In a later commit, or after a restart: executed already.
+    let later = block(2, vec![transaction]);
+    let outcome = handler
+        .handle(&node.epoch, commit(2, 2, vec![later.clone()], vec![]))
+        .unwrap();
+    assert!(matches!(outcome.transactions[0].fate, Fate::Duplicate));
+    let outcome = CommitHandler::new(node.store.clone(), node.cache.clone())
+        .handle(&node.epoch, commit(1, 2, vec![later], vec![]))
+        .unwrap();
+    assert!(matches!(outcome.transactions[0].fate, Fate::Duplicate));
+}
+
+#[test]
+fn the_first_of_two_transactions_spending_one_coin_wins() {
+    let node = Node::new();
+    let gas = node.gas();
+    let first = user_transaction(&node.transfer(gas), &[no_alias()]);
+    let second = user_transaction(&node.transfer(gas), &[no_alias()]);
+    let block = block(1, vec![first, second]);
+    // Both pass voting: neither has executed when the block is voted on.
+    assert_eq!(node.voter().vote(&node.epoch, block.clone()), Ok(vec![]));
+    let outcome = handler(&node)
+        .handle(&node.epoch, commit(1, 1, vec![block], vec![]))
+        .unwrap();
+    assert!(succeeded(&outcome, 0));
+    assert!(matches!(outcome.transactions[1].fate, Fate::Dropped(_)));
+}
+
+#[test]
+fn blocks_below_the_gc_round_are_evicted() {
+    let node = Node::new();
+    let depth = node.epoch.config.gc_depth();
+    assert!(depth > 0);
+    let old = block(1, vec![]);
+    let recent = block(depth + 2, vec![]);
+    let leader = block(depth + 3, vec![]);
+    for b in [&old, &recent] {
+        assert_eq!(node.voter().vote(&node.epoch, b.clone()), Ok(vec![]));
+    }
+    handler(&node)
+        .handle(
+            &node.epoch,
+            commit(1, leader.reference.round, vec![leader], vec![]),
+        )
+        .unwrap();
+    assert!(node.cache.take(&old.reference).is_none());
+    assert!(node.cache.take(&recent.reference).is_some());
 }

@@ -278,7 +278,7 @@ impl Processor for InputChecker {
 }
 
 /// The transaction's results, if it executed.
-fn executed(store: &store::Store, digest: &[u8; 32]) -> Option<Outcome> {
+pub(crate) fn executed(store: &store::Store, digest: &[u8; 32]) -> Option<Outcome> {
     match execution::executed(store, digest) {
         Ok(executed) => executed.map(|e| Outcome::Executed(Box::new(e))),
         Err(e) => Some(Outcome::Failed(format!("{e:?}"))),
@@ -301,22 +301,29 @@ impl TransactionExecutor {
     }
 
     fn execute(&self, epoch: &EpochState, transaction: &InputsCheckedTransaction) -> Outcome {
-        let digest = transaction.get().0.digest().bytes;
-        // `Transaction` BCS is `SenderSignedData`'s: its empty signature
-        // info has no bytes.
-        let outcome = match epoch
-            .execution
-            .execute(&self.store, transaction.wire_bytes())
-        {
-            Ok(outcome) => outcome,
-            Err(e) => return Outcome::Failed(format!("{e:?}")),
-        };
-        if let Err(e) = self.store.commit(outcome.commit) {
-            return Outcome::Failed(format!("{e:?}"));
-        }
-        executed(&self.store, &digest)
-            .unwrap_or_else(|| Outcome::Failed("committed, but not in the store".to_owned()))
+        execute_and_commit(&self.store, epoch, transaction)
     }
+}
+
+/// Executes `transaction` against `store` and commits its outputs, then
+/// answers from the store.
+pub(crate) fn execute_and_commit(
+    store: &store::Store,
+    epoch: &EpochState,
+    transaction: &InputsCheckedTransaction,
+) -> Outcome {
+    let digest = transaction.get().0.digest().bytes;
+    // `Transaction` BCS is `SenderSignedData`'s: its empty signature
+    // info has no bytes.
+    let outcome = match epoch.execution.execute(store, transaction.wire_bytes()) {
+        Ok(outcome) => outcome,
+        Err(e) => return Outcome::Failed(format!("{e:?}")),
+    };
+    if let Err(e) = store.commit(outcome.commit) {
+        return Outcome::Failed(format!("{e:?}"));
+    }
+    executed(store, &digest)
+        .unwrap_or_else(|| Outcome::Failed("committed, but not in the store".to_owned()))
 }
 
 impl Processor for TransactionExecutor {
