@@ -102,3 +102,29 @@ What is left of the per-transaction type work is not repeated within a transacti
 ~1–1.5 µs each. Removing them needs caches across transactions (layouts and types by type tag),
 which rest on a separate argument: that a type tag's layout does not depend on which version
 of its packages the linkage picks, since upgrades preserve struct layouts.
+
+## After the review fixes (Group A)
+
+Sorted-vector maps for the execution inputs and object changes, the natives cost table built
+once per epoch, invariant bookkeeping only with the expensive checks, events and removals
+carried out of the temporary store instead of rebuilt, and per-transaction memos for type
+linkages, input layouts, write-out types and event layouts:
+
+| workload | execute | allocs | reference execute | reference allocs |
+|---|---|---|---|---|
+| transfer | 22.8 µs | 294 | 42.1 µs | 739 |
+| create | 30.4 µs | 397 | 53.6 µs | 844 |
+
+## After the epoch type cache (Group B)
+
+A per-epoch `TypeCache` keeps the VM's layouts and types by the answering VM's linkage table
+and the type tag (see `type_cache.rs` for why a hit is never false). Layouts are shared, so a
+hit allocates nothing:
+
+| workload | execute | allocs | reference execute | reference allocs |
+|---|---|---|---|---|
+| transfer | 19.8 µs | 199 | 41.7 µs | 739 |
+| create | 25.5 µs | 289 | 52.8 µs | 844 |
+
+Native execution is now ~2.1× the reference's speed with a quarter to a third of its
+allocations. Commit is unchanged by this work (18–24 µs per transaction, varying run to run).
