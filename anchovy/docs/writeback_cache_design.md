@@ -167,13 +167,14 @@ existing rule. Nothing is notified from inside the cache.
 A new processor:
 
 ```
-CheckpointAggregator --certified--> commit waiter (wait for Committed(seq - 1))
-    --> CheckpointCommitter --> notify Committed(seq)
+CheckpointAggregator --certified, in sequence order--> CheckpointCommitter
 ```
 
-- **Order.** The aggregator certifies in quorum order. The commit waiter
-  releases checkpoint `seq` only once `seq - 1` has committed (I5, B-01),
-  the explicit-wait rule again.
+- **Order.** The aggregator certifies in sequence order, as the
+  reference's does: a quorum on a later checkpoint waits for the earlier
+  ones (I5, B-01). Certificates therefore reach the committer in commit
+  order, with no waiter between them. Nothing downstream could use a
+  later certificate sooner.
 - **What it commits.** The checkpoint's transactions in checkpoint order:
   the order of its contents, which is causal order (R3.1).
 - **Steps:**
@@ -193,9 +194,10 @@ CheckpointAggregator --certified--> commit waiter (wait for Committed(seq - 1))
        `COMMITTED_VERSIONS`; bump the generation;
      - its record into the committed LRU with a write ticket;
      - then drop the record from the uncommitted map.
-  4. **Notify `Committed(seq)`**, and prune pipeline tables that only
-     uncommitted work needs: chunk table entries, and built checkpoints
-     below `seq` in the in-memory checkpoint store.
+  4. **Prune** pipeline tables that only uncommitted work needs: chunk
+     table entries, and built checkpoints below `seq` in the in-memory
+     checkpoint store. A pruned checkpoint still counts as built for the
+     waiters, so a late signature for it is released and dropped.
 
 **The checkpoint record moves into the commit batch.** Today
 `SummaryBuilder` persists each built checkpoint as soon as it is built.
@@ -334,7 +336,7 @@ From R9.4:
    their `Store` methods.
 2. The executor writes through `Store::write`; uncommitted outputs are
    visible everywhere; nothing reaches the database yet.
-3. `CheckpointCommitter`, the commit waiter, and the commit batch with
+3. `CheckpointCommitter`, the in-order aggregator, and the commit batch with
    the watermark and the checkpoint record; `SummaryBuilder` stops
    persisting.
 4. Restart: replay of the epoch's commits, with the end-to-end restart

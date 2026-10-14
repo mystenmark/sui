@@ -24,6 +24,22 @@ seeing uncommitted outputs, and it caches reads positively and negatively.
       clones. All callers use `write_through` for now.
    2. The executor writes through the cache (`Store::write`). Done; the
       legacy `ScheduleExecutor` and standalone validator keep `write_through`.
-   3. `CheckpointCommitter`, the commit waiter, the commit batch. Next.
-   4. Restart by replay.
+   3. `CheckpointCommitter` and the commit batch. Done:
+      - checkpoint signatures from voted blocks too, duplicates dropped
+        before parsing;
+      - the aggregator certifies in sequence order and hands certificates
+        to the committer (no commit waiter: simpler);
+      - the checkpoint record and certified summary move into the commit
+        batch; genesis sets the committed watermark;
+      - built checkpoints and chunks pruned below the committed one.
+      The restart test is ignored until step 4.
+   4. Restart by replay. Next.
    5. Backpressure.
+
+## TODOs
+
+- Resubmit this validator's checkpoint signature until it is seen
+  processed, as the reference's consensus adapter does.
+- Bound the summary waiter: pre-commit signatures can name any sequence
+  number.
+- The executor parses its outputs, and `Store::write` parses them again.
