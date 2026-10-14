@@ -203,6 +203,14 @@ impl Pending {
         signed: &SignedSummary<'_>,
         scratch: &mut Vec<u8>,
     ) -> bool {
+        // Most signatures arrive twice, from their block and their commit.
+        if self
+            .signatures
+            .get(&position)
+            .is_some_and(|c| c.bytes == *signed.signature)
+        {
+            return false;
+        }
         let Ok(signature) = BLS12381Signature::from_bytes(signed.signature) else {
             warn!(
                 seq = self.local.seq,
@@ -259,6 +267,14 @@ impl Pending {
         signed: &SignedSummary<'_>,
         scratch: &mut Vec<u8>,
     ) {
+        let digest = Digest::of("CheckpointSummary", signed.summary).bytes;
+        if self
+            .others
+            .get(&digest)
+            .is_some_and(|(signers, _)| signers.contains(&position))
+        {
+            return;
+        }
         let member = committee.member(position);
         let verified = BLS12381Signature::from_bytes(signed.signature).is_ok_and(|signature| {
             let message = signing_message(scratch, signed.summary, signed.epoch);
@@ -271,11 +287,7 @@ impl Pending {
             );
             return;
         }
-        let digest = Digest::of("CheckpointSummary", signed.summary).bytes;
         let (signers, stake) = self.others.entry(digest).or_default();
-        if signers.contains(&position) {
-            return;
-        }
         signers.push(position);
         *stake += member.stake;
         self.vote(position, member.stake);

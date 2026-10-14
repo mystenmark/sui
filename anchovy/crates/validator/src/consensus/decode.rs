@@ -260,6 +260,26 @@ enum Decoded {
     Other,
 }
 
+/// The checkpoint signature `transaction` carries, if it is one.
+pub(crate) fn checkpoint_signature(
+    transaction: &Message<ConsensusTransaction<'static>>,
+) -> Option<CheckpointSignature> {
+    let (ConsensusTransactionKind::CheckpointSignature(message)
+    | ConsensusTransactionKind::CheckpointSignatureV2(message)) = transaction.get().kind()
+    else {
+        return None;
+    };
+    let summary = &message.get().summary.data;
+    let wire = transaction.wire_bytes();
+    // The signature message is the transaction's last field, and starts
+    // with its summary, whose bytes are a slice of the wire.
+    let start = summary.bytes.as_ptr() as usize - wire.as_ptr() as usize;
+    Some(CheckpointSignature {
+        seq: summary.sequence_number,
+        message: wire[start..].into(),
+    })
+}
+
 /// Decodes a committed transaction that missed the cache.
 ///
 /// # Panics
@@ -269,18 +289,8 @@ fn decode_transaction(bytes: Vec<u8>) -> Decoded {
     let transaction = Message::<ConsensusTransaction<'static>>::parse(bytes)
         .map_err(|(e, _)| e)
         .expect("a committed transaction decodes");
-    if let ConsensusTransactionKind::CheckpointSignature(message)
-    | ConsensusTransactionKind::CheckpointSignatureV2(message) = transaction.get().kind()
-    {
-        let summary = &message.get().summary.data;
-        let wire = transaction.wire_bytes();
-        // The signature message is the transaction's last field, and starts
-        // with its summary, whose bytes are a slice of the wire.
-        let start = summary.bytes.as_ptr() as usize - wire.as_ptr() as usize;
-        return Decoded::CheckpointSignature(CheckpointSignature {
-            seq: summary.sequence_number,
-            message: wire[start..].into(),
-        });
+    if let Some(signature) = checkpoint_signature(&transaction) {
+        return Decoded::CheckpointSignature(signature);
     }
     let immutable = match transaction.get().kind() {
         ConsensusTransactionKind::UserTransactionV2(user) => {

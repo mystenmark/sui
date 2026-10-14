@@ -200,10 +200,15 @@ impl Pipeline {
         // 2. Voting.
         {
             let (store, cache) = (store.clone(), cache.clone());
+            let signatures = summary_waits.clone();
             workers.push(
                 Worker::new("voting")
                     .abort_on_panic()
-                    .run(vote_inbox, move || BlockVoter::new(store, cache), |()| {})
+                    .run(
+                        vote_inbox,
+                        move || BlockVoter::new(store, cache).with_signatures(signatures),
+                        |()| {},
+                    )
                     .spawn(),
             );
         }

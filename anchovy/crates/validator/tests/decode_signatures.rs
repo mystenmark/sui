@@ -1,8 +1,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Committed checkpoint signatures, routed by the commit decoder to the
-//! summary waiter.
+//! Checkpoint signatures, routed to the summary waiter by the block voter
+//! from valid blocks, and by the commit decoder from commits.
 
 use std::sync::Arc;
 
@@ -19,7 +19,8 @@ use sui_types::messages_checkpoint::{
 use sui_types::messages_consensus::ConsensusTransaction;
 use validator::consensus::cache::ConsensusTxCache;
 use validator::consensus::decode::CommitDecoder;
-use validator::epoch::EpochParams;
+use validator::consensus::vote::BlockVoter;
+use validator::epoch::{EpochParams, EpochState};
 use validator::pipeline::items::CheckpointSignature;
 use validator::pipeline::keys::LocalSummary;
 use waiter::{Command, WaiterProcessor};
@@ -141,4 +142,65 @@ fn unrouted_signatures_are_left_out() {
     let (_, transaction) = signature(7);
     let output = decoder.decode(&epoch(), commit(vec![transaction], vec![]));
     assert!(output.transactions.is_empty());
+}
+
+/// A voter over an empty store: blocks of signatures read nothing.
+fn voter(
+    queue: workqueue::Queue<Command<LocalSummary, CheckpointSignature>>,
+) -> (BlockVoter, Arc<EpochState>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(store::Store::open(dir.path()).unwrap());
+    let voter = BlockVoter::new(store, Arc::new(ConsensusTxCache::new())).with_signatures(queue);
+    let epoch = Arc::new(EpochState::new(
+        Chain::Unknown,
+        ProtocolVersion::MAX.as_u64(),
+        0,
+        Digest::new([0; 32]),
+        1000,
+        4,
+        [],
+    ));
+    (voter, epoch, dir)
+}
+
+fn block(transactions: Vec<Vec<u8>>) -> Block {
+    Block {
+        reference: BlockRef {
+            round: 1,
+            author: 1,
+            digest: [2; 32],
+        },
+        transactions,
+    }
+}
+
+#[test]
+fn signatures_in_a_voted_block_wait_for_their_local_summary() {
+    let (queue, inbox) = workqueue::queue(4);
+    let (mut voter, epoch, _dir) = voter(queue);
+    let (seven, seven_tx) = signature(7);
+    let (_, eight_tx) = signature(8);
+    assert_eq!(
+        voter.vote(&epoch, block(vec![seven_tx, eight_tx])),
+        Ok(vec![])
+    );
+
+    let routed = routed(&inbox);
+    assert_eq!(routed.len(), 2);
+    assert_eq!(routed[0].0, LocalSummary(7));
+    assert_eq!(&*routed[0].1.message, &seven[..]);
+    assert_eq!(routed[1].0, LocalSummary(8));
+}
+
+#[test]
+fn signatures_in_an_invalid_block_are_not_routed() {
+    let (queue, inbox) = workqueue::queue(4);
+    let (mut voter, epoch, _dir) = voter(queue);
+    let (_, transaction) = signature(7);
+    assert!(
+        voter
+            .vote(&epoch, block(vec![transaction, vec![0xff]]))
+            .is_err()
+    );
+    assert!(inbox.try_pop().is_none());
 }
