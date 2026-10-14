@@ -22,7 +22,8 @@ seeing uncommitted outputs, and it caches reads positively and negatively.
       the object and transaction tickets. `Message` now shares its buffers
       (an inner `Arc`, as the reference's `Object`), so the cache hands out
       clones. All callers use `write_through` for now.
-   2. The executor writes through the cache (`Store::write`). Next.
-   3. `CheckpointCommitter`, the commit waiter, the commit batch.
+   2. The executor writes through the cache (`Store::write`). Done; the
+      legacy `ScheduleExecutor` and standalone validator keep `write_through`.
+   3. `CheckpointCommitter`, the commit waiter, the commit batch. Next.
    4. Restart by replay.
    5. Backpressure.
