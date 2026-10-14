@@ -83,27 +83,41 @@ fn into<T: Send + 'static>(queue: Queue<T>, name: &'static str) -> impl FnMut(T)
     }
 }
 
-/// The highest checkpoint this node committed, which the pipeline continues
-/// after: `genesis`, committed first, on a fresh database.
-///
-/// # Panics
-/// If the store cannot be read or written.
-fn last_checkpoint(store: &store::Store, genesis: BuiltCheckpoint) -> BuiltCheckpoint {
-    if let Some((_, bytes)) = store.last_checkpoint().expect("the store reads") {
-        return BuiltCheckpoint::decode(&bytes);
-    }
-    assert_eq!(genesis.seq, 0, "the genesis checkpoint is checkpoint 0");
-    store.commit_genesis_checkpoint(genesis.encode());
-    genesis
-}
-
-/// What the commit handler takes from the epoch's start, the checkpoints
-/// numbered after `previous_checkpoint`. The first epoch's only:
+/// The epoch's start: the checkpoint its first checkpoint follows, and what
+/// the commit handler starts from. On a fresh database, `genesis`, committed
+/// now with the start read from the store. The first epoch's only:
 /// reconfiguration does not exist yet.
 ///
 /// # Panics
-/// If the store has no shared accumulator root.
-fn epoch_start(store: &store::Store, last: &BuiltCheckpoint) -> EpochStart {
+/// If the store cannot be read or written, or has no shared accumulator
+/// root.
+fn epoch_start(store: &store::Store, genesis: BuiltCheckpoint) -> (BuiltCheckpoint, EpochStart) {
+    let (checkpoint, agreed) = if let Some(bytes) = store.checkpoint(0).expect("the store reads") {
+        let agreed = store
+            .epoch_start()
+            .expect("the store reads")
+            .expect("the epoch's start is committed with the genesis checkpoint");
+        (BuiltCheckpoint::decode(&bytes), decode_agreed(&agreed))
+    } else {
+        assert_eq!(genesis.seq, 0, "the genesis checkpoint is checkpoint 0");
+        let agreed = agreed_at_genesis(store);
+        store.commit_genesis_checkpoint(genesis.encode(), encode_agreed(agreed));
+        (genesis, agreed)
+    };
+    let (accumulator_root_version, accumulator_root_initial_shared_version) = agreed;
+    let start = EpochStart {
+        previous_checkpoint: checkpoint.seq,
+        previous_height: checkpoint.last_height,
+        previous_timestamp_ms: checkpoint.timestamp_ms,
+        accumulator_root_version,
+        accumulator_root_initial_shared_version,
+    };
+    (checkpoint, start)
+}
+
+/// The accumulator root's version and initial shared version, as genesis
+/// left them.
+fn agreed_at_genesis(store: &store::Store) -> (u64, u64) {
     let root = store
         .live_object(&messages::base::ObjectId::from_u16(0xacc))
         .expect("the store reads")
@@ -114,28 +128,29 @@ fn epoch_start(store: &store::Store, last: &BuiltCheckpoint) -> EpochStart {
     else {
         panic!("the accumulator root is shared");
     };
-    EpochStart {
-        previous_checkpoint: last.seq,
-        previous_height: last.last_height,
-        previous_timestamp_ms: last.timestamp_ms,
-        accumulator_root_version: store
-            .live(&messages::base::ObjectId::from_u16(0xacc))
-            .expect("the store reads")
-            .expect("the accumulator root exists")
-            .version,
-        accumulator_root_initial_shared_version: initial_shared_version,
-    }
+    (root.get().version(), initial_shared_version)
+}
+
+fn encode_agreed((version, initial_shared_version): (u64, u64)) -> Vec<u8> {
+    [version.to_le_bytes(), initial_shared_version.to_le_bytes()].concat()
+}
+
+fn decode_agreed(bytes: &[u8]) -> (u64, u64) {
+    let word = |i: usize| u64::from_le_bytes(bytes[i..i + 8].try_into().expect("eight bytes"));
+    (word(0), word(8))
 }
 
 impl Pipeline {
     /// The pipeline over `store`, in `epoch`, signing checkpoints with
-    /// `protocol_key`, certifying them with `committee`'s signatures. It
-    /// builds checkpoints from the one after the highest the store holds as
-    /// executed; `genesis` is that checkpoint on a fresh database, and is
-    /// ignored otherwise.
+    /// `protocol_key`, certifying them with `committee`'s signatures.
+    /// `genesis` is the epoch's start on a fresh database, and is ignored
+    /// otherwise.
     ///
-    /// Not covered yet: replaying the commits since that checkpoint, to
-    /// rebuild the commit handler's and the resolver's state.
+    /// It starts from the epoch's start, so consensus must deliver the
+    /// epoch's commits from its first: replaying them rebuilds every
+    /// stage's state. Transactions in committed checkpoints are found
+    /// executed, and checkpoints up to the committed one are rebuilt but not
+    /// certified again.
     #[allow(clippy::too_many_lines)]
     pub fn start(
         store: &Arc<store::Store>,
@@ -149,10 +164,13 @@ impl Pipeline {
         let generations = Arc::new(GenerationTable::new());
         let chunks = Arc::new(ChunkTable::new());
         let checkpoints = Arc::new(CheckpointStore::new());
-        let last = last_checkpoint(store, genesis);
-        let next_to_certify = last.seq + 1;
-        let start = epoch_start(store, &last);
-        checkpoints.insert_built(last);
+        let (first, start) = epoch_start(store, genesis);
+        checkpoints.insert_built(first);
+        let next_to_certify = store
+            .committed_checkpoint()
+            .expect("the store reads")
+            .expect("the genesis checkpoint is committed")
+            + 1;
         let state_hashes = Arc::new(StateHashes::new());
         let statuses = Arc::new(ConsensusTxStatusCache::new());
 

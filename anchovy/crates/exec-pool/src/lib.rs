@@ -9,7 +9,8 @@ use std::sync::Arc;
 use execution::{Funds, Input};
 use messages::Message;
 use messages::effects::{
-    AccumulatorOperation, AccumulatorValue, ObjectOut, TransactionEffects, VersionedEffects,
+    AccumulatorOperation, AccumulatorValue, ObjectIn, ObjectOut, TransactionEffects,
+    UnchangedConsensusKind, VersionedEffects,
 };
 use messages::object::{Object, Owner};
 use messages::transaction::SharedObjectMutability;
@@ -46,7 +47,9 @@ use workqueue::{Processor, PushError, Queue, Sink};
 ///   wrapped the object or took it out of consensus. A stream its effects do
 ///   not change (an input that had ended, say) keeps the generation it read.
 /// - **Executed already** (a replayed commit): it is not executed again, but
-///   its generations are recorded from its stored effects.
+///   its generations are recorded from its stored effects, and so is a
+///   generation 0 it resolves from the live object: the store may hold later
+///   versions by now.
 /// - **Execution never fails.** Every transaction released here can run
 ///   (it may abort, with effects); an error outside the transaction (the
 ///   store, an input not found) is a bug, and panics.
@@ -147,6 +150,8 @@ impl Executor {
             ExecutableTransaction::System(system) => (system.digest, &system.bytes),
         };
 
+        let stored = self.stored_effects(digest);
+
         // 1. Its inputs, from the values its keys resolved to: the shared
         //    accesses' first, in access order (as the resolver keys them),
         //    then objects and packages, then its reservations.
@@ -183,7 +188,7 @@ impl Executor {
                     *generation
                 }
                 InputValue::Live => {
-                    let generation = self.live_generation(access, resolved_keys);
+                    let generation = self.live_generation(access, stored.as_ref(), resolved_keys);
                     let Generation::Version { version, .. } = generation else {
                         unreachable!("generation 0 of a live stream is a version");
                     };
@@ -208,8 +213,10 @@ impl Executor {
         }
 
         // 2. Its effects: stored, or from executing and committing it.
-        let (effects, written) =
-            self.effects_of(digest, bytes, &provided, funds, executable.root_version);
+        let (effects, written) = match stored {
+            Some(effects) => (effects, Vec::new()),
+            None => self.execute_now(digest, bytes, &provided, funds, executable.root_version),
+        };
         drop(provided);
         let VersionedEffects::V2(effects_v2) = &effects.get().version else {
             unreachable!("execution produces V2 effects");
@@ -294,14 +301,27 @@ impl Executor {
         effects_keys.push(EffectsKey(digest));
     }
 
-    /// The effects of the transaction with `digest`, and the objects it
-    /// wrote if it executed now: stored if it executed already, else from
-    /// executing `bytes` with `provided` inputs and committing.
+    /// The effects of the transaction with `digest`, if it executed already.
+    fn stored_effects(&self, digest: TxDigest) -> Option<Message<TransactionEffects<'static>>> {
+        let effects_digest = self
+            .store
+            .executed_effects(&messages::base::Digest::new(digest))
+            .expect("the store reads")?;
+        Some(
+            self.store
+                .effects(&effects_digest)
+                .expect("the store reads")
+                .expect("executed effects are stored with their transaction"),
+        )
+    }
+
+    /// The effects of executing `bytes` with `provided` inputs, written to
+    /// the store, and the objects it wrote.
     ///
     /// # Panics
     /// If execution fails outside the transaction: everything it reads was
     /// waited for, so that is a bug.
-    fn effects_of(
+    fn execute_now(
         &self,
         digest: TxDigest,
         bytes: &[u8],
@@ -309,18 +329,6 @@ impl Executor {
         funds: Funds,
         root_version: u64,
     ) -> (Message<TransactionEffects<'static>>, WrittenObjects) {
-        let stored = self
-            .store
-            .executed_effects(&messages::base::Digest::new(digest))
-            .expect("the store reads");
-        if let Some(effects_digest) = stored {
-            let effects = self
-                .store
-                .effects(&effects_digest)
-                .expect("the store reads")
-                .expect("executed effects are stored with their transaction");
-            return (effects, Vec::new());
-        }
         let outcome = self
             .epoch
             .execution
@@ -341,31 +349,40 @@ impl Executor {
 
     /// Generation 0 of `access`'s stream in its round, which the resolver
     /// gave no base: as recorded if a transaction of the round recorded it,
-    /// else the live version, recorded now and resolved.
+    /// else the version read (from `stored` effects if it executed already,
+    /// else live), recorded now and resolved.
     ///
     /// # Panics
     /// If the stream has no live object (see `Executor`).
     fn live_generation(
         &self,
         access: &SharedAccess,
+        stored: Option<&Message<TransactionEffects<'static>>>,
         resolved_keys: &mut Vec<(InputKey, InputValue)>,
     ) -> Generation {
         let stream = stream_of(access);
         let round = access.ordinal.round;
+        let read = stored.map(|effects| version_read(effects, &stream.id));
         if let Some(generation) = self.generations.get(stream, round, 0) {
+            assert!(
+                read.is_none_or(|read| read == generation),
+                "{stream:?}: replayed effects read {read:?}, generation 0 is {generation:?}"
+            );
             return generation;
         }
-        let live = self
-            .store
-            .live(&stream.id)
-            .expect("the store reads")
-            .unwrap_or_else(|| panic!("{stream:?}, which voting found live, is live"));
-        let generation = self
-            .generations
-            .get_or_record(stream, round, 0, || Generation::Version {
-                version: live.version,
-                digest: live.digest.bytes,
-            });
+        let generation = self.generations.get_or_record(stream, round, 0, || {
+            read.unwrap_or_else(|| {
+                let live = self
+                    .store
+                    .live(&stream.id)
+                    .expect("the store reads")
+                    .unwrap_or_else(|| panic!("{stream:?}, which voting found live, is live"));
+                Generation::Version {
+                    version: live.version,
+                    digest: live.digest.bytes,
+                }
+            })
+        });
         let Generation::Version { version, .. } = generation else {
             unreachable!("generation 0 of a live stream is a version");
         };
@@ -476,6 +493,40 @@ fn produced(
             version: effects.lamport_version,
             transaction: digest,
         },
+    }
+}
+
+/// The version of live shared object `id` that `effects` read.
+///
+/// # Panics
+/// If `effects` did not read `id` live: the resolver gave it as live.
+fn version_read(
+    effects: &Message<TransactionEffects<'static>>,
+    id: &messages::base::ObjectId,
+) -> Generation {
+    let VersionedEffects::V2(effects) = &effects.get().version else {
+        unreachable!("execution produces V2 effects");
+    };
+    let mutated = effects.changed_objects.iter().find(|c| c.id == id);
+    if let Some(ObjectIn::Exist {
+        version, digest, ..
+    }) = mutated.map(|c| c.input_state)
+    {
+        return Generation::Version {
+            version,
+            digest: digest.bytes,
+        };
+    }
+    match effects
+        .unchanged_consensus_objects
+        .iter()
+        .find(|(o, _)| *o == id)
+    {
+        Some((_, UnchangedConsensusKind::ReadOnlyRoot(version, digest))) => Generation::Version {
+            version: *version,
+            digest: digest.bytes,
+        },
+        other => panic!("{id:?}, read live, is in the effects as {mutated:?} and {other:?}"),
     }
 }
 

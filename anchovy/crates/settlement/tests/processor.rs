@@ -64,7 +64,7 @@ fn chunk(
     ChunkSettlement {
         epoch: epoch(),
         version: AccumulatorVersion(version),
-        root_version: 20,
+        root_version: ROOT_VERSION,
         last_of_commit: last,
         round,
         height,
@@ -346,7 +346,7 @@ fn settles_a_chunk_end_to_end() {
     let c = chunk(10, (3, 0), (1, true), digests.clone());
 
     h.process(SettlementInput::Chunk(c.clone()));
-    // The first chunk seen reads the accumulator state in the store.
+    // The first chunk seen starts from its own root version.
     assert_eq!(settles(&h.funds), [settled(1, ROOT_VERSION, &[], 0)]);
     let (waits, keys, _) = drain(&h.effects);
     assert!(matches!(&waits[..], [EffectsWaitItem::ChunkExecuted(w)] if w.height == 10));

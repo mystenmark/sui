@@ -94,9 +94,10 @@ fn wait_for<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
 /// A one-validator network: the pipeline, the store it runs over, and the
 /// consensus the test plays.
 struct Network {
-    pipeline: Pipeline,
+    /// Both none while crashed.
+    pipeline: Option<Pipeline>,
+    store: Option<Arc<store::Store>>,
     epoch: Arc<EpochState>,
-    store: Arc<store::Store>,
     sender: SuiAddress,
     key: AccountKeyPair,
     sui_committee: sui_types::committee::Committee,
@@ -115,8 +116,11 @@ struct Network {
     /// What became of each block with submissions, once committed.
     blocks: Vec<(BlockRef, oneshot::Sender<BlockStatus>)>,
     certified: BTreeMap<u64, CertifiedCheckpointSummary>,
+    /// Every commit delivered, which consensus replays to a restarted
+    /// pipeline.
+    delivered: Vec<CommittedSubDag>,
     // Dropped after the pipeline.
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
 }
 
 impl Network {
@@ -158,9 +162,9 @@ impl Network {
             genesis_checkpoint(),
         );
         Network {
-            pipeline,
+            pipeline: Some(pipeline),
+            store: Some(store),
             epoch,
-            store,
             sender,
             key,
             sui_committee,
@@ -173,31 +177,70 @@ impl Network {
             pending: Vec::new(),
             blocks: Vec::new(),
             certified: BTreeMap::new(),
-            _dir: dir,
+            delivered: Vec::new(),
+            dir,
         }
     }
 
-    /// Stops the pipeline and starts another over the same store, as a
-    /// restart between commits would.
-    fn restart(&mut self) {
-        let fresh = Pipeline::start(
-            &self.store,
+    fn pipeline(&self) -> &Pipeline {
+        self.pipeline.as_ref().expect("the node is running")
+    }
+
+    fn store(&self) -> &Arc<store::Store> {
+        self.store.as_ref().expect("the node is running")
+    }
+
+    /// Stops the node and reopens its store, so whatever it had not
+    /// committed is gone.
+    fn crash(&mut self) {
+        // The pipeline's workers hold the store: stopped first, it closes.
+        drop(self.pipeline.take());
+        let store = self.store.take().unwrap();
+        assert_eq!(
+            Arc::strong_count(&store),
+            1,
+            "only the network holds the store"
+        );
+        drop(store);
+        let store = Arc::new(store::Store::open(self.dir.path()).unwrap());
+        // Checkpoints certified and not committed are certified again.
+        let committed = store.committed_checkpoint().unwrap().unwrap();
+        self.certified.retain(|seq, _| *seq <= committed);
+        self.store = Some(store);
+    }
+
+    /// Starts the node again, and replays the epoch's commits to it, as
+    /// consensus does from its own store.
+    fn recover(&mut self) {
+        let pipeline = Pipeline::start(
+            self.store(),
             &self.epoch,
             &self.protocol_key,
             &self.committee,
             &self.client,
-            // Ignored: the store holds checkpoints.
+            // Ignored: the store holds the genesis checkpoint.
             BuiltCheckpoint {
                 seq: u64::MAX,
                 ..genesis_checkpoint()
             },
         );
-        drop(std::mem::replace(&mut self.pipeline, fresh));
+        for commit in &self.delivered {
+            assert!(
+                pipeline
+                    .commits
+                    .try_push(CommitRequest {
+                        epoch: self.epoch.params.clone(),
+                        commit: commit.clone(),
+                    })
+                    .is_ok()
+            );
+        }
+        self.pipeline = Some(pipeline);
     }
 
     fn live(&self, id: ObjectID) -> Object {
         let object = self
-            .store
+            .store()
             .live_object(&ObjectId(id.into_bytes()))
             .unwrap()
             .unwrap();
@@ -335,7 +378,7 @@ impl Network {
         while let Ok(guard) = self.lanes.0.try_recv() {
             self.pending.push(guard);
         }
-        while let Some(certified) = self.pipeline.certified.try_pop() {
+        while let Some(certified) = self.pipeline().certified.try_pop() {
             let summary: CertifiedCheckpointSummary = bcs::from_bytes(&certified.summary).unwrap();
             assert_eq!(summary.sequence_number, certified.seq);
             summary
@@ -385,9 +428,18 @@ impl Network {
             transactions,
         };
 
+        let commit = CommittedSubDag {
+            commit_index: index,
+            digest: [index as u8; 32],
+            leader: reference,
+            timestamp_ms: u64::from(index) * self.commit_interval_ms,
+            blocks: vec![block.clone()],
+            rejected: vec![],
+        };
+        self.delivered.push(commit.clone());
         let (reply, mut verdict) = tokio::sync::oneshot::channel();
         assert!(
-            self.pipeline
+            self.pipeline()
                 .votes
                 .try_push(VoteRequest {
                     epoch: self.epoch.clone(),
@@ -400,18 +452,11 @@ impl Network {
         assert_eq!(verdict, Ok(rejects.to_vec()), "the vote on commit {index}");
 
         assert!(
-            self.pipeline
+            self.pipeline()
                 .commits
                 .try_push(CommitRequest {
                     epoch: self.epoch.params.clone(),
-                    commit: CommittedSubDag {
-                        commit_index: index,
-                        digest: [index as u8; 32],
-                        leader: reference,
-                        timestamp_ms: u64::from(index) * self.commit_interval_ms,
-                        blocks: vec![block],
-                        rejected: vec![],
-                    },
+                    commit: commit.clone(),
                 })
                 .is_ok()
         );
@@ -438,10 +483,10 @@ impl Network {
                      settled chunks: {:?}, built: {:?}",
                     self.certified.keys().collect::<Vec<_>>(),
                     (1..=u64::from(self.commit_index))
-                        .filter(|h| self.pipeline.chunks.get(*h).is_some())
+                        .filter(|h| self.pipeline().chunks.get(*h).is_some())
                         .collect::<Vec<_>>(),
                     (0..=seq + 2)
-                        .filter(|s| self.pipeline.checkpoints.is_built(*s))
+                        .filter(|s| self.pipeline().checkpoints.is_built(*s))
                         .collect::<Vec<_>>(),
                 );
                 std::thread::sleep(Duration::from_millis(2));
@@ -451,8 +496,20 @@ impl Network {
         }
     }
 
+    /// The effects digest of `transaction`, if executed.
+    fn executed(&self, transaction: &Transaction) -> Option<messages::base::Digest> {
+        let digest = messages::base::Digest::new(transaction.digest().into_inner());
+        self.store().executed_effects(&digest).unwrap()
+    }
+
+    fn wait_executed(&self, transaction: &Transaction) -> messages::base::Digest {
+        wait_for(&format!("{} to execute", transaction.digest()), || {
+            self.executed(transaction)
+        })
+    }
+
     fn effects(&self, digest: &TransactionDigest) -> TransactionEffects {
-        let executed = execution::executed(&self.store, &digest.into_inner())
+        let executed = execution::executed(self.store(), &digest.into_inner())
             .unwrap()
             .unwrap_or_else(|| panic!("{digest} executed"));
         bcs::from_bytes(&executed.effects).unwrap()
@@ -462,7 +519,7 @@ impl Network {
     /// the background.
     fn committed(&self, seq: u64) -> BuiltCheckpoint {
         let bytes = wait_for(&format!("checkpoint {seq} to commit"), || {
-            self.store.checkpoint(seq).unwrap()
+            self.store().checkpoint(seq).unwrap()
         });
         BuiltCheckpoint::decode(&bytes)
     }
@@ -604,33 +661,86 @@ fn committed_transactions_execute_and_their_checkpoints_certify() {
     assert_no_panics();
 }
 
+/// Crashes before anything but genesis commits, and again with one
+/// checkpoint committed and later work executed: each time the work not
+/// committed is lost, replay executes it again, identically, and checkpoints
+/// carry on from the committed one.
 #[test]
-#[ignore = "a restart loses built checkpoints not yet committed until it replays the epoch"]
-fn a_restart_continues_after_the_highest_executed_checkpoint() {
-    let mut network = Network::new(2);
+fn a_crash_loses_only_uncommitted_work_which_replay_redoes() {
+    let mut network = Network::new(3);
     let first = network.transfer(network.coin(0));
     let seq_1 = network.commit(vec![consensus_transaction(&first)]);
-    network.certify(seq_1);
-    // Certifying committed the signature in a commit of its own. Restart once
-    // every commit is checkpointed: replaying the rest is not built yet.
-    let commits = u64::from(network.commit_index);
-    let (stored, bytes) = wait_for("every commit checkpointed", || {
-        network
-            .store
-            .last_checkpoint()
-            .unwrap()
-            .filter(|(seq, _)| *seq == commits)
-    });
-    let last = BuiltCheckpoint::decode(&bytes);
+    let executed = network.wait_executed(&first);
 
-    network.restart();
+    network.crash();
+    assert_eq!(network.store().committed_checkpoint().unwrap(), Some(0));
+    assert!(network.executed(&first).is_none());
+    network.recover();
+    assert_eq!(network.wait_executed(&first), executed);
+    network.certify(seq_1);
+    network.assert_checkpointed(seq_1, &[&first]);
+
     let second = network.transfer(network.coin(1));
     let seq_2 = network.commit(vec![consensus_transaction(&second)]);
-    assert_eq!(seq_2, stored + 1);
-    let after = network.certify(seq_2);
+    let executed = network.wait_executed(&second);
+    network.crash();
+    let committed = network.store().committed_checkpoint().unwrap().unwrap();
+    assert!((seq_1..seq_2).contains(&committed));
+    assert!(network.executed(&first).is_some());
+    assert!(network.executed(&second).is_none());
+    network.recover();
+    assert_eq!(network.wait_executed(&second), executed);
+
+    let third = network.transfer(network.coin(2));
+    let seq_3 = network.commit(vec![consensus_transaction(&third)]);
+    network.certify(seq_3);
     network.assert_checkpointed(seq_2, &[&second]);
-    assert_eq!(after.previous_digest.unwrap().into_inner(), last.digest);
-    assert!(after.network_total_transactions > last.network_total_transactions);
+    network.assert_checkpointed(seq_3, &[&third]);
+    // Rebuilt checkpoints are the ones committed before: each summary
+    // follows the stored one before it.
+    for seq in 1..=seq_3 {
+        let previous = network.committed(seq - 1);
+        let summary: CheckpointSummary = bcs::from_bytes(&network.committed(seq).summary).unwrap();
+        assert_eq!(
+            summary.previous_digest.unwrap().into_inner(),
+            previous.digest
+        );
+    }
+    assert_no_panics();
+}
+
+/// A shared object first touched by the transaction deleting it: after a
+/// crash, replay finds that transaction executed and the object gone, and
+/// takes the version it read from its effects.
+#[test]
+fn replay_reads_a_since_deleted_shared_object_from_effects() {
+    let mut network = Network::new(3);
+    let share = network.share(network.coin(0));
+    let seq = network.commit(vec![consensus_transaction(&share)]);
+    network.certify(seq);
+    let created = network.effects(share.digest()).created();
+    let (shared_ref, _) = created
+        .iter()
+        .find(|(_, owner)| matches!(owner, Owner::Shared { .. }))
+        .expect("a shared coin");
+    let shared = shared_arg(&network.live(shared_ref.0), true);
+    let delete = network.ptb(network.coin(1), |b| {
+        let coin = b.obj(shared).unwrap();
+        b.command(PtbCommand::MergeCoins(Argument::GasCoin, vec![coin]));
+    });
+    let seq = network.commit(vec![consensus_transaction(&delete)]);
+    network.certify(seq);
+    network.assert_checkpointed(seq, &[&delete]);
+    wait_for("the deletion to commit", || {
+        (network.store().committed_checkpoint().unwrap() >= Some(seq)).then_some(())
+    });
+
+    network.crash();
+    network.recover();
+    let after = network.transfer(network.coin(2));
+    let seq = network.commit(vec![consensus_transaction(&after)]);
+    network.certify(seq);
+    network.assert_checkpointed(seq, &[&after]);
     assert_no_panics();
 }
 
@@ -703,7 +813,7 @@ fn commit_submitted(network: &mut Network) -> u64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_submission_is_answered_with_its_position_then_its_effects() {
     let mut network = Network::new(1);
-    let service = Arc::new(network.pipeline.validator());
+    let service = Arc::new(network.pipeline().validator());
     let transfer = network.transfer(network.coin(0));
     let submitting = tokio::spawn({
         let (service, transfer) = (service.clone(), transfer.clone());
@@ -738,7 +848,7 @@ async fn a_submission_is_answered_with_its_position_then_its_effects() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_transaction_dropped_after_consensus_is_answered_rejected() {
     let mut network = Network::new(1);
-    let service = Arc::new(network.pipeline.validator());
+    let service = Arc::new(network.pipeline().validator());
     let coin = network.coin(0);
     let (first, second) = (network.transfer(coin), network.transfer(coin));
     let submitting = tokio::spawn({
@@ -766,7 +876,7 @@ async fn a_transaction_dropped_after_consensus_is_answered_rejected() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_position_never_committed_expires() {
     let mut network = Network::new(1);
-    let service = Arc::new(network.pipeline.validator());
+    let service = Arc::new(network.pipeline().validator());
     let transfer = network.transfer(network.coin(0));
     let submitting = tokio::spawn({
         let (service, transfer) = (service.clone(), transfer.clone());
@@ -792,7 +902,7 @@ async fn a_position_never_committed_expires() {
         async move { wait(&service, &transfer, Some(position)).await }
     });
     // Commits move the leader round past the block's retention.
-    let statuses = &network.pipeline.statuses;
+    let statuses = &network.pipeline().statuses;
     statuses.update_leader_round(1 + RETENTION_ROUNDS);
     statuses.update_leader_round(2 + RETENTION_ROUNDS);
     let RawValidatorTransactionStatus::Expired(expired) = waiting.await.unwrap() else {
@@ -814,7 +924,7 @@ fn back_to_back_commits_execute_in_order_and_certify() {
     let share = network.share(network.coin(0));
     network.commit(vec![consensus_transaction(&share)]);
     let effects = wait_for("the share to execute", || {
-        execution::executed(&network.store, &share.digest().into_inner()).unwrap()
+        execution::executed(network.store(), &share.digest().into_inner()).unwrap()
     });
     let effects: TransactionEffects = bcs::from_bytes(&effects.effects).unwrap();
     let (shared_ref, _) = effects
@@ -925,7 +1035,7 @@ fn checkpoints_of_several_commits() {
     // Commits until checkpoint 2 is cut and built.
     wait_for("checkpoint 2 to be built", || {
         network.commit(vec![]);
-        network.pipeline.checkpoints.is_built(2).then_some(())
+        network.pipeline().checkpoints.is_built(2).then_some(())
     });
     network.certify(2);
     let mut listed = HashSet::new();
@@ -961,7 +1071,7 @@ fn an_owned_conflict_in_one_commit_drops_the_later_transaction() {
     network.assert_checkpointed(seq, &[&first]);
     assert!(!network.contents(seq).contains(second.digest()));
     assert!(
-        execution::executed(&network.store, &second.digest().into_inner())
+        execution::executed(network.store(), &second.digest().into_inner())
             .unwrap()
             .is_none()
     );

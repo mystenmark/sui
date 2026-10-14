@@ -63,6 +63,7 @@ const DIGEST: usize = 32;
 /// `meta`'s keys.
 const GENESIS: &[u8; 8] = b"genesis\0";
 const COMMITTED: &[u8; 8] = b"commitwm";
+const EPOCH_START: &[u8; 8] = b"epochst\0";
 
 /// The reference's defaults.
 const MUTEXES: usize = if cfg!(debug_assertions) { 16 } else { 1024 };
@@ -327,6 +328,18 @@ impl Db {
             batch.write(self.certified, seq.to_be_bytes().to_vec(), certified);
         }
         batch.write(self.meta, COMMITTED.to_vec(), seq.to_be_bytes().to_vec());
+    }
+
+    /// What the current epoch's start agreed, as the pipeline encodes it.
+    pub fn put_epoch_start(&self, batch: &mut WriteBatch, epoch_start: Vec<u8>) {
+        batch.write(self.meta, EPOCH_START.to_vec(), epoch_start);
+    }
+
+    pub fn epoch_start(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .tidehunter
+            .get(self.meta, EPOCH_START)?
+            .map(|v| v.to_vec()))
     }
 
     /// The highest checkpoint whose outputs are all in the database.

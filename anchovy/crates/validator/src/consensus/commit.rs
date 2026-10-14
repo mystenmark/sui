@@ -354,21 +354,17 @@ const ACCUMULATOR_ROOT: messages::base::ObjectId = messages::base::ObjectId::fro
 /// `EpochParams`. Agreed like it, so reading it keeps the stage pure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EpochStart {
-    /// The last checkpoint executed (the previous epoch's last, or the
-    /// genesis checkpoint, 0): this run's first checkpoint follows it, its
-    /// first chunk follows `previous_height`, and its checkpoint intervals
-    /// count from `previous_timestamp_ms`.
-    ///
-    /// Not covered yet: the commits since, which a restart must replay to
-    /// rebuild the handler's other state (processed transactions, locks, the
-    /// commit timestamps the prologue digests).
+    /// The checkpoint before the epoch's first (the previous epoch's last, or
+    /// the genesis checkpoint, 0): the epoch's first checkpoint follows it,
+    /// its first chunk follows `previous_height`, and its checkpoint
+    /// intervals count from `previous_timestamp_ms`. A restart replays the
+    /// epoch's commits from its first, rebuilding the handler's other state.
     pub previous_checkpoint: u64,
     pub previous_height: u64,
     pub previous_timestamp_ms: u64,
     /// The accumulator root's stream starts at this version.
     pub accumulator_root_initial_shared_version: u64,
-    /// The root's version the first chunk reads: as the store holds it when
-    /// the pipeline starts.
+    /// The root's version the epoch's first chunk reads.
     pub accumulator_root_version: u64,
 }
 
