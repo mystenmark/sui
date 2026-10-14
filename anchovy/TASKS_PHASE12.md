@@ -17,8 +17,12 @@ seeing uncommitted outputs, and it caches reads positively and negatively.
    the epoch from its start (to be replaced later by persisted handler
    state); the uncommitted set is empty at epoch end.
 3. Implementation, in the design's order of work:
-   1. `store` split into the database and the cache. In progress.
-   2. The executor writes through the cache.
+   1. `store` split into the database (`db.rs`) and the cache (`cache.rs`).
+      Done: model tests (with and without eviction) and race tests for
+      the object and transaction tickets. `Message` now shares its buffers
+      (an inner `Arc`, as the reference's `Object`), so the cache hands out
+      clones. All callers use `write_through` for now.
+   2. The executor writes through the cache (`Store::write`). Next.
    3. `CheckpointCommitter`, the commit waiter, the commit batch.
    4. Restart by replay.
    5. Backpressure.
