@@ -53,7 +53,7 @@ impl Mainnet {
         let store = Arc::new(Store::open(dir.path()).unwrap());
         for t in checkpoint.get().transactions {
             store
-                .commit(Commit {
+                .write_through(Commit {
                     executed: Some(Executed {
                         digest: *t.transaction.digest(),
                         transaction: t.transaction.bytes().to_vec(),

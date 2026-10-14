@@ -156,7 +156,7 @@ fn account_object(balance: u128) -> Vec<u8> {
 
 fn write(store: &store::Store, id: ObjectId, version: u64, bytes: Vec<u8>) {
     store
-        .commit(store::Commit {
+        .write_through(store::Commit {
             written: vec![store::Written {
                 id,
                 version,
@@ -233,7 +233,7 @@ impl Harness {
             messages::effects::VersionedEffects::V1(_) => unreachable!(),
         };
         self.store
-            .commit(store::Commit {
+            .write_through(store::Commit {
                 executed: Some(store::Executed {
                     digest,
                     transaction: Vec::new(),

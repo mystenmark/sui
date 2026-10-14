@@ -75,7 +75,7 @@ impl Node {
         let native = self.native.execute_bytes(&self.store, &bytes).unwrap();
         let effects: TransactionEffects = bcs::from_bytes(&reference.effects).unwrap();
         assert_same(&reference, &native, &effects);
-        self.store.commit(reference.commit).unwrap();
+        self.store.write_through(reference.commit).unwrap();
         effects
     }
 }

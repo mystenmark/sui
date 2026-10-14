@@ -151,7 +151,7 @@ fn commit(store: &store::Store, effects: &[u8]) {
         unreachable!()
     };
     store
-        .commit(store::Commit {
+        .write_through(store::Commit {
             executed: Some(store::Executed {
                 digest: *v2.transaction_digest,
                 transaction: Vec::new(),
@@ -176,7 +176,7 @@ fn bench_process(size: usize, effects: &[Vec<u8>]) {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(store::Store::open(dir.path()).unwrap());
     store
-        .commit(store::Commit {
+        .write_through(store::Commit {
             written: vec![store::Written {
                 id: ObjectId(support::ROOT),
                 version: ISV,

@@ -78,7 +78,7 @@ fn objects_round_trip_and_follow_their_live_version() {
         .max()
         .unwrap();
     store
-        .commit(Commit {
+        .write_through(Commit {
             removed: vec![Removed {
                 id,
                 version: version + 1,
@@ -108,7 +108,7 @@ fn objects_round_trip_and_follow_their_live_version() {
         .bytes
         .to_vec();
     store
-        .commit(Commit {
+        .write_through(Commit {
             written: vec![Written {
                 id,
                 version: version + 2,
@@ -144,7 +144,7 @@ fn executed_transactions_round_trip_and_survive_reopening() {
         let store = Store::open(dir.path()).unwrap();
         assert!(store.executed_effects(&digest).unwrap().is_none());
         store
-            .commit(Commit {
+            .write_through(Commit {
                 written: written(checkpoint.get()),
                 removed: vec![],
                 executed: Some(Executed {
@@ -210,7 +210,7 @@ fn the_version_at_or_before_a_bound() {
         bytes: bytes.to_vec(),
     };
     store
-        .commit(Commit {
+        .write_through(Commit {
             written: vec![
                 write(id, 3, objects[0]),
                 write(id, 7, objects[1]),

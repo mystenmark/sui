@@ -255,7 +255,7 @@ fn an_executed_transaction_is_accepted_though_its_inputs_are_spent() {
         .execution
         .execute(&node.store, &transaction)
         .unwrap();
-    node.store.commit(outcome.commit).unwrap();
+    node.store.write_through(outcome.commit).unwrap();
     let block = block(5, vec![user_transaction(&transaction, &[no_alias()])]);
     assert_eq!(node.voter().vote(&node.epoch, block), Ok(vec![]));
 }
@@ -301,7 +301,7 @@ fn an_executed_transaction_s_immutable_claim_is_still_verified() {
         .execution
         .execute(&node.store, &transaction)
         .unwrap();
-    node.store.commit(outcome.commit).unwrap();
+    node.store.write_through(outcome.commit).unwrap();
     let block = block(
         10,
         vec![user_transaction(
@@ -614,7 +614,7 @@ fn handlers_decide_alike_whatever_has_executed() {
         .execution
         .execute(&node.store, &transaction)
         .unwrap();
-    node.store.commit(outcome.commit).unwrap();
+    node.store.write_through(outcome.commit).unwrap();
     let commits = [
         commit(
             1,

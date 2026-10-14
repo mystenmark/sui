@@ -257,7 +257,7 @@ fn availability(rng: &mut Rng) {
         })
         .collect();
     store
-        .commit(store::Commit {
+        .write_through(store::Commit {
             written,
             ..store::Commit::default()
         })

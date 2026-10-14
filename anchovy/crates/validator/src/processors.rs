@@ -339,7 +339,7 @@ pub(crate) fn execute_and_commit(
         Ok(outcome) => outcome,
         Err(e) => return Outcome::Failed(format!("{e:?}")),
     };
-    if let Err(e) = store.commit(outcome.commit) {
+    if let Err(e) = store.write_through(outcome.commit) {
         return Outcome::Failed(format!("{e:?}"));
     }
     executed(store, &digest)
