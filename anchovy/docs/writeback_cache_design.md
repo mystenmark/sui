@@ -285,9 +285,19 @@ parts:
    the checkpoint numbering are all functions of the commits, so replay
    rebuilds them exactly. A transaction in a committed checkpoint is found
    executed in the database: the executor records its generations from
-   its stored effects instead of executing it (phase 11's replay path),
-   and settlement and checkpointing skip work already committed.
+   its stored effects instead of executing it (phase 11's replay path).
+   Checkpoints up to the committed one are rebuilt, identically, but not
+   certified again: the aggregator starts after the committed one.
    Everything later is re-executed into the cache.
+
+   Start-up must take nothing from the store's current state, which may
+   be ahead of the epoch's start:
+   - the accumulator root's version at the epoch's start is committed
+     with the genesis checkpoint (with the previous epoch's last, once
+     reconfiguration exists);
+   - settlement's first root version comes from its first chunk;
+   - a replayed transaction's first read of a shared object comes from
+     its stored effects, as the object may since be deleted.
 2. **Later, if replay from epoch start is too slow:** persist handler
    state at checkpoint boundaries in the commit batch, the analogue of
    the reference's consensus quarantine (R7.4). It must keep B-40's rule:

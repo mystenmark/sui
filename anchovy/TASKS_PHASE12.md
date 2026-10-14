@@ -33,8 +33,11 @@ seeing uncommitted outputs, and it caches reads positively and negatively.
         batch; genesis sets the committed watermark;
       - built checkpoints and chunks pruned below the committed one.
       The restart test is ignored until step 4.
-   4. Restart by replay. Next.
-   5. Backpressure.
+   4. Restart by replay. Done: the pipeline always starts from the epoch's
+      start and consensus replays the epoch's commits. Tests crash for
+      real (reopening the store) before and after a commit, and replay a
+      transaction whose shared input was deleted since.
+   5. Backpressure. Next.
 
 ## TODOs
 
