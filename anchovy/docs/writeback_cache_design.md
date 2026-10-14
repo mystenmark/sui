@@ -236,7 +236,7 @@ empty. The reference expects this for everything but owned-only
 transactions (I16), and anchovy has none.
 
 Reconfiguration therefore asserts the uncommitted set is empty rather
-than dropping it, so there is no revert path to get wrong (B-04, B-09,
+than dropping it (decided; the reference holds the same), so there is no revert path to get wrong (B-04, B-09,
 R6.2). A `clear_uncommitted` exists for restart and tests only. It bumps
 each slot's generation under its lock, which closes R6.2's hazard of a
 reader re-inserting a dropped version.
@@ -262,7 +262,9 @@ parts:
 
 Part 1 needs consensus to redeliver the epoch's commits, which
 consensus-core does from its own store. Part 2 is an optimization, not a
-correctness need, and is not in this phase.
+correctness need, and is not in this phase. Decided: replay from epoch
+start for now; it will be replaced by persisted handler state
+eventually.
 
 ## Backpressure
 
