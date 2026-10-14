@@ -337,9 +337,7 @@ impl Executor {
             .iter()
             .map(|w| (w.id, w.version, object(w.bytes.clone())))
             .collect();
-        self.store
-            .write_through(outcome.commit)
-            .expect("the store writes");
+        self.store.write(outcome.commit);
         let effects = Message::parse(outcome.effects)
             .map_err(|(e, _)| e)
             .expect("execution's effects parse");
