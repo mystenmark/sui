@@ -208,7 +208,7 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
                 let _ = black_box(validation::verify::verify_signatures(
                     signed,
                     signatures,
-                    epoch.epoch,
+                    epoch.params.epoch,
                     &epoch.verifier,
                     &[],
                     &bump,
@@ -243,7 +243,7 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
                 let _ = black_box(validation::verify::verify_signatures(
                     signed,
                     signatures,
-                    epoch.epoch,
+                    epoch.params.epoch,
                     &epoch.verifier,
                     &[],
                     &bump,

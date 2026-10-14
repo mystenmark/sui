@@ -30,13 +30,13 @@ pub type Reply = oneshot::Sender<Result<Vec<Outcome>, Rejected>>;
 /// a transaction does.
 pub struct Request<S: TxState> {
     /// The epoch the request is checked in, every stage alike.
-    epoch: Arc<EpochState>,
-    transactions: Vec<Message<Transaction<'static, S>>>,
+    pub(crate) epoch: Arc<EpochState>,
+    pub(crate) transactions: Vec<Message<Transaction<'static, S>>>,
     /// Why the transaction after these failed validation, if one did. The
     /// reference checks each transaction's signatures before validating the
     /// next, so a bad signature among these is the request's error first.
-    then: Option<validation::Error>,
-    reply: Reply,
+    pub(crate) then: Option<validation::Error>,
+    pub(crate) reply: Reply,
 }
 
 impl Request<DigestPending> {
@@ -87,6 +87,9 @@ pub enum Outcome {
     /// Execution failed: the input checks passed what execution could not
     /// run, or the store failed.
     Failed(String),
+    /// Passed the checks, for the caller to submit to consensus: its
+    /// `ConsensusTransaction` BCS.
+    Submit(Vec<u8>),
 }
 
 /// Why a request was refused.
@@ -105,6 +108,10 @@ const ARENA_BYTES: usize = 64 * 1024;
 
 /// Validates a request's transactions (`checks::validate`) and passes the
 /// valid ones on; a request whose first transaction fails ends here.
+///
+/// Inward: RPC handlers (black box): `Request<DigestPending>`.
+/// Outward: `SignatureVerifier`: `Request<Valid>`; a refused request is
+/// answered directly.
 pub struct TransactionValidator {
     bump: Bump,
 }
@@ -154,6 +161,10 @@ impl Processor for TransactionValidator {
 /// Verifies a request's signatures (`SignatureChecks::verify`) and passes
 /// it on; a request with a bad signature, or whose validation failed after
 /// these transactions, ends here. What it emits is wholly verified.
+///
+/// Inward: `TransactionValidator`: `Request<Valid>`.
+/// Outward: `SubmitChecker` (in the pipeline) or `InputChecker` (today's
+/// direct path): `Request<Verified>`.
 pub struct SignatureVerifier {
     checks: SignatureChecks,
 }
@@ -235,6 +246,10 @@ impl Refuse for Checked {
 /// Checks each transaction's inputs against the store (`check_inputs`); a
 /// transaction executed before is answered from the store instead, as the
 /// reference does.
+///
+/// Today's direct path, which the pipeline's `SubmitChecker` replaces.
+/// Inward: `SignatureVerifier`: `Request<Verified>`.
+/// Outward: `TransactionExecutor`: `Checked`.
 pub struct InputChecker {
     store: Arc<store::Store>,
 }
@@ -291,6 +306,10 @@ pub(crate) fn executed(store: &store::Store, digest: &[u8; 32]) -> Option<Outcom
 /// # Panics
 /// On equivocation: an owned input consumed since its check (`Execution::
 /// execute`). Consensus will rule it out; until then nothing locks inputs.
+///
+/// Today's direct path, which the pipeline's `Executor` replaces.
+/// Inward: `InputChecker`: `Checked`.
+/// Outward: the request's reply.
 pub struct TransactionExecutor {
     store: Arc<store::Store>,
 }

@@ -251,3 +251,30 @@ fn the_version_at_or_before_a_bound() {
         None
     );
 }
+
+#[test]
+fn the_highest_checkpoint_is_the_executed_watermark_and_survives_reopening() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = store::Store::open(dir.path()).unwrap();
+        assert_eq!(store.last_checkpoint().unwrap(), None);
+        store.put_checkpoint(0, b"genesis".to_vec()).unwrap();
+        // Out of order, and past 255, where little-endian keys would sort
+        // wrongly.
+        store
+            .put_checkpoint(300, b"three hundred".to_vec())
+            .unwrap();
+        store.put_checkpoint(2, b"two".to_vec()).unwrap();
+        assert_eq!(
+            store.last_checkpoint().unwrap(),
+            Some((300, b"three hundred".to_vec()))
+        );
+    }
+    let store = store::Store::open(dir.path()).unwrap();
+    assert_eq!(
+        store.last_checkpoint().unwrap(),
+        Some((300, b"three hundred".to_vec()))
+    );
+    assert_eq!(store.checkpoint(2).unwrap(), Some(b"two".to_vec()));
+    assert_eq!(store.checkpoint(1).unwrap(), None);
+}

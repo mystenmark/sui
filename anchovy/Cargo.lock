@@ -80,6 +80,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "aggregator"
+version = "0.1.0"
+dependencies = [
+ "bcs",
+ "fastcrypto",
+ "messages",
+ "roaring",
+ "sui-types",
+ "tracing",
+ "validator",
+ "waiter",
+ "workqueue",
+]
+
+[[package]]
 name = "ahash"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1244,6 +1259,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "checkpoint"
+version = "0.1.0"
+dependencies = [
+ "bcs",
+ "blake2",
+ "consensus",
+ "containers",
+ "fastcrypto",
+ "messages",
+ "protocol-config",
+ "store",
+ "sui-protocol-config",
+ "sui-types",
+ "tempfile",
+ "validator",
+ "waiter",
+ "workqueue",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1429,6 +1464,9 @@ checksum = "6e8ccc4ea9f6acc32d102c0f6d471d11d913ad15f20c04de743374861fa1d414"
 [[package]]
 name = "consensus"
 version = "0.1.0"
+dependencies = [
+ "tokio",
+]
 
 [[package]]
 name = "consensus-config"
@@ -2366,6 +2404,26 @@ name = "ethnum"
 version = "1.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40404c3f5f511ec4da6fe866ddf6a717c309fdbb69fbbad7b0f3edab8f2e835f"
+
+[[package]]
+name = "exec-pool"
+version = "0.1.0"
+dependencies = [
+ "bcs",
+ "consensus",
+ "execution",
+ "messages",
+ "move-core-types",
+ "protocol-config",
+ "resolver",
+ "store",
+ "sui-types",
+ "tempfile",
+ "tokio",
+ "validator",
+ "waiter",
+ "workqueue",
+]
 
 [[package]]
 name = "exec-types"
@@ -5344,6 +5402,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b93853da6d84c2e3c7d730d6473e8817692dd89be387eb01b94d7f108ecb5b8c"
 
 [[package]]
+name = "node"
+version = "0.1.0"
+dependencies = [
+ "aggregator",
+ "bcs",
+ "checkpoint",
+ "consensus",
+ "exec-pool",
+ "execution",
+ "messages",
+ "move-core-types",
+ "protocol-config",
+ "resolver",
+ "settlement",
+ "state-hasher",
+ "store",
+ "sui-types",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "validator",
+ "waiter",
+ "workqueue",
+]
+
+[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6864,6 +6948,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "resolver"
+version = "0.1.0"
+dependencies = [
+ "bcs",
+ "containers",
+ "executor",
+ "messages",
+ "protocol-config",
+ "store",
+ "sui-types",
+ "tempfile",
+ "validator",
+ "waiter",
+ "workqueue",
+]
+
+[[package]]
 name = "rfc6979"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7534,6 +7635,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "settlement"
+version = "0.1.0"
+dependencies = [
+ "bcs",
+ "fastcrypto",
+ "foldhash 0.2.0",
+ "hashbrown 0.17.1",
+ "messages",
+ "move-core-types",
+ "protocol-config",
+ "rand 0.8.8",
+ "serde",
+ "store",
+ "sui-types",
+ "tempfile",
+ "validator",
+ "waiter",
+ "workqueue",
+]
+
+[[package]]
 name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7878,6 +8000,18 @@ dependencies = [
  "once_cell",
  "starlark_map",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "state-hasher"
+version = "0.1.0"
+dependencies = [
+ "bcs",
+ "fastcrypto",
+ "messages",
+ "sui-types",
+ "validator",
+ "workqueue",
 ]
 
 [[package]]
@@ -9976,6 +10110,7 @@ dependencies = [
  "consensus",
  "containers",
  "execution",
+ "foldhash 0.2.0",
  "hashbrown 0.17.1",
  "hyper-util",
  "messages",
@@ -9995,6 +10130,7 @@ dependencies = [
  "tonic-prost",
  "tower 0.5.3",
  "validation",
+ "waiter",
  "workqueue",
 ]
 

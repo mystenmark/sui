@@ -2,10 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The handlers. They decode, hand work to processors and await it; none
-//! does transaction work on the RPC runtime. Health answers; submission
-//! checks and executes, with no consensus yet; the rest need consensus or
-//! more of storage, which do not exist yet. Pings are among them, since a
-//! ping's answer is a consensus position and then that position's commit.
+//! does transaction work on the RPC runtime. Health answers.
+//!
+//! Submission checks each transaction on the processors. Over the pipeline
+//! (`Validator::with_consensus`) it then submits the rest to consensus and
+//! answers with their positions; a client then waits for each with
+//! `wait_for_effects`. Without consensus, the processors execute each
+//! transaction and answer with its effects.
+//!
+//! The rest need more of storage, which does not exist yet. Pings are among
+//! them, since a ping's answer is a consensus position and then that
+//! position's commit.
 
 use std::sync::Arc;
 
@@ -20,19 +27,38 @@ use messages::grpc::{
 };
 use tonic::{Request, Response, Status};
 
+use ::consensus::{Priority, TransactionClient};
+use waiter::{Command, WaitBatch};
+
 use crate::codec::Encoded;
+use crate::consensus::status::{
+    ConsensusPosition, ConsensusTxStatus, ConsensusTxStatusCache, StatusResult,
+};
 use crate::epoch::EpochState;
+use crate::pipeline::items::EffectsWaitItem;
+use crate::pipeline::keys::EffectsKey;
 use crate::processors::{self, Outcome, Rejected};
 use crate::proto::{
-    RawExecutedData, RawExecutedStatus, RawRejectedStatus, RawSubmitTxRequest, RawSubmitTxResponse,
-    RawSubmitTxResult, RawValidatorHealthRequest, RawValidatorHealthResponse,
-    RawValidatorSubmitStatus, RawWaitForEffectsRequest, RawWaitForEffectsResponse, SubmitTxType,
+    RawExecutedData, RawExecutedStatus, RawExpiredStatus, RawRejectedStatus, RawSubmitTxRequest,
+    RawSubmitTxResponse, RawSubmitTxResult, RawValidatorHealthRequest, RawValidatorHealthResponse,
+    RawValidatorSubmitStatus, RawValidatorTransactionStatus, RawWaitForEffectsRequest,
+    RawWaitForEffectsResponse, SubmitTxType,
 };
 use crate::service::validator_server::{self, ValidatorServer};
 
 pub struct Validator {
     epoch: Arc<EpochState>,
     transactions: Queue<processors::Request<DigestPending>>,
+    consensus: Option<Consensus>,
+}
+
+/// What submission and waiting take from the pipeline.
+pub struct Consensus {
+    pub client: TransactionClient,
+    pub statuses: Arc<ConsensusTxStatusCache>,
+    /// The effects waiter's queue.
+    pub effects: Queue<Command<EffectsKey, EffectsWaitItem>>,
+    pub store: Arc<store::Store>,
 }
 
 impl Validator {
@@ -43,6 +69,119 @@ impl Validator {
         Validator {
             epoch,
             transactions,
+            consensus: None,
+        }
+    }
+
+    /// Submits to consensus, and waits for effects, over the pipeline.
+    #[must_use]
+    pub fn with_consensus(mut self, consensus: Consensus) -> Validator {
+        self.consensus = Some(consensus);
+        self
+    }
+
+    /// Submits the transactions the processors readied, as one bundle, and
+    /// answers each with its position.
+    async fn submit(&self, outcomes: Vec<Outcome>) -> Result<Vec<RawSubmitTxResult>, Status> {
+        let bundle: Vec<Vec<u8>> = outcomes
+            .iter()
+            .filter_map(|o| match o {
+                Outcome::Submit(bytes) => Some(bytes.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut positions = Vec::new();
+        if !bundle.is_empty() {
+            let consensus = self
+                .consensus
+                .as_ref()
+                .expect("only the pipeline's processors ready transactions to submit");
+            // What becomes of the block is the status cache's to report, for
+            // any position, so its receiver is not kept.
+            let (block, indices, _) = consensus
+                .client
+                .submit(bundle, Priority::Normal)
+                .await
+                .map_err(|_| Status::unavailable("consensus is shutting down"))?;
+            positions = indices
+                .into_iter()
+                .map(|index| ConsensusPosition {
+                    epoch: self.epoch.params.epoch,
+                    block,
+                    index,
+                })
+                .collect();
+        }
+        let mut positions = positions.into_iter();
+        Ok(outcomes
+            .into_iter()
+            .map(|outcome| match outcome {
+                Outcome::Submit(_) => RawSubmitTxResult {
+                    inner: Some(RawValidatorSubmitStatus::Submitted(
+                        positions
+                            .next()
+                            .expect("a position per transaction submitted")
+                            .to_bcs()
+                            .into(),
+                    )),
+                },
+                outcome => result(outcome),
+            })
+            .collect())
+    }
+
+    /// The transaction's effects, once executed.
+    async fn executed(
+        consensus: &Consensus,
+        digest: [u8; 32],
+        include_details: bool,
+    ) -> Result<RawValidatorTransactionStatus, Status> {
+        let read = || {
+            execution::executed(&consensus.store, &digest)
+                .map_err(|e| Status::internal(format!("{e:?}")))
+        };
+        let executed = if let Some(executed) = read()? {
+            executed
+        } else {
+            let (reply, done) = oneshot::channel();
+            let mut batch = WaitBatch::with_capacity(1, 1);
+            batch.push(EffectsWaitItem::Executed(reply), [EffectsKey(digest)]);
+            consensus
+                .effects
+                .try_push(Command::Wait(batch))
+                .map_err(|e| match e {
+                    PushError::Full(_) => Status::resource_exhausted("effects waiter full"),
+                    PushError::Closed(_) => Status::unavailable("shutting down"),
+                })?;
+            done.await
+                .map_err(|_| Status::unavailable("shutting down"))?;
+            read()?.expect("effects notified once stored")
+        };
+        let mut status = executed_status(executed);
+        if !include_details {
+            status.details = None;
+        }
+        Ok(RawValidatorTransactionStatus::Executed(status))
+    }
+
+    /// What consensus decided about the transaction at `position`, unless it
+    /// was finalized: then its effects answer.
+    async fn decided(
+        &self,
+        statuses: &ConsensusTxStatusCache,
+        position: ConsensusPosition,
+    ) -> RawValidatorTransactionStatus {
+        match statuses.notify_read(position).await {
+            StatusResult::Status(ConsensusTxStatus::Rejected | ConsensusTxStatus::Dropped) => {
+                RawValidatorTransactionStatus::Rejected(RawRejectedStatus { error: None })
+            }
+            StatusResult::Status(ConsensusTxStatus::Finalized) => std::future::pending().await,
+            StatusResult::Expired(round) => {
+                RawValidatorTransactionStatus::Expired(RawExpiredStatus {
+                    epoch: self.epoch.params.epoch,
+                    round: Some(round),
+                })
+            }
         }
     }
 
@@ -64,7 +203,7 @@ impl Validator {
             }
             _ => {}
         }
-        let config = &self.epoch.config;
+        let config = &self.epoch.params.config;
         let max = if submit_type == SubmitTxType::SoftBundle {
             config.max_soft_bundle_size()
         } else {
@@ -108,27 +247,36 @@ impl Validator {
     }
 }
 
+/// An executed transaction as the reference's `ExecutedStatus`, with its
+/// details.
+fn executed_status(executed: execution::Executed) -> RawExecutedStatus {
+    RawExecutedStatus {
+        effects_digest: executed.effects_digest_bcs().into(),
+        details: Some(RawExecutedData {
+            effects: executed.effects.into(),
+            events: executed.events.map(Into::into),
+            input_objects: executed.input_objects.into_iter().map(Into::into).collect(),
+            output_objects: executed
+                .output_objects
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        }),
+    }
+}
+
 /// A transaction's result as the reference's `SubmitTxResult`.
 fn result(outcome: Outcome) -> RawSubmitTxResult {
     let status = match outcome {
-        Outcome::Executed(executed) => RawValidatorSubmitStatus::Executed(RawExecutedStatus {
-            effects_digest: executed.effects_digest_bcs().into(),
-            details: Some(RawExecutedData {
-                effects: executed.effects.into(),
-                events: executed.events.map(Into::into),
-                input_objects: executed.input_objects.into_iter().map(Into::into).collect(),
-                output_objects: executed
-                    .output_objects
-                    .into_iter()
-                    .map(Into::into)
-                    .collect(),
-            }),
-        }),
+        Outcome::Executed(executed) => {
+            RawValidatorSubmitStatus::Executed(executed_status(*executed))
+        }
         // Without the reason: it would be BCS of the reference's `SuiError`,
         // which anchovy's errors do not map to yet.
         Outcome::Rejected(_) | Outcome::Failed(_) => {
             RawValidatorSubmitStatus::Rejected(RawRejectedStatus { error: None })
         }
+        Outcome::Submit(_) => unreachable!("submitted, then answered with its position"),
     };
     RawSubmitTxResult {
         inner: Some(status),
@@ -147,8 +295,9 @@ fn rejection(rejected: &Rejected) -> Status {
 impl validator_server::Validator for Validator {
     /// Decodes each transaction here, without its digest; validates, hashes
     /// and verifies them on the processors, and fails the request if any is
-    /// invalid, as the reference does. Then, with no consensus yet, checks
-    /// each one's inputs and executes it, answering with its effects.
+    /// invalid, as the reference does. Then answers each: executed already,
+    /// rejected by its input checks, or submitted to consensus, with its
+    /// position (without consensus, executed now).
     async fn submit_transaction(
         &self,
         request: Request<RawSubmitTxRequest>,
@@ -164,15 +313,56 @@ impl validator_server::Validator for Validator {
             .map_err(|_| Status::internal("processing did not finish"))?
             .map_err(|e| rejection(&e))?;
         Ok(Response::new(RawSubmitTxResponse {
-            results: outcomes.into_iter().map(result).collect(),
+            results: self.submit(outcomes).await?,
         }))
     }
 
+    /// As the reference's: the transaction's effects once it executes, or,
+    /// given the position it was submitted at, whatever consensus decided
+    /// there first if that was not to finalize it: rejected or dropped, or
+    /// expired, never committed. Effects can come first, from the same
+    /// transaction committed at another position.
     async fn wait_for_effects(
         &self,
-        _request: Request<RawWaitForEffectsRequest>,
+        request: Request<RawWaitForEffectsRequest>,
     ) -> Result<Response<RawWaitForEffectsResponse>, Status> {
-        todo!("wait_for_effects")
+        let request = request.into_inner();
+        if request.ping_type.is_some() {
+            todo!("ping: a consensus position's commit")
+        }
+        let Some(consensus) = &self.consensus else {
+            return Err(Status::unimplemented("waiting needs consensus"));
+        };
+        let digest: [u8; 32] = request
+            .transaction_digest
+            .as_deref()
+            .and_then(|d| d.try_into().ok())
+            .ok_or_else(|| Status::invalid_argument("a 32-byte transaction digest is required"))?;
+        let position = match &request.consensus_position {
+            Some(bytes) => Some(
+                ConsensusPosition::from_bcs(bytes)
+                    .ok_or_else(|| Status::invalid_argument("not a consensus position"))?,
+            ),
+            None => None,
+        };
+        if let Some(position) = &position
+            && consensus.statuses.too_far_ahead(position)
+        {
+            return Err(Status::unavailable("ValidatorConsensusLagging"));
+        }
+        let decided = async {
+            match position {
+                Some(position) => Ok(self.decided(&consensus.statuses, position).await),
+                None => std::future::pending().await,
+            }
+        };
+        let status = tokio::select! {
+            status = Self::executed(consensus, digest, request.include_details) => status,
+            status = decided => status,
+        }?;
+        Ok(Response::new(RawWaitForEffectsResponse {
+            inner: Some(status),
+        }))
     }
 
     async fn object_info(

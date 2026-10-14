@@ -7,9 +7,11 @@ pub mod checks;
 pub mod codec;
 pub mod consensus;
 pub mod epoch;
+pub mod pipeline;
 pub mod processors;
 pub mod proto;
 pub mod server;
+pub mod submit;
 pub mod tls;
 
 pub use server::Validator;
