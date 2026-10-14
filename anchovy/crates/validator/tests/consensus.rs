@@ -17,7 +17,10 @@ use sui_types::messages_consensus::ConsensusTransaction;
 use sui_types::object::Object;
 use sui_types::transaction::{PlainTransactionWithClaims, Transaction, TransactionData};
 use validator::consensus::cache::ConsensusTxCache;
-use validator::consensus::commit::{CommitHandler, CommitOutcome, Fate};
+use validator::consensus::commit::{
+    CommitHandler, CommitOutcome, DropReason, Fate, ScheduleExecutor,
+};
+use validator::consensus::decode::CommitDecoder;
 use validator::consensus::vote::BlockVoter;
 use validator::epoch::EpochState;
 use validator::processors::Outcome;
@@ -84,13 +87,18 @@ impl Node {
     }
 
     fn signed_transfer(&self, gas: ObjectRef, key: &AccountKeyPair) -> Vec<u8> {
+        self.transfer_at(gas, key, RGP)
+    }
+
+    /// A transfer paid with `gas` at gas price `price`, signed with `key`.
+    fn transfer_at(&self, gas: ObjectRef, key: &AccountKeyPair, price: u64) -> Vec<u8> {
         let data = TransactionData::new_transfer_sui(
             SuiAddress::random_for_testing_only(),
             self.sender,
             Some(SUI),
             gas,
             BUDGET,
-            RGP,
+            price,
         );
         bcs::to_bytes(&Transaction::from_data_and_signer(data, vec![key])).unwrap()
     }
@@ -252,6 +260,58 @@ fn an_executed_transaction_is_accepted_though_its_inputs_are_spent() {
     assert_eq!(node.voter().vote(&node.epoch, block), Ok(vec![]));
 }
 
+/// `TransactionClaim::ImmutableInputObjects`.
+fn immutable(ids: &[ObjectID]) -> Vec<u8> {
+    let mut bytes = vec![1, ids.len() as u8];
+    for id in ids {
+        bytes.extend_from_slice(&id.into_bytes());
+    }
+    bytes
+}
+
+#[test]
+fn a_false_immutable_claim_is_rejected_and_cached_as_claimed() {
+    let node = Node::new();
+    let gas = node.gas();
+    let block = block(
+        9,
+        vec![user_transaction(
+            &node.transfer(gas),
+            &[no_alias(), immutable(&[gas.0])],
+        )],
+    );
+    let reference = block.reference;
+    assert_eq!(node.voter().vote(&node.epoch, block), Ok(vec![0]));
+    // The handler locks by the claim, whatever this validator voted: if a
+    // quorum accepts it, the coin it claims immutable is not locked.
+    let entries = node.cache.take(&reference).unwrap();
+    let owned = entries[0].as_ref().unwrap().owned.as_ref().unwrap();
+    assert!(owned.is_empty());
+}
+
+/// As the reference's: an executed transaction's inputs are not checked,
+/// but its immutable claim is, against the live objects.
+#[test]
+fn an_executed_transaction_s_immutable_claim_is_still_verified() {
+    let node = Node::new();
+    let gas = node.gas();
+    let transaction = node.transfer(gas);
+    let outcome = node
+        .epoch
+        .execution
+        .execute(&node.store, &transaction)
+        .unwrap();
+    node.store.commit(outcome.commit).unwrap();
+    let block = block(
+        10,
+        vec![user_transaction(
+            &transaction,
+            &[no_alias(), immutable(&[gas.0])],
+        )],
+    );
+    assert_eq!(node.voter().vote(&node.epoch, block), Ok(vec![0]));
+}
+
 #[test]
 fn undecodable_and_deprecated_transactions_invalidate_the_block() {
     let node = Node::new();
@@ -291,6 +351,7 @@ fn commit(
 ) -> CommittedSubDag {
     CommittedSubDag {
         commit_index: index,
+        digest: [index as u8; 32],
         leader: blocks.last().map_or(
             BlockRef {
                 round: leader_round,
@@ -308,8 +369,27 @@ fn commit(
     }
 }
 
-fn handler(node: &Node) -> CommitHandler {
-    CommitHandler::new(node.store.clone(), node.cache.clone())
+/// Commit decoding, handling then execution, as the processors run them.
+struct Committer {
+    decoder: CommitDecoder,
+    handler: CommitHandler,
+    executor: ScheduleExecutor,
+}
+
+impl Committer {
+    fn handle(&mut self, epoch: &EpochState, commit: CommittedSubDag) -> Option<CommitOutcome> {
+        let decoded = self.decoder.decode(&epoch.params, commit);
+        let handled = self.handler.handle(&epoch.params, decoded)?;
+        Some(self.executor.execute(handled))
+    }
+}
+
+fn committer(node: &Node) -> Committer {
+    Committer {
+        decoder: CommitDecoder::new(node.cache.clone()),
+        handler: CommitHandler::new(),
+        executor: ScheduleExecutor::new(node.store.clone(), node.epoch.clone()),
+    }
 }
 
 /// Whether the transaction at `i` executed successfully.
@@ -329,7 +409,7 @@ fn a_voted_block_s_transactions_come_from_the_cache() {
         vec![user_transaction(&node.transfer(node.gas()), &[no_alias()])],
     );
     assert_eq!(node.voter().vote(&node.epoch, block.clone()), Ok(vec![]));
-    let outcome = handler(&node)
+    let outcome = committer(&node)
         .handle(&node.epoch, commit(1, 1, vec![block], vec![]))
         .unwrap();
     assert_eq!((outcome.cache_hits, outcome.cache_misses), (1, 0));
@@ -351,7 +431,7 @@ fn an_unvoted_block_s_transactions_are_decoded() {
             user_transaction(&node.transfer(node.gas()), &[no_alias()]),
         ],
     );
-    let outcome = handler(&node)
+    let outcome = committer(&node)
         .handle(&node.epoch, commit(1, 1, vec![block], vec![]))
         .unwrap();
     assert_eq!((outcome.cache_hits, outcome.cache_misses), (0, 1));
@@ -368,7 +448,7 @@ fn rejected_transactions_are_skipped() {
         vec![user_transaction(&node.transfer(node.gas()), &[no_alias()])],
     );
     let rejected = vec![(block.reference, vec![0])];
-    let outcome = handler(&node)
+    let outcome = committer(&node)
         .handle(&node.epoch, commit(1, 1, vec![block], rejected))
         .unwrap();
     assert!(outcome.transactions.is_empty());
@@ -386,7 +466,7 @@ fn transactions_and_commits_are_handled_once() {
         },
         ..first.clone()
     };
-    let mut handler = handler(&node);
+    let mut handler = committer(&node);
     let outcome = handler
         .handle(
             &node.epoch,
@@ -407,7 +487,7 @@ fn transactions_and_commits_are_handled_once() {
         .handle(&node.epoch, commit(2, 2, vec![later.clone()], vec![]))
         .unwrap();
     assert!(matches!(outcome.transactions[0].fate, Fate::Duplicate));
-    let outcome = CommitHandler::new(node.store.clone(), node.cache.clone())
+    let outcome = committer(&node)
         .handle(&node.epoch, commit(1, 2, vec![later], vec![]))
         .unwrap();
     assert!(matches!(outcome.transactions[0].fate, Fate::Duplicate));
@@ -422,17 +502,20 @@ fn the_first_of_two_transactions_spending_one_coin_wins() {
     let block = block(1, vec![first, second]);
     // Both pass voting: neither has executed when the block is voted on.
     assert_eq!(node.voter().vote(&node.epoch, block.clone()), Ok(vec![]));
-    let outcome = handler(&node)
+    let outcome = committer(&node)
         .handle(&node.epoch, commit(1, 1, vec![block], vec![]))
         .unwrap();
     assert!(succeeded(&outcome, 0));
-    assert!(matches!(outcome.transactions[1].fate, Fate::Dropped(_)));
+    assert!(matches!(
+        outcome.transactions[1].fate,
+        Fate::Dropped(DropReason::LockConflict { .. })
+    ));
 }
 
 #[test]
 fn blocks_below_the_gc_round_are_evicted() {
     let node = Node::new();
-    let depth = node.epoch.config.gc_depth();
+    let depth = node.epoch.params.config.gc_depth();
     assert!(depth > 0);
     let old = block(1, vec![]);
     let recent = block(depth + 2, vec![]);
@@ -440,7 +523,7 @@ fn blocks_below_the_gc_round_are_evicted() {
     for b in [&old, &recent] {
         assert_eq!(node.voter().vote(&node.epoch, b.clone()), Ok(vec![]));
     }
-    handler(&node)
+    committer(&node)
         .handle(
             &node.epoch,
             commit(1, leader.reference.round, vec![leader], vec![]),
@@ -454,10 +537,13 @@ fn blocks_below_the_gc_round_are_evicted() {
 fn the_processors_vote_and_commit_on_their_threads() {
     let node = Node::new();
     let (outcomes, received) = std::sync::mpsc::channel();
-    let processors =
-        validator::consensus::ConsensusProcessors::start(node.store.clone(), move |outcome| {
+    let processors = validator::consensus::ConsensusProcessors::start(
+        node.store.clone(),
+        node.epoch.clone(),
+        move |outcome| {
             outcomes.send(outcome).unwrap();
-        });
+        },
+    );
     let block = block(
         1,
         vec![user_transaction(&node.transfer(node.gas()), &[no_alias()])],
@@ -474,8 +560,8 @@ fn the_processors_vote_and_commit_on_their_threads() {
     assert_eq!(verdict.blocking_recv().unwrap(), Ok(vec![]));
     processors
         .commits
-        .try_push(validator::consensus::commit::CommitRequest {
-            epoch: node.epoch.clone(),
+        .try_push(validator::consensus::decode::CommitRequest {
+            epoch: node.epoch.params.clone(),
             commit: commit(1, 1, vec![block], vec![]),
         })
         .unwrap_or_else(|_| panic!("commit queue refused"));
@@ -484,4 +570,107 @@ fn the_processors_vote_and_commit_on_their_threads() {
         .unwrap();
     assert_eq!(outcome.cache_hits, 1);
     assert!(succeeded(&outcome, 0));
+}
+
+#[test]
+fn owned_inputs_are_locked_in_consensus_order_before_gas_price_order() {
+    let node = Node::new();
+    let gas = node.gas();
+    let cheap = node.transfer_at(gas, &node.key, RGP);
+    let dear = node.transfer_at(gas, &node.key, 2 * RGP);
+    let block = block(
+        1,
+        vec![
+            user_transaction(&cheap, &[no_alias()]),
+            user_transaction(&dear, &[no_alias()]),
+        ],
+    );
+    let outcome = committer(&node)
+        .handle(&node.epoch, commit(1, 1, vec![block], vec![]))
+        .unwrap();
+    // Owned inputs are locked in consensus order, before the schedule's
+    // gas price order: the cheaper transaction, first in the block, takes
+    // the coin, and the dearer one is dropped unscheduled.
+    assert_eq!(outcome.transactions[0].index, 0);
+    assert!(succeeded(&outcome, 0));
+    assert_eq!(outcome.transactions[1].index, 1);
+    assert!(matches!(
+        outcome.transactions[1].fate,
+        Fate::Dropped(DropReason::LockConflict { .. })
+    ));
+}
+
+/// The handler is a replicated state machine: two handlers fed the same
+/// commits decide the same schedule, ordinals included, whatever has
+/// executed. Here one validator executed the commit's transaction already
+/// (before a restart, say); its handler still schedules it, and execution
+/// finds it executed.
+#[test]
+fn handlers_decide_alike_whatever_has_executed() {
+    let node = Node::new();
+    let transaction = node.transfer(node.gas());
+    let outcome = node
+        .epoch
+        .execution
+        .execute(&node.store, &transaction)
+        .unwrap();
+    node.store.commit(outcome.commit).unwrap();
+    let commits = [
+        commit(
+            1,
+            1,
+            vec![block(
+                1,
+                vec![user_transaction(&transaction, &[no_alias()])],
+            )],
+            vec![],
+        ),
+        commit(
+            2,
+            2,
+            vec![block(
+                2,
+                vec![user_transaction(&node.transfer(node.gas()), &[no_alias()])],
+            )],
+            vec![],
+        ),
+    ];
+    let decide = || {
+        let mut decoder = CommitDecoder::new(node.cache.clone());
+        let mut handler = CommitHandler::new();
+        commits
+            .iter()
+            .map(|c| {
+                let decided = handler
+                    .handle(
+                        &node.epoch.params,
+                        decoder.decode(&node.epoch.params, c.clone()),
+                    )
+                    .unwrap();
+                let order: Vec<_> = decided
+                    .schedule
+                    .transactions
+                    .iter()
+                    .map(|t| match t {
+                        validator::consensus::sequence::Scheduled::User(t) => {
+                            Some(t.get().0.digest().bytes)
+                        }
+                        validator::consensus::sequence::Scheduled::Prologue(_) => None,
+                    })
+                    .collect();
+                let accesses: Vec<_> = (0..decided.schedule.len())
+                    .map(|i| decided.schedule.accesses(i).to_vec())
+                    .collect();
+                (order, accesses)
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = decide();
+    assert_eq!(first, decide());
+    // The executed transaction is scheduled, not dropped as a duplicate.
+    assert_eq!(first[0].0.len(), 2);
+    let outcome = committer(&node)
+        .handle(&node.epoch, commits[0].clone())
+        .unwrap();
+    assert!(matches!(outcome.transactions[0].fate, Fate::Duplicate));
 }

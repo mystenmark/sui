@@ -54,10 +54,10 @@ fn sponsored(epoch_gas_price: u64) -> Vec<common::Case> {
 fn signer_indices_match_the_reference() {
     let (mut cases, jwks) = common::signed_vectors();
     let epoch = common::vectors_epoch(0, jwks);
-    cases.extend(sponsored(epoch.reference_gas_price));
+    cases.extend(sponsored(epoch.params.reference_gas_price));
     // As the epoch's verifier is configured; zkLogin cases fail without its
     // providers and are not compared.
-    let config = &epoch.config;
+    let config = &epoch.params.config;
     let params = VerifyParams {
         verify_legacy_zklogin_address: config.verify_legacy_zklogin_address(),
         accept_zklogin_in_multisig: config.accept_zklogin_in_multisig(),
@@ -82,7 +82,7 @@ fn signer_indices_match_the_reference() {
             let tx = bcs::from_bytes::<sui_types::transaction::Transaction>(&case.bytes).ok()?;
             verify_sender_signed_data_message_signatures(
                 tx.data(),
-                epoch.epoch,
+                epoch.params.epoch,
                 &params,
                 Arc::new(VerifiedDigestCache::new_empty()),
                 vec![],
@@ -99,9 +99,15 @@ fn signer_indices_match_the_reference() {
         let (sigs, _) = sender_signed::deserialization_checks(signed, &bump).unwrap();
         let before = verify::signer_signature_indices(signed, sigs, &epoch.verifier, &[], &bump)
             .map(|indices| indices.as_slice().to_vec());
-        let verified =
-            verify::verify_signatures(signed, sigs, epoch.epoch, &epoch.verifier, &[], &bump)
-                .map(|indices| indices.as_slice().to_vec());
+        let verified = verify::verify_signatures(
+            signed,
+            sigs,
+            epoch.params.epoch,
+            &epoch.verifier,
+            &[],
+            &bump,
+        )
+        .map(|indices| indices.as_slice().to_vec());
         compared += 1;
         for ours in [before, verified] {
             if ours.as_ref().ok() != Some(&reference) {

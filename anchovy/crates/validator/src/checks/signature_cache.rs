@@ -91,7 +91,7 @@ impl SignatureCache {
             self.current.clear();
             self.previous.clear();
         }
-        let key = key(epoch.epoch, &transaction.get().0);
+        let key = key(epoch.params.epoch, &transaction.get().0);
         let cached = self
             .current
             .get(&key)

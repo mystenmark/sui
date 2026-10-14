@@ -1,15 +1,22 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/aggregator",
     "crates/arena",
+    "crates/checkpoint",
     "crates/consensus",
     "crates/containers",
     "crates/exec-types",
+    "crates/exec-pool",
     "crates/execution",
     "crates/executor",
     "crates/messages",
     "crates/natives",
+    "crates/node",
     "crates/protocol-config",
+    "crates/resolver",
+    "crates/settlement",
+    "crates/state-hasher",
     "crates/store",
     "crates/validation",
     "crates/validator",
@@ -52,17 +59,25 @@ smallvec = "1.10.0"
 rand = "0.8.5"
 fastcrypto-vdf = { git = "https://github.com/MystenLabs/fastcrypto", rev = "076bf5ad8cea140dc7cf5c5861c24a36acdf64ce", features = ["experimental"] }
 prometheus = "0.14"
+aggregator = { path = "crates/aggregator" }
 arena = { path = "crates/arena" }
+checkpoint = { path = "crates/checkpoint" }
 consensus = { path = "crates/consensus" }
 containers = { path = "crates/containers" }
+exec-pool = { path = "crates/exec-pool" }
 execution = { path = "crates/execution" }
 executor = { path = "crates/executor" }
 exec-types = { path = "crates/exec-types" }
 natives = { path = "crates/natives" }
+node = { path = "crates/node" }
 messages = { path = "crates/messages" }
 protocol-config = { path = "crates/protocol-config" }
+resolver = { path = "crates/resolver" }
+settlement = { path = "crates/settlement" }
+state-hasher = { path = "crates/state-hasher" }
 store = { path = "crates/store" }
 validation = { path = "crates/validation" }
+validator = { path = "crates/validator" }
 waiter = { path = "crates/waiter" }
 workqueue = { path = "crates/workqueue" }
 # Two versions of the allocator trait: hashbrown and its Vec use 0.2,

@@ -132,6 +132,7 @@ impl<W> Inbox<W> {
 pub struct Worker {
     name: String,
     recipes: Vec<Box<dyn Unbuilt>>,
+    abort_on_panic: bool,
 }
 
 impl Worker {
@@ -139,7 +140,17 @@ impl Worker {
         Worker {
             name: name.into(),
             recipes: Vec::new(),
+            abort_on_panic: false,
         }
+    }
+
+    /// Aborts the process when an item panics, instead of dropping the item
+    /// and going on: for processors whose items others wait on, which would
+    /// otherwise wait forever. Release builds abort on any panic anyway.
+    #[must_use]
+    pub fn abort_on_panic(mut self) -> Worker {
+        self.abort_on_panic = true;
+        self
     }
 
     /// Adds a processor draining `inbox`, built by `make` on the worker's
@@ -179,11 +190,12 @@ impl Worker {
     /// item at a time: a slow item delays the thread's other processors.
     pub fn spawn(self) -> WorkerHandle {
         let (stop, stopped) = crossbeam_channel::bounded(0);
-        let recipes = self.recipes;
+        let (recipes, abort) = (self.recipes, self.abort_on_panic);
         let thread = std::thread::Builder::new()
             .name(self.name)
             .spawn(move || {
-                let slots: Vec<Box<dyn Slot>> = recipes.into_iter().map(Unbuilt::build).collect();
+                let slots: Vec<Box<dyn Slot>> =
+                    recipes.into_iter().map(|r| r.build(abort)).collect();
                 run(&slots, &stopped);
             })
             .expect("thread spawn");
@@ -213,7 +225,7 @@ impl Drop for WorkerHandle {
 
 /// A processor not yet built, and its inbox.
 trait Unbuilt: Send {
-    fn build(self: Box<Self>) -> Box<dyn Slot>;
+    fn build(self: Box<Self>, abort_on_panic: bool) -> Box<dyn Slot>;
 }
 
 struct Recipe<W, F, K> {
@@ -228,10 +240,11 @@ where
     F: FnOnce() -> P + Send,
     K: Sink<P::Output> + 'static,
 {
-    fn build(self: Box<Self>) -> Box<dyn Slot> {
+    fn build(self: Box<Self>, abort_on_panic: bool) -> Box<dyn Slot> {
         Box::new(Built {
             inbox: self.inbox,
             stage: RefCell::new(((self.make)(), self.sink)),
+            abort_on_panic,
         })
     }
 }
@@ -242,6 +255,7 @@ struct Built<P: Processor, K> {
     // A cell, as the thread's `Select` borrows every inbox for as long as
     // the thread runs.
     stage: RefCell<(P, K)>,
+    abort_on_panic: bool,
 }
 
 enum Step {
@@ -267,11 +281,15 @@ impl<P: Processor, K: Sink<P::Output>> Slot for Built<P, K> {
                 // A panicking item must not take the thread, and with it every
                 // later item, down. Its reply sender is dropped, which its
                 // sender sees.
-                let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let ran = std::panic::catch_unwind(AssertUnwindSafe(|| {
                     if let Some(output) = processor.process(item) {
                         sink.send(output);
                     }
                 }));
+                if ran.is_err() && self.abort_on_panic {
+                    // The panic hook has already reported it.
+                    std::process::abort();
+                }
                 Step::Ran
             }
             // Readiness can be spurious, or another worker took the item.
@@ -543,6 +561,39 @@ mod tests {
         name.try_push(to_name).unwrap();
         assert_eq!(from_echo.recv().unwrap().0, 14);
         assert_eq!(from_name.recv().unwrap(), "sturdy");
+    }
+
+    /// Run as its own process by `a_panic_aborts_a_worker_told_to`.
+    #[test]
+    fn aborting_child() {
+        if std::env::var_os("WORKQUEUE_ABORTING_CHILD").is_none() {
+            return;
+        }
+        let (echo, inbox) = queue(16);
+        let _worker = Worker::new("fragile")
+            .abort_on_panic()
+            .run(inbox, || Echo { seen: 0 }, discard)
+            .spawn();
+        let (to_echo, from_echo) = mpsc::channel();
+        echo.try_push((13, to_echo)).unwrap();
+        // Never answered. The panic drops the reply sender before the abort,
+        // so wake on that, then give the abort time to land.
+        let _ = from_echo.recv();
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn a_panic_aborts_a_worker_told_to() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::aborting_child", "--nocapture"])
+            .env("WORKQUEUE_ABORTING_CHILD", "1")
+            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success());
+        assert_eq!(status.code(), None, "killed by SIGABRT, not exited");
     }
 
     #[test]

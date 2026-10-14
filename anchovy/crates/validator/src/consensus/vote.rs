@@ -25,7 +25,8 @@ use validation::verify::SignerIndices;
 use workqueue::{Processor, Refusal, Refuse};
 
 use crate::checks::{self, SignatureChecks, VerifiedTransaction};
-use crate::consensus::cache::{BlockEntries, ConsensusTxCache};
+use crate::consensus::cache::{BlockEntries, CachedTransaction, ConsensusTxCache};
+use crate::consensus::decode::claimed_immutable;
 use crate::epoch::EpochState;
 
 /// The reference's `dkg_v1::DKG_MESSAGES_MAX_SIZE`.
@@ -77,6 +78,10 @@ impl From<validation::Error> for RejectReason {
 
 /// Votes on blocks against the store, filling the cache of decoded
 /// transactions.
+///
+/// Inward: consensus (black box): `VoteRequest`.
+/// Outward: consensus: the verdict, through the request's reply.
+/// Reads: the object store. Writes: the decoded-transaction cache.
 pub struct BlockVoter {
     store: Arc<store::Store>,
     cache: Arc<ConsensusTxCache>,
@@ -158,7 +163,7 @@ impl BlockVoter {
                     {
                         rejects.push(*index as TransactionIndex);
                     }
-                    entries[*index] = Some(transaction);
+                    entries[*index] = Some(CachedTransaction::new(transaction, &claims.immutable));
                 }
                 Err(_) => rejects.push(*index as TransactionIndex),
             }
@@ -179,11 +184,11 @@ impl BlockVoter {
         indices: SignerIndices,
         claims: &CopiedClaims,
     ) -> Result<(), RejectReason> {
-        if epoch.config.address_aliases() {
+        if epoch.params.config.address_aliases() {
             let indices = indices.as_slice();
             // No signer has an alias: aliases are object state anchovy does
             // not read yet, so each signer's alias version is `None`.
-            let matches = if epoch.config.fix_checkpoint_signature_mapping() {
+            let matches = if epoch.params.config.fix_checkpoint_signature_mapping() {
                 let claimed = claims
                     .aliases_v2
                     .as_ref()
@@ -209,16 +214,16 @@ impl BlockVoter {
             }
         }
 
-        // `handle_vote_transaction`: an executed transaction is accepted.
+        // `handle_vote_transaction`: an executed transaction's inputs are
+        // not checked. Its immutable claim still is, as the reference's: the
+        // claim decides what the commit handler locks.
         let digest = transaction.get().0.digest().bytes;
         if execution::executed(&self.store, &digest)
             .expect("the store reads")
-            .is_some()
+            .is_none()
         {
-            return Ok(());
+            checks::inputs_pass(epoch, &self.store, transaction)?;
         }
-        checks::inputs_pass(epoch, &self.store, transaction)?;
-
         if !claims.immutable.is_empty() {
             verify_immutable_object_claims(&self.store, transaction, &claims.immutable)?;
         }
@@ -263,13 +268,7 @@ impl<'a> Claims<'a> {
                 TransactionClaim::AddressAliases(a) => Some(*a),
                 _ => None,
             }),
-            immutable: claims
-                .iter()
-                .find_map(|c| match c {
-                    TransactionClaim::ImmutableInputObjects(ids) => Some(*ids),
-                    _ => None,
-                })
-                .unwrap_or(&[]),
+            immutable: claimed_immutable(claims),
         }
     }
 }
@@ -332,7 +331,7 @@ fn validate_transactions(
     transactions: &[Message<ConsensusTransaction<'static>>],
     bump: &Bump,
 ) -> Result<(), InvalidBlock> {
-    let config = &epoch.config;
+    let config = &epoch.params.config;
     for (index, transaction) in transactions.iter().enumerate() {
         let invalid = |reason: &str| {
             Err(InvalidBlock {
@@ -394,7 +393,7 @@ fn validate_transactions(
                     && !is_allowed_proposer(
                         user.transaction().0.data().expiration(),
                         block.author,
-                        epoch.epoch,
+                        epoch.params.epoch,
                     )
                 {
                     return invalid("proposer not allowed");

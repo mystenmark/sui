@@ -3,15 +3,18 @@
 
 //! Work that waits on keys: a transaction on its input objects,
 //! checkpointing on effects. An item is enqueued with the keys it waits for
-//! (`wait_for`), other processors announce keys as they become available
-//! (`notify`), and an item whose keys are all available is handed out
-//! (`get_ready`). Every method takes a batch.
+//! (`wait_for`), other processors announce keys as they resolve, each to a
+//! value (`resolve`; `notify` where the value is `()`), and an item whose
+//! keys have all resolved is handed out with their values (`get_ready`; see
+//! `Receive`). Every method takes a batch.
 //!
-//! A key notified before anything waits on it is found by the caller's
+//! A key resolved before anything waits on it is found by the caller's
 //! `Availability` check, so the waiter keeps only pending waits. For no wait
-//! to be lost, a key must be visible to the check before it is notified:
-//! then if the notification is handled first, the check sees the key; if
-//! the wait is, the key is pending and the notification wakes it.
+//! to be lost, a key must be visible to the check before it is resolved:
+//! then if the resolution is handled first, the check finds the key; if the
+//! wait is, the key is pending and the resolution wakes it. A key the check
+//! cannot find must instead be resolved only after its wait is enqueued,
+//! for instance through the same queue.
 //!
 //! One thread owns a waiter (see `WaiterProcessor`), so it takes no locks.
 
@@ -21,19 +24,30 @@ use hashbrown::HashMap;
 use hashbrown::hash_map::Entry;
 use workqueue::Processor;
 
-/// Whether keys are available now: the caller's state, such as the store,
-/// that a notification follows.
-pub trait Availability<K> {
-    /// Clears `available`, then pushes whether each of `keys` is available.
-    fn check(&mut self, keys: &[K], available: &mut Vec<bool>);
+/// Which keys have resolved already, and to what: the caller's state, such
+/// as the store, that a resolution follows.
+pub trait Availability<K, V = ()> {
+    /// Clears `found`, then pushes each of `keys`' value, if it has one now.
+    fn check(&mut self, keys: &[K], found: &mut Vec<Option<V>>);
 }
 
-/// A check one key at a time.
+/// A check one key at a time, of keys without values.
 impl<K, F: FnMut(&K) -> bool> Availability<K> for F {
-    fn check(&mut self, keys: &[K], available: &mut Vec<bool>) {
-        available.clear();
-        available.extend(keys.iter().map(&mut *self));
+    fn check(&mut self, keys: &[K], found: &mut Vec<Option<()>>) {
+        found.clear();
+        found.extend(keys.iter().map(|k| self(k).then_some(())));
     }
+}
+
+/// What a waiting item does with its keys' values: receives each as its key
+/// resolves, by the key's position in what it waited for. Items of waiters
+/// without values receive nothing.
+pub trait Receive<V> {
+    fn receive(&mut self, index: usize, value: V);
+}
+
+impl<T> Receive<()> for T {
+    fn receive(&mut self, _: usize, (): ()) {}
 }
 
 /// Items and the keys each waits for, laid out flat: three vectors however
@@ -85,56 +99,65 @@ impl<K, T> WaitBatch<K, T> {
         self.ends.clear();
         self.keys.clear();
     }
+
+    /// Each item with the keys it waits for.
+    pub fn into_parts(self) -> Vec<(T, Vec<K>)> {
+        let mut keys = self.keys.into_iter();
+        let mut start = 0;
+        self.items
+            .into_iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let end = self.ends[i] as usize;
+                let item_keys = keys.by_ref().take(end - start).collect();
+                start = end;
+                (item, item_keys)
+            })
+            .collect()
+    }
 }
 
-/// The items waiting on a key, by slot. Most keys have one or two.
+/// Where a key is waited on: the item's slot, and the key's position among
+/// the item's keys.
+#[derive(Clone, Copy)]
+struct Place {
+    slot: u32,
+    index: u32,
+}
+
+/// The places waiting on a key. Most keys have one or two.
 enum Waiters {
-    One(u32),
-    Two(u32, u32),
+    One(Place),
+    Two(Place, Place),
     /// Three or more, in a vector from the waiter's pool.
-    Many(Vec<u32>),
+    Many(Vec<Place>),
 }
 
 impl Waiters {
-    /// Adds `slot`, unless it was the last added: an item's keys are
-    /// registered together, so a key it repeats has it last. Spilling to
-    /// `Many` takes a vector from `spare`.
-    fn push(&mut self, slot: u32, spare: &mut Vec<Vec<u32>>) -> bool {
+    /// Adds `place`; spilling to `Many` takes a vector from `spare`.
+    fn push(&mut self, place: Place, spare: &mut Vec<Vec<Place>>) {
         match self {
-            Waiters::One(a) => {
-                if *a == slot {
-                    return false;
-                }
-                *self = Waiters::Two(*a, slot);
-            }
+            Waiters::One(a) => *self = Waiters::Two(*a, place),
             Waiters::Two(a, b) => {
-                if *b == slot {
-                    return false;
-                }
-                let mut slots = spare.pop().unwrap_or_default();
-                slots.extend([*a, *b, slot]);
-                *self = Waiters::Many(slots);
+                let mut places = spare.pop().unwrap_or_default();
+                places.extend([*a, *b, place]);
+                *self = Waiters::Many(places);
             }
-            Waiters::Many(slots) => {
-                if slots.last() == Some(&slot) {
-                    return false;
-                }
-                slots.push(slot);
-            }
+            Waiters::Many(places) => places.push(place),
         }
-        true
     }
 }
 
 struct Slot<T> {
     item: Option<T>,
-    /// The item's keys not yet available.
+    /// The item's keys not yet resolved, counting a repeated key each time.
     pending: u32,
 }
 
-/// Items waiting on keys of type `K`. See the crate documentation.
-pub struct Waiter<K, T, A> {
-    /// Each pending key's waiting items.
+/// Items waiting on keys of type `K`, each resolving to a `V`. See the
+/// crate documentation.
+pub struct Waiter<K, T, A, V = ()> {
+    /// Each pending key's waiting places.
     pending: HashMap<K, Waiters, foldhash::fast::RandomState>,
     /// Waiting items, by slot; free slots are reused first.
     slots: Vec<Slot<T>>,
@@ -144,13 +167,19 @@ pub struct Waiter<K, T, A> {
     availability: A,
     /// Scratch for `wait_for`'s availability check.
     checking: Vec<K>,
-    checked: Vec<bool>,
+    checked: Vec<Option<V>>,
     /// Vectors for keys with three or more waiters, kept once released.
-    spare: Vec<Vec<u32>>,
+    spare: Vec<Vec<Place>>,
 }
 
-impl<K: Hash + Eq + Clone, T, A: Availability<K>> Waiter<K, T, A> {
-    pub fn new(availability: A) -> Waiter<K, T, A> {
+impl<K, T, A, V> Waiter<K, T, A, V>
+where
+    K: Hash + Eq + Clone,
+    T: Receive<V>,
+    A: Availability<K, V>,
+    V: Clone,
+{
+    pub fn new(availability: A) -> Waiter<K, T, A, V> {
         Waiter {
             pending: HashMap::default(),
             slots: Vec::new(),
@@ -174,30 +203,29 @@ impl<K: Hash + Eq + Clone, T, A: Availability<K>> Waiter<K, T, A> {
         let mut start = 0;
         for (i, item) in batch.items.drain(..).enumerate() {
             let end = batch.ends[i] as usize;
+            let count = end - start;
             let slot = self.alloc_slot();
-            let mut pending = 0;
-            for key in keys.by_ref().take(end - start) {
+            for (index, key) in keys.by_ref().take(count).enumerate() {
+                let place = Place {
+                    slot,
+                    index: index as u32,
+                };
                 match self.pending.entry(key) {
-                    Entry::Occupied(mut waiters) => {
-                        if waiters.get_mut().push(slot, &mut self.spare) {
-                            pending += 1;
-                        }
-                    }
+                    Entry::Occupied(mut waiters) => waiters.get_mut().push(place, &mut self.spare),
                     Entry::Vacant(vacant) => {
                         self.checking.push(vacant.key().clone());
-                        vacant.insert(Waiters::One(slot));
-                        pending += 1;
+                        vacant.insert(Waiters::One(place));
                     }
                 }
             }
             start = end;
-            if pending == 0 {
+            if count == 0 {
                 self.free.push(slot);
                 self.ready.push(item);
             } else {
                 self.slots[slot as usize] = Slot {
                     item: Some(item),
-                    pending,
+                    pending: count as u32,
                 };
             }
         }
@@ -205,47 +233,49 @@ impl<K: Hash + Eq + Clone, T, A: Availability<K>> Waiter<K, T, A> {
         batch.ends.clear();
 
         // 2. The keys that were not pending, checked in one call: those
-        //    available count off as if notified.
+        //    found resolve as if resolved now.
         if !self.checking.is_empty() {
             let mut checking = std::mem::take(&mut self.checking);
-            self.availability.check(&checking, &mut self.checked);
-            assert_eq!(self.checked.len(), checking.len(), "a verdict per key");
-            for (i, key) in checking.iter().enumerate() {
-                if self.checked[i] {
-                    self.release(key);
+            let mut checked = std::mem::take(&mut self.checked);
+            self.availability.check(&checking, &mut checked);
+            assert_eq!(checked.len(), checking.len(), "a verdict per key");
+            for (i, value) in checked.drain(..).enumerate() {
+                if let Some(value) = value {
+                    self.release(&checking[i], value);
                 }
             }
             checking.clear();
             self.checking = checking;
+            self.checked = checked;
         }
     }
 
-    /// Each of `keys` is available from now on: the items waiting on it
-    /// count it off, and those with none left become ready. A key nothing
-    /// waits on is forgotten.
-    pub fn notify(&mut self, keys: &[K]) {
-        for key in keys {
-            self.release(key);
+    /// Each key has resolved, to its value, from now on: the items waiting
+    /// on it take the value, and those with no key left become ready. A key
+    /// nothing waits on is forgotten.
+    pub fn resolve(&mut self, resolved: impl IntoIterator<Item = (K, V)>) {
+        for (key, value) in resolved {
+            self.release(&key, value);
         }
     }
 
-    /// `key` is available: its waiters count it off.
-    fn release(&mut self, key: &K) {
+    /// `key` resolved to `value`: its waiters take it.
+    fn release(&mut self, key: &K, value: V) {
         let Some(waiters) = self.pending.remove(key) else {
             return;
         };
         match waiters {
-            Waiters::One(a) => self.count_off(a),
+            Waiters::One(a) => self.count_off(a, value),
             Waiters::Two(a, b) => {
-                self.count_off(a);
-                self.count_off(b);
+                self.count_off(a, value.clone());
+                self.count_off(b, value);
             }
-            Waiters::Many(mut slots) => {
-                for slot in &slots {
-                    self.count_off(*slot);
+            Waiters::Many(mut places) => {
+                for place in &places {
+                    self.count_off(*place, value.clone());
                 }
-                slots.clear();
-                self.spare.push(slots);
+                places.clear();
+                self.spare.push(places);
             }
         }
     }
@@ -262,13 +292,18 @@ impl<K: Hash + Eq + Clone, T, A: Availability<K>> Waiter<K, T, A> {
         u32::try_from(self.slots.len() - 1).expect("fewer than 2^32 waiting items")
     }
 
-    fn count_off(&mut self, slot: u32) {
-        let entry = &mut self.slots[slot as usize];
+    fn count_off(&mut self, place: Place, value: V) {
+        let entry = &mut self.slots[place.slot as usize];
+        entry
+            .item
+            .as_mut()
+            .expect("a waiting slot holds its item")
+            .receive(place.index as usize, value);
         entry.pending -= 1;
         if entry.pending == 0 {
             self.ready
                 .push(entry.item.take().expect("a waiting slot holds its item"));
-            self.free.push(slot);
+            self.free.push(place.slot);
         }
     }
 
@@ -288,39 +323,68 @@ impl<K: Hash + Eq + Clone, T, A: Availability<K>> Waiter<K, T, A> {
     }
 }
 
+impl<K, T, A> Waiter<K, T, A>
+where
+    K: Hash + Eq + Clone,
+    A: Availability<K>,
+{
+    /// Each of `keys` is available from now on: `resolve`, for keys
+    /// without values.
+    pub fn notify(&mut self, keys: &[K]) {
+        for key in keys {
+            self.release(key, ());
+        }
+    }
+}
+
 /// What a `WaiterProcessor` takes.
-pub enum Command<K, T> {
+pub enum Command<K, T, V = ()> {
     Wait(WaitBatch<K, T>),
-    Notify(Vec<K>),
+    /// Keys resolved, each to its value.
+    Resolve(Vec<(K, V)>),
+}
+
+impl<K, T> Command<K, T> {
+    /// Keys available, for waiters without values.
+    pub fn notify(keys: impl IntoIterator<Item = K>) -> Command<K, T> {
+        Command::Resolve(keys.into_iter().map(|k| (k, ())).collect())
+    }
 }
 
 /// A waiter on a worker thread: after each command, the items it made
 /// ready go to the sink as one batch.
-pub struct WaiterProcessor<K, T, A> {
-    waiter: Waiter<K, T, A>,
+pub struct WaiterProcessor<K, T, A, V = ()> {
+    waiter: Waiter<K, T, A, V>,
 }
 
-impl<K: Hash + Eq + Clone, T, A: Availability<K>> WaiterProcessor<K, T, A> {
-    pub fn new(availability: A) -> WaiterProcessor<K, T, A> {
+impl<K, T, A, V> WaiterProcessor<K, T, A, V>
+where
+    K: Hash + Eq + Clone,
+    T: Receive<V>,
+    A: Availability<K, V>,
+    V: Clone,
+{
+    pub fn new(availability: A) -> WaiterProcessor<K, T, A, V> {
         WaiterProcessor {
             waiter: Waiter::new(availability),
         }
     }
 }
 
-impl<K, T, A> Processor for WaiterProcessor<K, T, A>
+impl<K, T, A, V> Processor for WaiterProcessor<K, T, A, V>
 where
     K: Hash + Eq + Clone + Send + 'static,
-    T: Send + 'static,
-    A: Availability<K>,
+    T: Receive<V> + Send + 'static,
+    A: Availability<K, V>,
+    V: Clone + Send + 'static,
 {
-    type Input = Command<K, T>;
+    type Input = Command<K, T, V>;
     type Output = Vec<T>;
 
-    fn process(&mut self, command: Command<K, T>) -> Option<Vec<T>> {
+    fn process(&mut self, command: Command<K, T, V>) -> Option<Vec<T>> {
         match command {
             Command::Wait(mut batch) => self.waiter.wait_for(&mut batch),
-            Command::Notify(keys) => self.waiter.notify(&keys),
+            Command::Resolve(resolved) => self.waiter.resolve(resolved),
         }
         let mut ready = Vec::new();
         self.waiter.get_ready(&mut ready);

@@ -97,6 +97,29 @@ pub struct Outcome {
     pub commit: store::Commit,
 }
 
+/// Whether a transaction's funds reservations were all fulfilled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Funds {
+    /// Fulfilled, or it reserves none.
+    MaybeSufficient,
+    /// Some reservation was cancelled: it fails without running, with
+    /// `InsufficientFundsForWithdraw`.
+    Insufficient,
+}
+
+/// An input as the caller provides it, instead of execution reading it
+/// from the store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Input<'a> {
+    /// The object itself, as BCS.
+    Object(&'a [u8]),
+    /// A consensus object at exactly this version, read from the store.
+    At(u64),
+    /// The object's stream ended at `version`, in `transaction`: the input
+    /// reads as the reference's stream-ended marker.
+    Ended { version: u64, transaction: [u8; 32] },
+}
+
 /// An executed transaction as the reference answers for it
 /// (`ExecutedData`), each part BCS.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -153,40 +176,79 @@ impl Execution {
     /// If an owned input is no longer live at the version and digest the
     /// transaction gives: equivocation, which consensus rules out.
     pub fn execute(&self, store: &store::Store, transaction: &[u8]) -> Result<Outcome> {
+        self.execute_at(store, transaction, &[], Funds::MaybeSufficient, None)
+    }
+
+    /// `execute`, but each input named in `provided` is as given there
+    /// rather than read from the store at its live version, `funds` says
+    /// whether its withdrawals were reserved, and `assigned_accumulator` is
+    /// the accumulator root's version the transaction is assigned (the
+    /// reference's `SystemObjectVersions`), if not the live one. A system
+    /// transaction runs unmetered, as the reference runs it.
+    pub fn execute_at(
+        &self,
+        store: &store::Store,
+        transaction: &[u8],
+        provided: &[(messages::base::ObjectId, Input<'_>)],
+        funds: Funds,
+        assigned_accumulator: Option<u64>,
+    ) -> Result<Outcome> {
         let signed: SenderSignedData = bcs::from_bytes(transaction)?;
         let data = signed.transaction_data();
         let digest = data.digest();
         let view = StoreView::new(store);
 
-        let mut inputs = Vec::new();
-        for kind in data.input_objects()? {
-            let object = load(&view, &kind)?;
-            inputs.push(ObjectReadResult::new(
-                kind,
-                ObjectReadResultKind::Object(object),
-            ));
-        }
-        let gas_status = SuiGasStatus::new(
-            data.gas_budget(),
-            data.gas_price(),
-            self.reference_gas_price,
-            &self.config,
-        )?;
+        let inputs = load_at(&view, data.input_objects()?, provided)?;
+        let gas_status = if data.kind().is_system_tx() {
+            SuiGasStatus::new_unmetered(&self.config)
+        } else {
+            SuiGasStatus::new(
+                data.gas_budget(),
+                data.gas_price(),
+                self.reference_gas_price,
+                &self.config,
+            )?
+        };
         let accumulator_version = if self.config.enable_accumulators() {
-            accumulator_version(&view)?
+            accumulator_version(&view)?.map(|live| ConsensusObjectVersion {
+                version: assigned_accumulator.map_or(
+                    live.version,
+                    sui_types::base_types::SequenceNumber::from_u64,
+                ),
+                ..live
+            })
         } else {
             None
         };
 
+        let inputs =
+            CheckedInputObjects::new_with_checked_transaction_inputs(InputObjects::new(inputs));
+        // An input whose stream ended, or a withdrawal not reserved, fails
+        // the transaction before it runs.
+        let funds = match funds {
+            Funds::MaybeSufficient => {
+                sui_types::execution_params::FundsWithdrawStatus::MaybeSufficient
+            }
+            Funds::Insufficient => sui_types::execution_params::FundsWithdrawStatus::Insufficient,
+        };
+        let early = match sui_types::execution_params::get_early_execution_error(
+            &digest,
+            &inputs,
+            &std::collections::HashSet::new(),
+            &funds,
+        ) {
+            None => ExecutionOrEarlyError::ok(None),
+            Some(errors) => ExecutionOrEarlyError::failed(errors, None),
+        };
         let (store_out, _, effects, _, _) = self.executor.execute_transaction_to_effects(
             &view,
             &self.config,
             self.metrics.clone(),
             false,
-            ExecutionOrEarlyError::ok(None),
+            early,
             &self.epoch,
             self.epoch_start_timestamp_ms,
-            CheckedInputObjects::new_with_checked_transaction_inputs(InputObjects::new(inputs)),
+            inputs,
             SystemObjectVersions::new(accumulator_version),
             &EmptyUnsettledObjectFunds,
             data.gas_data().clone(),
@@ -272,6 +334,37 @@ pub fn executed(store: &store::Store, transaction: &[u8; 32]) -> Result<Option<E
         input_objects: objects(input_objects)?,
         output_objects: objects(output_objects)?,
     }))
+}
+
+/// Each input as execution reads it (`load`), but one named in `provided`
+/// as given there.
+fn load_at(
+    view: &StoreView<'_>,
+    kinds: Vec<InputObjectKind>,
+    provided: &[(messages::base::ObjectId, Input<'_>)],
+) -> Result<Vec<ObjectReadResult>> {
+    let mut inputs = Vec::new();
+    for kind in kinds {
+        let id = kind.object_id().into_bytes();
+        let given = provided.iter().find(|(p, _)| p.0 == id).map(|(_, v)| *v);
+        let result = match given {
+            None => ObjectReadResultKind::Object(load(view, &kind)?),
+            Some(Input::Object(bytes)) => ObjectReadResultKind::Object(bcs::from_bytes(bytes)?),
+            Some(Input::At(version)) => ObjectReadResultKind::Object(
+                view.object_at(&kind.object_id(), version)?
+                    .ok_or(Error::Missing(kind.object_id()))?,
+            ),
+            Some(Input::Ended {
+                version,
+                transaction,
+            }) => ObjectReadResultKind::ObjectConsensusStreamEnded(
+                sui_types::base_types::SequenceNumber::from_u64(version),
+                TransactionDigest::new(transaction),
+            ),
+        };
+        inputs.push(ObjectReadResult::new(kind, result));
+    }
+    Ok(inputs)
 }
 
 /// An input as execution reads it: packages and shared objects at their
