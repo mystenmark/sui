@@ -209,6 +209,38 @@ the same, and there is no separate executed watermark to fall out of step
 with it (R7.5 item 5): with no checkpoint executor of its own, the
 validator's committed checkpoint is its executed one.
 
+**`CheckpointCommitter` is the start of a `CheckpointExecutor`.** The
+reference's checkpoint executor also checks local effects against the
+checkpoint, runs end-of-epoch work, and is fed by state sync. The committer
+takes what that executor takes: certified checkpoints in sequence order,
+with transactions from the checkpoint's contents. Feeding it from state
+sync instead of the aggregator is the likely end state.
+
+**Checkpoint signatures.** Certification stays its own processor
+(`CheckpointAggregator`) behind the summary waiter, as no signature order
+is needed. Signatures come from two places, as in the reference
+(`consensus_validator.rs`, commit 2dfd307272):
+- the block voter, from blocks as it votes on them, for latency;
+- the commit decoder, from committed transactions.
+
+Each usually arrives twice. The aggregator ignores a signer it has
+already counted before parsing the signature, so the second copy is
+nearly free. Pending signatures are not persisted, nor are they in the
+reference (its table was removed in adeb47dc85). They come back on restart
+because every signature that matters, one for a checkpoint not yet
+certified, is in a commit the restart replays:
+- now, since replay starts at the epoch's start;
+- later, with persisted handler state, only if the persisted consensus
+  position never passes a commit holding such a signature. The reference
+  gets this from its quarantine flushing commits only up to the highest
+  executed checkpoint. Tying the persisted position to the committed
+  checkpoint (B-40's rule) gives it too: such a signature is committed
+  after the checkpoint it signs was built, so after every commit that
+  checkpoint holds.
+
+Signatures seen only in blocks may be lost on restart: each is a copy of a
+committed one, or its signer resubmits it.
+
 ## Read paths
 
 The lookup order is uncommitted, then committed, then the database, as
