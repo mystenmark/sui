@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use aggregator::{CheckpointAggregator, Committee, SummaryAvailability};
 use checkpoint::{
-    BuiltAvailability, ChunkAvailability, ContentsBuilder, ProtocolKey, SummaryBuilder,
+    BuiltAvailability, CheckpointCommitter, ChunkAvailability, ContentsBuilder, ProtocolKey,
+    SummaryBuilder,
 };
 use consensus::TransactionClient;
 use exec_pool::{EffectsAvailability, EffectsRouter, Executor};
@@ -82,8 +83,8 @@ fn into<T: Send + 'static>(queue: Queue<T>, name: &'static str) -> impl FnMut(T)
     }
 }
 
-/// The highest checkpoint this node executed, which the pipeline continues
-/// after: `genesis`, written first, on a fresh database.
+/// The highest checkpoint this node committed, which the pipeline continues
+/// after: `genesis`, committed first, on a fresh database.
 ///
 /// # Panics
 /// If the store cannot be read or written.
@@ -92,9 +93,7 @@ fn last_checkpoint(store: &store::Store, genesis: BuiltCheckpoint) -> BuiltCheck
         return BuiltCheckpoint::decode(&bytes);
     }
     assert_eq!(genesis.seq, 0, "the genesis checkpoint is checkpoint 0");
-    store
-        .put_checkpoint(0, genesis.encode())
-        .expect("the store writes");
+    store.commit_genesis_checkpoint(genesis.encode());
     genesis
 }
 
@@ -151,6 +150,7 @@ impl Pipeline {
         let chunks = Arc::new(ChunkTable::new());
         let checkpoints = Arc::new(CheckpointStore::new());
         let last = last_checkpoint(store, genesis);
+        let next_to_certify = last.seq + 1;
         let start = epoch_start(store, &last);
         checkpoints.insert_built(last);
         let state_hashes = Arc::new(StateHashes::new());
@@ -173,6 +173,7 @@ impl Pipeline {
         let (to_contents, contents_inbox) = workqueue::queue(QUEUE);
         let (to_hasher, hasher_inbox) = workqueue::queue(QUEUE);
         let (to_summary, summary_inbox) = workqueue::queue(QUEUE);
+        let (to_committer, committer_inbox) = workqueue::queue(QUEUE);
         let (to_aggregator, aggregator_inbox) = workqueue::queue(QUEUE);
 
         // Waiters' commands.
@@ -399,8 +400,7 @@ impl Pipeline {
                     )
                     .spawn(),
             );
-            let (store_s, checkpoints_s, key) =
-                (store.clone(), checkpoints.clone(), protocol_key.clone());
+            let (checkpoints_s, key) = (checkpoints.clone(), protocol_key.clone());
             let (sequence, summaries, consensus) = (
                 sequence_waits.clone(),
                 summary_waits.clone(),
@@ -412,14 +412,7 @@ impl Pipeline {
                     .run(
                         summary_inbox,
                         move || {
-                            SummaryBuilder::new(
-                                store_s,
-                                checkpoints_s,
-                                key,
-                                sequence,
-                                summaries,
-                                consensus,
-                            )
+                            SummaryBuilder::new(checkpoints_s, key, sequence, summaries, consensus)
                         },
                         |()| {},
                     )
@@ -445,7 +438,26 @@ impl Pipeline {
                     .abort_on_panic()
                     .run(
                         aggregator_inbox,
-                        move || CheckpointAggregator::new(committee, checkpoints_a, state_sync),
+                        move || {
+                            CheckpointAggregator::new(
+                                committee,
+                                checkpoints_a,
+                                next_to_certify,
+                                state_sync,
+                            )
+                        },
+                        into(to_committer, "committer"),
+                    )
+                    .spawn(),
+            );
+            let (store_c, checkpoints_c, chunks_c) =
+                (store.clone(), checkpoints.clone(), chunks.clone());
+            workers.push(
+                Worker::new("committer")
+                    .abort_on_panic()
+                    .run(
+                        committer_inbox,
+                        move || CheckpointCommitter::new(store_c, checkpoints_c, chunks_c),
                         |()| {},
                     )
                     .spawn(),

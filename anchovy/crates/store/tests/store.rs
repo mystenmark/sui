@@ -253,28 +253,36 @@ fn the_version_at_or_before_a_bound() {
 }
 
 #[test]
-fn the_highest_checkpoint_is_the_executed_watermark_and_survives_reopening() {
+fn committed_checkpoints_and_the_watermark_survive_reopening() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let store = store::Store::open(dir.path()).unwrap();
+        let store = Store::open(dir.path()).unwrap();
         assert_eq!(store.last_checkpoint().unwrap(), None);
-        store.put_checkpoint(0, b"genesis".to_vec()).unwrap();
-        // Out of order, and past 255, where little-endian keys would sort
-        // wrongly.
-        store
-            .put_checkpoint(300, b"three hundred".to_vec())
-            .unwrap();
-        store.put_checkpoint(2, b"two".to_vec()).unwrap();
-        assert_eq!(
-            store.last_checkpoint().unwrap(),
-            Some((300, b"three hundred".to_vec()))
-        );
+        assert_eq!(store.committed_checkpoint().unwrap(), None);
+        store.commit_genesis_checkpoint(b"genesis".to_vec());
+        // Past 255, where little-endian keys would sort wrongly.
+        for seq in 1..=300u64 {
+            store.commit_checkpoint(seq, &[], seq.to_le_bytes().to_vec(), vec![seq as u8]);
+        }
     }
-    let store = store::Store::open(dir.path()).unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    assert_eq!(store.committed_checkpoint().unwrap(), Some(300));
     assert_eq!(
         store.last_checkpoint().unwrap(),
-        Some((300, b"three hundred".to_vec()))
+        Some((300, 300u64.to_le_bytes().to_vec()))
     );
-    assert_eq!(store.checkpoint(2).unwrap(), Some(b"two".to_vec()));
-    assert_eq!(store.checkpoint(1).unwrap(), None);
+    assert_eq!(store.checkpoint(0).unwrap(), Some(b"genesis".to_vec()));
+    assert_eq!(store.certified(0).unwrap(), None);
+    assert_eq!(store.certified(2).unwrap(), Some(vec![2]));
+    assert_eq!(store.checkpoint(301).unwrap(), None);
+    store.commit_checkpoint(301, &[], vec![], vec![]);
+}
+
+#[test]
+#[should_panic(expected = "committed after")]
+fn checkpoints_commit_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    store.commit_genesis_checkpoint(vec![]);
+    store.commit_checkpoint(2, &[], vec![], vec![]);
 }

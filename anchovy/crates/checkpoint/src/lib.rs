@@ -5,6 +5,7 @@
 //! once the previous checkpoint is built (`docs/consensus_pipeline.md`,
 //! Checkpointing).
 
+mod commit;
 pub mod contents;
 mod key;
 pub mod summary;
@@ -25,6 +26,7 @@ use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable};
 use waiter::{Availability, Command, WaitBatch};
 use workqueue::{Processor, Queue};
 
+pub use commit::CheckpointCommitter;
 pub use key::ProtocolKey;
 
 /// Arena for one checkpoint's parsed effects and contents; a larger
@@ -146,8 +148,10 @@ impl Processor for ContentsBuilder {
 }
 
 /// Builds what of a checkpoint needs the previous one: the previous digest,
-/// the network total, the epoch's rolling gas cost, then the summary; writes
-/// it, notifies, signs and submits the signature.
+/// the network total, the epoch's rolling gas cost, then the summary; records
+/// it, notifies, signs and submits the signature. The checkpoint reaches the
+/// database only once certified, with its transactions
+/// (`CheckpointCommitter`).
 ///
 /// Not covered yet: a last checkpoint of the epoch gets no end-of-epoch data
 /// (see `summary::build`).
@@ -160,11 +164,8 @@ impl Processor for ContentsBuilder {
 /// - summary waiter, notify: `LocalSummary(seq)`;
 /// - consensus (black box): its checkpoint signature, at high priority.
 ///
-/// Reads and writes: the checkpoint store. Writes: each checkpoint built
-/// to the object store, whose highest is the executed watermark a restart
-/// resumes from.
+/// Reads and writes: the checkpoint store.
 pub struct SummaryBuilder {
-    store: Arc<store::Store>,
     checkpoints: Arc<CheckpointStore>,
     key: Arc<ProtocolKey>,
     sequence: Queue<Command<CheckpointBuilt, CheckpointContentsBuilt>>,
@@ -175,7 +176,6 @@ pub struct SummaryBuilder {
 
 impl SummaryBuilder {
     pub fn new(
-        store: Arc<store::Store>,
         checkpoints: Arc<CheckpointStore>,
         key: Arc<ProtocolKey>,
         sequence: Queue<Command<CheckpointBuilt, CheckpointContentsBuilt>>,
@@ -183,7 +183,6 @@ impl SummaryBuilder {
         consensus: TransactionClient,
     ) -> SummaryBuilder {
         SummaryBuilder {
-            store,
             checkpoints,
             key,
             sequence,
@@ -228,13 +227,10 @@ impl Processor for SummaryBuilder {
                     .expect("a checkpoint has chunks"),
                 timestamp_ms: built.pending.timestamp_ms,
             };
-            self.store
-                .put_checkpoint(seq, checkpoint.encode())
-                .expect("the store writes");
             self.checkpoints.insert_built(checkpoint);
             built_seqs.push(seq);
         }
-        // Every summary is in the store: notify.
+        // Every summary is in the checkpoint store: notify.
         push(
             &self.summaries,
             Command::notify(built_seqs.iter().copied().map(LocalSummary)),
@@ -279,6 +275,9 @@ pub struct BuiltAvailability {
 impl Availability<CheckpointBuilt> for BuiltAvailability {
     fn check(&mut self, keys: &[CheckpointBuilt], found: &mut Vec<Option<()>>) {
         found.clear();
-        found.extend(keys.iter().map(|k| self.checkpoints.built(k.0).map(|_| ())));
+        found.extend(
+            keys.iter()
+                .map(|k| self.checkpoints.is_built(k.0).then_some(())),
+        );
     }
 }

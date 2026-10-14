@@ -28,10 +28,13 @@ struct Setup {
     keys: Vec<AuthorityKeyPair>,
     checkpoints: Arc<CheckpointStore>,
     aggregator: CheckpointAggregator,
-    certified: Inbox<CertifiedCheckpoint>,
+    /// What the aggregator handed on, and what state sync got.
+    committer: Vec<CertifiedCheckpoint>,
+    state_sync: Inbox<CertifiedCheckpoint>,
 }
 
-fn setup(size: usize) -> Setup {
+/// An aggregator whose next checkpoint to certify is `next`.
+fn setup(size: usize, next: u64) -> Setup {
     let (sui, keys) = SuiCommittee::new_simple_test_committee_of_size(size);
     let mut keys: Vec<_> = keys
         .into_iter()
@@ -48,15 +51,20 @@ fn setup(size: usize) -> Setup {
     .unwrap();
     assert_eq!(committee.quorum_threshold(), sui.quorum_threshold());
     let checkpoints = Arc::new(CheckpointStore::new());
-    let (state_sync, certified) = workqueue::queue(16);
-    let aggregator =
-        CheckpointAggregator::new(Arc::new(committee), checkpoints.clone(), state_sync);
+    let (to_state_sync, state_sync) = workqueue::queue(16);
+    let aggregator = CheckpointAggregator::new(
+        Arc::new(committee),
+        checkpoints.clone(),
+        next,
+        to_state_sync,
+    );
     Setup {
         sui,
         keys,
         checkpoints,
         aggregator,
-        certified,
+        committer: Vec::new(),
+        state_sync,
     }
 }
 
@@ -114,11 +122,27 @@ impl Setup {
     }
 
     fn feed(&mut self, signatures: Vec<CheckpointSignature>) {
-        assert_eq!(self.aggregator.process(signatures), None);
+        let certified = self.aggregator.process(signatures);
+        assert!(certified.as_ref().is_none_or(|c| !c.is_empty()));
+        self.committer.extend(certified.unwrap_or_default());
     }
 
-    fn take_certified(&self) -> Vec<CertifiedCheckpoint> {
-        std::iter::from_fn(|| self.certified.try_pop()).collect()
+    /// The checkpoints certified since last taken, as the committer and
+    /// state sync both got them.
+    fn take_certified(&mut self) -> Vec<CertifiedCheckpoint> {
+        let synced: Vec<_> = std::iter::from_fn(|| self.state_sync.try_pop()).collect();
+        let certified = std::mem::take(&mut self.committer);
+        assert_eq!(
+            synced
+                .iter()
+                .map(|c| (c.seq, &c.summary))
+                .collect::<Vec<_>>(),
+            certified
+                .iter()
+                .map(|c| (c.seq, &c.summary))
+                .collect::<Vec<_>>()
+        );
+        certified
     }
 
     /// sui's certificate over `summary` from `signers`.
@@ -148,12 +172,11 @@ fn message(summary: SignedCheckpointSummary) -> CheckpointSignature {
 
 #[test]
 fn a_quorum_certifies_with_sui_s_bytes() {
-    let mut s = setup(4);
+    let mut s = setup(4, 7);
     let local = summary(7, 1000);
     build(&s.checkpoints, &local);
     s.feed(vec![s.signature(&local, 2), s.signature(&local, 0)]);
     assert!(s.take_certified().is_empty());
-    assert!(s.checkpoints.certified(7).is_none());
 
     s.feed(vec![s.signature(&local, 3), s.signature(&local, 1)]);
     let certified = s.take_certified();
@@ -163,7 +186,6 @@ fn a_quorum_certifies_with_sui_s_bytes() {
         &*certified[0].summary,
         &s.sui_certificate(&local, &[0, 2, 3])[..]
     );
-    assert_eq!(s.checkpoints.certified(7).unwrap(), certified[0].summary);
 
     let decoded: CertifiedCheckpointSummary = bcs::from_bytes(&certified[0].summary).unwrap();
     decoded.verify_authority_signatures(&s.sui).unwrap();
@@ -176,7 +198,7 @@ fn a_quorum_certifies_with_sui_s_bytes() {
 
 #[test]
 fn a_committee_of_a_hundred_certifies_at_two_thirds() {
-    let mut s = setup(100);
+    let mut s = setup(100, 1);
     let local = summary(1, 5);
     build(&s.checkpoints, &local);
     let threshold = s.sui.quorum_threshold();
@@ -200,8 +222,8 @@ fn a_committee_of_a_hundred_certifies_at_two_thirds() {
 }
 
 #[test]
-fn checkpoints_certify_independently() {
-    let mut s = setup(4);
+fn checkpoints_certify_in_order() {
+    let mut s = setup(4, 1);
     let (one, two) = (summary(1, 10), summary(2, 20));
     build(&s.checkpoints, &one);
     build(&s.checkpoints, &two);
@@ -212,15 +234,23 @@ fn checkpoints_certify_independently() {
         s.signature(&one, 1),
         s.signature(&two, 2),
     ]);
-    let certified = s.take_certified();
-    assert_eq!(certified.iter().map(|c| c.seq).collect::<Vec<_>>(), [2]);
+    // Two has a quorum, but waits for one.
+    assert!(s.take_certified().is_empty());
     s.feed(vec![s.signature(&one, 3)]);
-    assert_eq!(s.take_certified()[0].seq, 1);
+    let certified = s.take_certified();
+    assert_eq!(certified.iter().map(|c| c.seq).collect::<Vec<_>>(), [1, 2]);
+    assert_eq!(
+        &*certified[1].summary,
+        &s.sui_certificate(&two, &[0, 1, 2])[..]
+    );
+    // Signatures for certified checkpoints are dropped.
+    s.feed(vec![s.signature(&one, 2), s.signature(&two, 3)]);
+    assert!(s.take_certified().is_empty());
 }
 
 #[test]
 fn a_repeated_signature_counts_once() {
-    let mut s = setup(4);
+    let mut s = setup(4, 3);
     let local = summary(3, 0);
     build(&s.checkpoints, &local);
     s.feed(vec![
@@ -236,7 +266,7 @@ fn a_repeated_signature_counts_once() {
 
 #[test]
 fn an_invalid_signature_is_evicted_at_quorum() {
-    let mut s = setup(4);
+    let mut s = setup(4, 3);
     let local = summary(3, 0);
     build(&s.checkpoints, &local);
     // Signed by 3 in 0's name: stake enough for a quorum, but the aggregate
@@ -257,7 +287,7 @@ fn an_invalid_signature_is_evicted_at_quorum() {
 
 #[test]
 fn a_forgery_does_not_block_the_genuine_signature() {
-    let mut s = setup(4);
+    let mut s = setup(4, 3);
     let local = summary(3, 0);
     build(&s.checkpoints, &local);
     s.feed(vec![
@@ -275,7 +305,7 @@ fn a_forgery_does_not_block_the_genuine_signature() {
 
 #[test]
 fn a_signature_over_bad_bytes_is_dropped() {
-    let mut s = setup(4);
+    let mut s = setup(4, 3);
     let local = summary(3, 0);
     build(&s.checkpoints, &local);
     let mut bad = s.signature(&local, 0);
@@ -301,7 +331,7 @@ fn a_signature_over_bad_bytes_is_dropped() {
 
 #[test]
 fn outsiders_and_other_epochs_are_dropped() {
-    let mut s = setup(4);
+    let mut s = setup(4, 3);
     let local = summary(3, 0);
     build(&s.checkpoints, &local);
     let (_, outsiders) = SuiCommittee::new_simple_test_committee_of_size(1);
@@ -330,7 +360,7 @@ fn outsiders_and_other_epochs_are_dropped() {
 
 #[test]
 fn signatures_over_another_summary_never_count() {
-    let mut s = setup(4);
+    let mut s = setup(4, 3);
     let local = summary(3, 0);
     let fork = summary(3, 1);
     build(&s.checkpoints, &local);
@@ -341,10 +371,9 @@ fn signatures_over_another_summary_never_count() {
         s.signature(&local, 3),
     ]);
     assert!(s.take_certified().is_empty());
-    assert!(s.checkpoints.certified(3).is_none());
 
     // One forked signer does not stop the rest certifying.
-    let mut s = setup(4);
+    let mut s = setup(4, 3);
     build(&s.checkpoints, &local);
     s.feed(vec![
         s.signature(&fork, 0),
@@ -375,7 +404,7 @@ fn a_committee_rejects_bad_and_repeated_keys() {
 
 #[test]
 fn a_signature_waits_for_its_summary_then_certifies() {
-    let mut s = setup(4);
+    let mut s = setup(4, 5);
     let local = summary(5, 0);
     let mut waiter = WaiterProcessor::new(SummaryAvailability {
         checkpoints: s.checkpoints.clone(),
@@ -398,4 +427,13 @@ fn a_signature_waits_for_its_summary_then_certifies() {
     let mut batch = WaitBatch::new();
     batch.push(s.signature(&local, 3), [LocalSummary(5)]);
     assert_eq!(waiter.process(Command::Wait(batch)).unwrap().len(), 1);
+
+    // And once pruned, so a late signature is dropped, not parked forever.
+    s.checkpoints.prune_below(6);
+    assert!(s.checkpoints.built(5).is_none());
+    let mut batch = WaitBatch::new();
+    batch.push(s.signature(&local, 3), [LocalSummary(5)]);
+    let late = waiter.process(Command::Wait(batch)).unwrap();
+    s.feed(late);
+    assert!(s.take_certified().is_empty());
 }

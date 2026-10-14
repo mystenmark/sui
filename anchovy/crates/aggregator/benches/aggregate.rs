@@ -94,7 +94,8 @@ fn main() {
         );
         let checkpoints = Arc::new(CheckpointStore::new());
         let (state_sync, certified) = workqueue::queue(rounds + 1);
-        let mut aggregator = CheckpointAggregator::new(committee, checkpoints.clone(), state_sync);
+        let mut aggregator =
+            CheckpointAggregator::new(committee, checkpoints.clone(), 0, state_sync);
 
         let batches: Vec<Vec<CheckpointSignature>> = (0..=rounds as u64)
             .map(|seq| {

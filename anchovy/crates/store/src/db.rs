@@ -50,9 +50,12 @@ pub(crate) struct Db {
     events: KeySpace,
     /// Facts about the database itself: whether genesis is in.
     meta: KeySpace,
-    /// Big-endian sequence number: each checkpoint this node has executed,
-    /// as its pipeline encodes it. The highest is the executed watermark.
+    /// Big-endian sequence number: each committed checkpoint, as the
+    /// pipeline encodes it. The highest is the committed watermark's.
     checkpoints: KeySpace,
+    /// Big-endian sequence number: each committed checkpoint's certified
+    /// summary. Genesis has none.
+    certified: KeySpace,
 }
 
 const ID: usize = 32;
@@ -77,7 +80,8 @@ impl Db {
             .add_key_space("executed_effects", DIGEST, MUTEXES, uniform)
             .add_key_space("events", DIGEST, MUTEXES, uniform)
             .add_key_space("meta", GENESIS.len(), 1, uniform)
-            .add_key_space("checkpoints", 8, MUTEXES, uniform);
+            .add_key_space("checkpoints", 8, MUTEXES, uniform)
+            .add_key_space("certified", 8, MUTEXES, uniform);
         let db = Tidehunter::open(
             path,
             shape.build(),
@@ -93,6 +97,7 @@ impl Db {
             events: db.ks("events"),
             meta: db.ks("meta"),
             checkpoints: db.ks("checkpoints"),
+            certified: db.ks("certified"),
             tidehunter: db,
         })
     }
@@ -114,12 +119,6 @@ impl Db {
     }
 
     /// Records executed checkpoint `seq`, encoded.
-    pub fn put_checkpoint(&self, seq: u64, checkpoint: Vec<u8>) -> Result<()> {
-        let mut batch = self.tidehunter.write_batch();
-        batch.write(self.checkpoints, seq.to_be_bytes().to_vec(), checkpoint);
-        Ok(batch.commit()?)
-    }
-
     pub fn checkpoint(&self, seq: u64) -> Result<Option<Vec<u8>>> {
         Ok(self
             .tidehunter
@@ -127,7 +126,14 @@ impl Db {
             .map(|v| v.to_vec()))
     }
 
-    /// The highest executed checkpoint, and its sequence number: none on a
+    pub fn certified(&self, seq: u64) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .tidehunter
+            .get(self.certified, &seq.to_be_bytes())?
+            .map(|v| v.to_vec()))
+    }
+
+    /// The highest committed checkpoint, and its sequence number: none on a
     /// fresh database.
     pub fn last_checkpoint(&self) -> Result<Option<(u64, Vec<u8>)>> {
         let mut checkpoints = self.tidehunter.iterator(self.checkpoints);
@@ -307,8 +313,19 @@ impl Db {
 
     /// Checkpoint `seq` and the committed watermark, which says the
     /// outputs of every checkpoint through `seq` are in the database.
-    pub fn put_committed_checkpoint(&self, batch: &mut WriteBatch, seq: u64, checkpoint: Vec<u8>) {
+    /// Checkpoint `seq`, its certified summary unless it is genesis, and
+    /// the committed watermark at it.
+    pub fn put_committed_checkpoint(
+        &self,
+        batch: &mut WriteBatch,
+        seq: u64,
+        checkpoint: Vec<u8>,
+        certified: Option<Vec<u8>>,
+    ) {
         batch.write(self.checkpoints, seq.to_be_bytes().to_vec(), checkpoint);
+        if let Some(certified) = certified {
+            batch.write(self.certified, seq.to_be_bytes().to_vec(), certified);
+        }
         batch.write(self.meta, COMMITTED.to_vec(), seq.to_be_bytes().to_vec());
     }
 

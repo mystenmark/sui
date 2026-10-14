@@ -279,8 +279,8 @@ pub struct CheckpointContentsBuilt {
     pub randomness_rounds: Vec<u64>,
 }
 
-/// A checkpoint signature from consensus. `CommitDecoder` → summary waiter
-/// (wait for `LocalSummary(seq)`) → `CheckpointAggregator`.
+/// A checkpoint signature from consensus. `BlockVoter` and `CommitDecoder`
+/// → summary waiter (wait for `LocalSummary(seq)`) → `CheckpointAggregator`.
 #[derive(Debug, Clone)]
 pub struct CheckpointSignature {
     pub seq: u64,
@@ -288,7 +288,8 @@ pub struct CheckpointSignature {
     pub message: Arc<[u8]>,
 }
 
-/// A certified checkpoint, for state sync.
+/// A certified checkpoint. `CheckpointAggregator` → state sync, and →
+/// `CheckpointCommitter`, in sequence order.
 #[derive(Debug, Clone)]
 pub struct CertifiedCheckpoint {
     pub seq: u64,

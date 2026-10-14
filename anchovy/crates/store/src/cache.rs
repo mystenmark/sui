@@ -404,18 +404,44 @@ impl Store {
 
     /// Commits checkpoint `seq`: one database batch with the outputs of
     /// `transactions` (its transactions, in checkpoint order), the
-    /// checkpoint's record, and the committed watermark; then their
-    /// outputs move from uncommitted to committed. A transaction not
-    /// uncommitted was committed before (a commit that crashed before
-    /// returning), and is skipped.
+    /// checkpoint's record and certified summary, and the committed
+    /// watermark; then their outputs move from uncommitted to committed. A
+    /// transaction not uncommitted was committed before (a commit that
+    /// crashed before returning), and is skipped.
     ///
     /// # Panics
     /// If checkpoints commit out of order, or the database write fails.
-    pub fn commit_checkpoint(&self, seq: u64, transactions: &[Digest], checkpoint: Vec<u8>) {
+    pub fn commit_checkpoint(
+        &self,
+        seq: u64,
+        transactions: &[Digest],
+        checkpoint: Vec<u8>,
+        certified: Vec<u8>,
+    ) {
+        self.commit(seq, transactions, checkpoint, Some(certified));
+    }
+
+    /// Commits the genesis checkpoint, which has no transactions of its own
+    /// (genesis objects are in already) and no certificate.
+    ///
+    /// # Panics
+    /// If a checkpoint is committed already, or the database write fails.
+    pub fn commit_genesis_checkpoint(&self, checkpoint: Vec<u8>) {
+        self.commit(0, &[], checkpoint, None);
+    }
+
+    fn commit(
+        &self,
+        seq: u64,
+        transactions: &[Digest],
+        checkpoint: Vec<u8>,
+        certified: Option<Vec<u8>>,
+    ) {
         {
-            let last = lock(&self.last_committed);
-            assert!(
-                last.is_none_or(|last| seq == last + 1),
+            let last = *lock(&self.last_committed);
+            assert_eq!(
+                seq,
+                last.map_or(0, |last| last + 1),
                 "checkpoint {seq} committed after {last:?}"
             );
         }
@@ -451,7 +477,7 @@ impl Store {
             );
         }
         self.db
-            .put_committed_checkpoint(&mut batch, seq, checkpoint);
+            .put_committed_checkpoint(&mut batch, seq, checkpoint, certified);
         batch.commit().expect("the database writes");
 
         // 2. Then out of memory, in checkpoint order: each object's versions
@@ -759,16 +785,17 @@ impl Store {
         Ok(())
     }
 
-    /// Records checkpoint `seq` outside a commit (genesis).
-    pub fn put_checkpoint(&self, seq: u64, checkpoint: Vec<u8>) -> Result<()> {
-        self.db.put_checkpoint(seq, checkpoint)
-    }
-
+    /// Committed checkpoint `seq`, as the pipeline encodes it.
     pub fn checkpoint(&self, seq: u64) -> Result<Option<Vec<u8>>> {
         self.db.checkpoint(seq)
     }
 
-    /// The highest checkpoint stored, and its sequence number.
+    /// Committed checkpoint `seq`'s certified summary.
+    pub fn certified(&self, seq: u64) -> Result<Option<Vec<u8>>> {
+        self.db.certified(seq)
+    }
+
+    /// The highest committed checkpoint, and its sequence number.
     pub fn last_checkpoint(&self) -> Result<Option<(u64, Vec<u8>)>> {
         self.db.last_checkpoint()
     }
