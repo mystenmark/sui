@@ -340,12 +340,10 @@ fn written(object: &Object) -> store::Written {
 }
 
 /// `object` as the input waiter resolves a key to it.
-fn value(object: &Object) -> Arc<Message<messages::object::Object<'static>>> {
-    Arc::new(
-        Message::parse(bcs::to_bytes(object).unwrap())
-            .map_err(|(e, _)| e)
-            .unwrap(),
-    )
+fn value(object: &Object) -> Message<messages::object::Object<'static>> {
+    Message::parse(bcs::to_bytes(object).unwrap())
+        .map_err(|(e, _)| e)
+        .unwrap()
 }
 
 fn coin(id: ObjectID, version: u64) -> Object {

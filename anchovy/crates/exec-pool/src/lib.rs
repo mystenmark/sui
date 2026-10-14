@@ -11,7 +11,7 @@ use messages::Message;
 use messages::effects::{
     AccumulatorOperation, AccumulatorValue, ObjectOut, TransactionEffects, VersionedEffects,
 };
-use messages::object::Owner;
+use messages::object::{Object, Owner};
 use messages::transaction::SharedObjectMutability;
 use validator::consensus::sequence::SharedAccess;
 use validator::epoch::EpochState;
@@ -89,15 +89,14 @@ pub struct Executor {
     resolved: Vec<Generation>,
 }
 
-type Object = Arc<Message<messages::object::Object<'static>>>;
+/// The objects a transaction wrote: id, version, object.
+type WrittenObjects = Vec<(messages::base::ObjectId, u64, Message<Object<'static>>)>;
 
 /// A written object's value: the object as the input waiter resolves it.
-fn object(bytes: Vec<u8>) -> Object {
-    Arc::new(
-        Message::parse(bytes)
-            .map_err(|(e, _)| e)
-            .expect("a written object parses"),
-    )
+fn object(bytes: Vec<u8>) -> Message<Object<'static>> {
+    Message::parse(bytes)
+        .map_err(|(e, _)| e)
+        .expect("a written object parses")
 }
 
 impl Executor {
@@ -230,15 +229,14 @@ impl Executor {
         }
 
         // 3. The generations it produced, then its outputs, to resolve.
-        let object_at = |id: &messages::base::ObjectId, version: u64| -> Object {
+        let object_at = |id: &messages::base::ObjectId, version: u64| -> Message<Object<'static>> {
             match written.iter().find(|(w, v, _)| w == id && *v == version) {
                 Some((_, _, object)) => object.clone(),
-                None => Arc::new(
-                    self.store
-                        .object(id, version)
-                        .expect("the store reads")
-                        .expect("an executed transaction's outputs are stored"),
-                ),
+                None => self
+                    .store
+                    .object(id, version)
+                    .expect("the store reads")
+                    .expect("an executed transaction's outputs are stored"),
             }
         };
         for (i, access) in entry.shared.iter().enumerate() {
@@ -310,10 +308,7 @@ impl Executor {
         provided: &[(messages::base::ObjectId, Input<'_>)],
         funds: Funds,
         root_version: u64,
-    ) -> (
-        Message<TransactionEffects<'static>>,
-        Vec<(messages::base::ObjectId, u64, Object)>,
-    ) {
+    ) -> (Message<TransactionEffects<'static>>, WrittenObjects) {
         let stored = self
             .store
             .executed_effects(&messages::base::Digest::new(digest))
@@ -374,12 +369,11 @@ impl Executor {
         let Generation::Version { version, .. } = generation else {
             unreachable!("generation 0 of a live stream is a version");
         };
-        let object = Arc::new(
-            self.store
-                .object(&stream.id, version)
-                .expect("the store reads")
-                .expect("a live object is stored"),
-        );
+        let object = self
+            .store
+            .object(&stream.id, version)
+            .expect("the store reads")
+            .expect("a live object is stored");
         resolved_keys.push((
             InputKey::Generation {
                 stream,

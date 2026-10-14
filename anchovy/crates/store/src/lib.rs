@@ -8,7 +8,7 @@
 mod cache;
 mod db;
 
-pub use cache::{Capacity, Obj, Store, TxData};
+pub use cache::{Capacity, Store, TxData};
 
 use messages::ParseError;
 use messages::base::{Digest, ObjectId};

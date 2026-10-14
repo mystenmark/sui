@@ -56,18 +56,16 @@ impl Default for Capacity {
     }
 }
 
-pub type Obj = Message<Object<'static>>;
-
 /// An object version as the cache holds it.
 #[derive(Clone)]
 enum Entry {
-    Object(Obj, Digest),
+    Object(Message<Object<'static>>, Digest),
     Deleted,
     Wrapped,
 }
 
 impl Entry {
-    fn object(&self) -> Option<Obj> {
+    fn object(&self) -> Option<Message<Object<'static>>> {
         match self {
             Entry::Object(object, _) => Some(object.clone()),
             Entry::Deleted | Entry::Wrapped => None,
@@ -230,7 +228,7 @@ pub struct TxData {
 struct TxRecord {
     digest: Digest,
     data: Arc<TxData>,
-    written: Vec<(ObjectId, u64, Digest, Obj)>,
+    written: Vec<(ObjectId, u64, Digest, Message<Object<'static>>)>,
     removed: Vec<Removed>,
 }
 
@@ -357,7 +355,7 @@ impl Store {
     /// object's latest, or the outputs do not parse: each a bug upstream.
     pub fn write(&self, outputs: Commit) {
         let executed = outputs.executed.expect("a transaction's outputs");
-        let written: Vec<(ObjectId, u64, Digest, Obj)> = outputs
+        let written: Vec<(ObjectId, u64, Digest, Message<Object<'static>>)> = outputs
             .written
             .into_iter()
             .map(|w| (w.id, w.version, w.digest, parse(w.bytes)))
@@ -376,7 +374,7 @@ impl Store {
             };
             self.push_dirty(&removed.id, removed.version, entry);
         }
-        let child = |o: &Obj| matches!(o.get().owner, Owner::ObjectOwner(_));
+        let child = |o: &Message<Object<'static>>| matches!(o.get().owner, Owner::ObjectOwner(_));
         for children in [true, false] {
             for (id, version, digest, object) in &written {
                 if child(object) == children {
@@ -569,7 +567,7 @@ impl Store {
     ///
     /// # Panics
     /// If the database cannot be read.
-    pub fn object(&self, id: &ObjectId, version: u64) -> Result<Option<Obj>> {
+    pub fn object(&self, id: &ObjectId, version: u64) -> Result<Option<Message<Object<'static>>>> {
         let found = {
             let mut shard = self.objects(id);
             match shard.slots.get_mut(id) {
@@ -638,13 +636,17 @@ impl Store {
     }
 
     /// The object's live version.
-    pub fn live_object(&self, id: &ObjectId) -> Result<Option<Obj>> {
+    pub fn live_object(&self, id: &ObjectId) -> Result<Option<Message<Object<'static>>>> {
         Ok(self.latest(id)?.and_then(|(_, entry)| entry.object()))
     }
 
     /// The object's highest version at or below `bound`, live or not; none
     /// if that is a tombstone (sui's `find_object_lt_or_eq_version`).
-    pub fn object_at_or_before(&self, id: &ObjectId, bound: u64) -> Result<Option<Obj>> {
+    pub fn object_at_or_before(
+        &self,
+        id: &ObjectId,
+        bound: u64,
+    ) -> Result<Option<Message<Object<'static>>>> {
         {
             let mut shard = self.objects(id);
             if let Some(slot) = shard.slots.get_mut(id) {
