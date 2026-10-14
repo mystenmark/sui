@@ -1,0 +1,31 @@
+[package]
+name = "checkpoint"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+blake2.workspace = true
+consensus.workspace = true
+containers.workspace = true
+fastcrypto.workspace = true
+messages.workspace = true
+protocol-config.workspace = true
+store.workspace = true
+validator.workspace = true
+waiter.workspace = true
+workqueue.workspace = true
+
+[dev-dependencies]
+bcs.workspace = true
+sui-protocol-config.workspace = true
+sui-types.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "build"
+harness = false

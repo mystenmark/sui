@@ -115,6 +115,9 @@ pub struct Store {
     events: KeySpace,
     /// Facts about the database itself: whether genesis is in.
     meta: KeySpace,
+    /// Big-endian sequence number: each checkpoint this node has executed,
+    /// as its pipeline encodes it. The highest is the executed watermark.
+    checkpoints: KeySpace,
 }
 
 const ID: usize = 32;
@@ -137,7 +140,8 @@ impl Store {
             .add_key_space("effects", DIGEST, MUTEXES, uniform)
             .add_key_space("executed_effects", DIGEST, MUTEXES, uniform)
             .add_key_space("events", DIGEST, MUTEXES, uniform)
-            .add_key_space("meta", GENESIS.len(), 1, uniform);
+            .add_key_space("meta", GENESIS.len(), 1, uniform)
+            .add_key_space("checkpoints", 8, MUTEXES, uniform);
         let db = Db::open(
             path,
             shape.build(),
@@ -152,6 +156,7 @@ impl Store {
             executed_effects: db.ks("executed_effects"),
             events: db.ks("events"),
             meta: db.ks("meta"),
+            checkpoints: db.ks("checkpoints"),
             db,
         })
     }
@@ -170,6 +175,35 @@ impl Store {
         });
         batch.write(self.meta, GENESIS.to_vec(), Vec::new());
         Ok(batch.commit()?)
+    }
+
+    /// Records executed checkpoint `seq`, encoded.
+    pub fn put_checkpoint(&self, seq: u64, checkpoint: Vec<u8>) -> Result<()> {
+        let mut batch = self.db.write_batch();
+        batch.write(self.checkpoints, seq.to_be_bytes().to_vec(), checkpoint);
+        Ok(batch.commit()?)
+    }
+
+    pub fn checkpoint(&self, seq: u64) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .db
+            .get(self.checkpoints, &seq.to_be_bytes())?
+            .map(|v| v.to_vec()))
+    }
+
+    /// The highest executed checkpoint, and its sequence number: none on a
+    /// fresh database.
+    pub fn last_checkpoint(&self) -> Result<Option<(u64, Vec<u8>)>> {
+        let mut checkpoints = self.db.iterator(self.checkpoints);
+        checkpoints.reverse();
+        match checkpoints.next() {
+            Some(entry) => {
+                let (key, value) = entry?;
+                let seq = u64::from_be_bytes(key[..8].try_into().expect("an 8-byte key"));
+                Ok(Some((seq, value.to_vec())))
+            }
+            None => Ok(None),
+        }
     }
 
     /// The object at exactly `version`; none if there is none, or a tombstone.

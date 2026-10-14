@@ -11,12 +11,14 @@ path = "src/main.rs"
 
 [dependencies]
 base64.workspace = true
+bcs.workspace = true
 blake2.workspace = true
 bytes.workspace = true
 clap.workspace = true
 consensus.workspace = true
 containers.workspace = true
 execution.workspace = true
+foldhash.workspace = true
 hashbrown.workspace = true
 messages.workspace = true
 protocol-config.workspace = true
@@ -30,6 +32,7 @@ tokio-stream.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
 validation.workspace = true
+waiter.workspace = true
 workqueue.workspace = true
 
 [dev-dependencies]
@@ -53,4 +56,12 @@ workspace = true
 
 [[bench]]
 name = "vote"
+harness = false
+
+[[bench]]
+name = "schedule"
+harness = false
+
+[[bench]]
+name = "commit"
 harness = false

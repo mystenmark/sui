@@ -11,10 +11,30 @@ use std::sync::{Mutex, PoisonError};
 use ::consensus::BlockRef;
 
 use crate::checks::VerifiedTransaction;
+use crate::consensus::decode::{OwnedInputs, owned_inputs_to_lock};
 
 /// A block's decoded transactions, by index: a user transaction whose
 /// validity and signatures were checked, or `None` for any other.
-pub type BlockEntries = Vec<Option<VerifiedTransaction>>;
+pub type BlockEntries = Vec<Option<CachedTransaction>>;
+
+/// A decoded user transaction, with the owned inputs it locks.
+#[derive(Debug)]
+pub struct CachedTransaction {
+    pub transaction: VerifiedTransaction,
+    pub owned: OwnedInputs,
+}
+
+impl CachedTransaction {
+    /// `transaction`, whose submitter claimed the inputs `immutable`
+    /// immutable.
+    pub fn new(
+        transaction: VerifiedTransaction,
+        immutable: &[messages::base::ObjectId],
+    ) -> CachedTransaction {
+        let owned = owned_inputs_to_lock(&transaction, immutable);
+        CachedTransaction { transaction, owned }
+    }
+}
 
 /// Decoded transactions by block. Voters insert a block's entries; the
 /// commit handler takes them when the block is committed, and evicts the

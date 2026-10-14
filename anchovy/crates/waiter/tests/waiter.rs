@@ -255,8 +255,102 @@ fn the_processor_hands_out_ready_batches() {
     assert_eq!(received.recv_timeout(timeout).unwrap(), [10]);
     // Producers make a key visible before notifying it.
     visible.lock().unwrap().extend([2, 3]);
-    push(Command::Notify(vec![2]));
+    push(Command::notify(vec![2]));
     assert_eq!(received.recv_timeout(timeout).unwrap(), [11]);
-    push(Command::Notify(vec![3]));
+    push(Command::notify(vec![3]));
     assert_eq!(received.recv_timeout(timeout).unwrap(), [12]);
+}
+
+/// An item that records the values its keys resolve to, by position.
+#[derive(Debug, Default, PartialEq)]
+struct Collect {
+    name: &'static str,
+    values: Vec<(usize, String)>,
+}
+
+impl waiter::Receive<String> for Collect {
+    fn receive(&mut self, index: usize, value: String) {
+        self.values.push((index, value));
+    }
+}
+
+fn collect(name: &'static str) -> Collect {
+    Collect {
+        name,
+        values: Vec::new(),
+    }
+}
+
+/// A lookup that finds the keys in `found` with their values.
+struct Lookup(Vec<(u32, &'static str)>);
+
+impl Availability<u32, String> for Lookup {
+    fn check(&mut self, keys: &[u32], found: &mut Vec<Option<String>>) {
+        found.clear();
+        found.extend(keys.iter().map(|k| {
+            self.0
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| (*v).to_owned())
+        }));
+    }
+}
+
+#[test]
+fn an_item_receives_each_keys_value_by_position() {
+    let mut waiter: Waiter<u32, Collect, Lookup, String> = Waiter::new(Lookup(vec![(2, "two")]));
+    let mut batch = WaitBatch::new();
+    batch.push(collect("a"), [1, 2, 3]);
+    waiter.wait_for(&mut batch);
+    waiter.resolve([(3, "three".to_owned())]);
+    waiter.resolve([(1, "one".to_owned())]);
+    let mut ready = Vec::new();
+    waiter.get_ready(&mut ready);
+    let [item] = &mut ready[..] else {
+        panic!("one ready");
+    };
+    item.values.sort();
+    assert_eq!(
+        item.values,
+        [
+            (0, "one".to_owned()),
+            (1, "two".to_owned()),
+            (2, "three".to_owned())
+        ]
+    );
+}
+
+#[test]
+fn every_waiter_on_a_key_receives_its_value() {
+    let mut waiter: Waiter<u32, Collect, Lookup, String> = Waiter::new(Lookup(vec![]));
+    let mut batch = WaitBatch::new();
+    for name in ["a", "b", "c"] {
+        batch.push(collect(name), [7]);
+    }
+    // A key repeated within an item gets the value at each position.
+    batch.push(collect("d"), [7, 7]);
+    waiter.wait_for(&mut batch);
+    waiter.resolve([(7, "seven".to_owned())]);
+    let mut ready = Vec::new();
+    waiter.get_ready(&mut ready);
+    assert_eq!(ready.len(), 4);
+    for item in &ready[..3] {
+        assert_eq!(item.values, [(0, "seven".to_owned())], "{}", item.name);
+    }
+    let mut d = ready[3].values.clone();
+    d.sort();
+    assert_eq!(d, [(0, "seven".to_owned()), (1, "seven".to_owned())]);
+}
+
+#[test]
+fn a_key_resolved_before_its_wait_is_lost_unless_the_lookup_finds_it() {
+    let mut waiter: Waiter<u32, Collect, Lookup, String> = Waiter::new(Lookup(vec![]));
+    waiter.resolve([(4, "early".to_owned())]);
+    let mut batch = WaitBatch::new();
+    batch.push(collect("a"), [4]);
+    waiter.wait_for(&mut batch);
+    let mut ready = Vec::new();
+    waiter.get_ready(&mut ready);
+    assert!(ready.is_empty());
+    assert_eq!(waiter.waiting(), 1);
 }

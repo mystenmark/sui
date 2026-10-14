@@ -212,7 +212,7 @@ impl SignatureChecks {
                         verify::verify_signatures_deferring_ed25519(
                             signed,
                             signatures,
-                            epoch.epoch,
+                            epoch.params.epoch,
                             &epoch.verifier,
                             &[],
                             &self.bump,
@@ -279,7 +279,14 @@ impl SignatureChecks {
             bump.reset();
             let (signatures, _) = sender_signed::deserialization_checks(signed, bump)?;
             // No aliases: they are object state, which does not exist yet.
-            verify::verify_signatures(signed, signatures, epoch.epoch, &epoch.verifier, &[], bump)
+            verify::verify_signatures(
+                signed,
+                signatures,
+                epoch.params.epoch,
+                &epoch.verifier,
+                &[],
+                bump,
+            )
         })
     }
 }
