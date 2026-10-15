@@ -224,6 +224,19 @@ impl Epoch {
     }
 }
 
+impl Epoch {
+    /// No longer current, so requests wait for the next epoch; then every
+    /// item ready anywhere in the pipeline is processed. So every
+    /// checkpoint certified has been checked against the local one, and
+    /// nothing the epoch could still do now is left undone. Items waiting
+    /// on keys stay: a validator may move on through certified checkpoints
+    /// before it has built them all. Its consensus must have stopped.
+    pub fn drain(&self) {
+        self.current.clear();
+        self.pipeline.drain();
+    }
+}
+
 impl Drop for Epoch {
     /// No longer current, so requests wait for the next epoch; then the
     /// pipeline drops, stopping every worker.
@@ -330,8 +343,9 @@ impl Node {
             .insert(Epoch::start(&self.perpetual, consensus))
     }
 
-    /// Stops the running epoch, whose last checkpoint has committed, joining
-    /// every one of its workers, then moves the node into the next epoch.
+    /// Stops the running epoch, whose last checkpoint has committed: drains
+    /// it, then joins every one of its workers, then moves the node into the
+    /// next epoch. Its consensus must have stopped.
     ///
     /// # Panics
     /// If no epoch is running, or it has not ended.
@@ -341,6 +355,7 @@ impl Node {
             epoch.pipeline.ended.borrow().is_some(),
             "the epoch has ended"
         );
+        epoch.drain();
         drop(epoch);
         reconfigure(&self.perpetual.store);
     }

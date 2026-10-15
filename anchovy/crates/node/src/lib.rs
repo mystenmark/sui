@@ -22,7 +22,7 @@ use std::sync::Arc;
 use aggregator::{CheckpointAggregator, Committee, SummaryAvailability};
 use checkpoint::{
     BuiltAvailability, CheckpointCommitter, ChunkAvailability, ContentsBuilder, EpochCloser,
-    ProtocolKey, SummaryBuilder,
+    LocalCheckpoints, ProtocolKey, SummaryBuilder, check_forks,
 };
 use consensus::TransactionClient;
 use exec_pool::{EffectsAvailability, EffectsRouter, Executor};
@@ -43,7 +43,7 @@ use validator::processors::{Request, SignatureVerifier, TransactionValidator};
 use validator::server::Consensus;
 use validator::submit::SubmitChecker;
 use waiter::{Command, WaiterProcessor};
-use workqueue::{Queue, Worker, WorkerHandle};
+use workqueue::{Activity, Queue, Worker, WorkerHandle};
 
 use messages::transaction::DigestPending;
 
@@ -77,6 +77,8 @@ pub struct Pipeline {
     pub state_hashes: Arc<StateHashes>,
     /// The epoch's last checkpoint, once committed: the epoch is over.
     pub ended: watch::Receiver<Option<u64>>,
+    /// What the epoch's queues hold, and its workers have in hand.
+    activity: Activity,
 }
 
 /// Where consensus delivers an epoch's work: blocks to vote on, and
@@ -182,9 +184,11 @@ impl Pipeline {
         let statuses = Arc::new(ConsensusTxStatusCache::new());
 
         // Black boxes.
-        let (transactions, validation_inbox) = workqueue::queue(QUEUE);
-        let (votes, vote_inbox) = workqueue::queue(QUEUE);
-        let (commits, decode_inbox) = workqueue::queue(QUEUE);
+        // Every queue of the epoch's: draining them all leaves nothing ready.
+        let activity = Activity::new();
+        let (transactions, validation_inbox) = activity.queue(QUEUE);
+        let (votes, vote_inbox) = activity.queue(QUEUE);
+        let (commits, decode_inbox) = activity.queue(QUEUE);
         let consensus = &consensus(ConsensusOutput {
             votes: votes.clone(),
             commits: commits.clone(),
@@ -192,27 +196,28 @@ impl Pipeline {
         let to_state_sync = state_sync;
 
         // Between processors.
-        let (to_signatures, signature_inbox) = workqueue::queue(QUEUE);
-        let (to_submit, submit_inbox) = workqueue::queue(QUEUE);
-        let (to_handler, handler_inbox) = workqueue::queue(QUEUE);
-        let (to_resolver, resolver_inbox) = workqueue::queue(QUEUE);
-        let (to_settlement, settlement_inbox) = workqueue::queue(QUEUE);
-        let (to_executor, executor_inbox) = workqueue::queue(QUEUE);
-        let (to_funds, funds_inbox) = workqueue::queue(QUEUE);
-        let (to_contents, contents_inbox) = workqueue::queue(QUEUE);
-        let (to_hasher, hasher_inbox) = workqueue::queue(QUEUE);
-        let (to_summary, summary_inbox) = workqueue::queue(QUEUE);
-        let (to_closer, closer_inbox) = workqueue::queue(QUEUE);
+        let (to_signatures, signature_inbox) = activity.queue(QUEUE);
+        let (to_submit, submit_inbox) = activity.queue(QUEUE);
+        let (to_handler, handler_inbox) = activity.queue(QUEUE);
+        let (to_resolver, resolver_inbox) = activity.queue(QUEUE);
+        let (to_settlement, settlement_inbox) = activity.queue(QUEUE);
+        let (to_executor, executor_inbox) = activity.queue(QUEUE);
+        let (to_funds, funds_inbox) = activity.queue(QUEUE);
+        let (to_contents, contents_inbox) = activity.queue(QUEUE);
+        let (to_hasher, hasher_inbox) = activity.queue(QUEUE);
+        let (to_summary, summary_inbox) = activity.queue(QUEUE);
+        let (to_closer, closer_inbox) = activity.queue(QUEUE);
         let (ended_sender, ended) = watch::channel(None);
-        let (to_committer, committer_inbox) = workqueue::queue(QUEUE);
-        let (to_aggregator, aggregator_inbox) = workqueue::queue(QUEUE);
+        let (to_committer, committer_inbox) = activity.queue(QUEUE);
+        let (to_aggregator, aggregator_inbox) = activity.queue(QUEUE);
 
         // Waiters' commands.
-        let (input_waits, input_inbox) = workqueue::queue(QUEUE);
-        let (effects_waits, effects_inbox) = workqueue::queue(QUEUE);
-        let (checkpoint_waits, checkpoint_inbox) = workqueue::queue(QUEUE);
-        let (sequence_waits, sequence_inbox) = workqueue::queue(QUEUE);
-        let (summary_waits, summary_waiter_inbox) = workqueue::queue(QUEUE);
+        let (input_waits, input_inbox) = activity.queue(QUEUE);
+        let (effects_waits, effects_inbox) = activity.queue(QUEUE);
+        let (checkpoint_waits, checkpoint_inbox) = activity.queue(QUEUE);
+        let (sequence_waits, sequence_inbox) = activity.queue(QUEUE);
+        let (summary_waits, summary_waiter_inbox) = activity.queue(QUEUE);
+        let (fork_waits, fork_inbox) = activity.queue(QUEUE);
 
         let mut workers = Vec::new();
 
@@ -466,7 +471,11 @@ impl Pipeline {
                     )
                     .spawn(),
             );
-            let (checkpoints_s, key) = (checkpoints.clone(), protocol_key.clone());
+            let (checkpoints_s, key, fork_waits_s) = (
+                checkpoints.clone(),
+                protocol_key.clone(),
+                fork_waits.clone(),
+            );
             let (sequence, summaries, consensus) = (
                 sequence_waits.clone(),
                 summary_waits.clone(),
@@ -479,6 +488,7 @@ impl Pipeline {
                         summary_inbox,
                         move || {
                             SummaryBuilder::new(checkpoints_s, key, sequence, summaries, consensus)
+                                .with_fork_waiter(fork_waits_s)
                         },
                         |()| {},
                     )
@@ -511,8 +521,23 @@ impl Pipeline {
                                 next_to_certify,
                                 state_sync,
                             )
+                            .with_fork_waiter(fork_waits)
                         },
                         into(to_committer, "committer"),
+                    )
+                    .spawn(),
+            );
+            let availability = LocalCheckpoints {
+                checkpoints: checkpoints.clone(),
+                store: store.clone(),
+            };
+            workers.push(
+                Worker::new("fork-waiter")
+                    .abort_on_panic()
+                    .run(
+                        fork_inbox,
+                        move || WaiterProcessor::new(availability),
+                        check_forks,
                     )
                     .spawn(),
             );
@@ -547,8 +572,16 @@ impl Pipeline {
             checkpoints,
             state_hashes,
             ended,
+            activity,
             _workers: workers,
         }
+    }
+
+    /// Blocks until every item ready anywhere in the pipeline is processed,
+    /// waiters' ready items included; items waiting on keys stay. Pushes
+    /// from outside (consensus, RPC) must have stopped.
+    pub fn drain(&self) {
+        self.activity.wait_idle();
     }
 
     /// What the RPC service uses of this pipeline: submissions checked here

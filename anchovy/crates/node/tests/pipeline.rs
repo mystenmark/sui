@@ -252,8 +252,9 @@ impl Network {
     /// next epoch, with consensus for it. The ended epoch's last checkpoint.
     fn next_epoch(&mut self) -> u64 {
         let last = self.end_epoch();
-        self.node.as_mut().unwrap().finish_epoch();
+        // The ended epoch's consensus stops first.
         self.new_consensus();
+        self.node.as_mut().unwrap().finish_epoch();
         self.start_epoch();
         last
     }

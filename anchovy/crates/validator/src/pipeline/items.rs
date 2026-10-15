@@ -352,6 +352,21 @@ pub struct CheckpointSignature {
     pub message: Arc<[u8]>,
 }
 
+/// A certified checkpoint waiting for the one this validator built, to
+/// compare them. `CheckpointAggregator` → fork waiter (wait for
+/// `CheckpointBuilt(seq)`, resolved to the local checkpoint) → fork check.
+#[derive(Debug)]
+pub struct ForkCheck {
+    pub certified: CertifiedCheckpoint,
+    pub local: Option<Arc<crate::pipeline::tables::BuiltCheckpoint>>,
+}
+
+impl waiter::Receive<Arc<crate::pipeline::tables::BuiltCheckpoint>> for ForkCheck {
+    fn receive(&mut self, _: usize, local: Arc<crate::pipeline::tables::BuiltCheckpoint>) {
+        self.local = Some(local);
+    }
+}
+
 /// A certified checkpoint. `CheckpointAggregator` → state sync, and →
 /// `CheckpointCommitter`, in sequence order.
 #[derive(Debug, Clone)]
