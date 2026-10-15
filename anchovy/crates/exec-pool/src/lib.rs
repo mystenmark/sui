@@ -16,8 +16,9 @@ use messages::transaction::SharedObjectMutability;
 use validator::consensus::sequence::SharedAccess;
 use validator::epoch::EpochState;
 use validator::pipeline::items::{
-    EffectsWaitItem, Executable, ExecutableTransaction, FundsCommand, InputCommand, InputValue,
-    ReservationStatus, Settle, SettlementInput, SystemKind, SystemTransaction,
+    EffectsWaitItem, EpochCloserInput, Executable, ExecutableTransaction, FundsCommand,
+    InputCommand, InputValue, ReservationStatus, Settle, SettlementInput, SystemKind,
+    SystemTransaction,
 };
 use validator::pipeline::keys::{AccumulatorVersion, EffectsKey, InputKey, StreamId, TxDigest};
 use validator::pipeline::tables::{Generation, GenerationTable};
@@ -559,13 +560,15 @@ impl Availability<EffectsKey> for EffectsAvailability {
 
 /// Where the effects waiter's ready items go, by kind: a `wait_for_effects`
 /// is woken, to read the effects from the store; a chunk's effects, or its
-/// settlements', go to `SettlementScheduler`. Runs on the effects waiter's
-/// thread.
+/// settlements', go to `SettlementScheduler`; the change-epoch
+/// transaction's, to `EpochCloser`. Runs on the effects waiter's thread.
 ///
 /// Inward: effects waiter, ready: `Vec<EffectsWaitItem>`.
-/// Outward: replies; `SettlementScheduler`: `SettlementInput`.
+/// Outward: replies; `SettlementScheduler`: `SettlementInput`;
+/// `EpochCloser`: `EpochCloserInput::ChangeEpochExecuted`.
 pub struct EffectsRouter {
     pub settlement: Queue<SettlementInput>,
+    pub epoch_closer: Queue<EpochCloserInput>,
 }
 
 impl Sink<Vec<EffectsWaitItem>> for EffectsRouter {
@@ -585,6 +588,11 @@ impl Sink<Vec<EffectsWaitItem>> for EffectsRouter {
                     &self.settlement,
                     SettlementInput::SettlementExecuted { height, digests },
                     "settlement",
+                ),
+                EffectsWaitItem::ChangeEpochExecuted => push(
+                    &self.epoch_closer,
+                    EpochCloserInput::ChangeEpochExecuted,
+                    "epoch closer",
                 ),
             }
         }

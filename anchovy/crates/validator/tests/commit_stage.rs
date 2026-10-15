@@ -63,6 +63,8 @@ fn stage() -> (CommitStage, Outputs) {
         previous_timestamp_ms: 0,
         accumulator_root_initial_shared_version: ROOT_VERSION,
         accumulator_root_version: ROOT_VERSION,
+        epoch_start_timestamp_ms: 0,
+        epoch_duration_ms: u64::MAX,
     };
     (
         CommitStage::new(
@@ -182,7 +184,7 @@ fn summary(decided: &Decided) -> String {
     let checkpoints: Vec<_> = decided
         .checkpoints
         .iter()
-        .map(|c| (c.seq, &c.heights, c.timestamp_ms, c.last_of_epoch))
+        .map(|c| (c.seq, &c.heights, c.timestamp_ms, c.close.is_some()))
         .collect();
     format!("{chunks:?} {settlements:?} {checkpoints:?}")
 }

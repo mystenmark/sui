@@ -12,12 +12,32 @@ use messages::arena::BumpAlloc;
 use messages::effects::{ChangeKind, ObjectIn, ObjectOut, TransactionEffects, VersionedEffects};
 use messages::fast::Bump;
 use messages::reader::Reader;
-use workqueue::Processor;
+use workqueue::{Processor, Queue};
 
-use validator::pipeline::items::{CheckpointEffects, ExecutedEffects};
+use validator::pipeline::items::{CheckpointEffects, EpochCloserInput, ExecutedEffects};
 
 /// The reference's `GlobalStateHash`: an ECMH over object digests.
 pub use fastcrypto::hash::EllipticCurveMultisetHash as StateHash;
+
+/// `hash` as the epoch records keep it.
+pub fn encode(hash: &StateHash) -> Vec<u8> {
+    bcs::to_bytes(hash).expect("a state hash encodes")
+}
+
+/// # Panics
+/// If `bytes` is not what `encode` wrote.
+pub fn decode(bytes: &[u8]) -> StateHash {
+    bcs::from_bytes(bytes).expect("a state hash decodes")
+}
+
+/// The live object set of objects with `digests`: genesis's root.
+pub fn of_objects(digests: impl IntoIterator<Item = [u8; 32]>) -> StateHash {
+    let mut hash = StateHash::default();
+    for digest in digests {
+        hash.insert(digest);
+    }
+    hash
+}
 
 /// Arena for parsing one transaction's effects; larger effects spill into
 /// extra chunks, freed at the next reset.
@@ -132,21 +152,25 @@ impl StateHashes {
 /// checkpoint's hash is kept there until every earlier one is folded.
 ///
 /// Inward:
-/// - `ContentsBuilder`: `CheckpointEffects`.
+/// - `ContentsBuilder`, or `EpochCloser` for the epoch's last checkpoint:
+///   `CheckpointEffects`.
 ///
-/// Outward: none. Writes `StateHashes`, which the end of the epoch and the
-/// checkpoint executor read.
+/// Outward:
+/// - `EpochCloser`: the root after the epoch's last checkpoint, once folded.
+///
+/// Writes `StateHashes`, which the checkpoint executor reads.
 ///
 /// Starts from the root before the epoch's first checkpoint, given at
-/// construction. Loading it from the store on restart and handing the
-/// final root to the next epoch belong to reconfiguration, not covered yet.
+/// construction from the epoch's start record.
 pub struct StateHasher {
     hashes: Arc<StateHashes>,
+    epoch_closer: Option<Queue<EpochCloserInput>>,
     /// The next checkpoint to fold, and the root before it.
     next: u64,
     root: StateHash,
-    /// Computed, but some earlier checkpoint is not.
-    pending: BTreeMap<u64, StateHash>,
+    /// Computed, but some earlier checkpoint is not; whether each is its
+    /// epoch's last.
+    pending: BTreeMap<u64, (StateHash, bool)>,
     bump: Bump,
 }
 
@@ -156,11 +180,21 @@ impl StateHasher {
     pub fn new(hashes: Arc<StateHashes>, first: u64, prior: StateHash) -> StateHasher {
         StateHasher {
             hashes,
+            epoch_closer: None,
             next: first,
             root: prior,
             pending: BTreeMap::new(),
             bump: Bump::with_capacity(PARSE_ARENA),
         }
+    }
+}
+
+impl StateHasher {
+    /// Hands the root after the epoch's last checkpoint to `epoch_closer`.
+    #[must_use]
+    pub fn with_epoch_closer(mut self, epoch_closer: Queue<EpochCloserInput>) -> StateHasher {
+        self.epoch_closer = Some(epoch_closer);
+        self
     }
 }
 
@@ -176,11 +210,23 @@ impl Processor for StateHasher {
         );
         let hash = accumulate(&effects.effects, &mut self.bump);
         self.hashes.insert_checkpoint(seq, hash.clone());
-        self.pending.insert(seq, hash);
-        while let Some(hash) = self.pending.remove(&self.next) {
+        self.pending.insert(seq, (hash, effects.last_of_epoch));
+        while let Some((hash, last_of_epoch)) = self.pending.remove(&self.next) {
             self.root.union(&hash);
             self.hashes.insert_root(self.next, self.root.clone());
             self.next += 1;
+            if last_of_epoch {
+                let closer = self
+                    .epoch_closer
+                    .as_ref()
+                    .expect("an epoch's last checkpoint has a closer to tell");
+                // A closed queue means the pipeline is shutting down.
+                if let Err(workqueue::PushError::Full(_)) =
+                    closer.try_push(EpochCloserInput::Root(encode(&self.root)))
+                {
+                    panic!("the epoch closer refused the epoch's root");
+                }
+            }
         }
         None
     }

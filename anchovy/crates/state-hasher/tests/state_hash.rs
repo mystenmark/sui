@@ -109,6 +109,7 @@ fn roots_fold_in_order() {
         assert!(
             processor
                 .process(CheckpointEffects {
+                    last_of_epoch: false,
                     seq,
                     effects: effects.clone()
                 })
@@ -146,6 +147,7 @@ fn roots_fold_in_order_whatever_the_arrival_order() {
     for i in order {
         let seq = first + i as u64;
         processor.process(CheckpointEffects {
+            last_of_epoch: false,
             seq,
             effects: checkpoints[i].clone(),
         });
@@ -174,6 +176,7 @@ fn a_checkpoint_hashed_twice_panics() {
     let mut processor = StateHasher::new(Arc::new(StateHashes::new()), 0, StateHash::default());
     for _ in 0..2 {
         processor.process(CheckpointEffects {
+            last_of_epoch: false,
             seq: 3,
             effects: vec![],
         });

@@ -36,6 +36,9 @@ pub struct EpochRecord {
     /// The checkpoint the epoch's first checkpoint follows: the previous
     /// epoch's last, or genesis.
     pub previous_checkpoint: u64,
+    /// The live object set's ECMH after `previous_checkpoint`
+    /// (`state_hasher::encode`), which the epoch's state hashes continue.
+    pub root_state: Vec<u8>,
 }
 
 impl EpochRecord {
@@ -44,6 +47,7 @@ impl EpochRecord {
     pub fn new(
         state: execution::system_state::SystemState,
         previous_checkpoint: u64,
+        root_state: Vec<u8>,
     ) -> EpochRecord {
         EpochRecord {
             epoch: state.epoch,
@@ -53,6 +57,7 @@ impl EpochRecord {
             epoch_duration_ms: state.epoch_duration_ms,
             committee: state.committee,
             previous_checkpoint,
+            root_state,
         }
     }
 
@@ -60,7 +65,9 @@ impl EpochRecord {
     const MEMBER: usize = 96 + 8;
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(Self::FIXED + 8 + self.committee.len() * Self::MEMBER);
+        let mut bytes = Vec::with_capacity(
+            Self::FIXED + 16 + self.committee.len() * Self::MEMBER + self.root_state.len(),
+        );
         for word in [
             self.epoch,
             self.protocol_version,
@@ -76,6 +83,8 @@ impl EpochRecord {
             bytes.extend_from_slice(key);
             bytes.extend_from_slice(&stake.to_le_bytes());
         }
+        bytes.extend_from_slice(&(self.root_state.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&self.root_state);
         bytes
     }
 
@@ -84,11 +93,7 @@ impl EpochRecord {
     pub fn decode(bytes: &[u8]) -> EpochRecord {
         let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().expect("a word"));
         let members = usize::try_from(word(Self::FIXED)).expect("a committee fits in memory");
-        assert_eq!(
-            bytes.len(),
-            Self::FIXED + 8 + members * Self::MEMBER,
-            "an epoch start record"
-        );
+        let committee_end = Self::FIXED + 8 + members * Self::MEMBER;
         let committee = (0..members)
             .map(|i| {
                 let at = Self::FIXED + 8 + i * Self::MEMBER;
@@ -98,6 +103,12 @@ impl EpochRecord {
                 )
             })
             .collect();
+        let root_len = usize::try_from(word(committee_end)).expect("a root fits in memory");
+        assert_eq!(
+            bytes.len(),
+            committee_end + 8 + root_len,
+            "an epoch start record"
+        );
         EpochRecord {
             epoch: word(0),
             protocol_version: word(8),
@@ -106,6 +117,7 @@ impl EpochRecord {
             epoch_duration_ms: word(32),
             previous_checkpoint: word(40),
             committee,
+            root_state: bytes[committee_end + 8..].to_vec(),
         }
     }
 
@@ -124,18 +136,26 @@ impl EpochRecord {
 
 /// Writes the genesis checkpoint and the first epoch's start record, read
 /// from the system state genesis created, unless the store has them. The
-/// genesis objects must be in the store.
+/// genesis objects, with digests `objects`, must be in the store.
 ///
 /// # Panics
 /// If the store cannot be read or written, or holds no system state.
-pub fn genesis(store: &store::Store, checkpoint: &BuiltCheckpoint) {
+pub fn genesis(
+    store: &store::Store,
+    checkpoint: &BuiltCheckpoint,
+    objects: impl IntoIterator<Item = [u8; 32]>,
+) {
     if store.epoch_start().expect("the store reads").is_some() {
         return;
     }
     assert_eq!(checkpoint.seq, 0, "the genesis checkpoint is checkpoint 0");
     let state = execution::system_state::read(store).expect("genesis made a system state");
     assert_eq!(state.epoch, 0, "genesis starts epoch 0");
-    store.commit_genesis_checkpoint(checkpoint.encode(), EpochRecord::new(state, 0).encode());
+    let root = state_hasher::encode(&state_hasher::of_objects(objects));
+    store.commit_genesis_checkpoint(
+        checkpoint.encode(),
+        EpochRecord::new(state, 0, root).encode(),
+    );
 }
 
 /// What the node keeps across epochs.
@@ -189,7 +209,7 @@ impl Epoch {
             &committee,
             client,
             perpetual.state_sync.clone(),
-            record.previous_checkpoint,
+            &record,
         );
         perpetual.current.set(pipeline.handle());
         Epoch {

@@ -183,6 +183,8 @@ fn main() {
                 previous_timestamp_ms: 0,
                 accumulator_root_initial_shared_version: 1,
                 accumulator_root_version: 1,
+                epoch_start_timestamp_ms: 0,
+                epoch_duration_ms: u64::MAX,
             };
             let mut stage = CommitStage::new(
                 start,

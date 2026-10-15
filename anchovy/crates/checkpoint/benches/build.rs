@@ -201,6 +201,7 @@ fn main() {
             epoch_rolling_gas: [1, 2, 3, 4],
             last_height: 0,
             timestamp_ms: 0,
+            root_state: None,
         };
         let mut bump = Bump::with_capacity(4096);
 
@@ -214,7 +215,7 @@ fn main() {
                 seq: 1,
                 heights: vec![0, 1],
                 timestamp_ms: 0,
-                last_of_epoch: false,
+                close: None,
             };
             let before = ALLOCATIONS.load(Ordering::Relaxed);
             let start = Instant::now();

@@ -96,7 +96,10 @@ fn a_transaction_is_readied_for_consensus_and_its_wait_woken_once_executed() {
 
     // A wait for its effects is woken once it executes.
     let (settlement, settlement_inbox) = workqueue::queue::<SettlementInput>(16);
-    let mut router = EffectsRouter { settlement };
+    let mut router = EffectsRouter {
+        settlement,
+        epoch_closer: workqueue::queue(1).0,
+    };
     let mut waiter = WaiterProcessor::new(EffectsAvailability {
         store: node.store.clone(),
     });
@@ -146,7 +149,10 @@ fn a_transaction_failing_the_input_checks_is_answered_at_once() {
 #[test]
 fn settlement_work_is_routed_to_the_settlement_scheduler() {
     let (settlement, inbox) = workqueue::queue(16);
-    let mut router = EffectsRouter { settlement };
+    let mut router = EffectsRouter {
+        settlement,
+        epoch_closer: workqueue::queue(1).0,
+    };
     router.send(vec![EffectsWaitItem::SettlementExecuted {
         height: 3,
         digests: vec![[9; 32]],

@@ -103,6 +103,7 @@ pub fn build(account: SuiAddress, coins: usize, amount: u64, epoch_duration_ms: 
         ],
         last_height: 0,
         timestamp_ms: summary.timestamp_ms,
+        root_state: None,
     };
     let mut coins: Vec<ObjectID> = genesis
         .objects()

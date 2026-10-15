@@ -11,6 +11,7 @@ use messages::base::Digest;
 use messages::checkpoint::{CheckpointContents, VersionedCheckpointContents};
 use messages::fast::Bump;
 use messages::reader::Reader;
+use tokio::sync::watch;
 use validator::pipeline::items::CertifiedCheckpoint;
 use validator::pipeline::tables::{CheckpointStore, ChunkTable};
 use workqueue::Processor;
@@ -18,7 +19,8 @@ use workqueue::Processor;
 /// Commits each certified checkpoint's transactions from the writeback
 /// cache to the database, with its record, certificate and the committed
 /// watermark, in one batch; then prunes what only uncommitted checkpoints
-/// need. The start of a `CheckpointExecutor`.
+/// need. Once the epoch's last checkpoint has committed, says so: the epoch
+/// is over. The start of a `CheckpointExecutor`.
 ///
 /// Inward: `CheckpointAggregator`: `Vec<CertifiedCheckpoint>`, in sequence
 /// order.
@@ -29,6 +31,8 @@ pub struct CheckpointCommitter {
     store: Arc<store::Store>,
     checkpoints: Arc<CheckpointStore>,
     chunks: Arc<ChunkTable>,
+    /// The epoch's last checkpoint, once committed.
+    ended: watch::Sender<Option<u64>>,
     bump: Bump,
 }
 
@@ -37,11 +41,13 @@ impl CheckpointCommitter {
         store: Arc<store::Store>,
         checkpoints: Arc<CheckpointStore>,
         chunks: Arc<ChunkTable>,
+        ended: watch::Sender<Option<u64>>,
     ) -> CheckpointCommitter {
         CheckpointCommitter {
             store,
             checkpoints,
             chunks,
+            ended,
             bump: Bump::with_capacity(super::ARENA),
         }
     }
@@ -65,6 +71,9 @@ impl CheckpointCommitter {
         // The next summary is built over this one.
         self.checkpoints.prune_below(seq);
         self.chunks.prune_through(built.last_height);
+        if built.root_state.is_some() {
+            self.ended.send_replace(Some(seq));
+        }
     }
 }
 

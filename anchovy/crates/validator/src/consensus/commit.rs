@@ -31,7 +31,7 @@ use crate::consensus::sequence::{
 use crate::consensus::status::{ConsensusTxStatus, ConsensusTxStatusCache};
 use crate::epoch::{EpochParams, EpochState};
 use crate::pipeline::items::{
-    Chunk, ChunkSettlement, ExecutableTransaction, PendingCheckpoint, ScheduledEntry,
+    Chunk, ChunkSettlement, EpochClose, ExecutableTransaction, PendingCheckpoint, ScheduledEntry,
     SettlementInput, SystemKind, SystemTransaction,
 };
 use crate::pipeline::keys::{AccumulatorVersion, ChunkSettled, TxDigest};
@@ -350,6 +350,11 @@ impl Processor for ScheduleExecutor {
 /// chunk's settlement writes.
 const ACCUMULATOR_ROOT: messages::base::ObjectId = messages::base::ObjectId::from_u16(0xacc);
 
+/// The system state object, which the change-epoch transaction writes, and
+/// the version its sharing started at.
+const SYSTEM_STATE: messages::base::ObjectId = messages::base::ObjectId::from_u16(0x5);
+const SYSTEM_STATE_INITIAL_SHARED_VERSION: u64 = 1;
+
 /// What the epoch agreed on at its start that `CommitStage` needs, beyond
 /// `EpochParams`. Agreed like it, so reading it keeps the stage pure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -367,6 +372,10 @@ pub struct EpochStart {
     /// The root's version the epoch's first chunk reads: where version
     /// assignment starts it (`Store::start_version`).
     pub accumulator_root_version: u64,
+    /// The epoch ends with the first commit at or past
+    /// `epoch_start_timestamp_ms + epoch_duration_ms`.
+    pub epoch_start_timestamp_ms: u64,
+    pub epoch_duration_ms: u64,
 }
 
 /// What `CommitStage` decided about one commit, in emission order.
@@ -397,8 +406,10 @@ pub struct Decided {
 ///   no user transactions (the reference estimates each one's cost);
 /// - randomness: transactions using it are scheduled last in the commit's
 ///   chunks, not in chunks of their own;
-/// - the end of the epoch: no checkpoint is the last of its epoch, and a
-///   commit's timestamp is not clamped to the epoch's start.
+/// - the end of the epoch, beyond a stand-in: the first commit at or past the
+///   epoch's end time is its last, ending it at once, without draining
+///   deferred transactions or a close deadline; a commit's timestamp is not
+///   clamped to the epoch's start.
 ///
 /// Inward:
 /// - `CommitDecoder`: `DecodedRequest`.
@@ -421,6 +432,8 @@ pub struct CommitStage {
     /// The last commit decided. Accumulator versions count commits, so
     /// commits must come without gaps.
     last_commit: Option<u32>,
+    /// The epoch's last commit is decided: later ones schedule nothing.
+    closed: bool,
     /// The accumulator root's version the next chunk reads. Each chunk's
     /// barrier, its root's one exclusive writer and with the root its only
     /// input, writes the next version.
@@ -449,6 +462,7 @@ impl CommitStage {
             ),
             commit_times: CommitIntervalObserver::default(),
             last_commit: None,
+            closed: false,
             root_version: start.accumulator_root_version,
             chunks_out: chunks,
             settlements_out: settlements,
@@ -458,8 +472,11 @@ impl CommitStage {
     }
 
     /// Decides `commit` and lays it out in chunks and checkpoints, or
-    /// nothing if it was handled before.
+    /// nothing if it was handled before or follows the epoch's last.
     pub fn decide(&mut self, epoch: &Arc<EpochParams>, commit: DecodedCommit) -> Option<Decided> {
+        if self.closed {
+            return None;
+        }
         let HandledCommit {
             mut schedule,
             origins,
@@ -517,8 +534,38 @@ impl CommitStage {
             });
         }
 
-        // 3. Chunks and checkpoints.
-        let mut decided = self.chunk(epoch, &prologue, entries, digests);
+        // 3. The epoch's last commit reserves the change-epoch transaction's
+        //    write of the system state, after every other.
+        let end = self
+            .start
+            .epoch_start_timestamp_ms
+            .saturating_add(self.start.epoch_duration_ms);
+        let close = (prologue.timestamp_ms >= end).then(|| {
+            self.closed = true;
+            let writes_before = entries
+                .iter()
+                .filter(|e| {
+                    e.shared.iter().any(|a| {
+                        a.id == SYSTEM_STATE
+                            && a.mutability
+                                == messages::transaction::SharedObjectMutability::Mutable
+                    })
+                })
+                .count();
+            vec![SharedAccess {
+                id: SYSTEM_STATE,
+                initial_shared_version: SYSTEM_STATE_INITIAL_SHARED_VERSION,
+                mutability: messages::transaction::SharedObjectMutability::Mutable,
+                ordinal: SharedOrdinal {
+                    round: prologue.round,
+                    writes_before: u32::try_from(writes_before)
+                        .expect("fewer than 2^32 transactions"),
+                },
+            }]
+        });
+
+        // 4. Chunks and checkpoints.
+        let mut decided = self.chunk(epoch, &prologue, entries, digests, close);
         decided.dropped = dropped;
         Some(decided)
     }
@@ -532,6 +579,7 @@ impl CommitStage {
         prologue: &Prologue,
         entries: Vec<ScheduledEntry>,
         digests: Vec<TxDigest>,
+        close: Option<Vec<SharedAccess>>,
     ) -> Decided {
         let config = &epoch.config;
         let max = usize::try_from(config.max_transactions_per_checkpoint())
@@ -594,6 +642,9 @@ impl CommitStage {
         }
         let min_interval = config.min_checkpoint_interval_ms.unwrap_or(0);
         flushed.extend(self.queue.flush(prologue.timestamp_ms, min_interval));
+        if close.is_some() {
+            flushed.extend(self.queue.flush_forced());
+        }
         decided.checkpoints = flushed
             .into_iter()
             .map(|f| PendingCheckpoint {
@@ -601,9 +652,21 @@ impl CommitStage {
                 seq: f.seq,
                 heights: f.heights,
                 timestamp_ms: f.timestamp_ms,
-                last_of_epoch: false,
+                close: None,
             })
             .collect();
+        if let Some(shared) = close {
+            let last = decided
+                .checkpoints
+                .last_mut()
+                .expect("the last commit cuts the epoch's last checkpoint");
+            last.close = Some(EpochClose {
+                version: AccumulatorVersion(u64::from(prologue.commit_index)),
+                round: prologue.round,
+                root_version: self.root_version,
+                shared,
+            });
+        }
         decided
     }
 
@@ -823,28 +886,18 @@ impl CommitIntervalObserver {
     }
 }
 
-/// The consensus commit prologue of a commit, as the reference's
-/// `ConsensusCommitInfo::create_consensus_commit_prologue_transaction`
-/// builds it: a `ConsensusCommitPrologueV4` system transaction listing no
-/// cancelled transactions.
+/// `prologue`'s `ConsensusCommitPrologueV4`, as the reference's
+/// `create_consensus_commit_prologue_transaction`: no cancelled transactions,
+/// and `additional_state_digest` over the commits through this one.
 pub fn prologue_transaction(
     prologue: &Prologue,
     additional_state_digest: &[u8; 32],
 ) -> SystemTransaction {
-    use messages::build::base::{
-        AdditionalConsensusStateDigest, ConsensusCommitDigest, Digest, ObjectDigest, ObjectId,
-        SequenceNumber, SuiAddress,
-    };
-    use messages::build::signature::{EmptySignInfo, GenericSignature};
+    use messages::build::base::{AdditionalConsensusStateDigest, ConsensusCommitDigest, Digest};
     use messages::build::system_transaction::{
         ConsensusCommitPrologueV4, ConsensusDeterminedVersionAssignments,
     };
-    use messages::build::transaction::{
-        GasData, Intent, IntentMessage, SenderSignedData, SenderSignedTransaction, Transaction,
-        TransactionData, TransactionDataV1, TransactionExpiration, TransactionKind,
-    };
-    /// `GAS_PRICE_FOR_SYSTEM_TX`.
-    const SYSTEM_GAS_PRICE: u64 = 1;
+    use messages::build::transaction::TransactionKind;
 
     let kind = TransactionKind::ConsensusCommitPrologueV4(ConsensusCommitPrologueV4 {
         epoch: prologue.epoch,
@@ -856,13 +909,73 @@ pub fn prologue_transaction(
             ConsensusDeterminedVersionAssignments::CancelledTransactionsV2(Vec::new()),
         additional_state_digest: AdditionalConsensusStateDigest(Digest(*additional_state_digest)),
     });
+    system_transaction(
+        kind,
+        SystemKind::Prologue {
+            round: prologue.round,
+        },
+    )
+}
+
+/// The change-epoch transaction ending `epoch`: an `EndOfEpochTransaction`
+/// of `ChangeEpoch` alone, starting epoch `epoch + 1` at
+/// `epoch_start_timestamp_ms` with `protocol_version` and no new system
+/// packages, and charging the epoch's gas totals `gas` (computation,
+/// storage, rebate, non-refundable).
+///
+/// Not yet: the other end-of-epoch kinds the reference includes when its
+/// protocol flags hold (R2.8 of `docs/reconfiguration_reference.md`).
+pub fn change_epoch_transaction(
+    epoch: u64,
+    protocol_version: u64,
+    gas: [u64; 4],
+    epoch_start_timestamp_ms: u64,
+) -> SystemTransaction {
+    use messages::build::base::ProtocolVersion;
+    use messages::build::system_transaction::{ChangeEpoch, EndOfEpochTransactionKind};
+    use messages::build::transaction::TransactionKind;
+
+    let [computation, storage, rebate, non_refundable] = gas;
+    let kind =
+        TransactionKind::EndOfEpochTransaction(vec![EndOfEpochTransactionKind::ChangeEpoch(
+            ChangeEpoch {
+                epoch: epoch + 1,
+                protocol_version: ProtocolVersion(protocol_version),
+                storage_charge: storage,
+                computation_charge: computation,
+                storage_rebate: rebate,
+                non_refundable_storage_fee: non_refundable,
+                epoch_start_timestamp_ms,
+                system_packages: Vec::new(),
+            },
+        )]);
+    system_transaction(kind, SystemKind::ChangeEpoch { epoch })
+}
+
+/// A system transaction of `kind`: sent by the zero address, with no gas
+/// and an all-zero signature, as the reference's `VerifiedTransaction::new_system_transaction`.
+fn system_transaction(
+    kind: messages::build::transaction::TransactionKind,
+    system: SystemKind,
+) -> SystemTransaction {
+    use messages::build::base::{
+        AccountAddress, Digest, ObjectDigest, ObjectId, SequenceNumber, SuiAddress,
+    };
+    use messages::build::signature::{EmptySignInfo, GenericSignature};
+    use messages::build::transaction::{
+        GasData, Intent, IntentMessage, SenderSignedData, SenderSignedTransaction, Transaction,
+        TransactionData, TransactionDataV1, TransactionExpiration,
+    };
+    /// `GAS_PRICE_FOR_SYSTEM_TX`.
+    const SYSTEM_GAS_PRICE: u64 = 1;
+
     let sender = SuiAddress([0; 32]);
     let data = TransactionData::V1(TransactionDataV1 {
         kind,
         sender,
         gas_data: GasData {
             payment: vec![(
-                ObjectId(messages::build::base::AccountAddress([0; 32])),
+                ObjectId(AccountAddress([0; 32])),
                 SequenceNumber(0),
                 ObjectDigest(Digest([0; 32])),
             )],
@@ -894,9 +1007,7 @@ pub fn prologue_transaction(
         auth_signature: EmptySignInfo {},
     };
     SystemTransaction {
-        kind: SystemKind::Prologue {
-            round: prologue.round,
-        },
+        kind: system,
         bytes: bcs::to_bytes(&transaction).expect("a transaction serializes"),
         digest,
     }

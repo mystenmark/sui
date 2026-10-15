@@ -5,6 +5,7 @@
 //! once the previous checkpoint is built (`docs/consensus_pipeline.md`,
 //! Checkpointing).
 
+mod close;
 mod commit;
 pub mod contents;
 mod key;
@@ -18,7 +19,7 @@ use messages::base::Digest;
 use messages::fast::Bump;
 use messages::transaction::SenderSignedData;
 use validator::pipeline::items::{
-    CheckpointContentsBuilt, CheckpointEffects, CheckpointSignature, ExecutedEffects,
+    CheckpointContentsBuilt, CheckpointEffects, CheckpointSignature, ExecutedEffects, LastOfEpoch,
     PendingCheckpoint,
 };
 use validator::pipeline::keys::{CheckpointBuilt, ChunkSettled, LocalSummary};
@@ -26,6 +27,7 @@ use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable};
 use waiter::{Availability, Command, WaitBatch};
 use workqueue::{Processor, Queue};
 
+pub use close::EpochCloser;
 pub use commit::CheckpointCommitter;
 pub use key::ProtocolKey;
 
@@ -49,13 +51,15 @@ fn push<T>(queue: &Queue<T>, item: T, name: &str) {
 ///
 /// Checkpoint `seq` then waits for `CheckpointBuilt(seq - 1)`, checkpoint 0
 /// for nothing. The first checkpoint of an epoch waits like any other: the
-/// checkpoint store holds the previous epoch's last.
+/// checkpoint store holds the previous epoch's last. The epoch's last
+/// checkpoint is built without the change-epoch transaction, which
+/// `EpochCloser` adds; its effects go there, not to the hasher.
 ///
 /// Inward:
 /// - checkpoint waiter, ready: `Vec<PendingCheckpoint>`.
 ///
 /// Outward:
-/// - `StateHasher`: `CheckpointEffects`;
+/// - `StateHasher`: `CheckpointEffects`, but the epoch's last checkpoint's;
 /// - sequence waiter, wait for: `CheckpointContentsBuilt`, keyed by
 ///   `CheckpointBuilt(seq - 1)`.
 ///
@@ -100,33 +104,42 @@ impl ContentsBuilder {
                 .expect("a ready checkpoint's chunks are in the chunk table");
             effects.extend(chunk.effects.iter().cloned());
         }
-        let stored: Vec<Message<SenderSignedData<'static>>> = effects
-            .iter()
-            .map(|e| {
-                self.store
-                    .transaction(&Digest::new(e.digest))
-                    .expect("the store reads")
-                    .expect("an executed transaction is stored with its effects")
-            })
-            .collect();
-        let transactions: Vec<SenderSignedData<'_>> = stored.iter().map(|m| *m.get()).collect();
-        let contents = contents::build(
-            &pending.epoch.config,
-            &effects,
-            &transactions,
-            &mut self.bump,
-        );
-        let built = CheckpointContentsBuilt {
-            epoch: pending.epoch.clone(),
-            transaction_count: effects.len() as u64,
-            pending,
-            contents: contents.bytes,
-            contents_digest: contents.digest,
-            gas: contents.gas,
-            artifacts_digest: contents.artifacts_digest,
-            randomness_rounds: contents.randomness_rounds,
-        };
+        let built = contents_of(&self.store, pending, &effects, &mut self.bump);
         (built, effects)
+    }
+}
+
+/// `pending`'s contents, of `effects` in checkpoint order.
+///
+/// # Panics
+/// If the store cannot be read or lacks an executed transaction.
+fn contents_of(
+    store: &store::Store,
+    pending: PendingCheckpoint,
+    effects: &[ExecutedEffects],
+    bump: &mut Bump,
+) -> CheckpointContentsBuilt {
+    let stored: Vec<Message<SenderSignedData<'static>>> = effects
+        .iter()
+        .map(|e| {
+            store
+                .transaction(&Digest::new(e.digest))
+                .expect("the store reads")
+                .expect("an executed transaction is stored with its effects")
+        })
+        .collect();
+    let transactions: Vec<SenderSignedData<'_>> = stored.iter().map(|m| *m.get()).collect();
+    let contents = contents::build(&pending.epoch.config, effects, &transactions, bump);
+    CheckpointContentsBuilt {
+        epoch: pending.epoch.clone(),
+        transaction_count: effects.len() as u64,
+        pending,
+        contents: contents.bytes,
+        contents_digest: contents.digest,
+        gas: contents.gas,
+        artifacts_digest: contents.artifacts_digest,
+        randomness_rounds: contents.randomness_rounds,
+        last: None,
     }
 }
 
@@ -138,8 +151,21 @@ impl Processor for ContentsBuilder {
         let mut waits = WaitBatch::with_capacity(ready.len(), ready.len());
         for pending in ready {
             let seq = pending.seq;
-            let (built, effects) = self.build(pending);
-            push(&self.hasher, CheckpointEffects { seq, effects }, "hasher");
+            let (mut built, effects) = self.build(pending);
+            if built.pending.close.is_some() {
+                // Built again, and hashed, with the change-epoch transaction.
+                built.last = Some(LastOfEpoch::Effects(effects));
+            } else {
+                push(
+                    &self.hasher,
+                    CheckpointEffects {
+                        seq,
+                        effects,
+                        last_of_epoch: false,
+                    },
+                    "hasher",
+                );
+            }
             waits.push(built, seq.checked_sub(1).map(CheckpointBuilt));
         }
         push(&self.sequence, Command::Wait(waits), "sequence waiter");
@@ -152,9 +178,6 @@ impl Processor for ContentsBuilder {
 /// it, notifies, signs and submits the signature. The checkpoint reaches the
 /// database only once certified, with its transactions
 /// (`CheckpointCommitter`).
-///
-/// Not covered yet: a last checkpoint of the epoch gets no end-of-epoch data
-/// (see `summary::build`).
 ///
 /// Inward:
 /// - sequence waiter, ready: `Vec<CheckpointContentsBuilt>`.
@@ -226,6 +249,10 @@ impl Processor for SummaryBuilder {
                     .last()
                     .expect("a checkpoint has chunks"),
                 timestamp_ms: built.pending.timestamp_ms,
+                root_state: match &built.last {
+                    Some(LastOfEpoch::Closed(end)) => Some(end.root_state.clone()),
+                    _ => None,
+                },
             };
             self.checkpoints.insert_built(checkpoint);
             built_seqs.push(seq);

@@ -46,6 +46,9 @@ pub enum SystemKind {
     Settlement { height: u64, index: u32 },
     /// The accumulator barrier of the chunk at `height`.
     Barrier { height: u64 },
+    /// The change-epoch transaction ending `epoch`: the last of its last
+    /// checkpoint.
+    ChangeEpoch { epoch: u64 },
 }
 
 /// A scheduled transaction with its shared accesses and, for a user
@@ -117,7 +120,22 @@ pub struct PendingCheckpoint {
     /// Its chunks' heights, in order.
     pub heights: Vec<u64>,
     pub timestamp_ms: u64,
-    pub last_of_epoch: bool,
+    /// Set on the epoch's last checkpoint only.
+    pub close: Option<EpochClose>,
+}
+
+/// What the commit handler reserved, in the epoch's last commit, for the
+/// change-epoch transaction that `EpochCloser` builds once everything else
+/// in the epoch has executed.
+#[derive(Debug, Clone)]
+pub struct EpochClose {
+    /// As the last commit's chunks'.
+    pub version: AccumulatorVersion,
+    pub round: u32,
+    /// The accumulator root's version after the last chunk's barrier.
+    pub root_version: u64,
+    /// Its shared accesses, after every other access of the epoch.
+    pub shared: Vec<SharedAccess>,
 }
 
 /// A transaction with its inputs as keys. `VersionResolver` or
@@ -229,6 +247,9 @@ pub enum EffectsWaitItem {
     /// A chunk's settlement and barrier transactions executed.
     /// `SettlementScheduler` → effects waiter → `SettlementScheduler`.
     SettlementExecuted { height: u64, digests: Vec<TxDigest> },
+    /// The change-epoch transaction executed. `EpochCloser` → effects waiter
+    /// → `EpochCloser`.
+    ChangeEpochExecuted,
 }
 
 /// A transaction's executed effects, as the chunk table and checkpointing
@@ -251,12 +272,14 @@ pub struct SettledChunk {
     pub effects: Vec<ExecutedEffects>,
 }
 
-/// A checkpoint's effects, for its state hash. `ContentsBuilder` →
-/// `StateHasher`.
+/// A checkpoint's effects, for its state hash. `ContentsBuilder`, or
+/// `EpochCloser` for the epoch's last → `StateHasher`.
 #[derive(Debug, Clone)]
 pub struct CheckpointEffects {
     pub seq: u64,
     pub effects: Vec<ExecutedEffects>,
+    /// The epoch's last checkpoint: its root goes to `EpochCloser`.
+    pub last_of_epoch: bool,
 }
 
 /// A checkpoint's contents, built without the previous checkpoint.
@@ -277,6 +300,47 @@ pub struct CheckpointContentsBuilt {
     /// The rounds of the checkpoint's randomness state updates, in order,
     /// for the summary's version-specific data.
     pub randomness_rounds: Vec<u64>,
+    /// The epoch's last checkpoint: built first without the change-epoch
+    /// transaction, with its effects kept for `EpochCloser` to build it
+    /// again with it; then with its end-of-epoch data.
+    pub last: Option<LastOfEpoch>,
+}
+
+/// What `EpochCloser` takes.
+#[derive(Debug)]
+pub enum EpochCloserInput {
+    /// Checkpoints whose previous one is built. Sequence waiter →
+    /// `EpochCloser`.
+    Built(Vec<CheckpointContentsBuilt>),
+    /// The change-epoch transaction executed. Effects waiter →
+    /// `EpochCloser`.
+    ChangeEpochExecuted,
+    /// The live object set's ECMH after the epoch's last checkpoint
+    /// (`StateHash` BCS). `StateHasher` → `EpochCloser`.
+    Root(Vec<u8>),
+}
+
+/// The epoch's last checkpoint, on its way through `EpochCloser`.
+#[derive(Debug, Clone)]
+pub enum LastOfEpoch {
+    /// Its effects, without the change-epoch transaction's.
+    Effects(Vec<ExecutedEffects>),
+    /// Built whole: its end-of-epoch data.
+    Closed(EndOfEpoch),
+}
+
+/// A last checkpoint's end-of-epoch data, from the system state the
+/// change-epoch transaction wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndOfEpoch {
+    /// Each member's protocol key and voting power, in committee order.
+    pub next_committee: Vec<([u8; 96], u64)>,
+    pub next_protocol_version: u64,
+    /// The live object set's ECMH after the checkpoint (`StateHash` BCS),
+    /// which the next epoch's root continues from.
+    pub root_state: Vec<u8>,
+    /// Its digest, the epoch's commitment, when the protocol commits it.
+    pub root_state_digest: Option<[u8; 32]>,
 }
 
 /// A checkpoint signature from consensus. `BlockVoter` and `CommitDecoder`

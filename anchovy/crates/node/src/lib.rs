@@ -14,18 +14,21 @@
 
 pub mod epoch;
 
+use epoch::EpochRecord;
+use tokio::sync::watch;
+
 use std::sync::Arc;
 
 use aggregator::{CheckpointAggregator, Committee, SummaryAvailability};
 use checkpoint::{
-    BuiltAvailability, CheckpointCommitter, ChunkAvailability, ContentsBuilder, ProtocolKey,
-    SummaryBuilder,
+    BuiltAvailability, CheckpointCommitter, ChunkAvailability, ContentsBuilder, EpochCloser,
+    ProtocolKey, SummaryBuilder,
 };
 use consensus::TransactionClient;
 use exec_pool::{EffectsAvailability, EffectsRouter, Executor};
 use resolver::{InputAvailability, VersionResolver};
 use settlement::{FundsReserver, SettlementScheduler};
-use state_hasher::{StateHash, StateHasher, StateHashes};
+use state_hasher::{StateHasher, StateHashes};
 use validator::consensus::cache::ConsensusTxCache;
 use validator::consensus::commit::{CommitStage, EpochStart};
 use validator::consensus::decode::{CommitDecoder, CommitRequest};
@@ -33,7 +36,7 @@ use validator::consensus::status::ConsensusTxStatusCache;
 use validator::consensus::vote::{BlockVoter, VoteRequest};
 use validator::current::EpochHandle;
 use validator::epoch::EpochState;
-use validator::pipeline::items::{CertifiedCheckpoint, EffectsWaitItem};
+use validator::pipeline::items::{CertifiedCheckpoint, EffectsWaitItem, EpochCloserInput};
 use validator::pipeline::keys::EffectsKey;
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable, GenerationTable};
 use validator::processors::{Request, SignatureVerifier, TransactionValidator};
@@ -70,9 +73,10 @@ pub struct Pipeline {
     pub generations: Arc<GenerationTable>,
     pub chunks: Arc<ChunkTable>,
     pub checkpoints: Arc<CheckpointStore>,
-    /// Each checkpoint's state hash and the running root, for the end of
-    /// the epoch.
+    /// Each checkpoint's state hash and the running root.
     pub state_hashes: Arc<StateHashes>,
+    /// The epoch's last checkpoint, once committed: the epoch is over.
+    pub ended: watch::Receiver<Option<u64>>,
 }
 
 /// A sink pushing each batch to `queue`. Inside the pipeline a full queue is
@@ -92,10 +96,11 @@ fn into<T: Send + 'static>(queue: Queue<T>, name: &'static str) -> impl FnMut(T)
 /// # Panics
 /// If the store cannot be read or written, lacks `previous`, or has no
 /// shared accumulator root.
-fn epoch_start(store: &store::Store, epoch: u64, previous: u64) -> (BuiltCheckpoint, EpochStart) {
+fn epoch_start(store: &store::Store, record: &EpochRecord) -> (BuiltCheckpoint, EpochStart) {
+    let epoch = record.epoch;
     let checkpoint = BuiltCheckpoint::decode(
         &store
-            .checkpoint(previous)
+            .checkpoint(record.previous_checkpoint)
             .expect("the store reads")
             .expect("the epoch's previous checkpoint is committed"),
     );
@@ -125,6 +130,8 @@ fn epoch_start(store: &store::Store, epoch: u64, previous: u64) -> (BuiltCheckpo
         previous_timestamp_ms: checkpoint.timestamp_ms,
         accumulator_root_version,
         accumulator_root_initial_shared_version: initial_shared_version,
+        epoch_start_timestamp_ms: record.epoch_start_timestamp_ms,
+        epoch_duration_ms: record.epoch_duration_ms,
     };
     (checkpoint, start)
 }
@@ -132,8 +139,8 @@ fn epoch_start(store: &store::Store, epoch: u64, previous: u64) -> (BuiltCheckpo
 impl Pipeline {
     /// The pipeline over `store`, in `epoch`, signing checkpoints with
     /// `protocol_key`, certifying them with `committee`'s signatures and
-    /// handing them to `state_sync`. The epoch's first checkpoint follows
-    /// `previous_checkpoint`.
+    /// handing them to `state_sync`; as `record`, the epoch's start record,
+    /// says it starts.
     ///
     /// It starts from the epoch's start, so consensus must deliver the
     /// epoch's commits from its first: replaying them rebuilds every
@@ -148,13 +155,13 @@ impl Pipeline {
         committee: &Arc<Committee>,
         consensus: &TransactionClient,
         state_sync: Queue<CertifiedCheckpoint>,
-        previous_checkpoint: u64,
+        record: &EpochRecord,
     ) -> Pipeline {
         let cache = Arc::new(ConsensusTxCache::new());
         let generations = Arc::new(GenerationTable::new());
         let chunks = Arc::new(ChunkTable::new());
         let checkpoints = Arc::new(CheckpointStore::new());
-        let (first, start) = epoch_start(store, epoch.params.epoch, previous_checkpoint);
+        let (first, start) = epoch_start(store, record);
         checkpoints.insert_built(first);
         let next_to_certify = store
             .committed_checkpoint()
@@ -181,6 +188,8 @@ impl Pipeline {
         let (to_contents, contents_inbox) = workqueue::queue(QUEUE);
         let (to_hasher, hasher_inbox) = workqueue::queue(QUEUE);
         let (to_summary, summary_inbox) = workqueue::queue(QUEUE);
+        let (to_closer, closer_inbox) = workqueue::queue(QUEUE);
+        let (ended_sender, ended) = watch::channel(None);
         let (to_committer, committer_inbox) = workqueue::queue(QUEUE);
         let (to_aggregator, aggregator_inbox) = workqueue::queue(QUEUE);
 
@@ -302,6 +311,7 @@ impl Pipeline {
             };
             let router = EffectsRouter {
                 settlement: to_settlement.clone(),
+                epoch_closer: to_closer.clone(),
             };
             workers.push(
                 Worker::new("effects-waiter")
@@ -382,15 +392,19 @@ impl Pipeline {
                     )
                     .spawn(),
             );
-            // Read at the end of the epoch, which is not wired yet. Folds from
-            // genesis until reconfiguration supplies the epoch's start.
-            let state_hashes = state_hashes.clone();
+            let (state_hashes, closer) = (state_hashes.clone(), to_closer.clone());
+            let (first, prior) = (
+                record.previous_checkpoint + 1,
+                state_hasher::decode(&record.root_state),
+            );
             workers.push(
                 Worker::new("state-hasher")
                     .abort_on_panic()
                     .run(
                         hasher_inbox,
-                        move || StateHasher::new(state_hashes, 0, StateHash::default()),
+                        move || {
+                            StateHasher::new(state_hashes, first, prior).with_epoch_closer(closer)
+                        },
                         |()| {},
                     )
                     .spawn(),
@@ -404,7 +418,37 @@ impl Pipeline {
                     .run(
                         sequence_inbox,
                         move || WaiterProcessor::new(availability),
-                        into(to_summary, "summary"),
+                        {
+                            let closer = into(to_closer.clone(), "epoch closer");
+                            let mut closer = closer;
+                            move |ready| closer(EpochCloserInput::Built(ready))
+                        },
+                    )
+                    .spawn(),
+            );
+            let (store_e, checkpoints_e, resolver, effects, hasher) = (
+                store.clone(),
+                checkpoints.clone(),
+                to_resolver.clone(),
+                effects_waits.clone(),
+                to_hasher.clone(),
+            );
+            workers.push(
+                Worker::new("epoch-closer")
+                    .abort_on_panic()
+                    .run(
+                        closer_inbox,
+                        move || {
+                            EpochCloser::new(
+                                store_e,
+                                checkpoints_e,
+                                resolver,
+                                effects,
+                                hasher,
+                                to_summary,
+                            )
+                        },
+                        |()| {},
                     )
                     .spawn(),
             );
@@ -465,7 +509,9 @@ impl Pipeline {
                     .abort_on_panic()
                     .run(
                         committer_inbox,
-                        move || CheckpointCommitter::new(store_c, checkpoints_c, chunks_c),
+                        move || {
+                            CheckpointCommitter::new(store_c, checkpoints_c, chunks_c, ended_sender)
+                        },
                         |()| {},
                     )
                     .spawn(),
@@ -486,6 +532,7 @@ impl Pipeline {
             chunks,
             checkpoints,
             state_hashes,
+            ended,
             _workers: workers,
         }
     }

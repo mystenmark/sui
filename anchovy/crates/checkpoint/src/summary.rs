@@ -4,11 +4,12 @@
 //! A checkpoint's summary, which needs the previous checkpoint, and this
 //! validator's signature over it.
 
-use messages::base::Digest;
+use messages::base::{AuthorityPublicKeyBytes, Digest};
 use messages::checkpoint::CheckpointCommitmentKind;
 use messages::effects::GasCostSummary;
+use messages::fast::checkpoint::{CommitteeMember, EndOfEpoch};
 use messages::fast::{Bump, SummaryBuilder};
-use validator::pipeline::items::CheckpointContentsBuilt;
+use validator::pipeline::items::{CheckpointContentsBuilt, LastOfEpoch};
 use validator::pipeline::tables::BuiltCheckpoint;
 
 use crate::key::ProtocolKey;
@@ -29,14 +30,24 @@ pub struct Summary {
     pub epoch_rolling_gas: [u64; 4],
 }
 
+/// The epoch's gas totals through `built` (computation, storage, rebate,
+/// non-refundable), after `previous`: restarted with each epoch's first
+/// checkpoint.
+pub fn rolling_gas(
+    built: &CheckpointContentsBuilt,
+    previous: Option<&BuiltCheckpoint>,
+) -> [u64; 4] {
+    match previous {
+        Some(p) if summary_epoch(&p.summary) == built.epoch.epoch => {
+            std::array::from_fn(|i| p.epoch_rolling_gas[i] + built.gas[i])
+        }
+        _ => built.gas,
+    }
+}
+
 /// The summary of `built` after `previous` (`None` only for checkpoint 0),
-/// as the reference's `CheckpointSummary::new`. `bump` is scratch, reset
-/// here.
-///
-/// The last checkpoint of an epoch is built without its end-of-epoch data:
-/// that needs the advance-epoch transaction, the next committee and
-/// protocol version and the epoch's root state digest, which wait on
-/// reconfiguration.
+/// as the reference's `CheckpointSummary::new`, with its end-of-epoch data
+/// if it is the epoch's last. `bump` is scratch, reset here.
 pub fn build(
     built: &CheckpointContentsBuilt,
     previous: Option<&BuiltCheckpoint>,
@@ -45,13 +56,7 @@ pub fn build(
     let epoch = built.epoch.epoch;
     let network_total_transactions =
         previous.map_or(0, |p| p.network_total_transactions) + built.transaction_count;
-    // Rolling gas restarts with each epoch's first checkpoint.
-    let epoch_rolling_gas = match previous {
-        Some(p) if summary_epoch(&p.summary) == epoch => {
-            std::array::from_fn(|i| p.epoch_rolling_gas[i] + built.gas[i])
-        }
-        _ => built.gas,
-    };
+    let epoch_rolling_gas = rolling_gas(built, previous);
 
     let version_specific_data = match built.epoch.config.checkpoint_summary_version_specific_data {
         None | Some(0) => Vec::new(),
@@ -87,6 +92,32 @@ pub fn build(
     summary.previous_digest = previous.map(|p| Digest::new(p.digest));
     summary.checkpoint_commitments = &commitments;
     summary.version_specific_data = &version_specific_data;
+    let closed = match &built.last {
+        Some(LastOfEpoch::Closed(end)) => Some(end),
+        Some(LastOfEpoch::Effects(_)) => panic!("an epoch's last checkpoint summarized unclosed"),
+        None => None,
+    };
+    let next_committee: Vec<CommitteeMember> = closed.map_or_else(Vec::new, |end| {
+        end.next_committee
+            .iter()
+            .map(|(key, power)| (AuthorityPublicKeyBytes::new(*key), *power))
+            .collect()
+    });
+    let epoch_commitments: Vec<(CheckpointCommitmentKind, Digest)> = closed
+        .and_then(|end| end.root_state_digest)
+        .map(|d| {
+            (
+                CheckpointCommitmentKind::EcmhLiveObjectSetDigest,
+                Digest::new(d),
+            )
+        })
+        .into_iter()
+        .collect();
+    summary.end_of_epoch_data = closed.map(|end| EndOfEpoch {
+        next_epoch_committee: &next_committee,
+        next_epoch_protocol_version: end.next_protocol_version,
+        epoch_commitments: &epoch_commitments,
+    });
     let finished = summary.finish();
     Summary {
         bytes: finished.bytes.to_vec(),

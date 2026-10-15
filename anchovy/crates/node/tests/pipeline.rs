@@ -6,7 +6,7 @@
 //! commits it, and puts the checkpoint signatures the pipeline submits into
 //! the next commit, until the checkpoints certify.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
@@ -18,6 +18,7 @@ use messages::base::ObjectId;
 use move_core_types::ident_str;
 mod genesis;
 
+use fastcrypto::hash::MultisetHash;
 use node::Pipeline;
 use node::epoch::{Epoch, Perpetual};
 use protocol_config::Chain;
@@ -29,10 +30,12 @@ use sui_types::execution_status::{ExecutionErrorKind, ExecutionStatus};
 use sui_types::gas_coin::{GAS, GasCoin};
 use sui_types::message_envelope::Message as _;
 use sui_types::messages_checkpoint::{
-    CertifiedCheckpointSummary, CheckpointContents, CheckpointSummary,
+    CertifiedCheckpointSummary, CheckpointCommitment, CheckpointContents, CheckpointSummary,
 };
 use sui_types::object::{Object, Owner};
 use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
+use sui_types::supported_protocol_versions::ProtocolVersion;
+use sui_types::transaction::TransactionDataAPI as _;
 use sui_types::transaction::{
     Argument, CallArg, Command as PtbCommand, FundsWithdrawalArg, ObjectArg,
     SharedObjectMutability, Transaction, TransactionData,
@@ -126,6 +129,8 @@ struct Network {
     delivered: Vec<CommittedSubDag>,
     /// The sender's gas coins, by id.
     coins: Vec<ObjectID>,
+    /// Every object genesis made, by id.
+    genesis_objects: Vec<ObjectID>,
     // Dropped after the pipeline.
     dir: tempfile::TempDir,
 }
@@ -146,7 +151,11 @@ impl Network {
         let store = Arc::new(store::Store::open(dir.path()).unwrap());
         let genesis = genesis::build(sender, coins, 10 * SUI, epoch_duration_ms);
         execution::genesis::commit(&store, &genesis.objects).unwrap();
-        node::epoch::genesis(&store, &genesis.checkpoint);
+        node::epoch::genesis(
+            &store,
+            &genesis.checkpoint,
+            genesis.objects.iter().map(|o| o.digest().into_inner()),
+        );
         let protocol_key = Arc::new(ProtocolKey::new(genesis::protocol_key_pair()));
         let chain_identifier = messages::base::Digest::new(genesis.chain_identifier);
 
@@ -182,6 +191,7 @@ impl Network {
             certified: BTreeMap::new(),
             delivered: Vec::new(),
             coins: genesis.coins,
+            genesis_objects: genesis.objects.iter().map(|o| o.id()).collect(),
             dir,
         }
     }
@@ -492,6 +502,28 @@ impl Network {
         u64::from(index)
     }
 
+    /// Plays consensus until the epoch's last checkpoint has committed: its
+    /// sequence number.
+    fn end_epoch(&mut self) -> u64 {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            self.poll();
+            if let Some(seq) = *self.pipeline().ended.borrow() {
+                return seq;
+            }
+            assert_no_panics();
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the epoch to end"
+            );
+            if self.pending.is_empty() {
+                std::thread::sleep(Duration::from_millis(2));
+            } else {
+                self.commit(vec![]);
+            }
+        }
+    }
+
     /// Plays consensus until checkpoint `seq` certifies: commits each
     /// checkpoint signature the pipeline submits.
     fn certify(&mut self, seq: u64) -> CertifiedCheckpointSummary {
@@ -738,6 +770,86 @@ fn replay_reads_a_since_deleted_shared_object_from_effects() {
     let seq = network.commit(vec![consensus_transaction(&after)]);
     network.certify(seq);
     network.assert_checkpointed(seq, &[&after]);
+    assert_no_panics();
+}
+
+/// The first commit at or past the epoch's end is its last: its last
+/// checkpoint ends with the change-epoch transaction, and carries the next
+/// epoch's committee and protocol version and the epoch's root. Once it
+/// commits, the system state is the next epoch's, and the epoch is over.
+#[test]
+fn the_epoch_ends_with_a_checkpoint_closing_it() {
+    // Commits are 10 s apart from 10 s: the third is the epoch's last.
+    let mut network = Network::with_epoch_duration(2, 25_000);
+    let transfer = network.transfer(network.coin(0));
+    network.commit(vec![consensus_transaction(&transfer)]);
+    network.commit(vec![]);
+    let last_commit = network.commit(vec![]);
+    let last = network.end_epoch();
+    assert!(
+        last >= last_commit,
+        "the last commit's checkpoint ends the epoch"
+    );
+    network.assert_checkpointed(1, &[&transfer]);
+
+    // Its summary closes the epoch, as certified.
+    let certified = network.certify(last);
+    let end = certified
+        .end_of_epoch_data
+        .as_ref()
+        .expect("the last checkpoint has end-of-epoch data");
+    assert_eq!(end.next_epoch_protocol_version, ProtocolVersion::MAX);
+    assert_eq!(
+        end.next_epoch_committee,
+        network.sui_committee.voting_rights
+    );
+    let committed = network.committed(last);
+    let root = state_hasher::decode(committed.root_state.as_ref().unwrap());
+    assert_eq!(
+        end.epoch_commitments,
+        vec![CheckpointCommitment::ECMHLiveObjectSetDigest(
+            root.digest().into()
+        )]
+    );
+    for seq in 1..last {
+        assert!(network.certify(seq).end_of_epoch_data.is_none(), "{seq}");
+    }
+    // The root is the live object set's: every object genesis or a
+    // checkpoint wrote, at its live version.
+    let mut ids: BTreeSet<ObjectID> = network.genesis_objects.iter().copied().collect();
+    for seq in 1..=last {
+        for digest in network.contents(seq) {
+            for (object, _, _) in network.effects(&digest).all_changed_objects() {
+                ids.insert(object.0);
+            }
+        }
+    }
+    let mut live = state_hasher::StateHash::default();
+    for id in ids {
+        if let Some(object) = network.store().live(&ObjectId(id.into_bytes())).unwrap() {
+            live.insert(object.digest.bytes);
+        }
+    }
+    assert_eq!(
+        live.digest(),
+        root.digest(),
+        "the root is the live object set's"
+    );
+
+    // It ends with the change-epoch transaction, committed with it.
+    let contents = network.contents(last);
+    let change_epoch = contents.last().unwrap();
+    let transaction = network
+        .store()
+        .transaction(&messages::base::Digest::new(change_epoch.into_inner()))
+        .unwrap()
+        .unwrap();
+    let transaction: sui_types::transaction::SenderSignedData =
+        bcs::from_bytes(transaction.wire_bytes()).unwrap();
+    assert!(transaction.transaction_data().is_end_of_epoch_tx());
+    let state = execution::system_state::read(network.store()).unwrap();
+    assert_eq!(state.epoch, 1);
+    assert_eq!(state.epoch_start_timestamp_ms, committed.timestamp_ms);
     assert_no_panics();
 }
 
