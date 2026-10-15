@@ -60,8 +60,8 @@ Out of scope for now:
 All steps of the design done. Open:
 - the reference's other end-of-epoch transaction kinds, and protocol
   upgrades (capability votes);
-- comparing certified checkpoints with local ones (fork detection), in the
-  checkpoint executor;
+- fork detection: done (a fork waiter, and every epoch drained before it
+  is dropped);
 - correct end-of-epoch determination (deferred transactions, randomness,
   the close deadline);
 - a production genesis loader (the node tests build genesis with sui's

@@ -87,6 +87,20 @@ The steps of the reference's reconfiguration (R4.10) map onto this:
   the next iteration builds a new `EpochState` and pipeline. No global
   swaps.
 
+**Draining.** Before an ended epoch is dropped, it is drained: every item
+ready anywhere in its pipeline is processed, waiters' ready items
+included. Every queue of the epoch's counts toward one `Activity` (an item
+counts from its push until it is processed and its outputs are pushed on),
+and draining waits until nothing counts. Items waiting on keys stay: a
+validator may move on through certified checkpoints before it has built
+them all. The epoch's consensus stops first, so nothing new arrives.
+
+**Fork detection.** A fork waiter holds each certified checkpoint until
+this validator has built it (`CheckpointBuilt(seq)`, resolved to the
+local checkpoint by `SummaryBuilder`, or read as committed once pruned),
+then compares their summaries and aborts on a fork. Draining the epoch
+checks every certified checkpoint whose local one is built.
+
 ## `CurrentEpoch`
 
 A perpetual `tokio::sync::watch` of `Option<Arc<EpochHandle>>`.
