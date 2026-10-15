@@ -21,7 +21,9 @@ Out of scope for now:
 - Deciding the end of the epoch correctly: deferred transactions,
   randomness, the close deadline (R1). A simple timestamp rule stands in.
 - Protocol upgrades: no capability votes (R2.9, R2.10). The next epoch
-  keeps the protocol version and system packages.
+  keeps the protocol version and system packages. Its parameters are still
+  read from the system state, so upgrades and committee changes will need
+  no change to how an epoch is built.
 - Joining or leaving the committee (R4.19): this node is assumed to stay a
   validator.
 - Executing checkpoints synced from peers.
@@ -177,6 +179,11 @@ commit.
 any other. Afterwards it signals `final_checkpoint_committed` to the node
 loop, and the epoch has nothing left to do.
 
+**A real genesis.** Anchovy's genesis has no system state object, and
+`advance_epoch` needs one, with validators and staking pools. Genesis is
+built by sui's genesis builder instead, which also gives the first epoch
+start record its parameters and committee.
+
 ## Testing
 
 - The node test network gains epochs: a genesis with a short epoch
@@ -196,16 +203,19 @@ loop, and the epoch has nothing left to do.
    made perpetual and awaiting the current epoch, consensus per epoch, and
    the node loop with the epoch start record. Tests drive one epoch, as
    now.
-2. **The final checkpoint.** The timestamp stub, the reserved accesses,
-   `EpochCloser`, `EndOfEpochData`, and the committer's signal.
+2. **The final checkpoint.** A genesis with a system state, the timestamp
+   stub, the reserved accesses, `EpochCloser`, `EndOfEpochData`, and the
+   committer's signal.
 3. **Reconfiguration.** `reconfigure`, the loop crossing epochs, and the
    crash tests.
 
-## Open questions
+## Decisions
 
-1. Is the timestamp rule a good enough stub for ending the epoch?
-2. The change-epoch transaction is built by `EpochCloser` with its
-   versions reserved by the commit handler, not executed by the builder
-   outside the pipeline as in the reference. Agreed?
-3. Is "no protocol upgrades and an unchanged validator set" right for this
-   phase?
+- The timestamp rule is the stub for ending the epoch.
+- `EpochCloser` builds the change-epoch transaction, with its versions
+  reserved by the commit handler. Executing it into the cache is the
+  "execute without committing" step that lets the final checkpoint be
+  built and signed. The committer commits it with the certified final
+  checkpoint, so it isn't executed a second time.
+- No protocol upgrades or validator-set changes in this phase, but epoch
+  parameters are read from the system state regardless.

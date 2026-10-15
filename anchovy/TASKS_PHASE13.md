@@ -25,11 +25,16 @@ Out of scope for now:
   makes a final checkpoint.
 - Backpressure (phase 12's last step, on hold).
 
-## Status: design proposed, awaiting review
+## Status: implementing (design agreed)
 
 ## Steps
 
 1. Spec of the reference's end of epoch and reconfiguration, with its bug
    history: `docs/reconfiguration_reference.md` (sub-agent). Done.
-2. Design: `docs/reconfiguration_design.md`. Proposed.
-3. Implementation, in the design's order of work.
+2. Design: `docs/reconfiguration_design.md`. Agreed.
+3. Implementation, in the design's order of work:
+   1. Lifetimes without an epoch end: `CurrentEpoch`, perpetual gRPC and
+      state sync, consensus per epoch, the node loop and the epoch start
+      record. In progress.
+   2. The final checkpoint, with a genesis that has a system state.
+   3. Reconfiguration across epochs, and the crash tests.
