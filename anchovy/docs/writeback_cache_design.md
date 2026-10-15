@@ -290,14 +290,16 @@ parts:
    certified again: the aggregator starts after the committed one.
    Everything later is re-executed into the cache.
 
-   Start-up must take nothing from the store's current state, which may
-   be ahead of the epoch's start:
-   - the accumulator root's version at the epoch's start is committed
-     with the genesis checkpoint (with the previous epoch's last, once
-     reconfiguration exists);
-   - settlement's first root version comes from its first chunk;
-   - a replayed transaction's first read of a shared object comes from
-     its stored effects, as the object may since be deleted.
+   Nothing may be taken from the store's current state, which may be
+   ahead of the epoch's start. Version assignment starts each shared
+   object (the accumulator root included) at its live version the first
+   time it assigns the object a version in the epoch, as the reference's
+   `get_or_init_next_object_versions` does, and records that start
+   durably at once in a start-version table, before anything it assigned
+   can commit. A replay reads the start from the table. Settlement's
+   first root version is the first chunk's assigned one. Later, persisted
+   handler state updates the table as it commits consensus state, as the
+   reference's quarantine flushes `next_shared_object_versions`.
 2. **Later, if replay from epoch start is too slow:** persist handler
    state at checkpoint boundaries in the commit batch, the analogue of
    the reference's consensus quarantine (R7.4). It must keep B-40's rule:

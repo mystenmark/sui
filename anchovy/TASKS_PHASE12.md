@@ -36,7 +36,9 @@ seeing uncommitted outputs, and it caches reads positively and negatively.
    4. Restart by replay. Done: the pipeline always starts from the epoch's
       start and consensus replays the epoch's commits. Tests crash for
       real (reopening the store) before and after a commit, and replay a
-      transaction whose shared input was deleted since.
+      transaction whose shared input was deleted since. Shared objects
+      (the accumulator root included) start version assignment from a
+      persisted start-version table, initialized at the first assignment.
    5. Backpressure. Next.
 
 ## TODOs
@@ -46,3 +48,6 @@ seeing uncommitted outputs, and it caches reads positively and negatively.
 - Bound the summary waiter: pre-commit signatures can name any sequence
   number.
 - The executor parses its outputs, and `Store::write` parses them again.
+- Update the start-version table when committing consensus state (with
+  persisted handler state), as the reference flushes
+  `next_shared_object_versions`.
