@@ -10,6 +10,7 @@ pub mod genesis;
 pub mod native;
 pub mod reads;
 mod store_view;
+pub mod system_state;
 
 use std::sync::Arc;
 

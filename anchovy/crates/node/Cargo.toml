@@ -19,10 +19,14 @@ checkpoint.workspace = true
 state-hasher.workspace = true
 aggregator.workspace = true
 protocol-config.workspace = true
+execution.workspace = true
 
 [dev-dependencies]
 bcs.workspace = true
-execution.workspace = true
+sui-genesis-builder.workspace = true
+sui-config.workspace = true
+fastcrypto.workspace = true
+rand.workspace = true
 move-core-types.workspace = true
 sui-types.workspace = true
 tempfile.workspace = true

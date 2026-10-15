@@ -16,15 +16,16 @@ use consensus::{
 };
 use messages::base::ObjectId;
 use move_core_types::ident_str;
+mod genesis;
+
 use node::Pipeline;
-use node::epoch::{Epoch, EpochRecord, Perpetual};
-use protocol_config::{Chain, ProtocolVersion};
+use node::epoch::{Epoch, Perpetual};
+use protocol_config::Chain;
 use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
 use sui_types::crypto::{AccountKeyPair, AuthorityPublicKeyBytes, get_key_pair};
 use sui_types::digests::TransactionDigest;
 use sui_types::effects::{TransactionEffects, TransactionEffectsAPI};
 use sui_types::execution_status::{ExecutionErrorKind, ExecutionStatus};
-use sui_types::gas::GasCostSummary;
 use sui_types::gas_coin::{GAS, GasCoin};
 use sui_types::message_envelope::Message as _;
 use sui_types::messages_checkpoint::{
@@ -54,7 +55,6 @@ use workqueue::{Inbox, Queue};
 
 const RGP: u64 = 1000;
 const CHAIN: Chain = Chain::Unknown;
-const CHAIN_IDENTIFIER: messages::base::Digest = messages::base::Digest::new([0; 32]);
 const BUDGET: u64 = 50_000_000;
 const SUI: u64 = 1_000_000_000;
 /// Long enough for a debug build; a hang fails instead of blocking.
@@ -124,41 +124,31 @@ struct Network {
     /// Every commit delivered, which consensus replays to a restarted
     /// pipeline.
     delivered: Vec<CommittedSubDag>,
+    /// The sender's gas coins, by id.
+    coins: Vec<ObjectID>,
     // Dropped after the pipeline.
     dir: tempfile::TempDir,
 }
 
 impl Network {
-    /// A genesis giving the sender `coins` gas coins of 10 SUI.
+    /// A genesis giving the sender `coins` gas coins of 10 SUI, with an
+    /// epoch longer than any test.
     fn new(coins: usize) -> Network {
+        Network::with_epoch_duration(coins, 1 << 40)
+    }
+
+    /// A genesis giving the sender `coins` gas coins of 10 SUI, its first
+    /// epoch lasting `epoch_duration_ms`.
+    fn with_epoch_duration(coins: usize, epoch_duration_ms: u64) -> Network {
         record_panics();
         let (sender, key) = get_key_pair::<AccountKeyPair>();
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(store::Store::open(dir.path()).unwrap());
-        let mut private = [0u8; 32];
-        private[31] = 7;
-        let protocol_key = Arc::new(ProtocolKey::from_private_bytes(&private).unwrap());
-        let first = EpochRecord {
-            epoch: 0,
-            protocol_version: ProtocolVersion::MAX.as_u64(),
-            reference_gas_price: RGP,
-            epoch_start_timestamp_ms: 0,
-            epoch_duration_ms: u64::MAX,
-            committee: vec![(*protocol_key.public(), 10_000)],
-            previous_checkpoint: 0,
-        };
-        let genesis_epoch = EpochState::new(
-            CHAIN,
-            first.protocol_version,
-            0,
-            CHAIN_IDENTIFIER,
-            RGP,
-            1,
-            [],
-        );
-        let funded = vec![(sender.to_inner(), 10 * SUI); coins];
-        assert!(execution::genesis::init(&genesis_epoch.execution, &store, &funded).unwrap());
-        node::epoch::genesis(&store, &genesis_checkpoint(), &first);
+        let genesis = genesis::build(sender, coins, 10 * SUI, epoch_duration_ms);
+        execution::genesis::commit(&store, &genesis.objects).unwrap();
+        node::epoch::genesis(&store, &genesis.checkpoint);
+        let protocol_key = Arc::new(ProtocolKey::new(genesis::protocol_key_pair()));
+        let chain_identifier = messages::base::Digest::new(genesis.chain_identifier);
 
         let sui_committee = sui_types::committee::Committee::new(
             0,
@@ -172,8 +162,8 @@ impl Network {
             current: CurrentEpoch::new(),
             state_sync: state_sync.0.clone(),
             chain: CHAIN,
-            chain_identifier: CHAIN_IDENTIFIER,
-            protocol_key: protocol_key.clone(),
+            chain_identifier,
+            protocol_key,
         };
         let running = Epoch::start(&perpetual, &client);
         Network {
@@ -191,6 +181,7 @@ impl Network {
             blocks: Vec::new(),
             certified: BTreeMap::new(),
             delivered: Vec::new(),
+            coins: genesis.coins,
             dir,
         }
     }
@@ -225,6 +216,7 @@ impl Network {
             store,
             current,
             protocol_key,
+            chain_identifier,
             ..
         } = self.perpetual.take().unwrap();
         drop(current);
@@ -243,7 +235,7 @@ impl Network {
             current: CurrentEpoch::new(),
             state_sync: self.state_sync.0.clone(),
             chain: CHAIN,
-            chain_identifier: CHAIN_IDENTIFIER,
+            chain_identifier,
             protocol_key,
         });
     }
@@ -283,7 +275,7 @@ impl Network {
 
     /// Gas coin `i`, as of now.
     fn coin(&self, i: u64) -> ObjectRef {
-        let id = ObjectID::derive_id(TransactionDigest::genesis_marker(), i);
+        let id = self.coins[usize::try_from(i).unwrap()];
         self.live(id).compute_object_reference()
     }
 
@@ -581,35 +573,6 @@ impl Network {
                 .unwrap_or_else(|| panic!("checkpoint {seq} lists {digest}"));
             assert_eq!(entry.effects, effects.digest());
         }
-    }
-}
-
-/// The genesis checkpoint, which checkpoint 1 follows: a stand-in, as these
-/// tests' genesis funds objects directly rather than running a genesis
-/// transaction.
-fn genesis_checkpoint() -> BuiltCheckpoint {
-    let contents = CheckpointContents::new_with_digests_only_for_tests([]);
-    let summary = CheckpointSummary {
-        epoch: 0,
-        sequence_number: 0,
-        network_total_transactions: 1,
-        content_digest: *contents.digest(),
-        previous_digest: None,
-        epoch_rolling_gas_cost_summary: GasCostSummary::default(),
-        timestamp_ms: 0,
-        checkpoint_commitments: vec![],
-        end_of_epoch_data: None,
-        version_specific_data: vec![],
-    };
-    BuiltCheckpoint {
-        seq: 0,
-        summary: bcs::to_bytes(&summary).unwrap(),
-        digest: summary.digest().into_inner(),
-        contents: bcs::to_bytes(&contents).unwrap(),
-        network_total_transactions: 1,
-        epoch_rolling_gas: [0; 4],
-        last_height: 0,
-        timestamp_ms: 0,
     }
 }
 

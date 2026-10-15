@@ -39,6 +39,23 @@ pub struct EpochRecord {
 }
 
 impl EpochRecord {
+    /// The epoch the system state object describes, its first checkpoint
+    /// following `previous_checkpoint`.
+    pub fn new(
+        state: execution::system_state::SystemState,
+        previous_checkpoint: u64,
+    ) -> EpochRecord {
+        EpochRecord {
+            epoch: state.epoch,
+            protocol_version: state.protocol_version,
+            reference_gas_price: state.reference_gas_price,
+            epoch_start_timestamp_ms: state.epoch_start_timestamp_ms,
+            epoch_duration_ms: state.epoch_duration_ms,
+            committee: state.committee,
+            previous_checkpoint,
+        }
+    }
+
     const FIXED: usize = 6 * 8;
     const MEMBER: usize = 96 + 8;
 
@@ -105,21 +122,20 @@ impl EpochRecord {
     }
 }
 
-/// Writes the genesis checkpoint and the first epoch's start record, unless
-/// the store has them.
+/// Writes the genesis checkpoint and the first epoch's start record, read
+/// from the system state genesis created, unless the store has them. The
+/// genesis objects must be in the store.
 ///
 /// # Panics
-/// If the store cannot be read or written.
-pub fn genesis(store: &store::Store, checkpoint: &BuiltCheckpoint, first: &EpochRecord) {
+/// If the store cannot be read or written, or holds no system state.
+pub fn genesis(store: &store::Store, checkpoint: &BuiltCheckpoint) {
     if store.epoch_start().expect("the store reads").is_some() {
         return;
     }
     assert_eq!(checkpoint.seq, 0, "the genesis checkpoint is checkpoint 0");
-    assert_eq!(
-        first.previous_checkpoint, 0,
-        "the first epoch follows genesis"
-    );
-    store.commit_genesis_checkpoint(checkpoint.encode(), first.encode());
+    let state = execution::system_state::read(store).expect("genesis made a system state");
+    assert_eq!(state.epoch, 0, "genesis starts epoch 0");
+    store.commit_genesis_checkpoint(checkpoint.encode(), EpochRecord::new(state, 0).encode());
 }
 
 /// What the node keeps across epochs.
@@ -152,13 +168,14 @@ impl Epoch {
     /// If the store cannot be read, or the record's committee is invalid.
     pub fn start(perpetual: &Perpetual, client: &TransactionClient) -> Epoch {
         let record = EpochRecord::load(&perpetual.store);
-        let state = Arc::new(EpochState::new(
+        let state = Arc::new(EpochState::starting_at(
             perpetual.chain,
             record.protocol_version,
             record.epoch,
             perpetual.chain_identifier,
             record.reference_gas_price,
             u32::try_from(record.committee.len()).expect("a committee of fewer than 2^32"),
+            record.epoch_start_timestamp_ms,
             [],
         ));
         let committee = Arc::new(
