@@ -152,20 +152,34 @@ scheduled. It is built in two steps:
    after every other access of the epoch, and puts them in the final
    `PendingCheckpoint`. Versions stay defined by version assignment, as
    for every shared object.
-2. **`EpochCloser` builds it**, a per-epoch processor between
-   `ContentsBuilder` and `SummaryBuilder` that passes non-final
-   checkpoints straight through. For the final checkpoint, everything else
-   in the epoch has executed by then, since its chunks have settled. It:
+2. **`EpochCloser` builds it**, a per-epoch processor between the
+   sequence waiter and `SummaryBuilder` that passes non-final checkpoints
+   straight through. It sits after the sequence waiter so that the
+   previous checkpoint's summary, and so the epoch's rolling gas, is
+   built. For the final checkpoint, everything else in the epoch has
+   executed by then, since its chunks have settled. `ContentsBuilder`
+   builds the final checkpoint without the change-epoch transaction and
+   keeps its effects for `EpochCloser`, instead of hashing them. It:
    - builds `EndOfEpochTransaction [ChangeEpoch]`: the epoch's gas totals
      (the previous checkpoint's rolling gas plus this checkpoint's), the
      final checkpoint's timestamp as the next epoch's start (R2.4), the
      current protocol version and no system packages;
    - sends it to the resolver with its reserved accesses, so it executes
      like any system transaction, into the cache;
-   - waits for its effects, appends them to the contents, and fills in
-     `EndOfEpochData` (R2.14): the next committee and protocol version
-     from the system state it wrote, and the epoch's root state hash from
-     the state hasher's running root through the final checkpoint.
+   - waits for its effects (on the effects waiter), builds the contents
+     again with them last, and hands the whole checkpoint's effects to
+     the state hasher;
+   - once the hasher has folded them, it hands `EpochCloser` the root:
+     the hasher is the producer, so no waiter is needed;
+   - fills in `EndOfEpochData` (R2.14): the next committee and protocol
+     version from the system state the transaction wrote, and the root's
+     digest.
+
+**The epoch's root.** The root state hash is cumulative from genesis. The
+state hasher starts each epoch from the root after the epoch's previous
+checkpoint, which the epoch's start record carries. Genesis computes it
+from the genesis objects; the final checkpoint's record carries the root
+after it, committed with it, for the next epoch's record.
 
 The reference executes the change-epoch transaction in the builder without
 committing it, then again in the checkpoint executor (R2.13, R3.2). Anchovy
@@ -180,9 +194,10 @@ any other. Afterwards it signals `final_checkpoint_committed` to the node
 loop, and the epoch has nothing left to do.
 
 **A real genesis.** Anchovy's genesis has no system state object, and
-`advance_epoch` needs one, with validators and staking pools. Genesis is
-built by sui's genesis builder instead, which also gives the first epoch
-start record its parameters and committee.
+`advance_epoch` needs one, with validators and staking pools. The node
+tests build genesis with sui's genesis builder instead. The first epoch's
+start record is read from the system state it makes
+(`execution::system_state`), as each later epoch's is.
 
 ## Testing
 

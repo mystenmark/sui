@@ -39,6 +39,14 @@ Out of scope for now:
       `CurrentEpoch` (requests carry over to the next epoch), state sync's
       queue owned outside the pipeline. The node loop itself moves to step
       3, where an epoch can end.
-      Next: step 2.
-   2. The final checkpoint, with a genesis that has a system state.
+   2. The final checkpoint. Done:
+      - genesis from sui's genesis builder in the node tests; epoch
+        records read from the system state; `EpochState` takes the
+        epoch's start timestamp;
+      - the timestamp stub, the reserved write of the system state,
+        `EpochCloser`, `EndOfEpochData`, the committer's signal;
+      - the state hasher seeded per epoch from the record (it had waited
+        for a checkpoint 0 that never came).
+      The test checks the root against the live object set independently.
+      Next: step 3.
    3. Reconfiguration across epochs, and the crash tests.
