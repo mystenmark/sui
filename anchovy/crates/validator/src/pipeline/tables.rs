@@ -72,7 +72,7 @@ impl GenerationTable {
 
 /// Settled chunks by height. Written by `SettlementScheduler` (owner: the
 /// settlement work), read by the checkpoint waiter's availability check and
-/// by `ContentsBuilder`.
+/// by `ContentsBuilder`, pruned by `CheckpointCommitter`.
 #[derive(Default)]
 pub struct ChunkTable {
     chunks: Mutex<FastMap<u64, Arc<SettledChunk>>>,
@@ -89,6 +89,11 @@ impl ChunkTable {
 
     pub fn get(&self, height: u64) -> Option<Arc<SettledChunk>> {
         lock(&self.chunks).get(&height).cloned()
+    }
+
+    /// Drops the chunks at or below `height`.
+    pub fn prune_through(&self, height: u64) {
+        lock(&self.chunks).retain(|&h, _| h > height);
     }
 }
 
@@ -112,7 +117,7 @@ pub struct BuiltCheckpoint {
 }
 
 impl BuiltCheckpoint {
-    /// As the object store keeps it (`Store::put_checkpoint`).
+    /// As the object store keeps it (`Store::commit_checkpoint`).
     pub fn encode(&self) -> Vec<u8> {
         bcs::to_bytes(&(
             self.seq,
@@ -153,13 +158,19 @@ impl BuiltCheckpoint {
     }
 }
 
-/// Checkpoints built and certified, by sequence number. Written by
-/// `SummaryBuilder` and `CheckpointAggregator` (owner: the checkpoint work),
-/// read by the sequence and summary waiters' availability checks.
+/// Checkpoints built, by sequence number. Written by `SummaryBuilder`
+/// (owner: the checkpoint work) and pruned by `CheckpointCommitter`; read by
+/// the sequence and summary waiters' availability checks.
 #[derive(Default)]
 pub struct CheckpointStore {
-    built: Mutex<BTreeMap<u64, Arc<BuiltCheckpoint>>>,
-    certified: Mutex<BTreeMap<u64, Arc<[u8]>>>,
+    built: Mutex<Built>,
+}
+
+#[derive(Default)]
+struct Built {
+    checkpoints: BTreeMap<u64, Arc<BuiltCheckpoint>>,
+    /// Every checkpoint below was built, and pruned.
+    pruned_below: u64,
 }
 
 impl CheckpointStore {
@@ -168,19 +179,25 @@ impl CheckpointStore {
     }
 
     pub fn insert_built(&self, checkpoint: BuiltCheckpoint) {
-        lock(&self.built).insert(checkpoint.seq, Arc::new(checkpoint));
+        lock(&self.built)
+            .checkpoints
+            .insert(checkpoint.seq, Arc::new(checkpoint));
     }
 
     pub fn built(&self, seq: u64) -> Option<Arc<BuiltCheckpoint>> {
-        lock(&self.built).get(&seq).cloned()
+        lock(&self.built).checkpoints.get(&seq).cloned()
     }
 
-    /// Records the certified summary (`CertifiedCheckpointSummary` BCS).
-    pub fn insert_certified(&self, seq: u64, certified: Arc<[u8]>) {
-        lock(&self.certified).insert(seq, certified);
+    /// Whether checkpoint `seq` was built, though perhaps pruned since.
+    pub fn is_built(&self, seq: u64) -> bool {
+        let built = lock(&self.built);
+        seq < built.pruned_below || built.checkpoints.contains_key(&seq)
     }
 
-    pub fn certified(&self, seq: u64) -> Option<Arc<[u8]>> {
-        lock(&self.certified).get(&seq).cloned()
+    /// Drops the checkpoints below `seq`.
+    pub fn prune_below(&self, seq: u64) {
+        let mut built = lock(&self.built);
+        built.checkpoints = built.checkpoints.split_off(&seq);
+        built.pruned_below = built.pruned_below.max(seq);
     }
 }

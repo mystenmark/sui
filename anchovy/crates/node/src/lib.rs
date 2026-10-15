@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use aggregator::{CheckpointAggregator, Committee, SummaryAvailability};
 use checkpoint::{
-    BuiltAvailability, ChunkAvailability, ContentsBuilder, ProtocolKey, SummaryBuilder,
+    BuiltAvailability, CheckpointCommitter, ChunkAvailability, ContentsBuilder, ProtocolKey,
+    SummaryBuilder,
 };
 use consensus::TransactionClient;
 use exec_pool::{EffectsAvailability, EffectsRouter, Executor};
@@ -82,61 +83,66 @@ fn into<T: Send + 'static>(queue: Queue<T>, name: &'static str) -> impl FnMut(T)
     }
 }
 
-/// The highest checkpoint this node executed, which the pipeline continues
-/// after: `genesis`, written first, on a fresh database.
+/// The epoch's start: the checkpoint its first checkpoint follows, and what
+/// the commit handler starts from. On a fresh database, `genesis`, committed
+/// now. The first epoch's only: reconfiguration does not exist yet.
 ///
 /// # Panics
-/// If the store cannot be read or written.
-fn last_checkpoint(store: &store::Store, genesis: BuiltCheckpoint) -> BuiltCheckpoint {
-    if let Some((_, bytes)) = store.last_checkpoint().expect("the store reads") {
-        return BuiltCheckpoint::decode(&bytes);
-    }
-    assert_eq!(genesis.seq, 0, "the genesis checkpoint is checkpoint 0");
-    store
-        .put_checkpoint(0, genesis.encode())
-        .expect("the store writes");
-    genesis
-}
-
-/// What the commit handler takes from the epoch's start, the checkpoints
-/// numbered after `previous_checkpoint`. The first epoch's only:
-/// reconfiguration does not exist yet.
-///
-/// # Panics
-/// If the store has no shared accumulator root.
-fn epoch_start(store: &store::Store, last: &BuiltCheckpoint) -> EpochStart {
-    let root = store
-        .live_object(&messages::base::ObjectId::from_u16(0xacc))
-        .expect("the store reads")
-        .expect("the accumulator root exists");
+/// If the store cannot be read or written, or has no shared accumulator
+/// root.
+fn epoch_start(
+    store: &store::Store,
+    epoch: u64,
+    genesis: BuiltCheckpoint,
+) -> (BuiltCheckpoint, EpochStart) {
+    let checkpoint = if let Some(bytes) = store.checkpoint(0).expect("the store reads") {
+        BuiltCheckpoint::decode(&bytes)
+    } else {
+        assert_eq!(genesis.seq, 0, "the genesis checkpoint is checkpoint 0");
+        store.commit_genesis_checkpoint(genesis.encode());
+        genesis
+    };
+    let root = messages::base::ObjectId::from_u16(0xacc);
+    // Its initial shared version never changes, whatever the store holds.
     let messages::object::Owner::Shared {
         initial_shared_version,
-    } = root.get().owner
+    } = store
+        .live_object(&root)
+        .expect("the store reads")
+        .expect("the accumulator root exists")
+        .get()
+        .owner
     else {
         panic!("the accumulator root is shared");
     };
-    EpochStart {
-        previous_checkpoint: last.seq,
-        previous_height: last.last_height,
-        previous_timestamp_ms: last.timestamp_ms,
-        accumulator_root_version: store
-            .live(&messages::base::ObjectId::from_u16(0xacc))
-            .expect("the store reads")
-            .expect("the accumulator root exists")
-            .version,
+    // Version assignment starts here, as for any shared object: the
+    // commit handler numbers each chunk's root version from it.
+    let accumulator_root_version = store
+        .start_version(epoch, &root, initial_shared_version)
+        .expect("the store reads and writes")
+        .expect("the accumulator root exists")
+        .version;
+    let start = EpochStart {
+        previous_checkpoint: checkpoint.seq,
+        previous_height: checkpoint.last_height,
+        previous_timestamp_ms: checkpoint.timestamp_ms,
+        accumulator_root_version,
         accumulator_root_initial_shared_version: initial_shared_version,
-    }
+    };
+    (checkpoint, start)
 }
 
 impl Pipeline {
     /// The pipeline over `store`, in `epoch`, signing checkpoints with
-    /// `protocol_key`, certifying them with `committee`'s signatures. It
-    /// builds checkpoints from the one after the highest the store holds as
-    /// executed; `genesis` is that checkpoint on a fresh database, and is
-    /// ignored otherwise.
+    /// `protocol_key`, certifying them with `committee`'s signatures.
+    /// `genesis` is the epoch's start on a fresh database, and is ignored
+    /// otherwise.
     ///
-    /// Not covered yet: replaying the commits since that checkpoint, to
-    /// rebuild the commit handler's and the resolver's state.
+    /// It starts from the epoch's start, so consensus must deliver the
+    /// epoch's commits from its first: replaying them rebuilds every
+    /// stage's state. Transactions in committed checkpoints are found
+    /// executed, and checkpoints up to the committed one are rebuilt but not
+    /// certified again.
     #[allow(clippy::too_many_lines)]
     pub fn start(
         store: &Arc<store::Store>,
@@ -150,9 +156,13 @@ impl Pipeline {
         let generations = Arc::new(GenerationTable::new());
         let chunks = Arc::new(ChunkTable::new());
         let checkpoints = Arc::new(CheckpointStore::new());
-        let last = last_checkpoint(store, genesis);
-        let start = epoch_start(store, &last);
-        checkpoints.insert_built(last);
+        let (first, start) = epoch_start(store, epoch.params.epoch, genesis);
+        checkpoints.insert_built(first);
+        let next_to_certify = store
+            .committed_checkpoint()
+            .expect("the store reads")
+            .expect("the genesis checkpoint is committed")
+            + 1;
         let state_hashes = Arc::new(StateHashes::new());
         let statuses = Arc::new(ConsensusTxStatusCache::new());
 
@@ -173,6 +183,7 @@ impl Pipeline {
         let (to_contents, contents_inbox) = workqueue::queue(QUEUE);
         let (to_hasher, hasher_inbox) = workqueue::queue(QUEUE);
         let (to_summary, summary_inbox) = workqueue::queue(QUEUE);
+        let (to_committer, committer_inbox) = workqueue::queue(QUEUE);
         let (to_aggregator, aggregator_inbox) = workqueue::queue(QUEUE);
 
         // Waiters' commands.
@@ -200,10 +211,15 @@ impl Pipeline {
         // 2. Voting.
         {
             let (store, cache) = (store.clone(), cache.clone());
+            let signatures = summary_waits.clone();
             workers.push(
                 Worker::new("voting")
                     .abort_on_panic()
-                    .run(vote_inbox, move || BlockVoter::new(store, cache), |()| {})
+                    .run(
+                        vote_inbox,
+                        move || BlockVoter::new(store, cache).with_signatures(signatures),
+                        |()| {},
+                    )
                     .spawn(),
             );
         }
@@ -394,8 +410,7 @@ impl Pipeline {
                     )
                     .spawn(),
             );
-            let (store_s, checkpoints_s, key) =
-                (store.clone(), checkpoints.clone(), protocol_key.clone());
+            let (checkpoints_s, key) = (checkpoints.clone(), protocol_key.clone());
             let (sequence, summaries, consensus) = (
                 sequence_waits.clone(),
                 summary_waits.clone(),
@@ -407,14 +422,7 @@ impl Pipeline {
                     .run(
                         summary_inbox,
                         move || {
-                            SummaryBuilder::new(
-                                store_s,
-                                checkpoints_s,
-                                key,
-                                sequence,
-                                summaries,
-                                consensus,
-                            )
+                            SummaryBuilder::new(checkpoints_s, key, sequence, summaries, consensus)
                         },
                         |()| {},
                     )
@@ -440,7 +448,26 @@ impl Pipeline {
                     .abort_on_panic()
                     .run(
                         aggregator_inbox,
-                        move || CheckpointAggregator::new(committee, checkpoints_a, state_sync),
+                        move || {
+                            CheckpointAggregator::new(
+                                committee,
+                                checkpoints_a,
+                                next_to_certify,
+                                state_sync,
+                            )
+                        },
+                        into(to_committer, "committer"),
+                    )
+                    .spawn(),
+            );
+            let (store_c, checkpoints_c, chunks_c) =
+                (store.clone(), checkpoints.clone(), chunks.clone());
+            workers.push(
+                Worker::new("committer")
+                    .abort_on_panic()
+                    .run(
+                        committer_inbox,
+                        move || CheckpointCommitter::new(store_c, checkpoints_c, chunks_c),
                         |()| {},
                     )
                     .spawn(),

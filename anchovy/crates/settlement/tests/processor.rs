@@ -64,7 +64,7 @@ fn chunk(
     ChunkSettlement {
         epoch: epoch(),
         version: AccumulatorVersion(version),
-        root_version: 20,
+        root_version: ROOT_VERSION,
         last_of_commit: last,
         round,
         height,
@@ -156,7 +156,7 @@ fn account_object(balance: u128) -> Vec<u8> {
 
 fn write(store: &store::Store, id: ObjectId, version: u64, bytes: Vec<u8>) {
     store
-        .commit(store::Commit {
+        .write_through(store::Commit {
             written: vec![store::Written {
                 id,
                 version,
@@ -233,7 +233,7 @@ impl Harness {
             messages::effects::VersionedEffects::V1(_) => unreachable!(),
         };
         self.store
-            .commit(store::Commit {
+            .write_through(store::Commit {
                 executed: Some(store::Executed {
                     digest,
                     transaction: Vec::new(),
@@ -346,7 +346,7 @@ fn settles_a_chunk_end_to_end() {
     let c = chunk(10, (3, 0), (1, true), digests.clone());
 
     h.process(SettlementInput::Chunk(c.clone()));
-    // The first chunk seen reads the accumulator state in the store.
+    // The first chunk seen starts from its own root version.
     assert_eq!(settles(&h.funds), [settled(1, ROOT_VERSION, &[], 0)]);
     let (waits, keys, _) = drain(&h.effects);
     assert!(matches!(&waits[..], [EffectsWaitItem::ChunkExecuted(w)] if w.height == 10));

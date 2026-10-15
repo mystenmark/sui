@@ -203,6 +203,14 @@ impl Pending {
         signed: &SignedSummary<'_>,
         scratch: &mut Vec<u8>,
     ) -> bool {
+        // Most signatures arrive twice, from their block and their commit.
+        if self
+            .signatures
+            .get(&position)
+            .is_some_and(|c| c.bytes == *signed.signature)
+        {
+            return false;
+        }
         let Ok(signature) = BLS12381Signature::from_bytes(signed.signature) else {
             warn!(
                 seq = self.local.seq,
@@ -259,6 +267,14 @@ impl Pending {
         signed: &SignedSummary<'_>,
         scratch: &mut Vec<u8>,
     ) {
+        let digest = Digest::of("CheckpointSummary", signed.summary).bytes;
+        if self
+            .others
+            .get(&digest)
+            .is_some_and(|(signers, _)| signers.contains(&position))
+        {
+            return;
+        }
         let member = committee.member(position);
         let verified = BLS12381Signature::from_bytes(signed.signature).is_ok_and(|signature| {
             let message = signing_message(scratch, signed.summary, signed.epoch);
@@ -271,11 +287,7 @@ impl Pending {
             );
             return;
         }
-        let digest = Digest::of("CheckpointSummary", signed.summary).bytes;
         let (signers, stake) = self.others.entry(digest).or_default();
-        if signers.contains(&position) {
-            return;
-        }
         signers.push(position);
         *stake += member.stake;
         self.vote(position, member.stake);
@@ -397,8 +409,8 @@ impl Pending {
 }
 
 /// Collects checkpoint signatures against this validator's own summary;
-/// at quorum on its digest, stores the certified checkpoint and hands it to
-/// state sync.
+/// at quorum on its digest, certifies the checkpoint and hands it to state
+/// sync and on.
 ///
 /// Signatures are checked as sui's `CheckpointSignatureAggregator` checks
 /// them: the epoch, membership, one signature per signer, and the aggregate
@@ -408,21 +420,25 @@ impl Pending {
 /// never counts toward a certificate (in sui it cannot either: it is
 /// verified against the local summary and evicted).
 ///
-/// Unlike sui, which certifies in sequence order, each checkpoint is
-/// certified as soon as it has a quorum.
+/// As in sui, checkpoints are certified in sequence order: a quorum on a
+/// later checkpoint waits for the earlier ones, as nothing downstream can
+/// use it sooner.
 ///
 /// Inward:
 /// - summary waiter, ready: `Vec<CheckpointSignature>` (signatures wait
 ///   there until this validator has built the checkpoint).
 ///
 /// Outward:
-/// - state sync (black box): `CertifiedCheckpoint`.
+/// - state sync (black box): `CertifiedCheckpoint`;
+/// - `CheckpointCommitter`: `Vec<CertifiedCheckpoint>`, in sequence order.
 ///
-/// Reads and writes: the checkpoint store.
+/// Reads: the checkpoint store.
 pub struct CheckpointAggregator {
     committee: Arc<Committee>,
     checkpoints: Arc<CheckpointStore>,
     state_sync: Queue<CertifiedCheckpoint>,
+    /// The checkpoint to certify next; every earlier one is certified.
+    next: u64,
     pending: BTreeMap<u64, Pending>,
     scratch: Vec<u8>,
 }
@@ -431,20 +447,22 @@ impl CheckpointAggregator {
     pub fn new(
         committee: Arc<Committee>,
         checkpoints: Arc<CheckpointStore>,
+        next: u64,
         state_sync: Queue<CertifiedCheckpoint>,
     ) -> CheckpointAggregator {
         CheckpointAggregator {
             committee,
             checkpoints,
             state_sync,
+            next,
             pending: BTreeMap::new(),
             scratch: Vec::new(),
         }
     }
 
-    fn add(&mut self, signature: &CheckpointSignature) {
+    fn add(&mut self, signature: &CheckpointSignature, certified: &mut Vec<CertifiedCheckpoint>) {
         let seq = signature.seq;
-        if self.checkpoints.certified(seq).is_some() {
+        if seq < self.next {
             return;
         }
         let committee = &*self.committee;
@@ -478,39 +496,48 @@ impl CheckpointAggregator {
             pending.add_other(committee, position, &signed, &mut self.scratch);
             return;
         }
-        if !pending.add_local(committee, position, &signed, &mut self.scratch) {
-            return;
+        if pending.add_local(committee, position, &signed, &mut self.scratch) && seq == self.next {
+            self.certify_in_order(certified);
         }
-        let Some(certified) = pending.certify(committee, &mut self.scratch) else {
-            return;
-        };
-        self.pending.remove(&seq);
-        let summary: Arc<[u8]> = certified.into();
-        self.checkpoints.insert_certified(seq, summary.clone());
-        if self
-            .state_sync
-            .try_push(CertifiedCheckpoint { seq, summary })
-            .is_err()
-        {
-            warn!(seq, "state sync refused a certified checkpoint");
+    }
+
+    /// Certifies `next`, then each later checkpoint that already has a
+    /// quorum.
+    fn certify_in_order(&mut self, certified: &mut Vec<CertifiedCheckpoint>) {
+        while let Some(pending) = self.pending.get_mut(&self.next) {
+            let Some(summary) = pending.certify(&self.committee, &mut self.scratch) else {
+                return;
+            };
+            let seq = self.next;
+            self.pending.remove(&seq);
+            self.next += 1;
+            let checkpoint = CertifiedCheckpoint {
+                seq,
+                summary: summary.into(),
+            };
+            if self.state_sync.try_push(checkpoint.clone()).is_err() {
+                warn!(seq, "state sync refused a certified checkpoint");
+            }
+            certified.push(checkpoint);
         }
     }
 }
 
 impl Processor for CheckpointAggregator {
     type Input = Vec<CheckpointSignature>;
-    type Output = ();
+    type Output = Vec<CertifiedCheckpoint>;
 
-    fn process(&mut self, ready: Vec<CheckpointSignature>) -> Option<()> {
+    fn process(&mut self, ready: Vec<CheckpointSignature>) -> Option<Vec<CertifiedCheckpoint>> {
+        let mut certified = Vec::new();
         for signature in &ready {
-            self.add(signature);
+            self.add(signature, &mut certified);
         }
-        None
+        (!certified.is_empty()).then_some(certified)
     }
 }
 
 /// The summary waiter's availability check: a summary the checkpoint store
-/// holds as built.
+/// holds as built, or held before pruning it.
 pub struct SummaryAvailability {
     pub checkpoints: Arc<CheckpointStore>,
 }
@@ -518,6 +545,9 @@ pub struct SummaryAvailability {
 impl Availability<LocalSummary> for SummaryAvailability {
     fn check(&mut self, keys: &[LocalSummary], found: &mut Vec<Option<()>>) {
         found.clear();
-        found.extend(keys.iter().map(|k| self.checkpoints.built(k.0).map(|_| ())));
+        found.extend(
+            keys.iter()
+                .map(|k| self.checkpoints.is_built(k.0).then_some(())),
+        );
     }
 }

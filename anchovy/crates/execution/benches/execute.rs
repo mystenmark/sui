@@ -144,7 +144,7 @@ fn publish(setup: &mut Setup, reference: &Execution) -> ObjectID {
         .execute(&setup.store, &sign(data, &setup.key))
         .unwrap();
     let effects: TransactionEffects = bcs::from_bytes(&outcome.effects).unwrap();
-    setup.store.commit(outcome.commit).unwrap();
+    setup.store.write_through(outcome.commit).unwrap();
     effects
         .created()
         .into_iter()
@@ -250,7 +250,7 @@ fn main() {
             let warm = txs.len().min(10);
             for tx in &txs[..warm] {
                 let outcome = executor.execute(&setup.store, tx);
-                setup.store.commit(outcome.commit).unwrap();
+                setup.store.write_through(outcome.commit).unwrap();
             }
             let mut execute = Duration::ZERO;
             let mut commit = Duration::ZERO;
@@ -267,7 +267,7 @@ fn main() {
                     failed += 1;
                 }
                 let start = Instant::now();
-                setup.store.commit(outcome.commit).unwrap();
+                setup.store.write_through(outcome.commit).unwrap();
                 commit += start.elapsed();
             }
             let measured = (txs.len() - warm) as u32;

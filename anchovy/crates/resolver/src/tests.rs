@@ -322,7 +322,7 @@ fn store(objects: &[Object]) -> (Arc<store::Store>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let store = store::Store::open(dir.path()).unwrap();
     store
-        .commit(store::Commit {
+        .write_through(store::Commit {
             written: objects.iter().map(written).collect(),
             ..store::Commit::default()
         })
@@ -340,12 +340,10 @@ fn written(object: &Object) -> store::Written {
 }
 
 /// `object` as the input waiter resolves a key to it.
-fn value(object: &Object) -> Arc<Message<messages::object::Object<'static>>> {
-    Arc::new(
-        Message::parse(bcs::to_bytes(object).unwrap())
-            .map_err(|(e, _)| e)
-            .unwrap(),
-    )
+fn value(object: &Object) -> Message<messages::object::Object<'static>> {
+    Message::parse(bcs::to_bytes(object).unwrap())
+        .map_err(|(e, _)| e)
+        .unwrap()
 }
 
 fn coin(id: ObjectID, version: u64) -> Object {
@@ -472,7 +470,7 @@ fn a_resolved_chunk_waits_in_the_input_waiter_until_its_keys_are_available() {
     assert_eq!(ready[0].entry.shared[0].mutability, Mutable);
 
     store
-        .commit(store::Commit {
+        .write_through(store::Commit {
             written: vec![written(&coin(ObjectID::new(clock.id.0), 2))],
             ..store::Commit::default()
         })
@@ -505,7 +503,7 @@ fn a_resolved_chunk_waits_in_the_input_waiter_until_its_keys_are_available() {
     ));
 
     store
-        .commit(store::Commit {
+        .write_through(store::Commit {
             written: vec![written(&coin(id(1), 5))],
             ..store::Commit::default()
         })

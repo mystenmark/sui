@@ -153,10 +153,10 @@ pub type InputCommand = waiter::Command<crate::pipeline::keys::InputKey, Executa
 #[derive(Clone, Debug)]
 pub enum InputValue {
     /// `ObjectVersion` or `Package`: the object.
-    Object(Arc<Message<Object<'static>>>),
+    Object(Message<Object<'static>>),
     /// `Generation`: the generation, and the object at its version unless
     /// the stream ended.
-    Generation(Generation, Option<Arc<Message<Object<'static>>>>),
+    Generation(Generation, Option<Message<Object<'static>>>),
     /// `StreamLive`: nothing. `Executor` reads generation 0 itself, as it
     /// must be the same for every transaction of the round.
     Live,
@@ -279,8 +279,8 @@ pub struct CheckpointContentsBuilt {
     pub randomness_rounds: Vec<u64>,
 }
 
-/// A checkpoint signature from consensus. `CommitDecoder` → summary waiter
-/// (wait for `LocalSummary(seq)`) → `CheckpointAggregator`.
+/// A checkpoint signature from consensus. `BlockVoter` and `CommitDecoder`
+/// → summary waiter (wait for `LocalSummary(seq)`) → `CheckpointAggregator`.
 #[derive(Debug, Clone)]
 pub struct CheckpointSignature {
     pub seq: u64,
@@ -288,7 +288,8 @@ pub struct CheckpointSignature {
     pub message: Arc<[u8]>,
 }
 
-/// A certified checkpoint, for state sync.
+/// A certified checkpoint. `CheckpointAggregator` → state sync, and →
+/// `CheckpointCommitter`, in sequence order.
 #[derive(Debug, Clone)]
 pub struct CertifiedCheckpoint {
     pub seq: u64,
