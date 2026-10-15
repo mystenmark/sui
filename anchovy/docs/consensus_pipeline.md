@@ -76,11 +76,12 @@ not the handler, skips a transaction that has already executed.
 
 **How the rule is enforced.** By construction: the handler has no member
 and takes no parameter that reaches state outside consensus. It is built from
-its own state alone. Each call gets a commit and the epoch's parameters
+its own state alone. It is built for one epoch with the epoch's parameters
 (`EpochParams`: what every validator agrees on about the epoch, kept apart
-from `EpochState`'s verifier and executor), and returns its decisions. The
-whole commit path, from decoder to handler, carries only `EpochParams`. Anything that needs the store, an executor or a clock
-happens downstream, in processors the handler never sees.
+from `EpochState`'s verifier and executor); each call gets a commit and
+returns its decisions. The whole commit path, from decoder to handler, is
+built with only `EpochParams`. Anything that needs the store, an executor or
+a clock happens downstream, in processors the handler never sees.
 
 Two habits keep it deterministic within those inputs:
 - **Order:** output order comes from sorted vectors, ordered maps or explicit
