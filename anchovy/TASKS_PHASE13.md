@@ -25,11 +25,11 @@ Out of scope for now:
   makes a final checkpoint.
 - Backpressure (phase 12's last step, on hold).
 
-## Status: design (researching the reference)
+## Status: design proposed, awaiting review
 
 ## Steps
 
 1. Spec of the reference's end of epoch and reconfiguration, with its bug
-   history: `docs/reconfiguration_reference.md` (sub-agent). In progress.
-2. Design: `docs/reconfiguration_design.md`.
+   history: `docs/reconfiguration_reference.md` (sub-agent). Done.
+2. Design: `docs/reconfiguration_design.md`. Proposed.
 3. Implementation, in the design's order of work.
