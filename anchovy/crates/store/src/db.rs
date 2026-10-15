@@ -34,6 +34,14 @@ pub(crate) enum Latest {
 const DELETED: &[u8] = &[0];
 const WRAPPED: &[u8] = &[1];
 
+fn start_version_key(epoch: u64, id: &ObjectId, initial_shared_version: u64) -> [u8; 8 + ID + 8] {
+    let mut key = [0; 8 + ID + 8];
+    key[..8].copy_from_slice(&epoch.to_be_bytes());
+    key[8..8 + ID].copy_from_slice(&id.0);
+    key[8 + ID..].copy_from_slice(&initial_shared_version.to_be_bytes());
+    key
+}
+
 pub(crate) struct Db {
     tidehunter: Arc<Tidehunter>,
     /// Object id and big-endian version: every version of an object, in
@@ -56,6 +64,10 @@ pub(crate) struct Db {
     /// Big-endian sequence number: each committed checkpoint's certified
     /// summary. Genesis has none.
     certified: KeySpace,
+    /// Big-endian epoch, object id, big-endian initial shared version: the
+    /// version and digest that version assignment starts the object at in
+    /// the epoch.
+    start_versions: KeySpace,
 }
 
 const ID: usize = 32;
@@ -63,7 +75,6 @@ const DIGEST: usize = 32;
 /// `meta`'s keys.
 const GENESIS: &[u8; 8] = b"genesis\0";
 const COMMITTED: &[u8; 8] = b"commitwm";
-const EPOCH_START: &[u8; 8] = b"epochst\0";
 
 /// The reference's defaults.
 const MUTEXES: usize = if cfg!(debug_assertions) { 16 } else { 1024 };
@@ -82,7 +93,8 @@ impl Db {
             .add_key_space("events", DIGEST, MUTEXES, uniform)
             .add_key_space("meta", GENESIS.len(), 1, uniform)
             .add_key_space("checkpoints", 8, MUTEXES, uniform)
-            .add_key_space("certified", 8, MUTEXES, uniform);
+            .add_key_space("certified", 8, MUTEXES, uniform)
+            .add_key_space("start_versions", 8 + ID + 8, MUTEXES, uniform);
         let db = Tidehunter::open(
             path,
             shape.build(),
@@ -99,6 +111,7 @@ impl Db {
             meta: db.ks("meta"),
             checkpoints: db.ks("checkpoints"),
             certified: db.ks("certified"),
+            start_versions: db.ks("start_versions"),
             tidehunter: db,
         })
     }
@@ -330,16 +343,38 @@ impl Db {
         batch.write(self.meta, COMMITTED.to_vec(), seq.to_be_bytes().to_vec());
     }
 
-    /// What the current epoch's start agreed, as the pipeline encodes it.
-    pub fn put_epoch_start(&self, batch: &mut WriteBatch, epoch_start: Vec<u8>) {
-        batch.write(self.meta, EPOCH_START.to_vec(), epoch_start);
-    }
-
-    pub fn epoch_start(&self) -> Result<Option<Vec<u8>>> {
+    pub fn start_version(
+        &self,
+        epoch: u64,
+        id: &ObjectId,
+        initial_shared_version: u64,
+    ) -> Result<Option<Live>> {
+        let key = start_version_key(epoch, id, initial_shared_version);
         Ok(self
             .tidehunter
-            .get(self.meta, EPOCH_START)?
-            .map(|v| v.to_vec()))
+            .get(self.start_versions, &key)?
+            .map(|value| Live {
+                version: u64::from_le_bytes(value[..8].try_into().expect("eight bytes")),
+                digest: Digest::new(value[8..].try_into().expect("a digest")),
+            }))
+    }
+
+    pub fn put_start_version(
+        &self,
+        epoch: u64,
+        id: &ObjectId,
+        initial_shared_version: u64,
+        start: Live,
+    ) -> Result<()> {
+        let mut batch = self.tidehunter.write_batch();
+        let mut value = start.version.to_le_bytes().to_vec();
+        value.extend_from_slice(&start.digest.bytes);
+        batch.write(
+            self.start_versions,
+            start_version_key(epoch, id, initial_shared_version).to_vec(),
+            value,
+        );
+        Ok(batch.commit()?)
     }
 
     /// The highest checkpoint whose outputs are all in the database.

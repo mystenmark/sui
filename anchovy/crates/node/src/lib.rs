@@ -85,59 +85,51 @@ fn into<T: Send + 'static>(queue: Queue<T>, name: &'static str) -> impl FnMut(T)
 
 /// The epoch's start: the checkpoint its first checkpoint follows, and what
 /// the commit handler starts from. On a fresh database, `genesis`, committed
-/// now with the start read from the store. The first epoch's only:
-/// reconfiguration does not exist yet.
+/// now. The first epoch's only: reconfiguration does not exist yet.
 ///
 /// # Panics
 /// If the store cannot be read or written, or has no shared accumulator
 /// root.
-fn epoch_start(store: &store::Store, genesis: BuiltCheckpoint) -> (BuiltCheckpoint, EpochStart) {
-    let (checkpoint, agreed) = if let Some(bytes) = store.checkpoint(0).expect("the store reads") {
-        let agreed = store
-            .epoch_start()
-            .expect("the store reads")
-            .expect("the epoch's start is committed with the genesis checkpoint");
-        (BuiltCheckpoint::decode(&bytes), decode_agreed(&agreed))
+fn epoch_start(
+    store: &store::Store,
+    epoch: u64,
+    genesis: BuiltCheckpoint,
+) -> (BuiltCheckpoint, EpochStart) {
+    let checkpoint = if let Some(bytes) = store.checkpoint(0).expect("the store reads") {
+        BuiltCheckpoint::decode(&bytes)
     } else {
         assert_eq!(genesis.seq, 0, "the genesis checkpoint is checkpoint 0");
-        let agreed = agreed_at_genesis(store);
-        store.commit_genesis_checkpoint(genesis.encode(), encode_agreed(agreed));
-        (genesis, agreed)
+        store.commit_genesis_checkpoint(genesis.encode());
+        genesis
     };
-    let (accumulator_root_version, accumulator_root_initial_shared_version) = agreed;
+    let root = messages::base::ObjectId::from_u16(0xacc);
+    // Its initial shared version never changes, whatever the store holds.
+    let messages::object::Owner::Shared {
+        initial_shared_version,
+    } = store
+        .live_object(&root)
+        .expect("the store reads")
+        .expect("the accumulator root exists")
+        .get()
+        .owner
+    else {
+        panic!("the accumulator root is shared");
+    };
+    // Version assignment starts here, as for any shared object: the
+    // commit handler numbers each chunk's root version from it.
+    let accumulator_root_version = store
+        .start_version(epoch, &root, initial_shared_version)
+        .expect("the store reads and writes")
+        .expect("the accumulator root exists")
+        .version;
     let start = EpochStart {
         previous_checkpoint: checkpoint.seq,
         previous_height: checkpoint.last_height,
         previous_timestamp_ms: checkpoint.timestamp_ms,
         accumulator_root_version,
-        accumulator_root_initial_shared_version,
+        accumulator_root_initial_shared_version: initial_shared_version,
     };
     (checkpoint, start)
-}
-
-/// The accumulator root's version and initial shared version, as genesis
-/// left them.
-fn agreed_at_genesis(store: &store::Store) -> (u64, u64) {
-    let root = store
-        .live_object(&messages::base::ObjectId::from_u16(0xacc))
-        .expect("the store reads")
-        .expect("the accumulator root exists");
-    let messages::object::Owner::Shared {
-        initial_shared_version,
-    } = root.get().owner
-    else {
-        panic!("the accumulator root is shared");
-    };
-    (root.get().version(), initial_shared_version)
-}
-
-fn encode_agreed((version, initial_shared_version): (u64, u64)) -> Vec<u8> {
-    [version.to_le_bytes(), initial_shared_version.to_le_bytes()].concat()
-}
-
-fn decode_agreed(bytes: &[u8]) -> (u64, u64) {
-    let word = |i: usize| u64::from_le_bytes(bytes[i..i + 8].try_into().expect("eight bytes"));
-    (word(0), word(8))
 }
 
 impl Pipeline {
@@ -164,7 +156,7 @@ impl Pipeline {
         let generations = Arc::new(GenerationTable::new());
         let chunks = Arc::new(ChunkTable::new());
         let checkpoints = Arc::new(CheckpointStore::new());
-        let (first, start) = epoch_start(store, genesis);
+        let (first, start) = epoch_start(store, epoch.params.epoch, genesis);
         checkpoints.insert_built(first);
         let next_to_certify = store
             .committed_checkpoint()

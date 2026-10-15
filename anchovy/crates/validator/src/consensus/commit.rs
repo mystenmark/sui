@@ -364,7 +364,8 @@ pub struct EpochStart {
     pub previous_timestamp_ms: u64,
     /// The accumulator root's stream starts at this version.
     pub accumulator_root_initial_shared_version: u64,
-    /// The root's version the epoch's first chunk reads.
+    /// The root's version the epoch's first chunk reads: where version
+    /// assignment starts it (`Store::start_version`).
     pub accumulator_root_version: u64,
 }
 

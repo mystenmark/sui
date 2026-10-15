@@ -9,8 +9,7 @@ use std::sync::Arc;
 use execution::{Funds, Input};
 use messages::Message;
 use messages::effects::{
-    AccumulatorOperation, AccumulatorValue, ObjectIn, ObjectOut, TransactionEffects,
-    UnchangedConsensusKind, VersionedEffects,
+    AccumulatorOperation, AccumulatorValue, ObjectOut, TransactionEffects, VersionedEffects,
 };
 use messages::object::{Object, Owner};
 use messages::transaction::SharedObjectMutability;
@@ -31,9 +30,9 @@ use workqueue::{Processor, PushError, Queue, Sink};
 ///
 /// - **Resolving.** Generation `k > 0` of a round is the version its writer
 ///   produced. Generation 0 is the earlier round's generation the resolver
-///   gave (`resolved_base`) or, for a stream it had none for, the stream's
-///   live version, recorded as generation 0 of the round by the first
-///   transaction to read it. Invariant: the round's writer of generation 0
+///   gave (`resolved_base`) or, for a stream it had none for, the version
+///   the stream starts the epoch at (`Store::start_version`), recorded as
+///   generation 0 of the round by the first transaction to read it. Invariant: the round's writer of generation 0
 ///   records it before it commits, so a reader finding no entry has seen no
 ///   write of the round. That holds with several workers too: the resolver
 ///   gives a stream `StreamLive` only in the round that first touches it,
@@ -47,9 +46,7 @@ use workqueue::{Processor, PushError, Queue, Sink};
 ///   wrapped the object or took it out of consensus. A stream its effects do
 ///   not change (an input that had ended, say) keeps the generation it read.
 /// - **Executed already** (a replayed commit): it is not executed again, but
-///   its generations are recorded from its stored effects, and so is a
-///   generation 0 it resolves from the live object: the store may hold later
-///   versions by now.
+///   its generations are recorded from its stored effects.
 /// - **Execution never fails.** Every transaction released here can run
 ///   (it may abort, with effects); an error outside the transaction (the
 ///   store, an input not found) is a bug, and panics.
@@ -188,7 +185,7 @@ impl Executor {
                     *generation
                 }
                 InputValue::Live => {
-                    let generation = self.live_generation(access, stored.as_ref(), resolved_keys);
+                    let generation = self.live_generation(access, resolved_keys);
                     let Generation::Version { version, .. } = generation else {
                         unreachable!("generation 0 of a live stream is a version");
                     };
@@ -349,39 +346,35 @@ impl Executor {
 
     /// Generation 0 of `access`'s stream in its round, which the resolver
     /// gave no base: as recorded if a transaction of the round recorded it,
-    /// else the version read (from `stored` effects if it executed already,
-    /// else live), recorded now and resolved.
+    /// else the version the stream starts the epoch at, recorded now and
+    /// resolved.
     ///
     /// # Panics
     /// If the stream has no live object (see `Executor`).
     fn live_generation(
         &self,
         access: &SharedAccess,
-        stored: Option<&Message<TransactionEffects<'static>>>,
         resolved_keys: &mut Vec<(InputKey, InputValue)>,
     ) -> Generation {
         let stream = stream_of(access);
         let round = access.ordinal.round;
-        let read = stored.map(|effects| version_read(effects, &stream.id));
         if let Some(generation) = self.generations.get(stream, round, 0) {
-            assert!(
-                read.is_none_or(|read| read == generation),
-                "{stream:?}: replayed effects read {read:?}, generation 0 is {generation:?}"
-            );
             return generation;
         }
         let generation = self.generations.get_or_record(stream, round, 0, || {
-            read.unwrap_or_else(|| {
-                let live = self
-                    .store
-                    .live(&stream.id)
-                    .expect("the store reads")
-                    .unwrap_or_else(|| panic!("{stream:?}, which voting found live, is live"));
-                Generation::Version {
-                    version: live.version,
-                    digest: live.digest.bytes,
-                }
-            })
+            let start = self
+                .store
+                .start_version(
+                    self.epoch.params.epoch,
+                    &stream.id,
+                    stream.initial_shared_version,
+                )
+                .expect("the store reads and writes")
+                .unwrap_or_else(|| panic!("{stream:?}, which voting found live, is live"));
+            Generation::Version {
+                version: start.version,
+                digest: start.digest.bytes,
+            }
         });
         let Generation::Version { version, .. } = generation else {
             unreachable!("generation 0 of a live stream is a version");
@@ -493,40 +486,6 @@ fn produced(
             version: effects.lamport_version,
             transaction: digest,
         },
-    }
-}
-
-/// The version of live shared object `id` that `effects` read.
-///
-/// # Panics
-/// If `effects` did not read `id` live: the resolver gave it as live.
-fn version_read(
-    effects: &Message<TransactionEffects<'static>>,
-    id: &messages::base::ObjectId,
-) -> Generation {
-    let VersionedEffects::V2(effects) = &effects.get().version else {
-        unreachable!("execution produces V2 effects");
-    };
-    let mutated = effects.changed_objects.iter().find(|c| c.id == id);
-    if let Some(ObjectIn::Exist {
-        version, digest, ..
-    }) = mutated.map(|c| c.input_state)
-    {
-        return Generation::Version {
-            version,
-            digest: digest.bytes,
-        };
-    }
-    match effects
-        .unchanged_consensus_objects
-        .iter()
-        .find(|(o, _)| *o == id)
-    {
-        Some((_, UnchangedConsensusKind::ReadOnlyRoot(version, digest))) => Generation::Version {
-            version: *version,
-            digest: digest.bytes,
-        },
-        other => panic!("{id:?}, read live, is in the effects as {mutated:?} and {other:?}"),
     }
 }
 
