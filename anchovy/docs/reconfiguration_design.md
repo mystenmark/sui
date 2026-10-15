@@ -213,9 +213,12 @@ start record its parameters and committee.
 
 - The timestamp rule is the stub for ending the epoch.
 - `EpochCloser` builds the change-epoch transaction, with its versions
-  reserved by the commit handler. Executing it into the cache is the
-  "execute without committing" step that lets the final checkpoint be
-  built and signed. The committer commits it with the certified final
-  checkpoint, so it isn't executed a second time.
+  reserved by the commit handler, and the final checkpoint is built whole
+  at once. Executing it into the cache is the "execute without
+  committing" step. The committer commits it with the certified final
+  checkpoint, so it isn't executed a second time. The reference's two
+  executions are likely a vestige of the time before its writeback cache.
+  A fork shows as a certified checkpoint differing from the locally built
+  one, which the checkpoint executor will compare.
 - No protocol upgrades or validator-set changes in this phase, but epoch
   parameters are read from the system state regardless.

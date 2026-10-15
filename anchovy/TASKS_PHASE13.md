@@ -33,8 +33,12 @@ Out of scope for now:
    history: `docs/reconfiguration_reference.md` (sub-agent). Done.
 2. Design: `docs/reconfiguration_design.md`. Agreed.
 3. Implementation, in the design's order of work:
-   1. Lifetimes without an epoch end: `CurrentEpoch`, perpetual gRPC and
-      state sync, consensus per epoch, the node loop and the epoch start
-      record. In progress.
+   1. Lifetimes without an epoch end. Done: `Perpetual` and `Epoch`
+      (dropping it clears `CurrentEpoch` and joins every worker), the
+      epoch start record written at genesis, the gRPC server over
+      `CurrentEpoch` (requests carry over to the next epoch), state sync's
+      queue owned outside the pipeline. The node loop itself moves to step
+      3, where an epoch can end.
+      Next: step 2.
    2. The final checkpoint, with a genesis that has a system state.
    3. Reconfiguration across epochs, and the crash tests.
