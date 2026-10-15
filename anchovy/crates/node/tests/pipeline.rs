@@ -20,7 +20,7 @@ mod genesis;
 
 use fastcrypto::hash::MultisetHash;
 use node::Pipeline;
-use node::epoch::{Epoch, Perpetual};
+use node::epoch::{Epoch, EpochRecord, Node, Perpetual};
 use protocol_config::Chain;
 use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
 use sui_types::crypto::{AccountKeyPair, AuthorityPublicKeyBytes, get_key_pair};
@@ -100,19 +100,23 @@ fn wait_for<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
     }
 }
 
-/// A one-validator network: the node, as its perpetual part and its running
-/// epoch, state sync's end of its queue, and the consensus the test plays.
+/// A one-validator network: the node, state sync's end of its queue, and
+/// the consensus the test plays, one epoch at a time.
 struct Network {
-    /// Both none while crashed.
-    running: Option<Epoch>,
-    perpetual: Option<Perpetual>,
+    /// None while crashed.
+    node: Option<Node>,
     /// State sync's inbox, kept across crashes: what the aggregator certified.
     state_sync: (Queue<CertifiedCheckpoint>, Inbox<CertifiedCheckpoint>),
     sender: SuiAddress,
     key: AccountKeyPair,
     sui_committee: sui_types::committee::Committee,
+    /// The current epoch's last commit, from 1 each epoch.
     commit_index: u32,
     commit_interval_ms: u64,
+    /// The last commit's timestamp, across epochs.
+    clock_ms: u64,
+    /// The checkpoint the current epoch's first follows.
+    checkpoint_offset: u64,
     /// The consensus client's lanes, normal and priority.
     lanes: (
         mpsc::Receiver<TransactionsGuard>,
@@ -124,8 +128,8 @@ struct Network {
     /// What became of each block with submissions, once committed.
     blocks: Vec<(BlockRef, oneshot::Sender<BlockStatus>)>,
     certified: BTreeMap<u64, CertifiedCheckpointSummary>,
-    /// Every commit delivered, which consensus replays to a restarted
-    /// pipeline.
+    /// Every commit of the current epoch delivered, which consensus replays
+    /// to a restarted pipeline.
     delivered: Vec<CommittedSubDag>,
     /// The sender's gas coins, by id.
     coins: Vec<ObjectID>,
@@ -174,16 +178,18 @@ impl Network {
             chain_identifier,
             protocol_key,
         };
-        let running = Epoch::start(&perpetual, &client);
+        let mut node = Node::new(perpetual);
+        node.start_epoch(|_, _| client.clone());
         Network {
-            running: Some(running),
-            perpetual: Some(perpetual),
+            node: Some(node),
             state_sync,
             sender,
             key,
             sui_committee,
             commit_index: 0,
             commit_interval_ms: COMMIT_INTERVAL_MS,
+            clock_ms: 0,
+            checkpoint_offset: 0,
             lanes,
             client,
             pending: Vec::new(),
@@ -196,8 +202,12 @@ impl Network {
         }
     }
 
+    fn node(&self) -> &Node {
+        self.node.as_ref().expect("the node is running")
+    }
+
     fn running(&self) -> &Epoch {
-        self.running.as_ref().expect("the node is running")
+        self.node().running().expect("an epoch is running")
     }
 
     fn pipeline(&self) -> &Pipeline {
@@ -209,26 +219,56 @@ impl Network {
     }
 
     fn store(&self) -> &Arc<store::Store> {
-        &self.perpetual.as_ref().expect("the node is running").store
+        &self.node().perpetual.store
     }
 
     /// The validator service, over whichever epoch runs.
     fn service(&self) -> Validator {
-        Validator::over(self.perpetual.as_ref().unwrap().current.clone())
+        Validator::over(self.node().perpetual.current.clone())
+    }
+
+    /// Consensus for a new epoch: a new client, and commits from 1.
+    fn new_consensus(&mut self) {
+        let (client, normal, priority) = TransactionClient::new(64);
+        self.client = client;
+        self.lanes = (normal, priority);
+        self.pending.clear();
+        self.blocks.clear();
+        self.delivered.clear();
+        self.commit_index = 0;
+    }
+
+    /// Starts the node's current epoch over the current consensus.
+    fn start_epoch(&mut self) {
+        let client = self.client.clone();
+        let node = self.node.as_mut().expect("the node is running");
+        let epoch = node.start_epoch(|_, _| client).state.params.epoch;
+        let record = EpochRecord::load(&node.perpetual.store);
+        assert_eq!(record.epoch, epoch);
+        self.checkpoint_offset = record.previous_checkpoint;
+    }
+
+    /// Plays consensus until the epoch ends, then moves the node into the
+    /// next epoch, with consensus for it. The ended epoch's last checkpoint.
+    fn next_epoch(&mut self) -> u64 {
+        let last = self.end_epoch();
+        self.node.as_mut().unwrap().finish_epoch();
+        self.new_consensus();
+        self.start_epoch();
+        last
     }
 
     /// Stops the node and reopens its store, so whatever it had not
     /// committed is gone.
     fn crash(&mut self) {
         // The epoch's workers hold the store: stopped first, it closes.
-        drop(self.running.take());
         let Perpetual {
             store,
             current,
             protocol_key,
             chain_identifier,
             ..
-        } = self.perpetual.take().unwrap();
+        } = self.node.take().unwrap().into_perpetual();
         drop(current);
         assert_eq!(
             Arc::strong_count(&store),
@@ -240,25 +280,30 @@ impl Network {
         // Checkpoints certified and not committed are certified again.
         let committed = store.committed_checkpoint().unwrap().unwrap();
         self.certified.retain(|seq, _| *seq <= committed);
-        self.perpetual = Some(Perpetual {
+        self.node = Some(Node::new(Perpetual {
             store,
             current: CurrentEpoch::new(),
             state_sync: self.state_sync.0.clone(),
             chain: CHAIN,
             chain_identifier,
             protocol_key,
-        });
+        }));
     }
 
     /// Stops the running epoch, leaving the node between epochs.
     fn stop_epoch(&mut self) {
-        drop(self.running.take());
+        self.node.as_mut().unwrap().stop();
     }
 
     /// Starts the node's epoch again, and replays the epoch's commits to
-    /// it, as consensus does from its own store.
+    /// it, as consensus does from its own store. If the epoch had ended
+    /// before the crash, the node starts the next, with consensus for it.
     fn recover(&mut self) {
-        let running = Epoch::start(self.perpetual.as_ref().unwrap(), &self.client);
+        if node::epoch::epoch_ended(self.store()) {
+            self.new_consensus();
+        }
+        self.start_epoch();
+        let running = self.running();
         for commit in &self.delivered {
             assert!(
                 running
@@ -271,7 +316,6 @@ impl Network {
                     .is_ok()
             );
         }
-        self.running = Some(running);
     }
 
     fn live(&self, id: ObjectID) -> Object {
@@ -417,9 +461,13 @@ impl Network {
         while let Some(certified) = self.state_sync.1.try_pop() {
             let summary: CertifiedCheckpointSummary = bcs::from_bytes(&certified.summary).unwrap();
             assert_eq!(summary.sequence_number, certified.seq);
-            summary
-                .verify_authority_signatures(&self.sui_committee)
-                .unwrap();
+            // The validator set never changes: each epoch's committee is the
+            // same.
+            let committee = sui_types::committee::Committee::new(
+                summary.epoch,
+                self.sui_committee.voting_rights.iter().copied().collect(),
+            );
+            summary.verify_authority_signatures(&committee).unwrap();
             assert!(
                 self.certified.insert(certified.seq, summary).is_none(),
                 "checkpoint {} certified twice",
@@ -441,6 +489,7 @@ impl Network {
     fn commit_outvoted(&mut self, transactions: Vec<Vec<u8>>, rejects: &[u16]) -> u64 {
         self.poll();
         self.commit_index += 1;
+        self.clock_ms += self.commit_interval_ms;
         let index = self.commit_index;
         let reference = BlockRef {
             round: index,
@@ -468,7 +517,7 @@ impl Network {
             commit_index: index,
             digest: [index as u8; 32],
             leader: reference,
-            timestamp_ms: u64::from(index) * self.commit_interval_ms,
+            timestamp_ms: self.clock_ms,
             blocks: vec![block.clone()],
             rejected: vec![],
         };
@@ -499,7 +548,8 @@ impl Network {
         for (block, status) in self.blocks.drain(..) {
             let _ = status.send(BlockStatus::Sequenced(block));
         }
-        u64::from(index)
+        // One checkpoint per commit, numbered on from the previous epoch's.
+        self.checkpoint_offset + u64::from(index)
     }
 
     /// Plays consensus until the epoch's last checkpoint has committed: its
@@ -516,11 +566,10 @@ impl Network {
                 Instant::now() < deadline,
                 "timed out waiting for the epoch to end"
             );
-            if self.pending.is_empty() {
-                std::thread::sleep(Duration::from_millis(2));
-            } else {
-                self.commit(vec![]);
-            }
+            // Commits carry the checkpoint signatures, and move the clock to
+            // the epoch's end.
+            self.commit(vec![]);
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 
@@ -552,6 +601,27 @@ impl Network {
                 self.commit(vec![]);
             }
         }
+    }
+
+    /// The live object set's ECMH: every object genesis or a checkpoint
+    /// through `last` wrote, at its live version. Recomputed from the store,
+    /// apart from the state hasher.
+    fn live_set(&self, last: u64) -> state_hasher::StateHash {
+        let mut ids: BTreeSet<ObjectID> = self.genesis_objects.iter().copied().collect();
+        for seq in 1..=last {
+            for digest in self.contents(seq) {
+                for (object, _, _) in self.effects(&digest).all_changed_objects() {
+                    ids.insert(object.0);
+                }
+            }
+        }
+        let mut live = state_hasher::StateHash::default();
+        for id in ids {
+            if let Some(object) = self.store().live(&ObjectId(id.into_bytes())).unwrap() {
+                live.insert(object.digest.bytes);
+            }
+        }
+        live
     }
 
     /// The effects digest of `transaction`, if executed.
@@ -814,28 +884,11 @@ fn the_epoch_ends_with_a_checkpoint_closing_it() {
     for seq in 1..last {
         assert!(network.certify(seq).end_of_epoch_data.is_none(), "{seq}");
     }
-    // The root is the live object set's: every object genesis or a
-    // checkpoint wrote, at its live version.
-    let mut ids: BTreeSet<ObjectID> = network.genesis_objects.iter().copied().collect();
-    for seq in 1..=last {
-        for digest in network.contents(seq) {
-            for (object, _, _) in network.effects(&digest).all_changed_objects() {
-                ids.insert(object.0);
-            }
-        }
-    }
-    let mut live = state_hasher::StateHash::default();
-    for id in ids {
-        if let Some(object) = network.store().live(&ObjectId(id.into_bytes())).unwrap() {
-            live.insert(object.digest.bytes);
-        }
-    }
     assert_eq!(
-        live.digest(),
+        network.live_set(last).digest(),
         root.digest(),
         "the root is the live object set's"
     );
-
     // It ends with the change-epoch transaction, committed with it.
     let contents = network.contents(last);
     let change_epoch = contents.last().unwrap();
@@ -850,6 +903,87 @@ fn the_epoch_ends_with_a_checkpoint_closing_it() {
     let state = execution::system_state::read(network.store()).unwrap();
     assert_eq!(state.epoch, 1);
     assert_eq!(state.epoch_start_timestamp_ms, committed.timestamp_ms);
+    assert_no_panics();
+}
+
+/// Epochs follow one another: each is built from the system state the
+/// previous one's last checkpoint committed, its checkpoints continue the
+/// previous one's, and transactions keep executing and certifying.
+#[test]
+fn epochs_follow_one_another() {
+    let mut network = Network::with_epoch_duration(3, 25_000);
+    let mut previous_last = 0;
+    for (epoch, coin) in [(0, 0), (1, 1), (2, 2)] {
+        assert_eq!(network.epoch().params.epoch, epoch);
+        let record = EpochRecord::load(network.store());
+        assert_eq!(record.epoch, epoch);
+        assert_eq!(record.previous_checkpoint, previous_last);
+        let transfer = network.transfer(network.coin(coin));
+        let seq = network.commit(vec![consensus_transaction(&transfer)]);
+        assert_eq!(seq, previous_last + 1, "checkpoints continue across epochs");
+        let certified = network.certify(seq);
+        assert_eq!(certified.epoch, epoch);
+        network.assert_checkpointed(seq, &[&transfer]);
+        previous_last = network.next_epoch();
+        let state = execution::system_state::read(network.store()).unwrap();
+        assert_eq!(state.epoch, epoch + 1);
+        let root = state_hasher::decode(&EpochRecord::load(network.store()).root_state);
+        assert_eq!(network.live_set(previous_last).digest(), root.digest());
+    }
+    // Each checkpoint follows the stored one before it, across both ends.
+    for seq in 1..=previous_last {
+        let previous = network.committed(seq - 1);
+        let summary: CheckpointSummary = bcs::from_bytes(&network.committed(seq).summary).unwrap();
+        assert_eq!(
+            summary.previous_digest.unwrap().into_inner(),
+            previous.digest
+        );
+    }
+    assert_no_panics();
+}
+
+/// A crash after the epoch's last checkpoint commits, before the next
+/// epoch's start record: the node starts in the ended epoch, so moves on to
+/// the next at once.
+#[test]
+fn a_crash_between_the_last_checkpoint_and_the_next_epoch_moves_on_at_once() {
+    let mut network = Network::with_epoch_duration(2, 25_000);
+    let last = network.end_epoch();
+    network.crash();
+    assert_eq!(EpochRecord::load(network.store()).epoch, 0);
+    assert!(node::epoch::epoch_ended(network.store()));
+    network.recover();
+    assert_eq!(network.epoch().params.epoch, 1);
+    let record = EpochRecord::load(network.store());
+    assert_eq!((record.epoch, record.previous_checkpoint), (1, last));
+
+    let transfer = network.transfer(network.coin(0));
+    let seq = network.commit(vec![consensus_transaction(&transfer)]);
+    assert_eq!(seq, last + 1);
+    network.certify(seq);
+    network.assert_checkpointed(seq, &[&transfer]);
+    assert_no_panics();
+}
+
+/// A crash in the next epoch, after its start record: the node starts in
+/// it, and replays its commits, executing again what had not committed.
+#[test]
+fn a_crash_in_the_next_epoch_replays_it() {
+    let mut network = Network::with_epoch_duration(2, 25_000);
+    let last = network.next_epoch();
+    let transfer = network.transfer(network.coin(0));
+    let seq = network.commit(vec![consensus_transaction(&transfer)]);
+    let executed = network.wait_executed(&transfer);
+
+    network.crash();
+    assert_eq!(EpochRecord::load(network.store()).epoch, 1);
+    assert!(network.executed(&transfer).is_none());
+    network.recover();
+    assert_eq!(network.epoch().params.epoch, 1);
+    assert_eq!(network.wait_executed(&transfer), executed);
+    assert_eq!(seq, last + 1);
+    network.certify(seq);
+    network.assert_checkpointed(seq, &[&transfer]);
     assert_no_panics();
 }
 

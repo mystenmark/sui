@@ -814,6 +814,17 @@ impl Store {
         self.db.epoch_start()
     }
 
+    /// Replaces the current epoch's start record, moving the node into the
+    /// epoch it describes.
+    ///
+    /// # Panics
+    /// If the database write fails.
+    pub fn commit_epoch_start(&self, record: Vec<u8>) {
+        let mut batch = self.db.write_batch();
+        self.db.put_epoch_start(&mut batch, record);
+        batch.commit().expect("the database writes");
+    }
+
     /// The version and digest version assignment starts shared object `id`
     /// (shared at `initial_shared_version`) at in `epoch`: as recorded the
     /// first time a version was assigned to it in the epoch, else its live

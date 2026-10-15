@@ -28,6 +28,7 @@ pub struct Genesis {
     /// The genesis checkpoint's digest.
     pub chain_identifier: [u8; 32],
     /// The test account's gas coins, by id.
+    #[allow(dead_code, reason = "not every test crate spends them")]
     pub coins: Vec<ObjectID>,
 }
 

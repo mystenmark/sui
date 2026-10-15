@@ -19,7 +19,7 @@ use validator::pipeline::items::CertifiedCheckpoint;
 use validator::pipeline::tables::BuiltCheckpoint;
 use workqueue::Queue;
 
-use crate::Pipeline;
+use crate::{ConsensusOutput, Pipeline};
 
 /// What every epoch is built from, as the epoch's start agreed it. Stored
 /// whole as the epoch's start record: the one durable point at which the
@@ -181,12 +181,15 @@ pub struct Epoch {
 }
 
 impl Epoch {
-    /// The epoch the store's start record names, over consensus's
-    /// `client`, made the current epoch.
+    /// The epoch the store's start record names, its consensus started by
+    /// `consensus`, made the current epoch.
     ///
     /// # Panics
     /// If the store cannot be read, or the record's committee is invalid.
-    pub fn start(perpetual: &Perpetual, client: &TransactionClient) -> Epoch {
+    pub fn start(
+        perpetual: &Perpetual,
+        consensus: impl FnOnce(&Arc<EpochState>, ConsensusOutput) -> TransactionClient,
+    ) -> Epoch {
         let record = EpochRecord::load(&perpetual.store);
         let state = Arc::new(EpochState::starting_at(
             perpetual.chain,
@@ -207,7 +210,7 @@ impl Epoch {
             &state,
             &perpetual.protocol_key,
             &committee,
-            client,
+            |output| consensus(&state, output),
             perpetual.state_sync.clone(),
             &record,
         );
@@ -226,5 +229,141 @@ impl Drop for Epoch {
     /// pipeline drops, stopping every worker.
     fn drop(&mut self) {
         self.current.clear();
+    }
+}
+
+/// Whether the current epoch's last checkpoint has committed: the epoch is
+/// over, though the next epoch's start record may not be written yet.
+///
+/// # Panics
+/// If the store cannot be read or has no genesis.
+pub fn epoch_ended(store: &store::Store) -> bool {
+    let record = EpochRecord::load(store);
+    let Some((seq, bytes)) = store.last_checkpoint().expect("the store reads") else {
+        return false;
+    };
+    // The previous epoch's last checkpoint has a root too.
+    seq > record.previous_checkpoint && BuiltCheckpoint::decode(&bytes).root_state.is_some()
+}
+
+/// Writes the next epoch's start record, once the current epoch's last
+/// checkpoint has committed: from the system state it wrote, following it,
+/// and continuing its root. Idempotent until written; the write is the
+/// durable point at which the node is in the next epoch.
+///
+/// # Panics
+/// If the current epoch has not ended, the store cannot be read or written,
+/// or the system state is not the next epoch's.
+pub fn reconfigure(store: &store::Store) {
+    assert!(epoch_ended(store), "only an ended epoch is followed");
+    let current = EpochRecord::load(store);
+    let (last, bytes) = store
+        .last_checkpoint()
+        .expect("the store reads")
+        .expect("the epoch's last checkpoint is committed");
+    let root_state = BuiltCheckpoint::decode(&bytes)
+        .root_state
+        .expect("an epoch's last checkpoint has its root");
+    let state = execution::system_state::read(store).expect("the store holds the system state");
+    assert_eq!(
+        state.epoch,
+        current.epoch + 1,
+        "the system state is the next epoch's"
+    );
+    // Every executed transaction was in a checkpoint, and the last one has
+    // committed.
+    assert_eq!(
+        store.uncommitted_transactions(),
+        0,
+        "nothing uncommitted outlives its epoch"
+    );
+    store.commit_epoch_start(EpochRecord::new(state, last, root_state).encode());
+}
+
+/// The node: what lives for good, and the epoch running now.
+pub struct Node {
+    // Dropped first: its workers use the perpetual parts.
+    running: Option<Epoch>,
+    pub perpetual: Perpetual,
+}
+
+impl Node {
+    pub fn new(perpetual: Perpetual) -> Node {
+        Node {
+            perpetual,
+            running: None,
+        }
+    }
+
+    pub fn running(&self) -> Option<&Epoch> {
+        self.running.as_ref()
+    }
+
+    /// Stops the running epoch, if any, without moving to the next: for
+    /// shutting down.
+    pub fn stop(&mut self) {
+        drop(self.running.take());
+    }
+
+    /// The perpetual parts, the running epoch stopped.
+    pub fn into_perpetual(mut self) -> Perpetual {
+        self.stop();
+        self.perpetual
+    }
+
+    /// Starts the store's current epoch, its consensus started by
+    /// `consensus`, first reconfiguring if that epoch has already ended: a
+    /// crash after its last checkpoint committed, before the next epoch's
+    /// record.
+    ///
+    /// # Panics
+    /// If an epoch is running.
+    pub fn start_epoch(
+        &mut self,
+        consensus: impl FnOnce(&Arc<EpochState>, ConsensusOutput) -> TransactionClient,
+    ) -> &Epoch {
+        assert!(self.running.is_none(), "one epoch at a time");
+        if epoch_ended(&self.perpetual.store) {
+            reconfigure(&self.perpetual.store);
+        }
+        self.running
+            .insert(Epoch::start(&self.perpetual, consensus))
+    }
+
+    /// Stops the running epoch, whose last checkpoint has committed, joining
+    /// every one of its workers, then moves the node into the next epoch.
+    ///
+    /// # Panics
+    /// If no epoch is running, or it has not ended.
+    pub fn finish_epoch(&mut self) {
+        let epoch = self.running.take().expect("an epoch is running");
+        assert!(
+            epoch.pipeline.ended.borrow().is_some(),
+            "the epoch has ended"
+        );
+        drop(epoch);
+        reconfigure(&self.perpetual.store);
+    }
+
+    /// Runs epoch after epoch, for good, starting each one's consensus with
+    /// `consensus`.
+    pub async fn run(
+        mut self,
+        mut consensus: impl FnMut(&Arc<EpochState>, ConsensusOutput) -> TransactionClient,
+    ) {
+        loop {
+            let mut ended = self.start_epoch(&mut consensus).pipeline.ended.clone();
+            ended
+                .wait_for(Option::is_some)
+                .await
+                .expect("the committer lives as long as the epoch");
+            // Joining the epoch's workers blocks.
+            self = tokio::task::spawn_blocking(move || {
+                self.finish_epoch();
+                self
+            })
+            .await
+            .expect("finishing an epoch does not panic");
+        }
     }
 }

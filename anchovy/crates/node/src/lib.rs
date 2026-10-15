@@ -79,6 +79,14 @@ pub struct Pipeline {
     pub ended: watch::Receiver<Option<u64>>,
 }
 
+/// Where consensus delivers an epoch's work: blocks to vote on, and
+/// commits. Consensus-core's transaction verifier and commit consumer.
+#[derive(Clone)]
+pub struct ConsensusOutput {
+    pub votes: Queue<VoteRequest>,
+    pub commits: Queue<CommitRequest>,
+}
+
 /// A sink pushing each batch to `queue`. Inside the pipeline a full queue is
 /// a sizing bug, not load to shed.
 fn into<T: Send + 'static>(queue: Queue<T>, name: &'static str) -> impl FnMut(T) + Send {
@@ -140,7 +148,9 @@ impl Pipeline {
     /// The pipeline over `store`, in `epoch`, signing checkpoints with
     /// `protocol_key`, certifying them with `committee`'s signatures and
     /// handing them to `state_sync`; as `record`, the epoch's start record,
-    /// says it starts.
+    /// says it starts. `consensus` starts the epoch's consensus, delivering
+    /// to the pipeline, and returns its client, as consensus-core's
+    /// `ConsensusAuthority::start` does.
     ///
     /// It starts from the epoch's start, so consensus must deliver the
     /// epoch's commits from its first: replaying them rebuilds every
@@ -153,7 +163,7 @@ impl Pipeline {
         epoch: &Arc<EpochState>,
         protocol_key: &Arc<ProtocolKey>,
         committee: &Arc<Committee>,
-        consensus: &TransactionClient,
+        consensus: impl FnOnce(ConsensusOutput) -> TransactionClient,
         state_sync: Queue<CertifiedCheckpoint>,
         record: &EpochRecord,
     ) -> Pipeline {
@@ -175,6 +185,10 @@ impl Pipeline {
         let (transactions, validation_inbox) = workqueue::queue(QUEUE);
         let (votes, vote_inbox) = workqueue::queue(QUEUE);
         let (commits, decode_inbox) = workqueue::queue(QUEUE);
+        let consensus = &consensus(ConsensusOutput {
+            votes: votes.clone(),
+            commits: commits.clone(),
+        });
         let to_state_sync = state_sync;
 
         // Between processors.
