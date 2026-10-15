@@ -421,16 +421,17 @@ impl Store {
         checkpoint: Vec<u8>,
         certified: Vec<u8>,
     ) {
-        self.commit(seq, transactions, checkpoint, Some(certified));
+        self.commit(seq, transactions, checkpoint, Some(certified), None);
     }
 
     /// Commits the genesis checkpoint, which has no transactions of its own
-    /// (genesis objects are in already) and no certificate.
+    /// (genesis objects are in already) and no certificate, with the first
+    /// epoch's start record.
     ///
     /// # Panics
     /// If a checkpoint is committed already, or the database write fails.
-    pub fn commit_genesis_checkpoint(&self, checkpoint: Vec<u8>) {
-        self.commit(0, &[], checkpoint, None);
+    pub fn commit_genesis_checkpoint(&self, checkpoint: Vec<u8>, epoch_start: Vec<u8>) {
+        self.commit(0, &[], checkpoint, None, Some(epoch_start));
     }
 
     fn commit(
@@ -439,6 +440,7 @@ impl Store {
         transactions: &[Digest],
         checkpoint: Vec<u8>,
         certified: Option<Vec<u8>>,
+        epoch_start: Option<Vec<u8>>,
     ) {
         {
             let last = *lock(&self.last_committed);
@@ -481,6 +483,9 @@ impl Store {
         }
         self.db
             .put_committed_checkpoint(&mut batch, seq, checkpoint, certified);
+        if let Some(epoch_start) = epoch_start {
+            self.db.put_epoch_start(&mut batch, epoch_start);
+        }
         batch.commit().expect("the database writes");
 
         // 2. Then out of memory, in checkpoint order: each object's versions
@@ -801,6 +806,12 @@ impl Store {
     /// The highest committed checkpoint, and its sequence number.
     pub fn last_checkpoint(&self) -> Result<Option<(u64, Vec<u8>)>> {
         self.db.last_checkpoint()
+    }
+
+    /// The current epoch's start record: the one durable point at which the
+    /// node is in that epoch.
+    pub fn epoch_start(&self) -> Result<Option<Vec<u8>>> {
+        self.db.epoch_start()
     }
 
     /// The version and digest version assignment starts shared object `id`

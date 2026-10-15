@@ -9,6 +9,10 @@
 //!
 //! A panic in any worker aborts the process: other processors wait on what
 //! each produces, so carrying on would only hang them.
+//!
+//! The pipeline lives for one epoch (`epoch`).
+
+pub mod epoch;
 
 use std::sync::Arc;
 
@@ -27,15 +31,16 @@ use validator::consensus::commit::{CommitStage, EpochStart};
 use validator::consensus::decode::{CommitDecoder, CommitRequest};
 use validator::consensus::status::ConsensusTxStatusCache;
 use validator::consensus::vote::{BlockVoter, VoteRequest};
+use validator::current::EpochHandle;
 use validator::epoch::EpochState;
 use validator::pipeline::items::{CertifiedCheckpoint, EffectsWaitItem};
 use validator::pipeline::keys::EffectsKey;
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable, GenerationTable};
 use validator::processors::{Request, SignatureVerifier, TransactionValidator};
-use validator::server::{Consensus, Validator};
+use validator::server::Consensus;
 use validator::submit::SubmitChecker;
 use waiter::{Command, WaiterProcessor};
-use workqueue::{Inbox, Queue, Worker, WorkerHandle};
+use workqueue::{Queue, Worker, WorkerHandle};
 
 use messages::transaction::DigestPending;
 
@@ -61,8 +66,6 @@ pub struct Pipeline {
     consensus: TransactionClient,
     store: Arc<store::Store>,
     epoch: Arc<EpochState>,
-    /// To state sync: certified checkpoints.
-    pub certified: Inbox<CertifiedCheckpoint>,
     pub cache: Arc<ConsensusTxCache>,
     pub generations: Arc<GenerationTable>,
     pub chunks: Arc<ChunkTable>,
@@ -83,25 +86,19 @@ fn into<T: Send + 'static>(queue: Queue<T>, name: &'static str) -> impl FnMut(T)
     }
 }
 
-/// The epoch's start: the checkpoint its first checkpoint follows, and what
-/// the commit handler starts from. On a fresh database, `genesis`, committed
-/// now. The first epoch's only: reconfiguration does not exist yet.
+/// The epoch's start: the checkpoint its first checkpoint follows,
+/// `previous`, and what the commit handler starts from.
 ///
 /// # Panics
-/// If the store cannot be read or written, or has no shared accumulator
-/// root.
-fn epoch_start(
-    store: &store::Store,
-    epoch: u64,
-    genesis: BuiltCheckpoint,
-) -> (BuiltCheckpoint, EpochStart) {
-    let checkpoint = if let Some(bytes) = store.checkpoint(0).expect("the store reads") {
-        BuiltCheckpoint::decode(&bytes)
-    } else {
-        assert_eq!(genesis.seq, 0, "the genesis checkpoint is checkpoint 0");
-        store.commit_genesis_checkpoint(genesis.encode());
-        genesis
-    };
+/// If the store cannot be read or written, lacks `previous`, or has no
+/// shared accumulator root.
+fn epoch_start(store: &store::Store, epoch: u64, previous: u64) -> (BuiltCheckpoint, EpochStart) {
+    let checkpoint = BuiltCheckpoint::decode(
+        &store
+            .checkpoint(previous)
+            .expect("the store reads")
+            .expect("the epoch's previous checkpoint is committed"),
+    );
     let root = messages::base::ObjectId::from_u16(0xacc);
     // Its initial shared version never changes, whatever the store holds.
     let messages::object::Owner::Shared {
@@ -134,9 +131,9 @@ fn epoch_start(
 
 impl Pipeline {
     /// The pipeline over `store`, in `epoch`, signing checkpoints with
-    /// `protocol_key`, certifying them with `committee`'s signatures.
-    /// `genesis` is the epoch's start on a fresh database, and is ignored
-    /// otherwise.
+    /// `protocol_key`, certifying them with `committee`'s signatures and
+    /// handing them to `state_sync`. The epoch's first checkpoint follows
+    /// `previous_checkpoint`.
     ///
     /// It starts from the epoch's start, so consensus must deliver the
     /// epoch's commits from its first: replaying them rebuilds every
@@ -150,13 +147,14 @@ impl Pipeline {
         protocol_key: &Arc<ProtocolKey>,
         committee: &Arc<Committee>,
         consensus: &TransactionClient,
-        genesis: BuiltCheckpoint,
+        state_sync: Queue<CertifiedCheckpoint>,
+        previous_checkpoint: u64,
     ) -> Pipeline {
         let cache = Arc::new(ConsensusTxCache::new());
         let generations = Arc::new(GenerationTable::new());
         let chunks = Arc::new(ChunkTable::new());
         let checkpoints = Arc::new(CheckpointStore::new());
-        let (first, start) = epoch_start(store, epoch.params.epoch, genesis);
+        let (first, start) = epoch_start(store, epoch.params.epoch, previous_checkpoint);
         checkpoints.insert_built(first);
         let next_to_certify = store
             .committed_checkpoint()
@@ -170,7 +168,7 @@ impl Pipeline {
         let (transactions, validation_inbox) = workqueue::queue(QUEUE);
         let (votes, vote_inbox) = workqueue::queue(QUEUE);
         let (commits, decode_inbox) = workqueue::queue(QUEUE);
-        let (to_state_sync, certified) = workqueue::queue(QUEUE);
+        let to_state_sync = state_sync;
 
         // Between processors.
         let (to_signatures, signature_inbox) = workqueue::queue(QUEUE);
@@ -483,7 +481,6 @@ impl Pipeline {
             consensus: consensus.clone(),
             store: store.clone(),
             epoch: epoch.clone(),
-            certified,
             cache,
             generations,
             chunks,
@@ -493,15 +490,19 @@ impl Pipeline {
         }
     }
 
-    /// The RPC service over this pipeline: submissions checked here and
-    /// submitted to consensus, waits answered from its effects and the
+    /// What the RPC service uses of this pipeline: submissions checked here
+    /// and submitted to consensus, waits answered from its effects and the
     /// consensus statuses of its commits.
-    pub fn validator(&self) -> Validator {
-        Validator::new(self.epoch.clone(), self.transactions.clone()).with_consensus(Consensus {
-            client: self.consensus.clone(),
-            statuses: self.statuses.clone(),
-            effects: self.effects.clone(),
-            store: self.store.clone(),
+    pub fn handle(&self) -> Arc<EpochHandle> {
+        Arc::new(EpochHandle {
+            epoch: self.epoch.clone(),
+            transactions: self.transactions.clone(),
+            consensus: Some(Consensus {
+                client: self.consensus.clone(),
+                statuses: self.statuses.clone(),
+                effects: self.effects.clone(),
+                store: self.store.clone(),
+            }),
         })
     }
 }

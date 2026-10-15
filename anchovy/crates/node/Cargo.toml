@@ -18,12 +18,12 @@ settlement.workspace = true
 checkpoint.workspace = true
 state-hasher.workspace = true
 aggregator.workspace = true
+protocol-config.workspace = true
 
 [dev-dependencies]
 bcs.workspace = true
 execution.workspace = true
 move-core-types.workspace = true
-protocol-config.workspace = true
 sui-types.workspace = true
 tempfile.workspace = true
 tokio.workspace = true

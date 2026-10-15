@@ -17,6 +17,7 @@ use consensus::{
 use messages::base::ObjectId;
 use move_core_types::ident_str;
 use node::Pipeline;
+use node::epoch::{Epoch, EpochRecord, Perpetual};
 use protocol_config::{Chain, ProtocolVersion};
 use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
 use sui_types::crypto::{AccountKeyPair, AuthorityPublicKeyBytes, get_key_pair};
@@ -40,15 +41,20 @@ use validator::Validator;
 use validator::consensus::decode::CommitRequest;
 use validator::consensus::status::{ConsensusPosition, RETENTION_ROUNDS};
 use validator::consensus::vote::VoteRequest;
+use validator::current::CurrentEpoch;
 use validator::epoch::EpochState;
+use validator::pipeline::items::CertifiedCheckpoint;
 use validator::pipeline::tables::BuiltCheckpoint;
 use validator::proto::{
     RawSubmitTxRequest, RawValidatorSubmitStatus, RawValidatorTransactionStatus,
     RawWaitForEffectsRequest, SubmitTxType,
 };
 use validator::service::validator_server::Validator as _;
+use workqueue::{Inbox, Queue};
 
 const RGP: u64 = 1000;
+const CHAIN: Chain = Chain::Unknown;
+const CHAIN_IDENTIFIER: messages::base::Digest = messages::base::Digest::new([0; 32]);
 const BUDGET: u64 = 50_000_000;
 const SUI: u64 = 1_000_000_000;
 /// Long enough for a debug build; a hang fails instead of blocking.
@@ -91,18 +97,17 @@ fn wait_for<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
     }
 }
 
-/// A one-validator network: the pipeline, the store it runs over, and the
-/// consensus the test plays.
+/// A one-validator network: the node, as its perpetual part and its running
+/// epoch, state sync's end of its queue, and the consensus the test plays.
 struct Network {
     /// Both none while crashed.
-    pipeline: Option<Pipeline>,
-    store: Option<Arc<store::Store>>,
-    epoch: Arc<EpochState>,
+    running: Option<Epoch>,
+    perpetual: Option<Perpetual>,
+    /// State sync's inbox, kept across crashes: what the aggregator certified.
+    state_sync: (Queue<CertifiedCheckpoint>, Inbox<CertifiedCheckpoint>),
     sender: SuiAddress,
     key: AccountKeyPair,
     sui_committee: sui_types::committee::Committee,
-    protocol_key: Arc<ProtocolKey>,
-    committee: Arc<aggregator::Committee>,
     commit_index: u32,
     commit_interval_ms: u64,
     /// The consensus client's lanes, normal and priority.
@@ -128,48 +133,56 @@ impl Network {
     fn new(coins: usize) -> Network {
         record_panics();
         let (sender, key) = get_key_pair::<AccountKeyPair>();
-        let epoch = Arc::new(EpochState::new(
-            Chain::Unknown,
-            ProtocolVersion::MAX.as_u64(),
-            0,
-            messages::base::Digest::new([0; 32]),
-            RGP,
-            4,
-            [],
-        ));
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(store::Store::open(dir.path()).unwrap());
-        let funded = vec![(sender.to_inner(), 10 * SUI); coins];
-        assert!(execution::genesis::init(&epoch.execution, &store, &funded).unwrap());
-
         let mut private = [0u8; 32];
         private[31] = 7;
         let protocol_key = Arc::new(ProtocolKey::from_private_bytes(&private).unwrap());
-        let committee =
-            Arc::new(aggregator::Committee::new(0, [(*protocol_key.public(), 10_000)]).unwrap());
+        let first = EpochRecord {
+            epoch: 0,
+            protocol_version: ProtocolVersion::MAX.as_u64(),
+            reference_gas_price: RGP,
+            epoch_start_timestamp_ms: 0,
+            epoch_duration_ms: u64::MAX,
+            committee: vec![(*protocol_key.public(), 10_000)],
+            previous_checkpoint: 0,
+        };
+        let genesis_epoch = EpochState::new(
+            CHAIN,
+            first.protocol_version,
+            0,
+            CHAIN_IDENTIFIER,
+            RGP,
+            1,
+            [],
+        );
+        let funded = vec![(sender.to_inner(), 10 * SUI); coins];
+        assert!(execution::genesis::init(&genesis_epoch.execution, &store, &funded).unwrap());
+        node::epoch::genesis(&store, &genesis_checkpoint(), &first);
+
         let sui_committee = sui_types::committee::Committee::new(
             0,
             BTreeMap::from([(AuthorityPublicKeyBytes::new(*protocol_key.public()), 10_000)]),
         );
+        let state_sync = workqueue::queue(1024);
         let (client, normal, priority) = TransactionClient::new(64);
         let lanes = (normal, priority);
-        let pipeline = Pipeline::start(
-            &store,
-            &epoch,
-            &protocol_key,
-            &committee,
-            &client,
-            genesis_checkpoint(),
-        );
+        let perpetual = Perpetual {
+            store,
+            current: CurrentEpoch::new(),
+            state_sync: state_sync.0.clone(),
+            chain: CHAIN,
+            chain_identifier: CHAIN_IDENTIFIER,
+            protocol_key: protocol_key.clone(),
+        };
+        let running = Epoch::start(&perpetual, &client);
         Network {
-            pipeline: Some(pipeline),
-            store: Some(store),
-            epoch,
+            running: Some(running),
+            perpetual: Some(perpetual),
+            state_sync,
             sender,
             key,
             sui_committee,
-            protocol_key,
-            committee,
             commit_index: 0,
             commit_interval_ms: COMMIT_INTERVAL_MS,
             lanes,
@@ -182,60 +195,81 @@ impl Network {
         }
     }
 
+    fn running(&self) -> &Epoch {
+        self.running.as_ref().expect("the node is running")
+    }
+
     fn pipeline(&self) -> &Pipeline {
-        self.pipeline.as_ref().expect("the node is running")
+        &self.running().pipeline
+    }
+
+    fn epoch(&self) -> &Arc<EpochState> {
+        &self.running().state
     }
 
     fn store(&self) -> &Arc<store::Store> {
-        self.store.as_ref().expect("the node is running")
+        &self.perpetual.as_ref().expect("the node is running").store
+    }
+
+    /// The validator service, over whichever epoch runs.
+    fn service(&self) -> Validator {
+        Validator::over(self.perpetual.as_ref().unwrap().current.clone())
     }
 
     /// Stops the node and reopens its store, so whatever it had not
     /// committed is gone.
     fn crash(&mut self) {
-        // The pipeline's workers hold the store: stopped first, it closes.
-        drop(self.pipeline.take());
-        let store = self.store.take().unwrap();
+        // The epoch's workers hold the store: stopped first, it closes.
+        drop(self.running.take());
+        let Perpetual {
+            store,
+            current,
+            protocol_key,
+            ..
+        } = self.perpetual.take().unwrap();
+        drop(current);
         assert_eq!(
             Arc::strong_count(&store),
             1,
-            "only the network holds the store"
+            "only the node holds the store"
         );
         drop(store);
         let store = Arc::new(store::Store::open(self.dir.path()).unwrap());
         // Checkpoints certified and not committed are certified again.
         let committed = store.committed_checkpoint().unwrap().unwrap();
         self.certified.retain(|seq, _| *seq <= committed);
-        self.store = Some(store);
+        self.perpetual = Some(Perpetual {
+            store,
+            current: CurrentEpoch::new(),
+            state_sync: self.state_sync.0.clone(),
+            chain: CHAIN,
+            chain_identifier: CHAIN_IDENTIFIER,
+            protocol_key,
+        });
     }
 
-    /// Starts the node again, and replays the epoch's commits to it, as
-    /// consensus does from its own store.
+    /// Stops the running epoch, leaving the node between epochs.
+    fn stop_epoch(&mut self) {
+        drop(self.running.take());
+    }
+
+    /// Starts the node's epoch again, and replays the epoch's commits to
+    /// it, as consensus does from its own store.
     fn recover(&mut self) {
-        let pipeline = Pipeline::start(
-            self.store(),
-            &self.epoch,
-            &self.protocol_key,
-            &self.committee,
-            &self.client,
-            // Ignored: the store holds the genesis checkpoint.
-            BuiltCheckpoint {
-                seq: u64::MAX,
-                ..genesis_checkpoint()
-            },
-        );
+        let running = Epoch::start(self.perpetual.as_ref().unwrap(), &self.client);
         for commit in &self.delivered {
             assert!(
-                pipeline
+                running
+                    .pipeline
                     .commits
                     .try_push(CommitRequest {
-                        epoch: self.epoch.params.clone(),
+                        epoch: running.state.params.clone(),
                         commit: commit.clone(),
                     })
                     .is_ok()
             );
         }
-        self.pipeline = Some(pipeline);
+        self.running = Some(running);
     }
 
     fn live(&self, id: ObjectID) -> Object {
@@ -378,7 +412,7 @@ impl Network {
         while let Ok(guard) = self.lanes.0.try_recv() {
             self.pending.push(guard);
         }
-        while let Some(certified) = self.pipeline().certified.try_pop() {
+        while let Some(certified) = self.state_sync.1.try_pop() {
             let summary: CertifiedCheckpointSummary = bcs::from_bytes(&certified.summary).unwrap();
             assert_eq!(summary.sequence_number, certified.seq);
             summary
@@ -442,7 +476,7 @@ impl Network {
             self.pipeline()
                 .votes
                 .try_push(VoteRequest {
-                    epoch: self.epoch.clone(),
+                    epoch: self.epoch().clone(),
                     block: block.clone(),
                     reply,
                 })
@@ -455,7 +489,7 @@ impl Network {
             self.pipeline()
                 .commits
                 .try_push(CommitRequest {
-                    epoch: self.epoch.params.clone(),
+                    epoch: self.epoch().params.clone(),
                     commit: commit.clone(),
                 })
                 .is_ok()
@@ -810,10 +844,43 @@ fn commit_submitted(network: &mut Network) -> u64 {
     network.commit(vec![])
 }
 
+/// A wait in flight when its epoch's pipeline stops, and a submission made
+/// while none runs, are both answered by the next pipeline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn requests_carry_over_to_the_next_pipeline() {
+    let mut network = Network::new(2);
+    let service = Arc::new(network.service());
+    let first = network.transfer(network.coin(0));
+    let waiting = tokio::spawn({
+        let (service, first) = (service.clone(), first.clone());
+        async move { wait(&service, &first, None).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    network.stop_epoch();
+
+    let second = network.transfer(network.coin(1));
+    let submitting = tokio::spawn({
+        let (service, second) = (service.clone(), second.clone());
+        async move { submit(&service, &[&second]).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!waiting.is_finished() && !submitting.is_finished());
+
+    network.recover();
+    network.commit(vec![consensus_transaction(&first)]);
+    let RawValidatorTransactionStatus::Executed(_) = waiting.await.unwrap() else {
+        panic!("executed");
+    };
+    let seq = commit_submitted(&mut network);
+    let position = submitted(&submitting.await.unwrap()[0]);
+    assert_eq!(u64::from(position.block.round), seq);
+    assert_no_panics();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_submission_is_answered_with_its_position_then_its_effects() {
     let mut network = Network::new(1);
-    let service = Arc::new(network.pipeline().validator());
+    let service = Arc::new(network.service());
     let transfer = network.transfer(network.coin(0));
     let submitting = tokio::spawn({
         let (service, transfer) = (service.clone(), transfer.clone());
@@ -848,7 +915,7 @@ async fn a_submission_is_answered_with_its_position_then_its_effects() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_transaction_dropped_after_consensus_is_answered_rejected() {
     let mut network = Network::new(1);
-    let service = Arc::new(network.pipeline().validator());
+    let service = Arc::new(network.service());
     let coin = network.coin(0);
     let (first, second) = (network.transfer(coin), network.transfer(coin));
     let submitting = tokio::spawn({
@@ -876,7 +943,7 @@ async fn a_transaction_dropped_after_consensus_is_answered_rejected() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_position_never_committed_expires() {
     let mut network = Network::new(1);
-    let service = Arc::new(network.pipeline().validator());
+    let service = Arc::new(network.service());
     let transfer = network.transfer(network.coin(0));
     let submitting = tokio::spawn({
         let (service, transfer) = (service.clone(), transfer.clone());

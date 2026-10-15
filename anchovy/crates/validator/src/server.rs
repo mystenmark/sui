@@ -13,6 +13,11 @@
 //! The rest need more of storage, which does not exist yet. Pings are among
 //! them, since a ping's answer is a consensus position and then that
 //! position's commit.
+//!
+//! The server is perpetual; the epoch it serves is not. Each request takes
+//! the running epoch once and works against it. If that epoch ends first,
+//! the request waits for the next and starts again there, so clients see a
+//! pause across reconfiguration, not an error.
 
 use std::sync::Arc;
 
@@ -34,6 +39,7 @@ use crate::codec::Encoded;
 use crate::consensus::status::{
     ConsensusPosition, ConsensusTxStatus, ConsensusTxStatusCache, StatusResult,
 };
+use crate::current::{CurrentEpoch, EpochHandle};
 use crate::epoch::EpochState;
 use crate::pipeline::items::EffectsWaitItem;
 use crate::pipeline::keys::EffectsKey;
@@ -47,9 +53,20 @@ use crate::proto::{
 use crate::service::validator_server::{self, ValidatorServer};
 
 pub struct Validator {
-    epoch: Arc<EpochState>,
-    transactions: Queue<processors::Request<DigestPending>>,
-    consensus: Option<Consensus>,
+    current: CurrentEpoch,
+}
+
+/// Why an attempt in one epoch did not answer.
+enum Failure {
+    Status(Status),
+    /// Its epoch's pipeline went away: try in the next.
+    EpochEnded,
+}
+
+impl From<Status> for Failure {
+    fn from(status: Status) -> Failure {
+        Failure::Status(status)
+    }
 }
 
 /// What submission and waiting take from the pipeline.
@@ -62,27 +79,62 @@ pub struct Consensus {
 }
 
 impl Validator {
+    /// A standalone validator's server, over processors that execute, in
+    /// one epoch for good.
     pub fn new(
         epoch: Arc<EpochState>,
         transactions: Queue<processors::Request<DigestPending>>,
     ) -> Validator {
-        Validator {
+        Validator::over(CurrentEpoch::fixed(EpochHandle {
             epoch,
             transactions,
             consensus: None,
+        }))
+    }
+
+    /// The server over whichever epoch runs.
+    pub fn over(current: CurrentEpoch) -> Validator {
+        Validator { current }
+    }
+
+    /// What to do after `failure` in `epoch`: answer, or retry once the
+    /// next epoch runs.
+    async fn retry(&self, failure: Failure, epoch: &Arc<EpochHandle>) -> Result<(), Status> {
+        match failure {
+            Failure::Status(status) => Err(status),
+            Failure::EpochEnded if !self.current.reconfigures() => {
+                Err(Status::unavailable("shutting down"))
+            }
+            Failure::EpochEnded => {
+                self.current.ended(epoch).await;
+                Ok(())
+            }
         }
     }
 
-    /// Submits to consensus, and waits for effects, over the pipeline.
-    #[must_use]
-    pub fn with_consensus(mut self, consensus: Consensus) -> Validator {
-        self.consensus = Some(consensus);
-        self
+    /// Checks, then submits, `request`'s transactions in `epoch`.
+    async fn submit_in(
+        epoch: &EpochHandle,
+        request: &RawSubmitTxRequest,
+    ) -> Result<RawSubmitTxResponse, Failure> {
+        let outcomes = Self::enqueue(epoch, request)?
+            .await
+            .map_err(|_| Failure::EpochEnded)?
+            .map_err(|e| match e {
+                Rejected::ShuttingDown => Failure::EpochEnded,
+                e => Failure::Status(rejection(&e)),
+            })?;
+        Ok(RawSubmitTxResponse {
+            results: Self::submit(epoch, outcomes).await?,
+        })
     }
 
     /// Submits the transactions the processors readied, as one bundle, and
     /// answers each with its position.
-    async fn submit(&self, outcomes: Vec<Outcome>) -> Result<Vec<RawSubmitTxResult>, Status> {
+    async fn submit(
+        epoch: &EpochHandle,
+        outcomes: Vec<Outcome>,
+    ) -> Result<Vec<RawSubmitTxResult>, Failure> {
         let bundle: Vec<Vec<u8>> = outcomes
             .iter()
             .filter_map(|o| match o {
@@ -92,7 +144,7 @@ impl Validator {
             .collect();
         let mut positions = Vec::new();
         if !bundle.is_empty() {
-            let consensus = self
+            let consensus = epoch
                 .consensus
                 .as_ref()
                 .expect("only the pipeline's processors ready transactions to submit");
@@ -102,11 +154,11 @@ impl Validator {
                 .client
                 .submit(bundle, Priority::Normal)
                 .await
-                .map_err(|_| Status::unavailable("consensus is shutting down"))?;
+                .map_err(|_| Failure::EpochEnded)?;
             positions = indices
                 .into_iter()
                 .map(|index| ConsensusPosition {
-                    epoch: self.epoch.params.epoch,
+                    epoch: epoch.epoch.params.epoch,
                     block,
                     index,
                 })
@@ -135,7 +187,7 @@ impl Validator {
         consensus: &Consensus,
         digest: [u8; 32],
         include_details: bool,
-    ) -> Result<RawValidatorTransactionStatus, Status> {
+    ) -> Result<RawValidatorTransactionStatus, Failure> {
         let read = || {
             execution::executed(&consensus.store, &digest)
                 .map_err(|e| Status::internal(format!("{e:?}")))
@@ -150,11 +202,12 @@ impl Validator {
                 .effects
                 .try_push(Command::Wait(batch))
                 .map_err(|e| match e {
-                    PushError::Full(_) => Status::resource_exhausted("effects waiter full"),
-                    PushError::Closed(_) => Status::unavailable("shutting down"),
+                    PushError::Full(_) => {
+                        Failure::Status(Status::resource_exhausted("effects waiter full"))
+                    }
+                    PushError::Closed(_) => Failure::EpochEnded,
                 })?;
-            done.await
-                .map_err(|_| Status::unavailable("shutting down"))?;
+            done.await.map_err(|_| Failure::EpochEnded)?;
             read()?.expect("effects notified once stored")
         };
         let mut status = executed_status(executed);
@@ -167,7 +220,7 @@ impl Validator {
     /// What consensus decided about the transaction at `position`, unless it
     /// was finalized: then its effects answer.
     async fn decided(
-        &self,
+        epoch: &EpochState,
         statuses: &ConsensusTxStatusCache,
         position: ConsensusPosition,
     ) -> RawValidatorTransactionStatus {
@@ -178,7 +231,7 @@ impl Validator {
             StatusResult::Status(ConsensusTxStatus::Finalized) => std::future::pending().await,
             StatusResult::Expired(round) => {
                 RawValidatorTransactionStatus::Expired(RawExpiredStatus {
-                    epoch: self.epoch.params.epoch,
+                    epoch: epoch.params.epoch,
                     round: Some(round),
                 })
             }
@@ -190,7 +243,10 @@ impl Validator {
     }
 
     /// The request's shape, as the reference checks it before decoding.
-    fn check_request(&self, request: &RawSubmitTxRequest) -> Result<SubmitTxType, Status> {
+    fn check_request(
+        epoch: &EpochState,
+        request: &RawSubmitTxRequest,
+    ) -> Result<SubmitTxType, Status> {
         let submit_type = SubmitTxType::try_from(request.submit_type)
             .map_err(|_| Status::invalid_argument("unknown submit type"))?;
         let count = request.transactions.len();
@@ -203,7 +259,7 @@ impl Validator {
             }
             _ => {}
         }
-        let config = &self.epoch.params.config;
+        let config = &epoch.params.config;
         let max = if submit_type == SubmitTxType::SoftBundle {
             config.max_soft_bundle_size()
         } else {
@@ -221,9 +277,9 @@ impl Validator {
     /// Not inlined into the handler: holding decoded messages across an
     /// `await` defeats the future's `Send` inference.
     fn enqueue(
-        &self,
+        epoch: &EpochHandle,
         request: &RawSubmitTxRequest,
-    ) -> Result<oneshot::Receiver<Result<Vec<Outcome>, Rejected>>, Status> {
+    ) -> Result<oneshot::Receiver<Result<Vec<Outcome>, Rejected>>, Failure> {
         let mut transactions = Vec::with_capacity(request.transactions.len());
         for bytes in &request.transactions {
             let transaction = Message::<Transaction<DigestPending>>::parse(bytes.to_vec())
@@ -233,15 +289,18 @@ impl Validator {
             transactions.push(transaction);
         }
         let (reply, verdict) = oneshot::channel();
-        self.transactions
+        epoch
+            .transactions
             .try_push(processors::Request::new(
-                self.epoch.clone(),
+                epoch.epoch.clone(),
                 transactions,
                 reply,
             ))
             .map_err(|e| match e {
-                PushError::Full(_) => Status::resource_exhausted("validation queue full"),
-                PushError::Closed(_) => Status::unavailable("shutting down"),
+                PushError::Full(_) => {
+                    Failure::Status(Status::resource_exhausted("validation queue full"))
+                }
+                PushError::Closed(_) => Failure::EpochEnded,
             })?;
         Ok(verdict)
     }
@@ -303,18 +362,20 @@ impl validator_server::Validator for Validator {
         request: Request<RawSubmitTxRequest>,
     ) -> Result<Response<RawSubmitTxResponse>, Status> {
         let request = request.into_inner();
-        if self.check_request(&request)? == SubmitTxType::Ping {
-            todo!("ping: a consensus position")
+        loop {
+            let epoch = self.current.get().await;
+            if Self::check_request(&epoch.epoch, &request)? == SubmitTxType::Ping {
+                todo!("ping: a consensus position")
+            }
+            let failure = tokio::select! {
+                result = Self::submit_in(&epoch, &request) => match result {
+                    Ok(response) => return Ok(Response::new(response)),
+                    Err(failure) => failure,
+                },
+                () = self.current.ended(&epoch) => Failure::EpochEnded,
+            };
+            self.retry(failure, &epoch).await?;
         }
-
-        let outcomes = self
-            .enqueue(&request)?
-            .await
-            .map_err(|_| Status::internal("processing did not finish"))?
-            .map_err(|e| rejection(&e))?;
-        Ok(Response::new(RawSubmitTxResponse {
-            results: self.submit(outcomes).await?,
-        }))
     }
 
     /// As the reference's: the transaction's effects once it executes, or,
@@ -330,9 +391,6 @@ impl validator_server::Validator for Validator {
         if request.ping_type.is_some() {
             todo!("ping: a consensus position's commit")
         }
-        let Some(consensus) = &self.consensus else {
-            return Err(Status::unimplemented("waiting needs consensus"));
-        };
         let digest: [u8; 32] = request
             .transaction_digest
             .as_deref()
@@ -345,24 +403,44 @@ impl validator_server::Validator for Validator {
             ),
             None => None,
         };
-        if let Some(position) = &position
-            && consensus.statuses.too_far_ahead(position)
-        {
-            return Err(Status::unavailable("ValidatorConsensusLagging"));
-        }
-        let decided = async {
-            match position {
-                Some(position) => Ok(self.decided(&consensus.statuses, position).await),
-                None => std::future::pending().await,
+        loop {
+            let epoch = self.current.get().await;
+            let Some(consensus) = &epoch.consensus else {
+                return Err(Status::unimplemented("waiting needs consensus"));
+            };
+            // A position from an earlier epoch has no status here: its
+            // effects answer.
+            let position = position.filter(|p| p.epoch == epoch.epoch.params.epoch);
+            if let Some(position) = &position
+                && consensus.statuses.too_far_ahead(position)
+            {
+                return Err(Status::unavailable("ValidatorConsensusLagging"));
             }
-        };
-        let status = tokio::select! {
-            status = Self::executed(consensus, digest, request.include_details) => status,
-            status = decided => status,
-        }?;
-        Ok(Response::new(RawWaitForEffectsResponse {
-            inner: Some(status),
-        }))
+            let decided = async {
+                match position {
+                    Some(position) => {
+                        Ok(Self::decided(&epoch.epoch, &consensus.statuses, position).await)
+                    }
+                    None => std::future::pending().await,
+                }
+            };
+            let failure = tokio::select! {
+                status = Self::executed(consensus, digest, request.include_details) => match status {
+                    Ok(status) => return Ok(Response::new(RawWaitForEffectsResponse {
+                        inner: Some(status),
+                    })),
+                    Err(failure) => failure,
+                },
+                status = decided => match status {
+                    Ok(status) => return Ok(Response::new(RawWaitForEffectsResponse {
+                        inner: Some(status),
+                    })),
+                    Err(failure) => failure,
+                },
+                () = self.current.ended(&epoch) => Failure::EpochEnded,
+            };
+            self.retry(failure, &epoch).await?;
+        }
     }
 
     async fn object_info(
