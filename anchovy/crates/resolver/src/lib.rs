@@ -356,11 +356,8 @@ pub struct InputAvailability {
 }
 
 impl InputAvailability {
-    fn object(&self, id: &ObjectId, version: u64) -> Option<Arc<Message<Object<'static>>>> {
-        self.store
-            .object(id, version)
-            .expect("the store reads")
-            .map(Arc::new)
+    fn object(&self, id: &ObjectId, version: u64) -> Option<Message<Object<'static>>> {
+        self.store.object(id, version).expect("the store reads")
     }
 }
 
@@ -379,7 +376,7 @@ impl Availability<InputKey, InputValue> for InputAvailability {
                     .store
                     .live_object(&id)
                     .expect("the store reads")
-                    .map(|o| InputValue::Object(Arc::new(o))),
+                    .map(InputValue::Object),
                 InputKey::Generation {
                     stream,
                     round,

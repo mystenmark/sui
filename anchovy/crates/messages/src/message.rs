@@ -6,6 +6,7 @@
 //! This is the only module that erases a lifetime.
 
 use std::fmt;
+use std::sync::Arc;
 
 use crate::arena::{Alloc, Arena, Build, Measure};
 use crate::base::Digest;
@@ -67,9 +68,7 @@ pub(crate) const fn same_layout<T: Wire, U: Wire>() -> bool {
     size_of::<Message<T>>() == size_of::<Message<U>>()
         && align_of::<Message<T>>() == align_of::<Message<U>>()
         && offset_of!(Message<T>, view) == offset_of!(Message<U>, view)
-        && offset_of!(Message<T>, wire) == offset_of!(Message<U>, wire)
-        && offset_of!(Message<T>, arena) == offset_of!(Message<U>, arena)
-        && offset_of!(Message<T>, arena_used) == offset_of!(Message<U>, arena_used)
+        && offset_of!(Message<T>, buffers) == offset_of!(Message<U>, buffers)
 }
 
 /// A conversion between views over the same buffers. `apply` works for
@@ -84,16 +83,30 @@ pub(crate) trait ViewUpdate<T: Wire> {
     fn apply(self, view: &mut T::View<'_>);
 }
 
-/// A parsed `T`. Dropping it frees the wire buffer and the arena and nothing
-/// else. `repr(C)` so that messages whose views lay out alike do too, which
-/// `Message::with_digests` relies on.
+/// A parsed `T`. Clones share the wire buffer and the arena, which the last
+/// one dropped frees. `repr(C)` so that messages whose views lay out alike do
+/// too, which `Message::with_digests` relies on.
 #[repr(C)]
 pub struct Message<T: Wire> {
-    // Points into `wire` and `arena`; `'static` stands for "while self lives".
+    // Points into `buffers`; `'static` stands for "while self lives".
     view: T::View<'static>,
+    buffers: Arc<Buffers>,
+}
+
+/// What a view points into. Never touched after construction.
+struct Buffers {
     wire: WireBuf,
     arena: Arena,
     arena_used: usize,
+}
+
+impl<T: Wire> Clone for Message<T> {
+    fn clone(&self) -> Self {
+        Message {
+            view: self.view,
+            buffers: self.buffers.clone(),
+        }
+    }
 }
 
 /// The smallest single-pass guess, so that tiny messages with a fixed
@@ -105,8 +118,9 @@ pub const MIN_ARENA_GUESS: usize = 256;
 /// checks a sequence's length against the input left before reserving.
 pub const MAX_ARENA_PER_WIRE_BYTE: usize = 32;
 
-// SAFETY: a `Message` is immutable after construction and owns what `view`
-// points to, so it is as thread-safe as the view's contents.
+// SAFETY: what `view` points to is immutable after construction and shared
+// only through the `Arc`, so a `Message` is as thread-safe as the view's
+// contents.
 unsafe impl<T: Wire> Send for Message<T> where for<'a> T::View<'a>: Send {}
 // SAFETY: as above.
 unsafe impl<T: Wire> Sync for Message<T> where for<'a> T::View<'a>: Sync {}
@@ -147,9 +161,11 @@ impl<T: Parse> Message<T> {
         match result {
             Ok((view, arena, arena_used)) => Ok(Message {
                 view,
-                wire,
-                arena,
-                arena_used,
+                buffers: Arc::new(Buffers {
+                    wire,
+                    arena,
+                    arena_used,
+                }),
             }),
             Err(e) => Err((e, wire)),
         }
@@ -207,9 +223,7 @@ impl<T: Wire> Message<T> {
     pub(crate) fn map<U: Wire>(self, f: impl ViewMap<T, U>) -> Message<U> {
         Message {
             view: f.apply(self.view),
-            wire: self.wire,
-            arena: self.arena,
-            arena_used: self.arena_used,
+            buffers: self.buffers,
         }
     }
 
@@ -224,17 +238,17 @@ impl<T: Wire> Message<T> {
     }
 
     pub fn wire_bytes(&self) -> &[u8] {
-        self.wire.as_slice()
+        self.buffers.wire.as_slice()
     }
 
     /// The arena allocation. After `parse` it may exceed `arena_used`.
     pub fn arena_size(&self) -> usize {
-        self.arena.size()
+        self.buffers.arena.size()
     }
 
     /// The arena bytes the view points into.
     pub fn arena_used(&self) -> usize {
-        self.arena_used
+        self.buffers.arena_used
     }
 }
 
@@ -326,9 +340,9 @@ impl<T: Wire> Kept<T> {
     /// Keeps `message`, lending its view for as long as `self` is borrowed.
     pub fn keep(&self, message: Message<T>) -> T::View<'_> {
         let view: *const T::View<'static> = &raw const message.view;
-        // SAFETY: the view is read before `message` moves. It points into the message's wire
-        // buffer and arena, two heap allocations that moving the message does not move, and
-        // `messages` is only pushed to, so they live until `self` drops. `View` is covariant
+        // SAFETY: the view points into the message's buffers, which do not move when the
+        // message does and live while it does, and `messages` is only pushed to, so they
+        // live until `self` drops. `View` is covariant
         // (`Wire::shrink`), so the `'static` standing for "while the message lives" may be
         // shortened to the borrow of `self`.
         let view = unsafe { *T::shrink(&*view) };

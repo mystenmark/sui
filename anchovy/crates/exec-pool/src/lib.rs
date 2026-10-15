@@ -11,7 +11,7 @@ use messages::Message;
 use messages::effects::{
     AccumulatorOperation, AccumulatorValue, ObjectOut, TransactionEffects, VersionedEffects,
 };
-use messages::object::Owner;
+use messages::object::{Object, Owner};
 use messages::transaction::SharedObjectMutability;
 use validator::consensus::sequence::SharedAccess;
 use validator::epoch::EpochState;
@@ -30,9 +30,9 @@ use workqueue::{Processor, PushError, Queue, Sink};
 ///
 /// - **Resolving.** Generation `k > 0` of a round is the version its writer
 ///   produced. Generation 0 is the earlier round's generation the resolver
-///   gave (`resolved_base`) or, for a stream it had none for, the stream's
-///   live version, recorded as generation 0 of the round by the first
-///   transaction to read it. Invariant: the round's writer of generation 0
+///   gave (`resolved_base`) or, for a stream it had none for, the version
+///   the stream starts the epoch at (`Store::start_version`), recorded as
+///   generation 0 of the round by the first transaction to read it. Invariant: the round's writer of generation 0
 ///   records it before it commits, so a reader finding no entry has seen no
 ///   write of the round. That holds with several workers too: the resolver
 ///   gives a stream `StreamLive` only in the round that first touches it,
@@ -89,15 +89,14 @@ pub struct Executor {
     resolved: Vec<Generation>,
 }
 
-type Object = Arc<Message<messages::object::Object<'static>>>;
+/// The objects a transaction wrote: id, version, object.
+type WrittenObjects = Vec<(messages::base::ObjectId, u64, Message<Object<'static>>)>;
 
 /// A written object's value: the object as the input waiter resolves it.
-fn object(bytes: Vec<u8>) -> Object {
-    Arc::new(
-        Message::parse(bytes)
-            .map_err(|(e, _)| e)
-            .expect("a written object parses"),
-    )
+fn object(bytes: Vec<u8>) -> Message<Object<'static>> {
+    Message::parse(bytes)
+        .map_err(|(e, _)| e)
+        .expect("a written object parses")
 }
 
 impl Executor {
@@ -147,6 +146,8 @@ impl Executor {
             }
             ExecutableTransaction::System(system) => (system.digest, &system.bytes),
         };
+
+        let stored = self.stored_effects(digest);
 
         // 1. Its inputs, from the values its keys resolved to: the shared
         //    accesses' first, in access order (as the resolver keys them),
@@ -209,8 +210,10 @@ impl Executor {
         }
 
         // 2. Its effects: stored, or from executing and committing it.
-        let (effects, written) =
-            self.effects_of(digest, bytes, &provided, funds, executable.root_version);
+        let (effects, written) = match stored {
+            Some(effects) => (effects, Vec::new()),
+            None => self.execute_now(digest, bytes, &provided, funds, executable.root_version),
+        };
         drop(provided);
         let VersionedEffects::V2(effects_v2) = &effects.get().version else {
             unreachable!("execution produces V2 effects");
@@ -230,15 +233,14 @@ impl Executor {
         }
 
         // 3. The generations it produced, then its outputs, to resolve.
-        let object_at = |id: &messages::base::ObjectId, version: u64| -> Object {
+        let object_at = |id: &messages::base::ObjectId, version: u64| -> Message<Object<'static>> {
             match written.iter().find(|(w, v, _)| w == id && *v == version) {
                 Some((_, _, object)) => object.clone(),
-                None => Arc::new(
-                    self.store
-                        .object(id, version)
-                        .expect("the store reads")
-                        .expect("an executed transaction's outputs are stored"),
-                ),
+                None => self
+                    .store
+                    .object(id, version)
+                    .expect("the store reads")
+                    .expect("an executed transaction's outputs are stored"),
             }
         };
         for (i, access) in entry.shared.iter().enumerate() {
@@ -296,36 +298,34 @@ impl Executor {
         effects_keys.push(EffectsKey(digest));
     }
 
-    /// The effects of the transaction with `digest`, and the objects it
-    /// wrote if it executed now: stored if it executed already, else from
-    /// executing `bytes` with `provided` inputs and committing.
+    /// The effects of the transaction with `digest`, if it executed already.
+    fn stored_effects(&self, digest: TxDigest) -> Option<Message<TransactionEffects<'static>>> {
+        let effects_digest = self
+            .store
+            .executed_effects(&messages::base::Digest::new(digest))
+            .expect("the store reads")?;
+        Some(
+            self.store
+                .effects(&effects_digest)
+                .expect("the store reads")
+                .expect("executed effects are stored with their transaction"),
+        )
+    }
+
+    /// The effects of executing `bytes` with `provided` inputs, written to
+    /// the store, and the objects it wrote.
     ///
     /// # Panics
     /// If execution fails outside the transaction: everything it reads was
     /// waited for, so that is a bug.
-    fn effects_of(
+    fn execute_now(
         &self,
         digest: TxDigest,
         bytes: &[u8],
         provided: &[(messages::base::ObjectId, Input<'_>)],
         funds: Funds,
         root_version: u64,
-    ) -> (
-        Message<TransactionEffects<'static>>,
-        Vec<(messages::base::ObjectId, u64, Object)>,
-    ) {
-        let stored = self
-            .store
-            .executed_effects(&messages::base::Digest::new(digest))
-            .expect("the store reads");
-        if let Some(effects_digest) = stored {
-            let effects = self
-                .store
-                .effects(&effects_digest)
-                .expect("the store reads")
-                .expect("executed effects are stored with their transaction");
-            return (effects, Vec::new());
-        }
+    ) -> (Message<TransactionEffects<'static>>, WrittenObjects) {
         let outcome = self
             .epoch
             .execution
@@ -337,7 +337,7 @@ impl Executor {
             .iter()
             .map(|w| (w.id, w.version, object(w.bytes.clone())))
             .collect();
-        self.store.commit(outcome.commit).expect("the store writes");
+        self.store.write(outcome.commit);
         let effects = Message::parse(outcome.effects)
             .map_err(|(e, _)| e)
             .expect("execution's effects parse");
@@ -346,7 +346,8 @@ impl Executor {
 
     /// Generation 0 of `access`'s stream in its round, which the resolver
     /// gave no base: as recorded if a transaction of the round recorded it,
-    /// else the live version, recorded now and resolved.
+    /// else the version the stream starts the epoch at, recorded now and
+    /// resolved.
     ///
     /// # Panics
     /// If the stream has no live object (see `Executor`).
@@ -360,26 +361,29 @@ impl Executor {
         if let Some(generation) = self.generations.get(stream, round, 0) {
             return generation;
         }
-        let live = self
-            .store
-            .live(&stream.id)
-            .expect("the store reads")
-            .unwrap_or_else(|| panic!("{stream:?}, which voting found live, is live"));
-        let generation = self
-            .generations
-            .get_or_record(stream, round, 0, || Generation::Version {
-                version: live.version,
-                digest: live.digest.bytes,
-            });
+        let generation = self.generations.get_or_record(stream, round, 0, || {
+            let start = self
+                .store
+                .start_version(
+                    self.epoch.params.epoch,
+                    &stream.id,
+                    stream.initial_shared_version,
+                )
+                .expect("the store reads and writes")
+                .unwrap_or_else(|| panic!("{stream:?}, which voting found live, is live"));
+            Generation::Version {
+                version: start.version,
+                digest: start.digest.bytes,
+            }
+        });
         let Generation::Version { version, .. } = generation else {
             unreachable!("generation 0 of a live stream is a version");
         };
-        let object = Arc::new(
-            self.store
-                .object(&stream.id, version)
-                .expect("the store reads")
-                .expect("a live object is stored"),
-        );
+        let object = self
+            .store
+            .object(&stream.id, version)
+            .expect("the store reads")
+            .expect("a live object is stored");
         resolved_keys.push((
             InputKey::Generation {
                 stream,

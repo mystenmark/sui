@@ -53,7 +53,7 @@ impl Mainnet {
         let store = Arc::new(Store::open(dir.path()).unwrap());
         for t in checkpoint.get().transactions {
             store
-                .commit(Commit {
+                .write_through(Commit {
                     executed: Some(Executed {
                         digest: *t.transaction.digest(),
                         transaction: t.transaction.bytes().to_vec(),
@@ -410,14 +410,8 @@ fn out_of_order_checkpoints_summarize_in_order() {
     let mut waiter = WaiterProcessor::new(BuiltAvailability {
         checkpoints: checkpoints.clone(),
     });
-    let mut summary = SummaryBuilder::new(
-        m.store.clone(),
-        checkpoints.clone(),
-        key(),
-        sequence,
-        summaries,
-        consensus,
-    );
+    let mut summary =
+        SummaryBuilder::new(checkpoints.clone(), key(), sequence, summaries, consensus);
 
     // Runs the sequence waiter and the summary builder until quiet; returns
     // the sequence numbers summarized, in order.

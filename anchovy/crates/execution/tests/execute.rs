@@ -70,7 +70,7 @@ impl Node {
 
     fn execute_and_commit(&self, data: TransactionData) -> TransactionEffects {
         let (outcome, effects) = self.execute(data);
-        self.store.commit(outcome.commit).unwrap();
+        self.store.write_through(outcome.commit).unwrap();
         effects
     }
 }

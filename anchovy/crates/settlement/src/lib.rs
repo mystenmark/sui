@@ -199,18 +199,13 @@ impl SettlementScheduler {
         let root = chunk.root.ordinal;
         if self.last_root.is_none() {
             // Every chunk before the first one seen settled before this
-            // run: genesis, or replay from a checkpoint boundary.
-            let root = self
-                .store
-                .live(&ACCUMULATOR_ROOT)
-                .expect("store read")
-                .expect("the accumulator root exists");
+            // run: the epoch's start.
             push(
                 &self.funds,
                 FundsCommand::Settle(vec![Settle::Settled {
                     balances: Vec::new(),
                     version: chunk.version,
-                    root_version: root.version,
+                    root_version: chunk.root_version,
                 }]),
                 "funds reserver",
             );

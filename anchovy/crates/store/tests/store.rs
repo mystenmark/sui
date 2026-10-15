@@ -78,7 +78,7 @@ fn objects_round_trip_and_follow_their_live_version() {
         .max()
         .unwrap();
     store
-        .commit(Commit {
+        .write_through(Commit {
             removed: vec![Removed {
                 id,
                 version: version + 1,
@@ -108,7 +108,7 @@ fn objects_round_trip_and_follow_their_live_version() {
         .bytes
         .to_vec();
     store
-        .commit(Commit {
+        .write_through(Commit {
             written: vec![Written {
                 id,
                 version: version + 2,
@@ -144,7 +144,7 @@ fn executed_transactions_round_trip_and_survive_reopening() {
         let store = Store::open(dir.path()).unwrap();
         assert!(store.executed_effects(&digest).unwrap().is_none());
         store
-            .commit(Commit {
+            .write_through(Commit {
                 written: written(checkpoint.get()),
                 removed: vec![],
                 executed: Some(Executed {
@@ -210,7 +210,7 @@ fn the_version_at_or_before_a_bound() {
         bytes: bytes.to_vec(),
     };
     store
-        .commit(Commit {
+        .write_through(Commit {
             written: vec![
                 write(id, 3, objects[0]),
                 write(id, 7, objects[1]),
@@ -253,28 +253,76 @@ fn the_version_at_or_before_a_bound() {
 }
 
 #[test]
-fn the_highest_checkpoint_is_the_executed_watermark_and_survives_reopening() {
+fn committed_checkpoints_and_the_watermark_survive_reopening() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let store = store::Store::open(dir.path()).unwrap();
+        let store = Store::open(dir.path()).unwrap();
         assert_eq!(store.last_checkpoint().unwrap(), None);
-        store.put_checkpoint(0, b"genesis".to_vec()).unwrap();
-        // Out of order, and past 255, where little-endian keys would sort
-        // wrongly.
-        store
-            .put_checkpoint(300, b"three hundred".to_vec())
-            .unwrap();
-        store.put_checkpoint(2, b"two".to_vec()).unwrap();
-        assert_eq!(
-            store.last_checkpoint().unwrap(),
-            Some((300, b"three hundred".to_vec()))
-        );
+        assert_eq!(store.committed_checkpoint().unwrap(), None);
+        store.commit_genesis_checkpoint(b"genesis".to_vec());
+        // Past 255, where little-endian keys would sort wrongly.
+        for seq in 1..=300u64 {
+            store.commit_checkpoint(seq, &[], seq.to_le_bytes().to_vec(), vec![seq as u8]);
+        }
     }
-    let store = store::Store::open(dir.path()).unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    assert_eq!(store.committed_checkpoint().unwrap(), Some(300));
     assert_eq!(
         store.last_checkpoint().unwrap(),
-        Some((300, b"three hundred".to_vec()))
+        Some((300, 300u64.to_le_bytes().to_vec()))
     );
-    assert_eq!(store.checkpoint(2).unwrap(), Some(b"two".to_vec()));
-    assert_eq!(store.checkpoint(1).unwrap(), None);
+    assert_eq!(store.checkpoint(0).unwrap(), Some(b"genesis".to_vec()));
+    assert_eq!(store.certified(0).unwrap(), None);
+    assert_eq!(store.certified(2).unwrap(), Some(vec![2]));
+    assert_eq!(store.checkpoint(301).unwrap(), None);
+    store.commit_checkpoint(301, &[], vec![], vec![]);
+}
+
+#[test]
+#[should_panic(expected = "committed after")]
+fn checkpoints_commit_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    store.commit_genesis_checkpoint(vec![]);
+    store.commit_checkpoint(2, &[], vec![], vec![]);
+}
+
+/// A shared object's start version is its live version when first asked
+/// for in an epoch, and stays that through later writes and a reopen.
+#[test]
+fn a_start_version_is_fixed_at_the_first_assignment() {
+    let dir = tempfile::tempdir().unwrap();
+    let checkpoint = checkpoint();
+    let bytes = checkpoint.get().transactions[0].output_objects[0]
+        .bytes
+        .to_vec();
+    let id = messages::base::ObjectId([0x42; 32]);
+    let write = |version: u64| Commit {
+        written: vec![Written {
+            id,
+            version,
+            digest: Digest::new([version as u8; 32]),
+            bytes: bytes.clone(),
+        }],
+        ..Commit::default()
+    };
+    let at = |version: u64| Live {
+        version,
+        digest: Digest::new([version as u8; 32]),
+    };
+    {
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.start_version(0, &id, 1).unwrap(), None);
+        store.write_through(write(3)).unwrap();
+        assert_eq!(store.start_version(0, &id, 1).unwrap(), Some(at(3)));
+        store.write_through(write(5)).unwrap();
+        assert_eq!(store.start_version(0, &id, 1).unwrap(), Some(at(3)));
+        // Another epoch, or another stream of the object, starts afresh.
+        assert_eq!(store.start_version(1, &id, 1).unwrap(), Some(at(5)));
+        assert_eq!(store.start_version(0, &id, 2).unwrap(), Some(at(5)));
+    }
+    let store = Store::open(dir.path()).unwrap();
+    store.write_through(write(7)).unwrap();
+    assert_eq!(store.start_version(0, &id, 1).unwrap(), Some(at(3)));
+    assert_eq!(store.start_version(1, &id, 1).unwrap(), Some(at(5)));
 }

@@ -137,7 +137,7 @@ fn executed(count: usize, store: &Store) -> Vec<ExecutedEffects> {
             let effects_bytes = bcs::to_bytes(&effects).unwrap();
             let effects_digest = Digest::of("TransactionEffects", &effects_bytes);
             store
-                .commit(Commit {
+                .write_through(Commit {
                     executed: Some(Executed {
                         digest: Digest::new(digest.into_inner()),
                         transaction: bcs::to_bytes(transaction.data()).unwrap(),

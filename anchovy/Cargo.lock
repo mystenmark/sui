@@ -8025,6 +8025,7 @@ name = "store"
 version = "0.1.0"
 dependencies = [
  "messages",
+ "rand 0.8.8",
  "tempfile",
  "tidehunter",
 ]
