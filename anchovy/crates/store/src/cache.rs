@@ -217,11 +217,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// A transaction's data apart from its objects.
-pub struct TxData {
-    pub transaction: Message<SenderSignedData<'static>>,
-    pub effects_digest: Digest,
-    pub effects: Message<TransactionEffects<'static>>,
-    pub events: Option<Message<TransactionEvents<'static>>>,
+struct TxData {
+    transaction: Message<SenderSignedData<'static>>,
+    effects_digest: Digest,
+    effects: Message<TransactionEffects<'static>>,
+    events: Option<Message<TransactionEvents<'static>>>,
 }
 
 /// An executed, uncommitted transaction.

@@ -39,7 +39,7 @@ seeing uncommitted outputs, and it caches reads positively and negatively.
       transaction whose shared input was deleted since. Shared objects
       (the accumulator root included) start version assignment from a
       persisted start-version table, initialized at the first assignment.
-   5. Backpressure. Next.
+   5. Backpressure. On hold (user, 2026-10-15); reconfiguration comes first.
 
 ## TODOs
 
