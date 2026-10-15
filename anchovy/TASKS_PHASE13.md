@@ -25,7 +25,7 @@ Out of scope for now:
   makes a final checkpoint.
 - Backpressure (phase 12's last step, on hold).
 
-## Status: implementing (design agreed)
+## Status: implemented
 
 ## Steps
 
@@ -48,5 +48,21 @@ Out of scope for now:
       - the state hasher seeded per epoch from the record (it had waited
         for a checkpoint 0 that never came).
       The test checks the root against the live object set independently.
-      Next: step 3.
-   3. Reconfiguration across epochs, and the crash tests.
+   3. Reconfiguration across epochs. Done: `reconfigure`, `Node`
+      (`start_epoch`, `finish_epoch`, `run`), consensus started per epoch
+      through `ConsensusOutput`. Tests: epochs follow one another (roots
+      checked against the live set at each end), crashes between the last
+      checkpoint and the next record and inside the next epoch, and `run`
+      left to itself for three epochs.
+
+## Status after step 3
+
+All steps of the design done. Open:
+- the reference's other end-of-epoch transaction kinds, and protocol
+  upgrades (capability votes);
+- comparing certified checkpoints with local ones (fork detection), in the
+  checkpoint executor;
+- correct end-of-epoch determination (deferred transactions, randomness,
+  the close deadline);
+- a production genesis loader (the node tests build genesis with sui's
+  builder).

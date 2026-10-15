@@ -49,27 +49,30 @@ already is.
 ## The node loop
 
 ```rust
-let store = Store::open(path)?;                   // perpetual
-let current = CurrentEpoch::new();
-let state_sync = StateSync::start(current.clone());
-let server = grpc::serve(listener, current.clone());
-
-loop {
-    let start = EpochStartRecord::load(&store);   // the durable commit point
-    if start.final_checkpoint_committed(&store) { // a crash after the final
-        reconfigure(&store, &start);              // commit, before the record
-        continue;                                 // (R4.23)
+impl Node {
+    pub async fn run(mut self, mut consensus: impl FnMut(&Arc<EpochState>, ConsensusOutput) -> TransactionClient) {
+        loop {
+            let mut ended = self.start_epoch(&mut consensus).pipeline.ended.clone();
+            ended.wait_for(Option::is_some).await;
+            self.finish_epoch(); // on a blocking thread
+        }
     }
-    let epoch = Arc::new(EpochState::new(&start));
-    let consensus = consensus.start(&epoch);      // per epoch
-    let pipeline = Pipeline::start(&store, &epoch, consensus, state_sync.queue());
-    current.set(pipeline.handle());
-    pipeline.final_checkpoint_committed().await;
-    current.clear();                              // new requests wait
-    drop(pipeline);                               // joins every worker
-    reconfigure(&store, &start);
+
+    /// Builds the store's current epoch from its start record and makes it
+    /// current; first reconfigures if that epoch already ended (R4.23).
+    pub fn start_epoch(&mut self, consensus: ...) -> &Epoch;
+
+    /// Drops the ended epoch, joining every worker, then `reconfigure`.
+    pub fn finish_epoch(&mut self);
 }
 ```
+
+The perpetual parts (`Perpetual`: the store, `CurrentEpoch`, the queue to
+state sync) are built before the loop, and the gRPC server and state sync
+outside it. Consensus is started per epoch by a function the pipeline
+calls with where to deliver blocks and commits (`ConsensusOutput`),
+returning the client, as consensus-core's `ConsensusAuthority::start`
+does.
 
 `reconfigure` reads the system state the final checkpoint committed, and
 writes the next epoch's start record (below). Nothing else.
