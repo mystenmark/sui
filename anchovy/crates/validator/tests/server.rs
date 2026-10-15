@@ -41,7 +41,7 @@ async fn serve() -> SocketAddr {
     // No genesis: these requests read no objects.
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(store::Store::open(dir.path()).unwrap());
-    let processors = Processors::start(64, store);
+    let processors = Processors::start(64, epoch.clone(), store);
     let service = Validator::new(epoch, processors.transactions.clone()).into_service();
     tokio::spawn(async move {
         // The processors and their store live as long as the server.

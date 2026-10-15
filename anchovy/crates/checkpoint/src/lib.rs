@@ -19,6 +19,7 @@ use messages::Message;
 use messages::base::Digest;
 use messages::fast::Bump;
 use messages::transaction::SenderSignedData;
+use validator::epoch::EpochParams;
 use validator::pipeline::items::{
     CheckpointContentsBuilt, CheckpointEffects, CheckpointSignature, ExecutedEffects, ForkCheck,
     LastOfEpoch, PendingCheckpoint,
@@ -69,6 +70,7 @@ fn push<T>(queue: &Queue<T>, item: T, name: &str) {
 /// signatures (stored with their effects, so present for every settled
 /// chunk).
 pub struct ContentsBuilder {
+    epoch: Arc<EpochParams>,
     chunks: Arc<ChunkTable>,
     store: Arc<store::Store>,
     hasher: Queue<CheckpointEffects>,
@@ -78,12 +80,14 @@ pub struct ContentsBuilder {
 
 impl ContentsBuilder {
     pub fn new(
+        epoch: Arc<EpochParams>,
         chunks: Arc<ChunkTable>,
         store: Arc<store::Store>,
         hasher: Queue<CheckpointEffects>,
         sequence: Queue<Command<CheckpointBuilt, CheckpointContentsBuilt>>,
     ) -> ContentsBuilder {
         ContentsBuilder {
+            epoch,
             chunks,
             store,
             hasher,
@@ -106,7 +110,7 @@ impl ContentsBuilder {
                 .expect("a ready checkpoint's chunks are in the chunk table");
             effects.extend(chunk.effects.iter().cloned());
         }
-        let built = contents_of(&self.store, pending, &effects, &mut self.bump);
+        let built = contents_of(&self.store, &self.epoch, pending, &effects, &mut self.bump);
         (built, effects)
     }
 }
@@ -117,6 +121,7 @@ impl ContentsBuilder {
 /// If the store cannot be read or lacks an executed transaction.
 fn contents_of(
     store: &store::Store,
+    epoch: &EpochParams,
     pending: PendingCheckpoint,
     effects: &[ExecutedEffects],
     bump: &mut Bump,
@@ -131,9 +136,8 @@ fn contents_of(
         })
         .collect();
     let transactions: Vec<SenderSignedData<'_>> = stored.iter().map(|m| *m.get()).collect();
-    let contents = contents::build(&pending.epoch.config, effects, &transactions, bump);
+    let contents = contents::build(&epoch.config, effects, &transactions, bump);
     CheckpointContentsBuilt {
-        epoch: pending.epoch.clone(),
         transaction_count: effects.len() as u64,
         pending,
         contents: contents.bytes,
@@ -192,6 +196,7 @@ impl Processor for ContentsBuilder {
 ///
 /// Reads and writes: the checkpoint store.
 pub struct SummaryBuilder {
+    epoch: Arc<EpochParams>,
     /// Resolves each built checkpoint for the fork check, once wired.
     fork_waiter: Option<Queue<Command<CheckpointBuilt, ForkCheck, Arc<BuiltCheckpoint>>>>,
     checkpoints: Arc<CheckpointStore>,
@@ -204,6 +209,7 @@ pub struct SummaryBuilder {
 
 impl SummaryBuilder {
     pub fn new(
+        epoch: Arc<EpochParams>,
         checkpoints: Arc<CheckpointStore>,
         key: Arc<ProtocolKey>,
         sequence: Queue<Command<CheckpointBuilt, CheckpointContentsBuilt>>,
@@ -211,6 +217,7 @@ impl SummaryBuilder {
         consensus: TransactionClient,
     ) -> SummaryBuilder {
         SummaryBuilder {
+            epoch,
             fork_waiter: None,
             checkpoints,
             key,
@@ -246,11 +253,11 @@ impl Processor for SummaryBuilder {
                     .built(previous)
                     .expect("a checkpoint is released once the previous one is built")
             });
-            let summary = summary::build(&built, previous.as_deref(), &mut self.bump);
+            let summary = summary::build(&built, previous.as_deref(), &self.epoch, &mut self.bump);
             signatures.push(summary::signature_transaction(
                 &self.key,
                 &summary.bytes,
-                built.epoch.epoch,
+                self.epoch.epoch,
             ));
             let checkpoint = BuiltCheckpoint {
                 seq,

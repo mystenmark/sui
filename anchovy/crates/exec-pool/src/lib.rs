@@ -124,8 +124,7 @@ impl Executor {
     /// what it produced, and pushes the keys it resolves.
     ///
     /// # Panics
-    /// On a transaction of another epoch (reconfiguration does not exist
-    /// yet), a store that fails, or a key the input waiter released it on
+    /// On a store that fails, or a key the input waiter released it on
     /// without a value.
     #[allow(clippy::too_many_lines)]
     fn execute(
@@ -135,10 +134,6 @@ impl Executor {
         effects_keys: &mut Vec<EffectsKey>,
         deposits: &mut Vec<Settle>,
     ) {
-        assert!(
-            Arc::ptr_eq(&executable.epoch, &self.epoch.params),
-            "a transaction of the executor's epoch"
-        );
         let entry = &executable.entry;
         let (digest, bytes): (TxDigest, &[u8]) = match &entry.transaction {
             ExecutableTransaction::User(transaction) => {
@@ -613,8 +608,6 @@ mod tests {
     };
     use messages::build::execution_status::ExecutionStatus;
     use messages::build::type_tag::TypeTag;
-    use protocol_config::Chain;
-    use validator::epoch::EpochParams;
     use validator::pipeline::items::{ScheduledEntry, SystemKind, SystemTransaction};
     use validator::pipeline::keys::Reservation;
 
@@ -666,14 +659,6 @@ mod tests {
     fn executable(reserved: &[(u8, u64)]) -> Executable {
         let version = AccumulatorVersion(7);
         Executable {
-            epoch: Arc::new(EpochParams::new(
-                Chain::Unknown,
-                protocol_config::ProtocolVersion::MAX.as_u64(),
-                0,
-                messages::base::Digest::ZERO,
-                1000,
-                4,
-            )),
             version,
             root_version: 1,
             reserved: reserved

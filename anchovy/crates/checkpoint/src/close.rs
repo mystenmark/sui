@@ -10,6 +10,7 @@ use fastcrypto::hash::MultisetHash;
 use messages::base::Digest;
 use messages::fast::Bump;
 use validator::consensus::commit::change_epoch_transaction;
+use validator::epoch::EpochParams;
 use validator::pipeline::items::{
     CheckpointContentsBuilt, CheckpointEffects, Chunk, EffectsWaitItem, EndOfEpoch,
     EpochCloserInput, ExecutableTransaction, ExecutedEffects, LastOfEpoch, ScheduledEntry,
@@ -53,6 +54,7 @@ use crate::{contents_of, push, summary};
 ///
 /// Reads: the checkpoint store, the object store.
 pub struct EpochCloser {
+    epoch: Arc<EpochParams>,
     store: Arc<store::Store>,
     checkpoints: Arc<CheckpointStore>,
     resolver: Queue<Chunk>,
@@ -71,6 +73,7 @@ struct Closing {
 
 impl EpochCloser {
     pub fn new(
+        epoch: Arc<EpochParams>,
         store: Arc<store::Store>,
         checkpoints: Arc<CheckpointStore>,
         resolver: Queue<Chunk>,
@@ -79,6 +82,7 @@ impl EpochCloser {
         summary: Queue<Vec<CheckpointContentsBuilt>>,
     ) -> EpochCloser {
         EpochCloser {
+            epoch,
             store,
             checkpoints,
             resolver,
@@ -102,18 +106,17 @@ impl EpochCloser {
             .checkpoints
             .built(seq - 1)
             .expect("a checkpoint is released once the previous one is built");
-        let epoch = &built.epoch;
+        let epoch = &self.epoch;
         let transaction = change_epoch_transaction(
             epoch.epoch,
             epoch.config.version.as_u64(),
-            summary::rolling_gas(&built, Some(&previous)),
+            summary::rolling_gas(&built, Some(&previous), epoch.epoch),
             built.pending.timestamp_ms,
         );
         let digest = transaction.digest;
         push(
             &self.resolver,
             Chunk {
-                epoch: epoch.clone(),
                 version: close.version,
                 root_version: close.root_version,
                 round: close.round,
@@ -156,6 +159,7 @@ impl EpochCloser {
         let seq = closing.built.pending.seq;
         closing.built = contents_of(
             &self.store,
+            &self.epoch,
             closing.built.pending.clone(),
             &effects,
             &mut self.bump,
@@ -197,10 +201,10 @@ impl EpochCloser {
             .expect("the change-epoch transaction wrote the system state");
         assert_eq!(
             next.epoch,
-            built.epoch.epoch + 1,
+            self.epoch.epoch + 1,
             "the change-epoch transaction advanced the epoch"
         );
-        let root_state_digest = built
+        let root_state_digest = self
             .epoch
             .config
             .commit_root_state_digest()

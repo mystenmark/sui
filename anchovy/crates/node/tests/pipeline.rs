@@ -311,7 +311,6 @@ impl Network {
                     .pipeline
                     .commits
                     .try_push(CommitRequest {
-                        epoch: running.state.params.clone(),
                         commit: commit.clone(),
                     })
                     .is_ok()
@@ -528,7 +527,6 @@ impl Network {
             self.pipeline()
                 .votes
                 .try_push(VoteRequest {
-                    epoch: self.epoch().clone(),
                     block: block.clone(),
                     reply,
                 })
@@ -541,7 +539,6 @@ impl Network {
             self.pipeline()
                 .commits
                 .try_push(CommitRequest {
-                    epoch: self.epoch().params.clone(),
                     commit: commit.clone(),
                 })
                 .is_ok()

@@ -30,7 +30,7 @@ fn cases() -> (Vec<Case>, Arc<EpochState>) {
 
 async fn serve(epoch: Arc<EpochState>) -> ValidatorClient<Channel> {
     let store = common::store(&epoch);
-    let processors = Processors::start(64, store.store.clone());
+    let processors = Processors::start(64, epoch.clone(), store.store.clone());
     let queue = processors.transactions.clone();
     serve_with(epoch, queue, (processors, store)).await
 }
@@ -191,7 +191,7 @@ async fn a_full_queue_between_processors_refuses_work() {
     // own thread, never takes an item.
     let (queue, inbox) = workqueue::queue(16);
     let store = common::store(&epoch);
-    let worker = Processors::worker(inbox, 0, store.store.clone()).spawn();
+    let worker = Processors::worker(inbox, 0, epoch.clone(), store.store.clone()).spawn();
     let mut client = serve_with(epoch, queue, (worker, store)).await;
     let status = client
         .submit_transaction(submit(&[valid], SubmitTxType::Default))

@@ -24,7 +24,7 @@ use messages::base::ObjectRef;
 use workqueue::{Processor, Refusal, Refuse};
 
 use crate::checks;
-use crate::consensus::decode::{CommittedTransaction, DecodedCommit, DecodedRequest, OwnedInputs};
+use crate::consensus::decode::{CommittedTransaction, DecodedCommit, OwnedInputs};
 use crate::consensus::sequence::{
     Prologue, Schedule, Scheduled, Sequencer, SharedAccess, SharedOrdinal,
 };
@@ -96,14 +96,8 @@ pub struct HandledCommit {
     pub cache_misses: usize,
 }
 
-/// A handled commit, in the epoch it belongs to.
-pub struct HandledRequest {
-    pub epoch: Arc<EpochParams>,
-    pub commit: HandledCommit,
-}
-
 /// A full queue drops the commit; consensus replays commits not handled.
-impl Refuse for HandledRequest {
+impl Refuse for HandledCommit {
     fn refuse(self, _: Refusal) {}
 }
 
@@ -234,16 +228,18 @@ impl CommitHandler {
     }
 }
 
-impl Processor for CommitHandler {
-    type Input = DecodedRequest;
-    type Output = HandledRequest;
+/// `CommitHandler` on a worker, in one epoch.
+pub struct HandlerStage {
+    pub epoch: Arc<EpochParams>,
+    pub handler: CommitHandler,
+}
 
-    fn process(&mut self, request: DecodedRequest) -> Option<HandledRequest> {
-        let commit = self.handle(&request.epoch, request.commit)?;
-        Some(HandledRequest {
-            epoch: request.epoch,
-            commit,
-        })
+impl Processor for HandlerStage {
+    type Input = DecodedCommit;
+    type Output = HandledCommit;
+
+    fn process(&mut self, commit: DecodedCommit) -> Option<HandledCommit> {
+        self.handler.handle(&self.epoch, commit)
     }
 }
 
@@ -252,7 +248,7 @@ impl Processor for CommitHandler {
 ///
 /// Today's serial path, which the pipeline's resolver, input waiter and
 /// `Executor` replace.
-/// Inward: `CommitHandler`: `HandledRequest`.
+/// Inward: `CommitHandler`: `HandledCommit`.
 /// Outward: `CommitOutcome` to its sink.
 pub struct ScheduleExecutor {
     store: Arc<store::Store>,
@@ -332,17 +328,11 @@ impl ScheduleExecutor {
 }
 
 impl Processor for ScheduleExecutor {
-    type Input = HandledRequest;
+    type Input = HandledCommit;
     type Output = CommitOutcome;
 
-    /// # Panics
-    /// On a commit of another epoch: reconfiguration does not exist yet.
-    fn process(&mut self, request: HandledRequest) -> Option<CommitOutcome> {
-        assert!(
-            Arc::ptr_eq(&request.epoch, &self.epoch.params),
-            "a commit of the executor's epoch"
-        );
-        Some(self.execute(request.commit))
+    fn process(&mut self, commit: HandledCommit) -> Option<CommitOutcome> {
+        Some(self.execute(commit))
     }
 }
 
@@ -425,6 +415,7 @@ pub struct Decided {
 /// by its position, and the committed leader round. Written, never read: the
 /// handler stays a state machine over its input.
 pub struct CommitStage {
+    epoch: Arc<EpochParams>,
     handler: CommitHandler,
     start: EpochStart,
     queue: CheckpointQueue,
@@ -446,6 +437,7 @@ pub struct CommitStage {
 
 impl CommitStage {
     pub fn new(
+        epoch: Arc<EpochParams>,
         start: EpochStart,
         chunks: workqueue::Queue<Chunk>,
         settlements: workqueue::Queue<SettlementInput>,
@@ -453,6 +445,7 @@ impl CommitStage {
         statuses: Arc<ConsensusTxStatusCache>,
     ) -> CommitStage {
         CommitStage {
+            epoch,
             handler: CommitHandler::new(),
             start,
             queue: CheckpointQueue::new(
@@ -473,7 +466,8 @@ impl CommitStage {
 
     /// Decides `commit` and lays it out in chunks and checkpoints, or
     /// nothing if it was handled before or follows the epoch's last.
-    pub fn decide(&mut self, epoch: &Arc<EpochParams>, commit: DecodedCommit) -> Option<Decided> {
+    pub fn decide(&mut self, commit: DecodedCommit) -> Option<Decided> {
+        let epoch = &self.epoch.clone();
         if self.closed {
             return None;
         }
@@ -609,7 +603,6 @@ impl CommitStage {
             let root_version = self.root_version;
             self.root_version += 1;
             decided.settlements.push(ChunkSettlement {
-                epoch: epoch.clone(),
                 version,
                 root_version,
                 last_of_commit: position + 1 == chunk_count,
@@ -631,7 +624,6 @@ impl CommitStage {
                 },
             });
             decided.chunks.push(Chunk {
-                epoch: epoch.clone(),
                 version,
                 root_version,
                 round: prologue.round,
@@ -648,7 +640,6 @@ impl CommitStage {
         decided.checkpoints = flushed
             .into_iter()
             .map(|f| PendingCheckpoint {
-                epoch: epoch.clone(),
                 seq: f.seq,
                 heights: f.heights,
                 timestamp_ms: f.timestamp_ms,
@@ -718,11 +709,10 @@ fn push<T>(queue: &workqueue::Queue<T>, item: T, name: &str) {
 }
 
 impl Processor for CommitStage {
-    type Input = DecodedRequest;
+    type Input = DecodedCommit;
     type Output = ();
 
-    fn process(&mut self, request: DecodedRequest) -> Option<()> {
-        let DecodedRequest { epoch, mut commit } = request;
+    fn process(&mut self, mut commit: DecodedCommit) -> Option<()> {
         let leader_round = commit.leader.round;
         let rejected = std::mem::take(&mut commit.rejected);
         let positions: Vec<(BlockRef, TransactionIndex)> = commit
@@ -730,7 +720,7 @@ impl Processor for CommitStage {
             .iter()
             .map(|t| (t.block, t.index))
             .collect();
-        let decided = self.decide(&epoch, commit)?;
+        let decided = self.decide(commit)?;
         // What became of each transaction, for its submitter: dropped, or
         // finalized (scheduled, or a duplicate of one that was).
         let dropped: HashSet<(BlockRef, TransactionIndex)> =

@@ -145,7 +145,7 @@ fn main() {
         .unwrap_or(1);
     let mode = std::env::var("MODE").ok();
     let cache = Arc::new(ConsensusTxCache::new());
-    let mut warm_voter = BlockVoter::new(store.clone(), cache.clone());
+    let mut warm_voter = BlockVoter::new(epoch.clone(), store.clone(), cache.clone());
     println!("signatures  txs    vote µs/tx  allocs/tx");
     for label in ["cold", "warm"] {
         if mode.as_deref().is_some_and(|m| m != label) {
@@ -154,7 +154,7 @@ fn main() {
         if label == "warm" {
             // Verify every signature once, unmeasured.
             for block in &blocks {
-                warm_voter.vote(&epoch, block.clone()).unwrap();
+                warm_voter.vote(block.clone()).unwrap();
                 cache.take(&block.reference);
             }
         }
@@ -162,7 +162,7 @@ fn main() {
         let mut allocations = 0;
         for _ in 0..passes {
             // A fresh voter has verified no signatures.
-            let mut cold_voter = BlockVoter::new(store.clone(), cache.clone());
+            let mut cold_voter = BlockVoter::new(epoch.clone(), store.clone(), cache.clone());
             let voter = if label == "cold" {
                 &mut cold_voter
             } else {
@@ -172,7 +172,7 @@ fn main() {
                 let block = block.clone();
                 let before = ALLOCATIONS.load(Ordering::Relaxed);
                 let start = Instant::now();
-                let verdict = voter.vote(&epoch, block);
+                let verdict = voter.vote(block);
                 elapsed += start.elapsed();
                 allocations += ALLOCATIONS.load(Ordering::Relaxed) - before;
                 assert_eq!(verdict, Ok(vec![]));

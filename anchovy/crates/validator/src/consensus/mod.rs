@@ -15,7 +15,7 @@ use std::sync::Arc;
 use workqueue::{Queue, Sink, Worker, WorkerHandle};
 
 use cache::ConsensusTxCache;
-use commit::{CommitHandler, CommitOutcome, ScheduleExecutor};
+use commit::{CommitHandler, CommitOutcome, HandlerStage, ScheduleExecutor};
 use decode::{CommitDecoder, CommitRequest};
 use vote::{BlockVoter, VoteRequest};
 
@@ -55,20 +55,38 @@ impl ConsensusProcessors {
         let (commits, commit_inbox) = workqueue::queue(COMMIT_QUEUE);
         let (to_handle, handle_inbox) = workqueue::queue(COMMIT_QUEUE);
         let voting = {
-            let (store, cache) = (store.clone(), cache.clone());
+            let (epoch, store, cache) = (epoch.clone(), store.clone(), cache.clone());
             Worker::new("consensus-votes")
-                .run(vote_inbox, move || BlockVoter::new(store, cache), |()| {})
+                .run(
+                    vote_inbox,
+                    move || BlockVoter::new(epoch, store, cache),
+                    |()| {},
+                )
                 .spawn()
         };
         let decoder = {
-            let cache = cache.clone();
+            let (params, cache) = (epoch.params.clone(), cache.clone());
             Worker::new("consensus-decode")
-                .run(commit_inbox, move || CommitDecoder::new(cache), to_handle)
+                .run(
+                    commit_inbox,
+                    move || CommitDecoder::new(params, cache),
+                    to_handle,
+                )
                 .spawn()
         };
         let (to_execute, execute_inbox) = workqueue::queue(COMMIT_QUEUE);
         let handler = Worker::new("consensus-handler")
-            .run(handle_inbox, CommitHandler::new, to_execute)
+            .run(
+                handle_inbox,
+                {
+                    let params = epoch.params.clone();
+                    move || HandlerStage {
+                        epoch: params,
+                        handler: CommitHandler::new(),
+                    }
+                },
+                to_execute,
+            )
             .spawn();
         let executor = Worker::new("consensus-execution")
             .run(

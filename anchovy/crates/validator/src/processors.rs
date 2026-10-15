@@ -29,8 +29,6 @@ pub type Reply = oneshot::Sender<Result<Vec<Outcome>, Rejected>>;
 /// processors. One per request, as a handoff costs far more than checking
 /// a transaction does.
 pub struct Request<S: TxState> {
-    /// The epoch the request is checked in, every stage alike.
-    pub(crate) epoch: Arc<EpochState>,
     pub(crate) transactions: Vec<Message<Transaction<'static, S>>>,
     /// Why the transaction after these failed validation, if one did. The
     /// reference checks each transaction's signatures before validating the
@@ -42,12 +40,10 @@ pub struct Request<S: TxState> {
 impl Request<DigestPending> {
     /// Freshly decoded transactions.
     pub fn new(
-        epoch: Arc<EpochState>,
         transactions: Vec<Message<Transaction<'static, DigestPending>>>,
         reply: Reply,
     ) -> Request<DigestPending> {
         Request {
-            epoch,
             transactions,
             then: None,
             reply,
@@ -113,20 +109,16 @@ const ARENA_BYTES: usize = 64 * 1024;
 /// Outward: `SignatureVerifier`: `Request<Valid>`; a refused request is
 /// answered directly.
 pub struct TransactionValidator {
+    epoch: Arc<EpochState>,
     bump: Bump,
 }
 
 impl TransactionValidator {
-    pub fn new() -> TransactionValidator {
+    pub fn new(epoch: Arc<EpochState>) -> TransactionValidator {
         TransactionValidator {
+            epoch,
             bump: Bump::with_capacity(ARENA_BYTES),
         }
-    }
-}
-
-impl Default for TransactionValidator {
-    fn default() -> TransactionValidator {
-        TransactionValidator::new()
     }
 }
 
@@ -136,14 +128,13 @@ impl Processor for TransactionValidator {
 
     fn process(&mut self, request: Request<DigestPending>) -> Option<Request<Valid>> {
         let Request {
-            epoch,
             transactions,
             then: _,
             reply,
         } = request;
-        let (valid, failure) = checks::validate(transactions, &epoch.context(), &mut self.bump);
+        let (valid, failure) =
+            checks::validate(transactions, &self.epoch.context(), &mut self.bump);
         let request = Request {
-            epoch,
             transactions: valid,
             then: failure,
             reply,
@@ -170,14 +161,14 @@ pub struct SignatureVerifier {
 }
 
 impl SignatureVerifier {
-    pub fn new() -> SignatureVerifier {
-        SignatureVerifier::with_cache(checks::GENERATION)
+    pub fn new(epoch: Arc<EpochState>) -> SignatureVerifier {
+        SignatureVerifier::with_cache(epoch, checks::GENERATION)
     }
 
     /// With a signature cache of `2 * generation` entries.
-    pub fn with_cache(generation: usize) -> SignatureVerifier {
+    pub fn with_cache(epoch: Arc<EpochState>, generation: usize) -> SignatureVerifier {
         SignatureVerifier {
-            checks: SignatureChecks::new(generation),
+            checks: SignatureChecks::new(epoch, generation),
         }
     }
 
@@ -187,26 +178,18 @@ impl SignatureVerifier {
     }
 }
 
-impl Default for SignatureVerifier {
-    fn default() -> SignatureVerifier {
-        SignatureVerifier::new()
-    }
-}
-
 impl Processor for SignatureVerifier {
     type Input = Request<Valid>;
     type Output = Request<Verified>;
 
     fn process(&mut self, request: Request<Valid>) -> Option<Request<Verified>> {
         let Request {
-            epoch,
             transactions,
             then,
             reply,
         } = request;
-        match (self.checks.verify(&epoch, transactions), then) {
+        match (self.checks.verify(transactions), then) {
             (Ok(verified), None) => Some(Request {
-                epoch,
                 transactions: verified,
                 then: None,
                 reply,
@@ -222,7 +205,6 @@ impl Processor for SignatureVerifier {
 /// A request whose inputs were checked: each transaction to execute, or
 /// already answered.
 pub struct Checked {
-    epoch: Arc<EpochState>,
     transactions: Vec<Step>,
     reply: Reply,
 }
@@ -251,12 +233,13 @@ impl Refuse for Checked {
 /// Inward: `SignatureVerifier`: `Request<Verified>`.
 /// Outward: `TransactionExecutor`: `Checked`.
 pub struct InputChecker {
+    epoch: Arc<EpochState>,
     store: Arc<store::Store>,
 }
 
 impl InputChecker {
-    pub fn new(store: Arc<store::Store>) -> InputChecker {
-        InputChecker { store }
+    pub fn new(epoch: Arc<EpochState>, store: Arc<store::Store>) -> InputChecker {
+        InputChecker { epoch, store }
     }
 }
 
@@ -266,7 +249,6 @@ impl Processor for InputChecker {
 
     fn process(&mut self, request: Request<Verified>) -> Option<Checked> {
         let Request {
-            epoch,
             transactions,
             then: _,
             reply,
@@ -277,7 +259,7 @@ impl Processor for InputChecker {
                 let digest = transaction.get().0.digest().bytes;
                 match executed(&self.store, &digest) {
                     Some(outcome) => Step::Done(outcome),
-                    None => match checks::check_inputs(&epoch, &self.store, transaction) {
+                    None => match checks::check_inputs(&self.epoch, &self.store, transaction) {
                         Ok(checked) => Step::Execute(checked),
                         Err(e) => Step::Done(Outcome::Rejected(e)),
                     },
@@ -285,7 +267,6 @@ impl Processor for InputChecker {
             })
             .collect();
         Some(Checked {
-            epoch,
             transactions,
             reply,
         })
@@ -311,16 +292,17 @@ pub(crate) fn executed(store: &store::Store, digest: &[u8; 32]) -> Option<Outcom
 /// Inward: `InputChecker`: `Checked`.
 /// Outward: the request's reply.
 pub struct TransactionExecutor {
+    epoch: Arc<EpochState>,
     store: Arc<store::Store>,
 }
 
 impl TransactionExecutor {
-    pub fn new(store: Arc<store::Store>) -> TransactionExecutor {
-        TransactionExecutor { store }
+    pub fn new(epoch: Arc<EpochState>, store: Arc<store::Store>) -> TransactionExecutor {
+        TransactionExecutor { epoch, store }
     }
 
-    fn execute(&self, epoch: &EpochState, transaction: &InputsCheckedTransaction) -> Outcome {
-        execute_and_commit(&self.store, epoch, transaction)
+    fn execute(&self, transaction: &InputsCheckedTransaction) -> Outcome {
+        execute_and_commit(&self.store, &self.epoch, transaction)
     }
 }
 
@@ -352,14 +334,13 @@ impl Processor for TransactionExecutor {
 
     fn process(&mut self, request: Checked) -> Option<()> {
         let Checked {
-            epoch,
             transactions,
             reply,
         } = request;
         let outcomes = transactions
             .into_iter()
             .map(|step| match step {
-                Step::Execute(transaction) => self.execute(&epoch, &transaction),
+                Step::Execute(transaction) => self.execute(&transaction),
                 Step::Done(outcome) => outcome,
             })
             .collect();
@@ -383,10 +364,14 @@ pub const VALIDATION_QUEUE: usize = 4096;
 pub const SIGNATURE_QUEUE: usize = 4096;
 
 impl Processors {
-    /// The pipeline, on one thread, over `store`.
-    pub fn start(validation_queue: usize, store: Arc<store::Store>) -> Processors {
+    /// The pipeline, on one thread, over `store`, in `epoch`.
+    pub fn start(
+        validation_queue: usize,
+        epoch: Arc<EpochState>,
+        store: Arc<store::Store>,
+    ) -> Processors {
         let (transactions, validation) = workqueue::queue(validation_queue);
-        let worker = Processors::worker(validation, SIGNATURE_QUEUE, store).spawn();
+        let worker = Processors::worker(validation, SIGNATURE_QUEUE, epoch, store).spawn();
         Processors {
             transactions,
             _worker: worker,
@@ -397,20 +382,34 @@ impl Processors {
     pub fn worker(
         validation: Inbox<Request<DigestPending>>,
         queue: usize,
+        epoch: Arc<EpochState>,
         store: Arc<store::Store>,
     ) -> Worker {
         let (signatures, verification) = workqueue::queue(queue);
         let (verified, input_checks) = workqueue::queue(queue);
         let (checked, executions) = workqueue::queue(queue);
+        let (validating, verifying, checking) = (epoch.clone(), epoch.clone(), epoch.clone());
         let checker_store = store.clone();
         Worker::new("transactions")
-            .run(validation, TransactionValidator::new, signatures)
-            .run(verification, SignatureVerifier::new, verified)
+            .run(
+                validation,
+                move || TransactionValidator::new(validating),
+                signatures,
+            )
+            .run(
+                verification,
+                move || SignatureVerifier::new(verifying),
+                verified,
+            )
             .run(
                 input_checks,
-                move || InputChecker::new(checker_store),
+                move || InputChecker::new(checking, checker_store),
                 checked,
             )
-            .run(executions, move || TransactionExecutor::new(store), |()| {})
+            .run(
+                executions,
+                move || TransactionExecutor::new(epoch, store),
+                |()| {},
+            )
     }
 }

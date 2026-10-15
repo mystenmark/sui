@@ -157,8 +157,8 @@ impl Pipeline {
         use validator::processors::{SignatureVerifier, TransactionValidator};
         Pipeline {
             epoch: epoch.clone(),
-            validator: TransactionValidator::new(),
-            verifier: SignatureVerifier::with_cache(generation),
+            validator: TransactionValidator::new(epoch.clone()),
+            verifier: SignatureVerifier::with_cache(epoch.clone(), generation),
         }
     }
 
@@ -173,7 +173,7 @@ impl Pipeline {
             .iter()
             .map(|b| Message::parse(b.to_vec()).map_err(|(e, _)| e).unwrap())
             .collect();
-        let request = Request::new(self.epoch.clone(), transactions, reply);
+        let request = Request::new(transactions, reply);
         let Some(verified) = self
             .validator
             .process(request)

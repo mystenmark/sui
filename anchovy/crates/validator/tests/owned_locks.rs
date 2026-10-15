@@ -109,6 +109,7 @@ async fn the_stage_records_each_committed_transaction_s_status() {
     let (checkpoints, _checkpoint_inbox) = workqueue::queue(16);
     let statuses = Arc::new(ConsensusTxStatusCache::new());
     let mut stage = CommitStage::new(
+        epoch.clone(),
         EpochStart {
             previous_checkpoint: 0,
             previous_height: 0,
@@ -126,10 +127,7 @@ async fn the_stage_records_each_committed_transaction_s_status() {
     let mut decoded = commit(1, &[(&first, &[]), (&second, &[])]);
     let block = decoded.leader;
     decoded.rejected = vec![(block, 2)];
-    stage.process(validator::consensus::decode::DecodedRequest {
-        epoch: epoch.clone(),
-        commit: decoded,
-    });
+    stage.process(decoded);
     let status = |index| {
         statuses.notify_read(ConsensusPosition {
             epoch: epoch.epoch,
@@ -429,18 +427,15 @@ fn decoding_carries_the_immutable_claims() {
         },
         transactions: vec![user_transaction(&bytes, &[frozen])],
     };
-    let mut decoder = CommitDecoder::new(Arc::new(ConsensusTxCache::new()));
-    let commit = decoder.decode(
-        &epoch,
-        CommittedSubDag {
-            commit_index: 1,
-            digest: [0; 32],
-            leader: block.reference,
-            timestamp_ms: 0,
-            blocks: vec![block],
-            rejected: vec![],
-        },
-    );
+    let mut decoder = CommitDecoder::new(epoch.clone(), Arc::new(ConsensusTxCache::new()));
+    let commit = decoder.decode(CommittedSubDag {
+        commit_index: 1,
+        digest: [0; 32],
+        leader: block.reference,
+        timestamp_ms: 0,
+        blocks: vec![block],
+        rejected: vec![],
+    });
     assert_eq!(commit.cache_misses, 1);
     let locked = commit.transactions[0].owned.as_ref().unwrap();
     assert_eq!(locked, &vec![wire(&owned), wire(&gas)]);
@@ -457,6 +452,7 @@ fn the_stage_leaves_dropped_transactions_out_of_its_chunks() {
     let (settlements, _settlement_inbox) = workqueue::queue(16);
     let (checkpoints, _checkpoint_inbox) = workqueue::queue(16);
     let mut stage = CommitStage::new(
+        epoch.clone(),
         EpochStart {
             previous_checkpoint: 0,
             previous_height: 0,
@@ -472,7 +468,7 @@ fn the_stage_leaves_dropped_transactions_out_of_its_chunks() {
         Arc::new(validator::consensus::status::ConsensusTxStatusCache::new()),
     );
     let decided = stage
-        .decide(&epoch, commit(1, &[(&first, &[]), (&second, &[])]))
+        .decide(commit(1, &[(&first, &[]), (&second, &[])]))
         .unwrap();
     let users: Vec<_> = decided
         .chunks

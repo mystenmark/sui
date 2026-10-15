@@ -252,7 +252,6 @@ impl Node {
         resolved_base: Vec<(StreamId, u32, u32)>,
     ) -> Executable {
         let mut executable = Executable {
-            epoch: self.epoch.params.clone(),
             version: AccumulatorVersion(1),
             root_version: 1,
             reserved: Vec::new(),

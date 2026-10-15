@@ -309,12 +309,12 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
             }
         }),
     );
-    let mut validator = TransactionValidator::new();
-    let mut verifier = SignatureVerifier::new();
+    let mut validator = TransactionValidator::new(epoch.clone());
+    let mut verifier = SignatureVerifier::new(epoch.clone());
     let mut both = |verifier: &mut SignatureVerifier, txs: &[Bytes]| {
         for bytes in txs {
             let (reply, _verdict) = oneshot::channel();
-            let request = Request::new(epoch.clone(), vec![decode(bytes)], reply);
+            let request = Request::new(vec![decode(bytes)], reply);
             let accepted = validator
                 .process(request)
                 .and_then(|valid| verifier.process(valid))
@@ -326,7 +326,7 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
         "decode + both processors, cache cold",
         per_tx(txs, 5, |txs| {
             // Its two tables' allocation is timed too: ~5 ns a transaction.
-            both(&mut SignatureVerifier::new(), txs);
+            both(&mut SignatureVerifier::new(epoch.clone()), txs);
         }),
     );
     row(
@@ -395,7 +395,7 @@ fn pool(
     rounds: usize,
 ) -> (f64, Duration) {
     let (_dir, store) = empty_store();
-    let processors = Processors::start(1 << 16, store);
+    let processors = Processors::start(1 << 16, epoch.clone(), store);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .build()
@@ -421,7 +421,7 @@ fn pool(
                         let (reply, verdict) = oneshot::channel();
                         let transaction = decode(&txs[i % txs.len()]);
                         if queue
-                            .try_push(Request::new(epoch.clone(), vec![transaction], reply))
+                            .try_push(Request::new(vec![transaction], reply))
                             .is_err()
                         {
                             panic!("queue full");
@@ -500,7 +500,7 @@ fn server(epoch: &Arc<EpochState>, workers: usize) -> (SocketAddr, impl Drop) {
         .build()
         .unwrap();
     let (dir, store) = empty_store();
-    let processors = Processors::start(1 << 16, store);
+    let processors = Processors::start(1 << 16, epoch.clone(), store);
     let service = Validator::new(epoch.clone(), processors.transactions.clone()).into_service();
     let listener = runtime
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))

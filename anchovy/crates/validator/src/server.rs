@@ -291,11 +291,7 @@ impl Validator {
         let (reply, verdict) = oneshot::channel();
         epoch
             .transactions
-            .try_push(processors::Request::new(
-                epoch.epoch.clone(),
-                transactions,
-                reply,
-            ))
+            .try_push(processors::Request::new(transactions, reply))
             .map_err(|e| match e {
                 PushError::Full(_) => {
                     Failure::Status(Status::resource_exhausted("validation queue full"))

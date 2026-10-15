@@ -209,6 +209,7 @@ fn bench_process(size: usize, effects: &[Vec<u8>]) {
     let (checkpoints_q, checkpoints_in) = workqueue::queue(64);
     let (funds_q, funds_in) = workqueue::queue(64);
     let mut scheduler = SettlementScheduler::new(
+        epoch.clone(),
         store.clone(),
         Arc::new(ChunkTable::new()),
         effects_q,
@@ -221,7 +222,6 @@ fn bench_process(size: usize, effects: &[Vec<u8>]) {
     for round in 0..=rounds {
         let height = round as u64 + 1;
         let chunk = ChunkSettlement {
-            epoch: epoch.clone(),
             version: AccumulatorVersion(height),
             root_version: height,
             last_of_commit: true,

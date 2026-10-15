@@ -45,9 +45,8 @@ const MAX_SHARE_SERIALIZED_BYTES: usize = 200 * 1024;
 /// to reject, or why the block is invalid.
 pub type Verdict = Result<Vec<TransactionIndex>, InvalidBlock>;
 
-/// A block to vote on, in the epoch it belongs to.
+/// A block to vote on, from the epoch's consensus.
 pub struct VoteRequest {
-    pub epoch: Arc<EpochState>,
     pub block: Block,
     pub reply: oneshot::Sender<Verdict>,
 }
@@ -92,6 +91,7 @@ impl From<validation::Error> for RejectReason {
 ///
 /// Reads: the object store. Writes: the decoded-transaction cache.
 pub struct BlockVoter {
+    epoch: Arc<EpochState>,
     store: Arc<store::Store>,
     cache: Arc<ConsensusTxCache>,
     signatures: SignatureChecks,
@@ -103,11 +103,16 @@ pub struct BlockVoter {
 const ARENA_BYTES: usize = 64 * 1024;
 
 impl BlockVoter {
-    pub fn new(store: Arc<store::Store>, cache: Arc<ConsensusTxCache>) -> BlockVoter {
+    pub fn new(
+        epoch: Arc<EpochState>,
+        store: Arc<store::Store>,
+        cache: Arc<ConsensusTxCache>,
+    ) -> BlockVoter {
         BlockVoter {
+            signatures: SignatureChecks::new(epoch.clone(), checks::GENERATION),
+            epoch,
             store,
             cache,
-            signatures: SignatureChecks::new(checks::GENERATION),
             checkpoint_signatures: None,
             bump: Bump::with_capacity(ARENA_BYTES),
         }
@@ -126,7 +131,8 @@ impl BlockVoter {
 
     /// Votes on `block`: `verify_and_vote_batch`. A valid block's decoded
     /// transactions are cached.
-    pub fn vote(&mut self, epoch: &Arc<EpochState>, block: Block) -> Verdict {
+    pub fn vote(&mut self, block: Block) -> Verdict {
+        let epoch = &self.epoch.clone();
         let Block {
             reference,
             transactions,
@@ -175,7 +181,7 @@ impl BlockVoter {
                 Err(_) => rejects.push(index as TransactionIndex),
             }
         }
-        let verified = self.signatures.verify_batch(epoch, valid);
+        let verified = self.signatures.verify_batch(valid);
         for (i, verified) in verified.into_iter().enumerate() {
             let (index, claims) = &pending[i];
             match verified {
@@ -278,12 +284,8 @@ impl Processor for BlockVoter {
     type Output = ();
 
     fn process(&mut self, request: VoteRequest) -> Option<()> {
-        let VoteRequest {
-            epoch,
-            block,
-            reply,
-        } = request;
-        let verdict = self.vote(&epoch, block);
+        let VoteRequest { block, reply } = request;
+        let verdict = self.vote(block);
         // Consensus may have stopped waiting; nothing to do then.
         let _ = reply.send(verdict);
         None

@@ -117,14 +117,8 @@ fn params(version: u64, epoch: u64) -> Arc<EpochParams> {
     ))
 }
 
-fn pending(
-    epoch: &Arc<EpochParams>,
-    seq: u64,
-    heights: Vec<u64>,
-    timestamp_ms: u64,
-) -> PendingCheckpoint {
+fn pending(seq: u64, heights: Vec<u64>, timestamp_ms: u64) -> PendingCheckpoint {
     PendingCheckpoint {
-        epoch: epoch.clone(),
         seq,
         heights,
         timestamp_ms,
@@ -197,13 +191,14 @@ fn contents_match_mainnet_and_sui() {
     let epoch = params(ProtocolVersion::MAX.as_u64(), s.epoch);
     let (hasher, hasher_inbox) = queue(16);
     let (sequence, _) = queue(16);
-    let mut builder = ContentsBuilder::new(m.chunks([3, 4], 5), m.store.clone(), hasher, sequence);
-    let (built, effects) = builder.build(pending(
-        &epoch,
-        s.sequence_number,
-        vec![3, 4],
-        s.timestamp_ms,
-    ));
+    let mut builder = ContentsBuilder::new(
+        epoch.clone(),
+        m.chunks([3, 4], 5),
+        m.store.clone(),
+        hasher,
+        sequence,
+    );
+    let (built, effects) = builder.build(pending(s.sequence_number, vec![3, 4], s.timestamp_ms));
     drop(hasher_inbox);
 
     let mainnet = &m.checkpoint.get().checkpoint_contents;
@@ -245,13 +240,14 @@ fn contents_v1_match_sui() {
     assert!(!epoch.config.address_aliases());
     let (hasher, _hasher_inbox) = queue(16);
     let (sequence, _) = queue(16);
-    let mut builder = ContentsBuilder::new(m.chunks([0, 1], 14), m.store.clone(), hasher, sequence);
-    let (built, effects) = builder.build(pending(
-        &epoch,
-        s.sequence_number,
-        vec![0, 1],
-        s.timestamp_ms,
-    ));
+    let mut builder = ContentsBuilder::new(
+        epoch.clone(),
+        m.chunks([0, 1], 14),
+        m.store.clone(),
+        hasher,
+        sequence,
+    );
+    let (built, effects) = builder.build(pending(s.sequence_number, vec![0, 1], s.timestamp_ms));
 
     let sui = sui_effects(&effects);
     let contents = SuiContents::new_with_digests_and_signatures(
@@ -275,13 +271,14 @@ fn summary_matches_mainnet_and_sui() {
     let epoch = params(ProtocolVersion::MAX.as_u64(), s.epoch);
     let (hasher, _hasher_inbox) = queue(16);
     let (sequence, _) = queue(16);
-    let mut builder = ContentsBuilder::new(m.chunks([0, 1], 1), m.store.clone(), hasher, sequence);
-    let (built, effects) = builder.build(pending(
-        &epoch,
-        s.sequence_number,
-        vec![0, 1],
-        s.timestamp_ms,
-    ));
+    let mut builder = ContentsBuilder::new(
+        epoch.clone(),
+        m.chunks([0, 1], 1),
+        m.store.clone(),
+        hasher,
+        sequence,
+    );
+    let (built, effects) = builder.build(pending(s.sequence_number, vec![0, 1], s.timestamp_ms));
 
     let rolling = s.epoch_rolling_gas_cost_summary;
     let before = [
@@ -297,7 +294,7 @@ fn summary_matches_mainnet_and_sui() {
         s.network_total_transactions - 14,
         before,
     );
-    let summary = summary::build(&built, Some(&prev), &mut Bump::with_capacity(1024));
+    let summary = summary::build(&built, Some(&prev), &epoch, &mut Bump::with_capacity(1024));
     assert_eq!(summary.bytes, s.bytes);
     assert_eq!(summary.digest, s.digest.bytes);
     assert_eq!(
@@ -341,13 +338,13 @@ fn summary_matches_mainnet_and_sui() {
         prev.network_total_transactions,
         before,
     );
-    let first = summary::build(&built, Some(&prev), &mut Bump::with_capacity(1024));
+    let first = summary::build(&built, Some(&prev), &epoch, &mut Bump::with_capacity(1024));
     assert_eq!(first.epoch_rolling_gas, built.gas);
 
     // Checkpoint 0 has no previous digest, and its total is its own.
     let mut genesis = built.clone();
     genesis.pending.seq = 0;
-    let zero = summary::build(&genesis, None, &mut Bump::with_capacity(1024));
+    let zero = summary::build(&genesis, None, &epoch, &mut Bump::with_capacity(1024));
     let parsed: SuiSummary = bcs::from_bytes(&zero.bytes).unwrap();
     assert_eq!(parsed.previous_digest, None);
     assert_eq!(parsed.network_total_transactions, 14);
@@ -380,6 +377,7 @@ fn signature_transaction_verifies_in_sui() {
 /// summaries come out in order, each chained to the one before, through
 /// the sequence waiter.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn out_of_order_checkpoints_summarize_in_order() {
     let m = Mainnet::load();
     let s = m.summary();
@@ -407,12 +405,24 @@ fn out_of_order_checkpoints_summarize_in_order() {
     let (sequence, sequence_inbox) = queue(16);
     let (summaries, summaries_inbox) = queue(16);
     let (consensus, _normal, mut signatures) = consensus::TransactionClient::new(16);
-    let mut contents = ContentsBuilder::new(chunks, m.store.clone(), to_hasher, sequence.clone());
+    let mut contents = ContentsBuilder::new(
+        epoch.clone(),
+        chunks,
+        m.store.clone(),
+        to_hasher,
+        sequence.clone(),
+    );
     let mut waiter = WaiterProcessor::new(BuiltAvailability {
         checkpoints: checkpoints.clone(),
     });
-    let mut summary =
-        SummaryBuilder::new(checkpoints.clone(), key(), sequence, summaries, consensus);
+    let mut summary = SummaryBuilder::new(
+        epoch.clone(),
+        checkpoints.clone(),
+        key(),
+        sequence,
+        summaries,
+        consensus,
+    );
 
     // Runs the sequence waiter and the summary builder until quiet; returns
     // the sequence numbers summarized, in order.
@@ -428,11 +438,11 @@ fn out_of_order_checkpoints_summarize_in_order() {
         summarized
     };
 
-    contents.process(vec![pending(&epoch, 13, vec![3], 30)]);
-    contents.process(vec![pending(&epoch, 12, vec![2], 20)]);
+    contents.process(vec![pending(13, vec![3], 30)]);
+    contents.process(vec![pending(12, vec![2], 20)]);
     assert!(settle(&mut waiter).is_empty(), "12 and 13 wait for 11");
     assert!(checkpoints.built(12).is_none());
-    contents.process(vec![pending(&epoch, 11, vec![0, 1], 10)]);
+    contents.process(vec![pending(11, vec![0, 1], 10)]);
     assert_eq!(settle(&mut waiter), vec![11, 12, 13]);
 
     let hashed: Vec<u64> = drain(&hasher_inbox).iter().map(|e| e.seq).collect();

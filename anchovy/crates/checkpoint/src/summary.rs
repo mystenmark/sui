@@ -9,6 +9,7 @@ use messages::checkpoint::CheckpointCommitmentKind;
 use messages::effects::GasCostSummary;
 use messages::fast::checkpoint::{CommitteeMember, EndOfEpoch};
 use messages::fast::{Bump, SummaryBuilder};
+use validator::epoch::EpochParams;
 use validator::pipeline::items::{CheckpointContentsBuilt, LastOfEpoch};
 use validator::pipeline::tables::BuiltCheckpoint;
 
@@ -30,35 +31,38 @@ pub struct Summary {
     pub epoch_rolling_gas: [u64; 4],
 }
 
-/// The epoch's gas totals through `built` (computation, storage, rebate,
+/// Epoch `epoch`'s gas totals through `built` (computation, storage, rebate,
 /// non-refundable), after `previous`: restarted with each epoch's first
 /// checkpoint.
 pub fn rolling_gas(
     built: &CheckpointContentsBuilt,
     previous: Option<&BuiltCheckpoint>,
+    epoch: u64,
 ) -> [u64; 4] {
     match previous {
-        Some(p) if summary_epoch(&p.summary) == built.epoch.epoch => {
+        Some(p) if summary_epoch(&p.summary) == epoch => {
             std::array::from_fn(|i| p.epoch_rolling_gas[i] + built.gas[i])
         }
         _ => built.gas,
     }
 }
 
-/// The summary of `built` after `previous` (`None` only for checkpoint 0),
-/// as the reference's `CheckpointSummary::new`, with its end-of-epoch data
-/// if it is the epoch's last. `bump` is scratch, reset here.
+/// The summary of `built`, in epoch `params`, after `previous` (`None` only
+/// for checkpoint 0), as the reference's `CheckpointSummary::new`, with its
+/// end-of-epoch data if it is the epoch's last. `bump` is scratch, reset
+/// here.
 pub fn build(
     built: &CheckpointContentsBuilt,
     previous: Option<&BuiltCheckpoint>,
+    params: &EpochParams,
     bump: &mut Bump,
 ) -> Summary {
-    let epoch = built.epoch.epoch;
+    let epoch = params.epoch;
     let network_total_transactions =
         previous.map_or(0, |p| p.network_total_transactions) + built.transaction_count;
-    let epoch_rolling_gas = rolling_gas(built, previous);
+    let epoch_rolling_gas = rolling_gas(built, previous, epoch);
 
-    let version_specific_data = match built.epoch.config.checkpoint_summary_version_specific_data {
+    let version_specific_data = match params.config.checkpoint_summary_version_specific_data {
         None | Some(0) => Vec::new(),
         Some(1) => version_specific_data_v1(&built.randomness_rounds),
         Some(v) => panic!("unknown checkpoint summary version-specific data version {v}"),

@@ -20,10 +20,8 @@ use crate::epoch::EpochParams;
 use crate::pipeline::items::CheckpointSignature;
 use crate::pipeline::keys::LocalSummary;
 
-/// A commit to decode, in the epoch it belongs to. The commit path carries
-/// only the epoch's agreed parameters.
+/// A commit to decode, from the epoch's consensus.
 pub struct CommitRequest {
-    pub epoch: Arc<EpochParams>,
     pub commit: CommittedSubDag,
 }
 
@@ -111,14 +109,8 @@ pub fn claimed_immutable<'a>(claims: &[TransactionClaim<'a>]) -> &'a [ObjectId] 
         .unwrap_or(&[])
 }
 
-/// A decoded commit, in the epoch it belongs to.
-pub struct DecodedRequest {
-    pub epoch: Arc<EpochParams>,
-    pub commit: DecodedCommit,
-}
-
 /// A full queue drops the commit; consensus replays commits not handled.
-impl Refuse for DecodedRequest {
+impl Refuse for DecodedCommit {
     fn refuse(self, _: Refusal) {}
 }
 
@@ -134,14 +126,16 @@ impl Refuse for DecodedRequest {
 ///
 /// Reads and evicts: the decoded-transaction cache.
 pub struct CommitDecoder {
+    epoch: Arc<EpochParams>,
     cache: Arc<ConsensusTxCache>,
     /// Where committed checkpoint signatures go; unrouted until set.
     signatures: Option<workqueue::Queue<waiter::Command<LocalSummary, CheckpointSignature>>>,
 }
 
 impl CommitDecoder {
-    pub fn new(cache: Arc<ConsensusTxCache>) -> CommitDecoder {
+    pub fn new(epoch: Arc<EpochParams>, cache: Arc<ConsensusTxCache>) -> CommitDecoder {
         CommitDecoder {
+            epoch,
             cache,
             signatures: None,
         }
@@ -161,7 +155,7 @@ impl CommitDecoder {
     /// skipped, checkpoint signatures go to the summary waiter if routed,
     /// and other kinds are left out. Then the cache drops the blocks of
     /// rounds consensus no longer commits.
-    pub fn decode(&mut self, epoch: &EpochParams, commit: CommittedSubDag) -> DecodedCommit {
+    pub fn decode(&mut self, commit: CommittedSubDag) -> DecodedCommit {
         let CommittedSubDag {
             commit_index,
             digest,
@@ -242,7 +236,7 @@ impl CommitDecoder {
             }
         }
 
-        let gc_depth = epoch.config.gc_depth();
+        let gc_depth = self.epoch.config.gc_depth();
         if gc_depth > 0 {
             self.cache
                 .evict_through(leader.round.saturating_sub(gc_depth));
@@ -308,13 +302,9 @@ fn decode_transaction(bytes: Vec<u8>) -> Decoded {
 
 impl Processor for CommitDecoder {
     type Input = CommitRequest;
-    type Output = DecodedRequest;
+    type Output = DecodedCommit;
 
-    fn process(&mut self, request: CommitRequest) -> Option<DecodedRequest> {
-        let commit = self.decode(&request.epoch, request.commit);
-        Some(DecodedRequest {
-            epoch: request.epoch,
-            commit,
-        })
+    fn process(&mut self, request: CommitRequest) -> Option<DecodedCommit> {
+        Some(self.decode(request.commit))
     }
 }

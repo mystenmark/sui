@@ -104,17 +104,15 @@ fn routed(
 #[test]
 fn committed_signatures_wait_for_their_local_summary() {
     let (queue, inbox) = workqueue::queue(4);
-    let mut decoder = CommitDecoder::new(Arc::new(ConsensusTxCache::new())).with_signatures(queue);
+    let mut decoder = CommitDecoder::new(Arc::new(epoch()), Arc::new(ConsensusTxCache::new()))
+        .with_signatures(queue);
     let (seven, seven_tx) = signature(7);
     let (eight, eight_tx) = signature(8);
     let end_of_publish = bcs::to_bytes(&ConsensusTransaction::new_end_of_publish(
         AuthorityPublicKeyBytes::ZERO,
     ))
     .unwrap();
-    let output = decoder.decode(
-        &epoch(),
-        commit(vec![seven_tx, end_of_publish, eight_tx], vec![]),
-    );
+    let output = decoder.decode(commit(vec![seven_tx, end_of_publish, eight_tx], vec![]));
     assert!(output.transactions.is_empty());
     assert_eq!((output.cache_hits, output.cache_misses), (0, 0));
 
@@ -130,27 +128,27 @@ fn committed_signatures_wait_for_their_local_summary() {
 #[test]
 fn rejected_signatures_are_not_routed() {
     let (queue, inbox) = workqueue::queue(4);
-    let mut decoder = CommitDecoder::new(Arc::new(ConsensusTxCache::new())).with_signatures(queue);
+    let mut decoder = CommitDecoder::new(Arc::new(epoch()), Arc::new(ConsensusTxCache::new()))
+        .with_signatures(queue);
     let (_, transaction) = signature(7);
-    decoder.decode(&epoch(), commit(vec![transaction], vec![0]));
+    decoder.decode(commit(vec![transaction], vec![0]));
     assert!(inbox.try_pop().is_none());
 }
 
 #[test]
 fn unrouted_signatures_are_left_out() {
-    let mut decoder = CommitDecoder::new(Arc::new(ConsensusTxCache::new()));
+    let mut decoder = CommitDecoder::new(Arc::new(epoch()), Arc::new(ConsensusTxCache::new()));
     let (_, transaction) = signature(7);
-    let output = decoder.decode(&epoch(), commit(vec![transaction], vec![]));
+    let output = decoder.decode(commit(vec![transaction], vec![]));
     assert!(output.transactions.is_empty());
 }
 
 /// A voter over an empty store: blocks of signatures read nothing.
 fn voter(
     queue: workqueue::Queue<Command<LocalSummary, CheckpointSignature>>,
-) -> (BlockVoter, Arc<EpochState>, tempfile::TempDir) {
+) -> (BlockVoter, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(store::Store::open(dir.path()).unwrap());
-    let voter = BlockVoter::new(store, Arc::new(ConsensusTxCache::new())).with_signatures(queue);
     let epoch = Arc::new(EpochState::new(
         Chain::Unknown,
         ProtocolVersion::MAX.as_u64(),
@@ -160,7 +158,9 @@ fn voter(
         4,
         [],
     ));
-    (voter, epoch, dir)
+    let voter = BlockVoter::new(epoch.clone(), store, Arc::new(ConsensusTxCache::new()))
+        .with_signatures(queue);
+    (voter, dir)
 }
 
 fn block(transactions: Vec<Vec<u8>>) -> Block {
@@ -177,13 +177,10 @@ fn block(transactions: Vec<Vec<u8>>) -> Block {
 #[test]
 fn signatures_in_a_voted_block_wait_for_their_local_summary() {
     let (queue, inbox) = workqueue::queue(4);
-    let (mut voter, epoch, _dir) = voter(queue);
+    let (mut voter, _dir) = voter(queue);
     let (seven, seven_tx) = signature(7);
     let (_, eight_tx) = signature(8);
-    assert_eq!(
-        voter.vote(&epoch, block(vec![seven_tx, eight_tx])),
-        Ok(vec![])
-    );
+    assert_eq!(voter.vote(block(vec![seven_tx, eight_tx])), Ok(vec![]));
 
     let routed = routed(&inbox);
     assert_eq!(routed.len(), 2);
@@ -195,12 +192,8 @@ fn signatures_in_a_voted_block_wait_for_their_local_summary() {
 #[test]
 fn signatures_in_an_invalid_block_are_not_routed() {
     let (queue, inbox) = workqueue::queue(4);
-    let (mut voter, epoch, _dir) = voter(queue);
+    let (mut voter, _dir) = voter(queue);
     let (_, transaction) = signature(7);
-    assert!(
-        voter
-            .vote(&epoch, block(vec![transaction, vec![0xff]]))
-            .is_err()
-    );
+    assert!(voter.vote(block(vec![transaction, vec![0xff]])).is_err());
     assert!(inbox.try_pop().is_none());
 }

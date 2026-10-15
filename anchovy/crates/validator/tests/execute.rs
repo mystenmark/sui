@@ -59,7 +59,7 @@ impl Node {
         let store = Arc::new(store::Store::open(dir.path()).unwrap());
         let funded = [(sender.to_inner(), 10 * SUI)];
         assert!(execution::genesis::init(&epoch.execution, &store, &funded).unwrap());
-        let processors = Processors::start(16, store.clone());
+        let processors = Processors::start(16, epoch.clone(), store.clone());
         Node {
             _dir: dir,
             epoch,
@@ -103,7 +103,7 @@ impl Node {
             .unwrap();
         self.processors
             .transactions
-            .try_push(Request::new(self.epoch.clone(), vec![parsed], reply))
+            .try_push(Request::new(vec![parsed], reply))
             .unwrap_or_else(|_| panic!("queue refused"));
         let mut outcomes = verdict.await.unwrap().unwrap();
         assert_eq!(outcomes.len(), 1);

@@ -52,7 +52,6 @@ impl Started {
             }
         }
         let _ = self.output.commits.try_push(CommitRequest {
-            epoch: self.params.clone(),
             commit: CommittedSubDag {
                 commit_index: index,
                 digest: [index as u8; 32],

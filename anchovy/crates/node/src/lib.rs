@@ -224,26 +224,39 @@ impl Pipeline {
         // 1. Submission.
         {
             let store = store.clone();
+            let (validating, verifying, submitting) = (epoch.clone(), epoch.clone(), epoch.clone());
             workers.push(
                 Worker::new("submission")
                     .abort_on_panic()
-                    .run(validation_inbox, TransactionValidator::new, to_signatures)
-                    .run(signature_inbox, SignatureVerifier::new, to_submit)
-                    .run(submit_inbox, move || SubmitChecker::new(store), |()| {})
+                    .run(
+                        validation_inbox,
+                        move || TransactionValidator::new(validating),
+                        to_signatures,
+                    )
+                    .run(
+                        signature_inbox,
+                        move || SignatureVerifier::new(verifying),
+                        to_submit,
+                    )
+                    .run(
+                        submit_inbox,
+                        move || SubmitChecker::new(submitting, store),
+                        |()| {},
+                    )
                     .spawn(),
             );
         }
 
         // 2. Voting.
         {
-            let (store, cache) = (store.clone(), cache.clone());
+            let (epoch, store, cache) = (epoch.clone(), store.clone(), cache.clone());
             let signatures = summary_waits.clone();
             workers.push(
                 Worker::new("voting")
                     .abort_on_panic()
                     .run(
                         vote_inbox,
-                        move || BlockVoter::new(store, cache).with_signatures(signatures),
+                        move || BlockVoter::new(epoch, store, cache).with_signatures(signatures),
                         |()| {},
                     )
                     .spawn(),
@@ -252,18 +265,19 @@ impl Pipeline {
 
         // 3. Commit handling.
         {
-            let cache = cache.clone();
+            let (params, cache) = (epoch.params.clone(), cache.clone());
             let signatures = summary_waits.clone();
             workers.push(
                 Worker::new("commit-decode")
                     .abort_on_panic()
                     .run(
                         decode_inbox,
-                        move || CommitDecoder::new(cache).with_signatures(signatures),
+                        move || CommitDecoder::new(params, cache).with_signatures(signatures),
                         to_handler,
                     )
                     .spawn(),
             );
+            let params = epoch.params.clone();
             let (chunks_out, settlements, waits, statuses) = (
                 to_resolver.clone(),
                 to_settlement.clone(),
@@ -275,7 +289,16 @@ impl Pipeline {
                     .abort_on_panic()
                     .run(
                         handler_inbox,
-                        move || CommitStage::new(start, chunks_out, settlements, waits, statuses),
+                        move || {
+                            CommitStage::new(
+                                params,
+                                start,
+                                chunks_out,
+                                settlements,
+                                waits,
+                                statuses,
+                            )
+                        },
                         |()| {},
                     )
                     .spawn(),
@@ -284,13 +307,14 @@ impl Pipeline {
 
         // 4. Execution.
         {
-            let (inputs, withdrawals) = (input_waits.clone(), to_funds.clone());
+            let (params, inputs, withdrawals) =
+                (epoch.params.clone(), input_waits.clone(), to_funds.clone());
             workers.push(
                 Worker::new("resolver")
                     .abort_on_panic()
                     .run(
                         resolver_inbox,
-                        move || VersionResolver::new(inputs, withdrawals),
+                        move || VersionResolver::new(params, inputs, withdrawals),
                         |()| {},
                     )
                     .spawn(),
@@ -346,7 +370,8 @@ impl Pipeline {
 
         // 5. Settlement and funds.
         {
-            let (store_s, chunks_s) = (store.clone(), chunks.clone());
+            let (params_s, store_s, chunks_s) =
+                (epoch.params.clone(), store.clone(), chunks.clone());
             let (effects, inputs, waits, funds) = (
                 effects_waits.clone(),
                 input_waits.clone(),
@@ -360,7 +385,7 @@ impl Pipeline {
                         settlement_inbox,
                         move || {
                             SettlementScheduler::new(
-                                store_s, chunks_s, effects, inputs, waits, funds,
+                                params_s, store_s, chunks_s, effects, inputs, waits, funds,
                             )
                         },
                         |()| {},
@@ -395,6 +420,7 @@ impl Pipeline {
                     )
                     .spawn(),
             );
+            let params_c = epoch.params.clone();
             let (chunks_c, store_c, hasher, sequence) = (
                 chunks.clone(),
                 store.clone(),
@@ -406,7 +432,7 @@ impl Pipeline {
                     .abort_on_panic()
                     .run(
                         contents_inbox,
-                        move || ContentsBuilder::new(chunks_c, store_c, hasher, sequence),
+                        move || ContentsBuilder::new(params_c, chunks_c, store_c, hasher, sequence),
                         |()| {},
                     )
                     .spawn(),
@@ -445,6 +471,7 @@ impl Pipeline {
                     )
                     .spawn(),
             );
+            let params_e = epoch.params.clone();
             let (store_e, checkpoints_e, resolver, effects, hasher) = (
                 store.clone(),
                 checkpoints.clone(),
@@ -459,6 +486,7 @@ impl Pipeline {
                         closer_inbox,
                         move || {
                             EpochCloser::new(
+                                params_e,
                                 store_e,
                                 checkpoints_e,
                                 resolver,
@@ -471,6 +499,7 @@ impl Pipeline {
                     )
                     .spawn(),
             );
+            let params_summary = epoch.params.clone();
             let (checkpoints_s, key, fork_waits_s) = (
                 checkpoints.clone(),
                 protocol_key.clone(),
@@ -487,8 +516,15 @@ impl Pipeline {
                     .run(
                         summary_inbox,
                         move || {
-                            SummaryBuilder::new(checkpoints_s, key, sequence, summaries, consensus)
-                                .with_fork_waiter(fork_waits_s)
+                            SummaryBuilder::new(
+                                params_summary,
+                                checkpoints_s,
+                                key,
+                                sequence,
+                                summaries,
+                                consensus,
+                            )
+                            .with_fork_waiter(fork_waits_s)
                         },
                         |()| {},
                     )

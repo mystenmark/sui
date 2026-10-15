@@ -17,16 +17,12 @@ use validation::ErrorKind;
 use validator::epoch::EpochState;
 use validator::processors::{Outcome, Processors, Rejected, Request};
 
-async fn submit(
-    processors: &Processors,
-    epoch: &Arc<EpochState>,
-    cases: &[&Case],
-) -> Result<Vec<Outcome>, Rejected> {
+async fn submit(processors: &Processors, cases: &[&Case]) -> Result<Vec<Outcome>, Rejected> {
     let (reply, verdict) = oneshot::channel();
     let transactions = cases.iter().map(|c| c.parse().unwrap()).collect();
     processors
         .transactions
-        .try_push(Request::new(epoch.clone(), transactions, reply))
+        .try_push(Request::new(transactions, reply))
         .unwrap_or_else(|_| panic!("queue refused"));
     verdict.await.unwrap()
 }
@@ -35,12 +31,12 @@ async fn submit(
 /// how many failed.
 async fn compare(epoch: &Arc<EpochState>, requests: &[Vec<&Case>]) -> (usize, usize) {
     let store = common::store(epoch);
-    let processors = Processors::start(1024, store.store.clone());
+    let processors = Processors::start(1024, epoch.clone(), store.store.clone());
     let (mut passed, mut failed) = (0, 0);
     for request in requests {
         let labels: Vec<&str> = request.iter().map(|c| c.label.as_str()).collect();
         let expected = common::expected(epoch, request);
-        match (submit(&processors, epoch, request).await, expected) {
+        match (submit(&processors, request).await, expected) {
             (Ok(outcomes), Ok(())) => {
                 assert_eq!(outcomes.len(), request.len(), "{labels:?}");
                 for outcome in &outcomes {
@@ -115,18 +111,18 @@ async fn a_bad_signature_comes_before_a_later_invalid_transaction() {
     );
     assert!(common::expected(&epoch, &[invalid]).is_err_and(|k| k != ErrorKind::InvalidSignature));
     let store = common::store(&epoch);
-    let processors = Processors::start(16, store.store.clone());
-    match submit(&processors, &epoch, &[bad_signature, invalid]).await {
+    let processors = Processors::start(16, epoch.clone(), store.store.clone());
+    match submit(&processors, &[bad_signature, invalid]).await {
         Err(Rejected::Invalid(e)) => assert_eq!(e.kind, ErrorKind::InvalidSignature),
         other => panic!("{:?}", other.map(|_| ())),
     }
 }
 
-/// A request is checked in the epoch it carries: of two requests through
-/// the same processors, only the one whose epoch has the JWKs a zkLogin
-/// signature needs passes.
+/// Requests are checked in their processors' epoch: of two sets of
+/// processors, only the one whose epoch has the JWKs a zkLogin signature
+/// needs passes it.
 #[tokio::test]
-async fn a_request_is_checked_in_its_own_epoch() {
+async fn requests_are_checked_in_their_processors_epoch() {
     let (cases, jwks) = common::signed_vectors();
     let zklogin = cases.iter().find(|c| c.label == "verify_zklogin").unwrap();
     let with_jwks = common::vectors_epoch(4, jwks);
@@ -134,8 +130,8 @@ async fn a_request_is_checked_in_its_own_epoch() {
     assert!(common::expected(&with_jwks, &[zklogin]).is_ok());
     assert!(common::expected(&without, &[zklogin]).is_err());
     let store = common::store(&with_jwks);
-    let processors = Processors::start(16, store.store.clone());
-    assert!(submit(&processors, &with_jwks, &[zklogin]).await.is_ok());
-    assert!(submit(&processors, &without, &[zklogin]).await.is_err());
-    assert!(submit(&processors, &with_jwks, &[zklogin]).await.is_ok());
+    let passing = Processors::start(16, with_jwks.clone(), store.store.clone());
+    let failing = Processors::start(16, without.clone(), store.store.clone());
+    assert!(submit(&passing, &[zklogin]).await.is_ok());
+    assert!(submit(&failing, &[zklogin]).await.is_err());
 }

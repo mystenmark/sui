@@ -13,7 +13,6 @@ use messages::object::Object;
 
 use crate::checks::VerifiedTransaction;
 use crate::consensus::sequence::SharedAccess;
-use crate::epoch::EpochParams;
 use crate::pipeline::keys::{AccumulatorVersion, Reservation, StreamId, TxDigest};
 use crate::pipeline::tables::Generation;
 
@@ -64,7 +63,6 @@ pub struct ScheduledEntry {
 /// `CommitHandler` → `VersionResolver`.
 #[derive(Debug)]
 pub struct Chunk {
-    pub epoch: Arc<EpochParams>,
     /// The version the commit's transactions reserve funds against.
     pub version: AccumulatorVersion,
     /// The accumulator root's version the chunk's transactions are assigned
@@ -80,7 +78,6 @@ pub struct Chunk {
 /// What settling a chunk takes. `CommitHandler` → `SettlementScheduler`.
 #[derive(Debug, Clone)]
 pub struct ChunkSettlement {
-    pub epoch: Arc<EpochParams>,
     /// The version the commit's transactions reserve funds against; settling
     /// the commit's last chunk makes `version + 1`.
     pub version: AccumulatorVersion,
@@ -115,7 +112,6 @@ pub enum SettlementInput {
 /// (wait for `ChunkSettled` of each height) → `ContentsBuilder`.
 #[derive(Debug, Clone)]
 pub struct PendingCheckpoint {
-    pub epoch: Arc<EpochParams>,
     pub seq: u64,
     /// Its chunks' heights, in order.
     pub heights: Vec<u64>,
@@ -142,7 +138,6 @@ pub struct EpochClose {
 /// `SettlementScheduler` → input waiter → `Executor`.
 #[derive(Debug)]
 pub struct Executable {
-    pub epoch: Arc<EpochParams>,
     /// The version its commit reserves funds against.
     pub version: AccumulatorVersion,
     /// As `Chunk::root_version`.
@@ -287,7 +282,6 @@ pub struct CheckpointEffects {
 /// → `SummaryBuilder`.
 #[derive(Debug, Clone)]
 pub struct CheckpointContentsBuilt {
-    pub epoch: Arc<EpochParams>,
     pub pending: PendingCheckpoint,
     /// `CheckpointContents` BCS and digest.
     pub contents: Arc<[u8]>,

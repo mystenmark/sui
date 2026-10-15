@@ -191,7 +191,8 @@ fn main() {
         }
         let (hasher, _hasher_inbox) = workqueue::queue(1);
         let (sequence, _sequence_inbox) = workqueue::queue(1);
-        let mut builder = ContentsBuilder::new(chunks, store.clone(), hasher, sequence);
+        let mut builder =
+            ContentsBuilder::new(epoch.clone(), chunks, store.clone(), hasher, sequence);
         let previous = BuiltCheckpoint {
             seq: 0,
             summary: 1u64.to_le_bytes().to_vec(),
@@ -211,7 +212,6 @@ fn main() {
         let mut sign_time = Duration::ZERO;
         for round in 0..=rounds {
             let pending = PendingCheckpoint {
-                epoch: epoch.clone(),
                 seq: 1,
                 heights: vec![0, 1],
                 timestamp_ms: 0,
@@ -226,7 +226,7 @@ fn main() {
 
             let before = ALLOCATIONS.load(Ordering::Relaxed);
             let start = Instant::now();
-            let summary = summary::build(&built, Some(&previous), &mut bump);
+            let summary = summary::build(&built, Some(&previous), &epoch, &mut bump);
             let summary_took = start.elapsed();
             let summary_allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
 
