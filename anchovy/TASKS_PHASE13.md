@@ -66,8 +66,8 @@ All steps of the design done. Open:
   the close deadline);
 - a production genesis loader (the node tests build genesis with sui's
   builder);
-- the epoch change and end-of-epoch transactions in anchovy's executor
-  (the system transactions' port): until then sui's executor runs them.
+- safe mode in anchovy's executor: a failed advance epoch transaction
+  panics where the reference falls back to safe mode.
 
 ## Architecture simplifications (after the review)
 
@@ -79,9 +79,19 @@ Done:
 - `Pipeline::start`'s wiring as a one-screen table (`node/src/wiring.rs`):
   queues declared once by name and item, shared dependencies in `Parts`.
 - The pipeline executes with anchovy's executor. Sui's (`Reference`) runs
-  genesis and the kinds the native one does not execute, and, with the
+  genesis, and, with the
   `testing` feature the pipeline crates' tests enable, every transaction as
   an oracle that must agree.
 
 Skipped: splitting the validator crate by role (it would move code more
 than simplify it).
+
+## System transactions port
+
+Done: the epoch change (legacy `ChangeEpoch` and `EndOfEpochTransaction`,
+every end-of-epoch kind), system package upgrades and publishes, and the
+authenticator state update, in `executor/src/execution_engine.rs`;
+`input_objects` for each. Tested against sui's executor over a genesis with
+a system state (`node/tests/system_transactions.rs`) and in every pipeline
+test through the oracle. Skipped, as agreed: safe mode.
+
