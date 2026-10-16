@@ -15,6 +15,7 @@ use store::Live;
 use store::epoch::{EpochDb, Space};
 
 use crate::pipeline::keys::{StreamId, TxDigest};
+use crate::pipeline::tables::Generation;
 
 /// Readers of every section, and the writes of the last. Cloned handles
 /// share the database.
@@ -90,6 +91,71 @@ impl EpochStore {
         batch.commit().expect("the epoch's database writes");
         Some(live)
     }
+}
+
+impl EpochStore {
+    /// Writes generations pruned from the generation table that readers may
+    /// still ask for: `(stream, round, generation, value)`.
+    ///
+    /// # Panics
+    /// If the database cannot be written.
+    pub fn put_generations(&self, generations: &[(StreamId, u32, u32, Generation)]) {
+        let mut batch = self.db.batch(&[Space::Generations]);
+        for (stream, round, generation, value) in generations {
+            let (tag, version, bytes) = match *value {
+                Generation::Version { version, digest } => (0, version, digest),
+                Generation::Ended {
+                    version,
+                    transaction,
+                } => (1, version, transaction),
+            };
+            let mut encoded = vec![tag];
+            encoded.extend_from_slice(&version.to_le_bytes());
+            encoded.extend_from_slice(&bytes);
+            batch.put(
+                Space::Generations,
+                generation_key(stream, *round, *generation).to_vec(),
+                encoded,
+            );
+        }
+        batch.commit().expect("the epoch's database writes");
+    }
+
+    /// A generation `put_generations` wrote.
+    ///
+    /// # Panics
+    /// If the database cannot be read.
+    pub fn generation(&self, stream: &StreamId, round: u32, generation: u32) -> Option<Generation> {
+        let v = self
+            .db
+            .get(
+                Space::Generations,
+                &generation_key(stream, round, generation),
+            )
+            .expect("the epoch's database reads")?;
+        let version = u64::from_le_bytes(v[1..9].try_into().expect("8 bytes"));
+        let bytes: [u8; 32] = v[9..].try_into().expect("32 bytes");
+        Some(match v[0] {
+            0 => Generation::Version {
+                version,
+                digest: bytes,
+            },
+            _ => Generation::Ended {
+                version,
+                transaction: bytes,
+            },
+        })
+    }
+}
+
+/// A generation's key: its stream's, then the big-endian round and
+/// generation.
+fn generation_key(stream: &StreamId, round: u32, generation: u32) -> [u8; 48] {
+    let mut key = [0; 48];
+    key[..40].copy_from_slice(&stream_key(&stream.id, stream.initial_shared_version));
+    key[40..44].copy_from_slice(&round.to_be_bytes());
+    key[44..].copy_from_slice(&generation.to_be_bytes());
+    key
 }
 
 /// A stream's key: its object id, then the big-endian version its sharing

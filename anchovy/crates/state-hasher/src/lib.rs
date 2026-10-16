@@ -134,6 +134,14 @@ impl StateHashes {
             .map(|(seq, root)| (*seq, root.clone()))
     }
 
+    /// Drops the hashes and roots of checkpoints below `seq`, which have
+    /// committed: their readers are done with them.
+    pub fn prune_below(&self, seq: u64) {
+        let mut hashes = lock(&self.hashes);
+        hashes.checkpoints = hashes.checkpoints.split_off(&seq);
+        hashes.roots = hashes.roots.split_off(&seq);
+    }
+
     fn insert_checkpoint(&self, seq: u64, hash: StateHash) {
         lock(&self.hashes).checkpoints.insert(seq, hash);
     }

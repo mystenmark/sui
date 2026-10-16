@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use crate::epoch_store::EpochStore;
 use crate::pipeline::items::SettledChunk;
 use crate::pipeline::keys::StreamId;
 
@@ -32,20 +33,35 @@ pub enum Generation {
 
 /// Stream generations by `(stream, round, generation)`. Written by
 /// `Executor` (owner: the exec-pool work), read by the input waiter's
-/// availability check and by `Executor` to resolve exact versions.
-#[derive(Default)]
+/// availability check and by `Executor` to resolve exact versions, pruned by
+/// `CheckpointCommitter` (`prune_below`).
 pub struct GenerationTable {
-    generations: Mutex<FastMap<(StreamId, u32, u32), Generation>>,
+    generations: Mutex<Generations>,
+    /// Where pruned generations that readers may still ask for are kept.
+    store: EpochStore,
+}
+
+#[derive(Default)]
+struct Generations {
+    recorded: FastMap<(StreamId, u32, u32), Generation>,
+    /// Rounds below this are pruned: their generations are in the epoch
+    /// store, if a reader may still ask for them.
+    pruned_below: u32,
 }
 
 impl GenerationTable {
-    pub fn new() -> GenerationTable {
-        GenerationTable::default()
+    pub fn new(store: EpochStore) -> GenerationTable {
+        GenerationTable {
+            generations: Mutex::default(),
+            store,
+        }
     }
 
     /// Records generation `generation` of `stream` in `round`.
     pub fn record(&self, stream: StreamId, round: u32, generation: u32, value: Generation) {
-        lock(&self.generations).insert((stream, round, generation), value);
+        lock(&self.generations)
+            .recorded
+            .insert((stream, round, generation), value);
     }
 
     /// Generation `generation` of `stream` in `round`: the one recorded, or
@@ -58,15 +74,59 @@ impl GenerationTable {
         value: impl FnOnce() -> Generation,
     ) -> Generation {
         *lock(&self.generations)
+            .recorded
             .entry((stream, round, generation))
             .or_insert_with(value)
     }
 
     /// Generation `generation` of `stream` in `round`, if recorded.
+    ///
+    /// # Panics
+    /// If it was pruned without being kept: no reader asks for one.
     pub fn get(&self, stream: StreamId, round: u32, generation: u32) -> Option<Generation> {
-        lock(&self.generations)
-            .get(&(stream, round, generation))
-            .copied()
+        let generations = lock(&self.generations);
+        if let Some(found) = generations.recorded.get(&(stream, round, generation)) {
+            return Some(*found);
+        }
+        if round >= generations.pruned_below {
+            return None;
+        }
+        let kept = self.store.generation(&stream, round, generation);
+        assert!(
+            kept.is_some(),
+            "generation {generation} of {stream:?} in round {round} was pruned, not kept"
+        );
+        kept
+    }
+
+    /// Prunes the rounds below `round`, all of whose transactions have
+    /// executed. Each stream's last generation among them stays readable,
+    /// from the epoch store: a later round reads it until the stream is
+    /// written again. No other is read again.
+    pub fn prune_below(&self, round: u32) {
+        let mut generations = lock(&self.generations);
+        if round <= generations.pruned_below {
+            return;
+        }
+        let mut last: FastMap<StreamId, (u32, u32, Generation)> = FastMap::default();
+        for (&(stream, r, k), value) in &generations.recorded {
+            if r < round
+                && last
+                    .get(&stream)
+                    .is_none_or(|&(lr, lk, _)| (r, k) > (lr, lk))
+            {
+                last.insert(stream, (r, k, *value));
+            }
+        }
+        let kept: Vec<_> = last
+            .into_iter()
+            .map(|(stream, (r, k, value))| (stream, r, k, value))
+            .collect();
+        // Written before they leave memory, under the lock: a reader never
+        // finds them in neither.
+        self.store.put_generations(&kept);
+        generations.recorded.retain(|&(_, r, _), _| r >= round);
+        generations.pruned_below = round;
     }
 }
 

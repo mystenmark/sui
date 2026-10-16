@@ -178,7 +178,7 @@ impl Pipeline {
             committee: committee.clone(),
             consensus: consensus.clone(),
             cache: Arc::new(ConsensusTxCache::new()),
-            generations: Arc::new(GenerationTable::new()),
+            generations: Arc::new(GenerationTable::new(epoch_store.clone())),
             chunks: Arc::new(ChunkTable::new()),
             checkpoints,
             statuses: Arc::new(ConsensusTxStatusCache::new()),

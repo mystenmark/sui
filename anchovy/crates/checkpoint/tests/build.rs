@@ -98,6 +98,7 @@ impl Mainnet {
         for (height, effects) in [(first, effects), (second, rest)] {
             chunks.insert(SettledChunk {
                 height,
+                round: 0,
                 checkpoint_seq: self.summary().sequence_number,
                 effects,
             });
@@ -393,6 +394,7 @@ fn out_of_order_checkpoints_summarize_in_order() {
     for (height, group) in groups.iter().enumerate() {
         chunks.insert(SettledChunk {
             height: height as u64,
+            round: 0,
             checkpoint_seq: 0,
             effects: group.to_vec(),
         });
