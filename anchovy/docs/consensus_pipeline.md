@@ -436,9 +436,10 @@ transactions to learn their digests: it reads the chunk table.
 
 ### 6. Checkpointing
 
-**Checkpoint waiter** → `ContentsBuilder` → **sequence waiter** →
-`SummaryBuilder`; signatures → consensus; **summary waiter** →
-`CheckpointAggregator` → state sync.
+**Checkpoint waiter** → `ContentsBuilder` → **built waiter** →
+`EpochCloser` → `SummaryBuilder`; signatures → consensus → **built
+waiter** → `CheckpointAggregator` → state sync, and → **built waiter** →
+fork check.
 
 Building a checkpoint is split at its first need for the previous one.
 
@@ -452,7 +453,7 @@ Building a checkpoint is split at its first need for the previous one.
    - this checkpoint's gas cost summary;
    - the artifacts commitment.
 
-   It sends the effects to `StateHasher`, then waits in the sequence waiter
+   It sends the effects to `StateHasher`, then waits in the built waiter
    for `CheckpointBuilt(seq - 1)`.
 3. **`SummaryBuilder`** does what needs the previous checkpoint:
    - the previous digest;
@@ -461,17 +462,22 @@ Building a checkpoint is split at its first need for the previous one.
    - the summary, with the version-specific data.
 
    It writes the checkpoint store, then:
-   - notifies `CheckpointBuilt(seq)` to the sequence waiter, releasing
-     `seq + 1`, and `LocalSummary(seq)` to the summary waiter;
+   - resolves `CheckpointBuilt(seq)` in the built waiter to the checkpoint
+     built, releasing `seq + 1`, the signatures over it, and its
+     certificate's fork check;
    - signs, and submits the signature to consensus.
 4. **`StateHasher`** computes each checkpoint's ECMH as its effects arrive.
    Only folding it into the running root waits for the previous root.
 5. **`CheckpointAggregator`** gets signatures from `CommitDecoder` (and from
    the voter's batch verification).
-   - Signatures for a checkpoint not built here yet wait in the summary
-     waiter on `LocalSummary(seq)`.
-   - At quorum on the local digest, it stores the certified checkpoint and
-     hands it to state sync.
+   - Signatures for a checkpoint not built here yet wait in the built
+     waiter on `CheckpointBuilt(seq)`.
+   - At quorum on the local digest, it hands the certified checkpoint to
+     state sync and the committer, and waits it in the built waiter, to be
+     compared with the local one: a difference is a fork, and panics.
+
+The built waiter routes each ready item by kind (`BuiltRouter`), as the
+effects waiter does.
 
 ## Waiter keys
 
@@ -484,8 +490,7 @@ Building a checkpoint is split at its first need for the previous one.
 | effects | `Effects(digest)` | RPC submission, `SettlementScheduler` | `Executor` | executed effects in the store |
 | (`FundsReserver`) | `Reservation(account, amount, v)`, resolving `Fulfilled` or `Cancelled` | `VersionResolver` | `Settle::Deposit` and `Settle::Credit` from `Executor`, `Settle::Settled` from `SettlementScheduler` | the rules of "Funds reservation" |
 | checkpoint | `ChunkSettled(height)` | `CommitHandler` (pending checkpoint) | `SettlementScheduler` | chunk table has it |
-| sequence | `CheckpointBuilt(seq)` | `ContentsBuilder` | `SummaryBuilder` | checkpoint store has it |
-| summary | `LocalSummary(seq)` | `CheckpointAggregator` | `SummaryBuilder` | checkpoint store has it |
+| built | `CheckpointBuilt(seq)`, resolving the checkpoint built | `ContentsBuilder`, `BlockVoter`, `CommitDecoder`, `CheckpointAggregator` | `SummaryBuilder` | checkpoint store has it, or committed it |
 
 ## What must match the reference
 
@@ -543,6 +548,6 @@ its object.
    effects.
 4. `SettlementScheduler`, the chunk table, `FundsReserver` and the funds
    waiter.
-5. `ContentsBuilder` and `SummaryBuilder` with the checkpoint and sequence
+5. `ContentsBuilder` and `SummaryBuilder` with the checkpoint and built
    waiters, then `StateHasher`.
-6. `CheckpointAggregator` with the summary waiter.
+6. `CheckpointAggregator`, its signatures waiting in the built waiter.

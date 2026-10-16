@@ -60,9 +60,28 @@ Out of scope for now:
 All steps of the design done. Open:
 - the reference's other end-of-epoch transaction kinds, and protocol
   upgrades (capability votes);
-- fork detection: done (a fork waiter, and every epoch drained before it
-  is dropped);
+- fork detection: done (in the built waiter, and every epoch drained
+  before it is dropped);
 - correct end-of-epoch determination (deferred transactions, randomness,
   the close deadline);
 - a production genesis loader (the node tests build genesis with sui's
-  builder).
+  builder);
+- the epoch change and end-of-epoch transactions in anchovy's executor
+  (the system transactions' port): until then sui's executor runs them.
+
+## Architecture simplifications (after the review)
+
+Done:
+- The validator crate's pre-pipeline paths deleted: its standalone binary,
+  the serial consensus path, `EpochHandle`'s optional consensus.
+- The sequence, summary and fork waiters, all keyed on a checkpoint being
+  built, merged into one built waiter routing by item kind.
+- `Pipeline::start`'s wiring as a one-screen table (`node/src/wiring.rs`):
+  queues declared once by name and item, shared dependencies in `Parts`.
+- The pipeline executes with anchovy's executor. Sui's (`Reference`) runs
+  genesis and the kinds the native one does not execute, and, with the
+  `testing` feature the pipeline crates' tests enable, every transaction as
+  an oracle that must agree.
+
+Skipped: splitting the validator crate by role (it would move code more
+than simplify it).

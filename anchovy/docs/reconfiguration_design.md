@@ -95,10 +95,10 @@ and draining waits until nothing counts. Items waiting on keys stay: a
 validator may move on through certified checkpoints before it has built
 them all. The epoch's consensus stops first, so nothing new arrives.
 
-**Fork detection.** A fork waiter holds each certified checkpoint until
-this validator has built it (`CheckpointBuilt(seq)`, resolved to the
-local checkpoint by `SummaryBuilder`, or read as committed once pruned),
-then compares their summaries and aborts on a fork. Draining the epoch
+**Fork detection.** The built waiter holds each certified checkpoint
+until this validator has built it (`CheckpointBuilt(seq)`, resolved to the
+local checkpoint by `SummaryBuilder`, or read as committed once pruned);
+its router then compares their summaries and aborts on a fork. Draining the epoch
 checks every certified checkpoint whose local one is built.
 
 ## `CurrentEpoch`
@@ -170,8 +170,8 @@ scheduled. It is built in two steps:
    `PendingCheckpoint`. Versions stay defined by version assignment, as
    for every shared object.
 2. **`EpochCloser` builds it**, a per-epoch processor between the
-   sequence waiter and `SummaryBuilder` that passes non-final checkpoints
-   straight through. It sits after the sequence waiter so that the
+   built waiter and `SummaryBuilder` that passes non-final checkpoints
+   straight through. It sits after the built waiter so that the
    previous checkpoint's summary, and so the epoch's rolling gas, is
    built. For the final checkpoint, everything else in the epoch has
    executed by then, since its chunks have settled. `ContentsBuilder`
