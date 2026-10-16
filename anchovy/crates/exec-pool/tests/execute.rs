@@ -48,7 +48,6 @@ fn read_at(
 }
 
 // The transactions are named as in the scenario.
-#[allow(clippy::many_single_char_names)]
 #[test]
 fn a_chain_of_shared_writes_executes_across_generations_and_rounds() {
     let mut node = Node::new(8);

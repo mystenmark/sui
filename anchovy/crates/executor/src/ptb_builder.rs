@@ -49,6 +49,11 @@ impl<'a> ProgrammableTransactionBuilder<'a> {
         }
     }
 
+    /// The arena the transaction is built in.
+    pub fn bump(&self) -> &'a Bump {
+        self.bump
+    }
+
     pub fn finish(self) -> ProgrammableTransaction<'a> {
         let Self {
             bump,

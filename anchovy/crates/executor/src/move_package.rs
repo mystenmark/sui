@@ -103,6 +103,71 @@ pub fn new_upgraded<'a, 'p, 'd: 'p>(
     )
 }
 
+/// `MovePackage::new_system`: a system package at `version`, linked to `dependencies`.
+///
+/// # Panics
+/// On a duplicate module.
+pub fn new_system<'a>(
+    bump: &'a Bump,
+    version: SequenceNumber,
+    modules: &[CompiledModule],
+    dependencies: &[ObjectId],
+) -> MovePackage<'a> {
+    let module = modules
+        .first()
+        .expect("Tried to build a Move package from an empty iterator of Compiled modules");
+
+    let storage_id = object_id(module.address());
+    let type_origin_table = build_initial_type_origin_table(bump, modules);
+
+    let mut linkage_table: BTreeMap<ObjectId, Linkage> = BTreeMap::new_in(bump);
+    linkage_table.extend(dependencies.iter().map(|&dep| {
+        let info = Linkage {
+            original_id: dep,
+            upgraded_id: dep,
+            // System packages can only depend on each other, and only one version of each is in
+            // use at a time, so their linkage tables always report version zero.
+            upgraded_version: U64Le::new(0),
+        };
+        (dep, info)
+    }));
+    let mut linkage = Vec::with_capacity_in(linkage_table.len(), bump);
+    linkage.extend(linkage_table.into_values());
+
+    let mut module_map: BTreeMap<&'a str, &'a [u8]> = BTreeMap::new_in(bump);
+    for module in modules {
+        let name = alloc_str(bump, module.name().as_str());
+        let mut bytes = std::vec::Vec::new();
+        module
+            .serialize_with_version(module.version, &mut bytes)
+            .unwrap();
+        if module_map
+            .insert(name, alloc_slice_copy(bump, &bytes))
+            .is_some()
+        {
+            panic!(
+                "Duplicate module {} in system package {}",
+                module.self_id(),
+                storage_id
+            );
+        }
+    }
+    let mut module_map_entries = Vec::with_capacity_in(module_map.len(), bump);
+    module_map_entries.extend(module_map);
+    module_map_entries.sort_by(|(a, _), (b, _)| cmp_encoded_names(a, b));
+
+    new(
+        bump,
+        storage_id,
+        version,
+        module_map_entries.leak(),
+        u64::MAX, // System packages are not subject to the size limit
+        type_origin_table,
+        linkage.leak(),
+    )
+    .expect("System packages are not subject to a size limit")
+}
+
 fn from_module_iter_with_type_origin_table<'a, 'p, 'd: 'p>(
     bump: &'a Bump,
     storage_id: ObjectId,

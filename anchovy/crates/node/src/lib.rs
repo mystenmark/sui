@@ -9,35 +9,36 @@
 //!
 //! A panic in any worker aborts the process: other processors wait on what
 //! each produces, so carrying on would only hang them.
+//!
+//! The pipeline lives for one epoch (`epoch`).
+
+pub mod epoch;
+mod wiring;
 
 use std::sync::Arc;
 
-use aggregator::{CheckpointAggregator, Committee, SummaryAvailability};
-use checkpoint::{
-    BuiltAvailability, CheckpointCommitter, ChunkAvailability, ContentsBuilder, ProtocolKey,
-    SummaryBuilder,
-};
+use aggregator::Committee;
+use checkpoint::ProtocolKey;
 use consensus::TransactionClient;
-use exec_pool::{EffectsAvailability, EffectsRouter, Executor};
-use resolver::{InputAvailability, VersionResolver};
-use settlement::{FundsReserver, SettlementScheduler};
-use state_hasher::{StateHash, StateHasher, StateHashes};
+use epoch::EpochRecord;
+use messages::transaction::DigestPending;
+use state_hasher::StateHashes;
+use tokio::sync::watch;
 use validator::consensus::cache::ConsensusTxCache;
-use validator::consensus::commit::{CommitStage, EpochStart};
-use validator::consensus::decode::{CommitDecoder, CommitRequest};
+use validator::consensus::commit::EpochStart;
+use validator::consensus::decode::CommitRequest;
 use validator::consensus::status::ConsensusTxStatusCache;
-use validator::consensus::vote::{BlockVoter, VoteRequest};
+use validator::consensus::vote::VoteRequest;
+use validator::current::EpochHandle;
 use validator::epoch::EpochState;
 use validator::pipeline::items::{CertifiedCheckpoint, EffectsWaitItem};
 use validator::pipeline::keys::EffectsKey;
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable, GenerationTable};
-use validator::processors::{Request, SignatureVerifier, TransactionValidator};
-use validator::server::{Consensus, Validator};
-use validator::submit::SubmitChecker;
-use waiter::{Command, WaiterProcessor};
-use workqueue::{Inbox, Queue, Worker, WorkerHandle};
-
-use messages::transaction::DigestPending;
+use validator::processors::Request;
+use validator::server::Consensus;
+use waiter::Command;
+use wiring::Parts;
+use workqueue::{Activity, Queue, WorkerHandle};
 
 /// Each queue's capacity.
 pub const QUEUE: usize = 4096;
@@ -61,47 +62,40 @@ pub struct Pipeline {
     consensus: TransactionClient,
     store: Arc<store::Store>,
     epoch: Arc<EpochState>,
-    /// To state sync: certified checkpoints.
-    pub certified: Inbox<CertifiedCheckpoint>,
     pub cache: Arc<ConsensusTxCache>,
     pub generations: Arc<GenerationTable>,
     pub chunks: Arc<ChunkTable>,
     pub checkpoints: Arc<CheckpointStore>,
-    /// Each checkpoint's state hash and the running root, for the end of
-    /// the epoch.
+    /// Each checkpoint's state hash and the running root.
     pub state_hashes: Arc<StateHashes>,
+    /// The epoch's last checkpoint, once committed: the epoch is over.
+    pub ended: watch::Receiver<Option<u64>>,
+    /// What the epoch's queues hold, and its workers have in hand.
+    activity: Activity,
 }
 
-/// A sink pushing each batch to `queue`. Inside the pipeline a full queue is
-/// a sizing bug, not load to shed.
-fn into<T: Send + 'static>(queue: Queue<T>, name: &'static str) -> impl FnMut(T) + Send {
-    move |item| {
-        // A closed queue means the pipeline is shutting down.
-        if let Err(workqueue::PushError::Full(_)) = queue.try_push(item) {
-            panic!("the {name} queue refused work");
-        }
-    }
+/// Where consensus delivers an epoch's work: blocks to vote on, and
+/// commits. Consensus-core's transaction verifier and commit consumer.
+#[derive(Clone)]
+pub struct ConsensusOutput {
+    pub votes: Queue<VoteRequest>,
+    pub commits: Queue<CommitRequest>,
 }
 
-/// The epoch's start: the checkpoint its first checkpoint follows, and what
-/// the commit handler starts from. On a fresh database, `genesis`, committed
-/// now. The first epoch's only: reconfiguration does not exist yet.
+/// The epoch's start: the checkpoint its first checkpoint follows,
+/// `previous`, and what the commit handler starts from.
 ///
 /// # Panics
-/// If the store cannot be read or written, or has no shared accumulator
-/// root.
-fn epoch_start(
-    store: &store::Store,
-    epoch: u64,
-    genesis: BuiltCheckpoint,
-) -> (BuiltCheckpoint, EpochStart) {
-    let checkpoint = if let Some(bytes) = store.checkpoint(0).expect("the store reads") {
-        BuiltCheckpoint::decode(&bytes)
-    } else {
-        assert_eq!(genesis.seq, 0, "the genesis checkpoint is checkpoint 0");
-        store.commit_genesis_checkpoint(genesis.encode());
-        genesis
-    };
+/// If the store cannot be read or written, lacks `previous`, or has no
+/// shared accumulator root.
+fn epoch_start(store: &store::Store, record: &EpochRecord) -> (BuiltCheckpoint, EpochStart) {
+    let epoch = record.epoch;
+    let checkpoint = BuiltCheckpoint::decode(
+        &store
+            .checkpoint(record.previous_checkpoint)
+            .expect("the store reads")
+            .expect("the epoch's previous checkpoint is committed"),
+    );
     let root = messages::base::ObjectId::from_u16(0xacc);
     // Its initial shared version never changes, whatever the store holds.
     let messages::object::Owner::Shared {
@@ -128,380 +122,109 @@ fn epoch_start(
         previous_timestamp_ms: checkpoint.timestamp_ms,
         accumulator_root_version,
         accumulator_root_initial_shared_version: initial_shared_version,
+        epoch_start_timestamp_ms: record.epoch_start_timestamp_ms,
+        epoch_duration_ms: record.epoch_duration_ms,
     };
     (checkpoint, start)
 }
 
 impl Pipeline {
     /// The pipeline over `store`, in `epoch`, signing checkpoints with
-    /// `protocol_key`, certifying them with `committee`'s signatures.
-    /// `genesis` is the epoch's start on a fresh database, and is ignored
-    /// otherwise.
+    /// `protocol_key`, certifying them with `committee`'s signatures and
+    /// handing them to `state_sync`; as `record`, the epoch's start record,
+    /// says it starts. `consensus` starts the epoch's consensus, delivering
+    /// to the pipeline, and returns its client, as consensus-core's
+    /// `ConsensusAuthority::start` does.
     ///
     /// It starts from the epoch's start, so consensus must deliver the
     /// epoch's commits from its first: replaying them rebuilds every
     /// stage's state. Transactions in committed checkpoints are found
     /// executed, and checkpoints up to the committed one are rebuilt but not
     /// certified again.
-    #[allow(clippy::too_many_lines)]
     pub fn start(
         store: &Arc<store::Store>,
         epoch: &Arc<EpochState>,
         protocol_key: &Arc<ProtocolKey>,
         committee: &Arc<Committee>,
-        consensus: &TransactionClient,
-        genesis: BuiltCheckpoint,
+        consensus: impl FnOnce(ConsensusOutput) -> TransactionClient,
+        state_sync: Queue<CertifiedCheckpoint>,
+        record: &EpochRecord,
     ) -> Pipeline {
-        let cache = Arc::new(ConsensusTxCache::new());
-        let generations = Arc::new(GenerationTable::new());
-        let chunks = Arc::new(ChunkTable::new());
+        let (first, start) = epoch_start(store, record);
         let checkpoints = Arc::new(CheckpointStore::new());
-        let (first, start) = epoch_start(store, epoch.params.epoch, genesis);
         checkpoints.insert_built(first);
         let next_to_certify = store
             .committed_checkpoint()
             .expect("the store reads")
             .expect("the genesis checkpoint is committed")
             + 1;
-        let state_hashes = Arc::new(StateHashes::new());
-        let statuses = Arc::new(ConsensusTxStatusCache::new());
 
-        // Black boxes.
-        let (transactions, validation_inbox) = workqueue::queue(QUEUE);
-        let (votes, vote_inbox) = workqueue::queue(QUEUE);
-        let (commits, decode_inbox) = workqueue::queue(QUEUE);
-        let (to_state_sync, certified) = workqueue::queue(QUEUE);
-
-        // Between processors.
-        let (to_signatures, signature_inbox) = workqueue::queue(QUEUE);
-        let (to_submit, submit_inbox) = workqueue::queue(QUEUE);
-        let (to_handler, handler_inbox) = workqueue::queue(QUEUE);
-        let (to_resolver, resolver_inbox) = workqueue::queue(QUEUE);
-        let (to_settlement, settlement_inbox) = workqueue::queue(QUEUE);
-        let (to_executor, executor_inbox) = workqueue::queue(QUEUE);
-        let (to_funds, funds_inbox) = workqueue::queue(QUEUE);
-        let (to_contents, contents_inbox) = workqueue::queue(QUEUE);
-        let (to_hasher, hasher_inbox) = workqueue::queue(QUEUE);
-        let (to_summary, summary_inbox) = workqueue::queue(QUEUE);
-        let (to_committer, committer_inbox) = workqueue::queue(QUEUE);
-        let (to_aggregator, aggregator_inbox) = workqueue::queue(QUEUE);
-
-        // Waiters' commands.
-        let (input_waits, input_inbox) = workqueue::queue(QUEUE);
-        let (effects_waits, effects_inbox) = workqueue::queue(QUEUE);
-        let (checkpoint_waits, checkpoint_inbox) = workqueue::queue(QUEUE);
-        let (sequence_waits, sequence_inbox) = workqueue::queue(QUEUE);
-        let (summary_waits, summary_waiter_inbox) = workqueue::queue(QUEUE);
-
-        let mut workers = Vec::new();
-
-        // 1. Submission.
-        {
-            let store = store.clone();
-            workers.push(
-                Worker::new("submission")
-                    .abort_on_panic()
-                    .run(validation_inbox, TransactionValidator::new, to_signatures)
-                    .run(signature_inbox, SignatureVerifier::new, to_submit)
-                    .run(submit_inbox, move || SubmitChecker::new(store), |()| {})
-                    .spawn(),
-            );
-        }
-
-        // 2. Voting.
-        {
-            let (store, cache) = (store.clone(), cache.clone());
-            let signatures = summary_waits.clone();
-            workers.push(
-                Worker::new("voting")
-                    .abort_on_panic()
-                    .run(
-                        vote_inbox,
-                        move || BlockVoter::new(store, cache).with_signatures(signatures),
-                        |()| {},
-                    )
-                    .spawn(),
-            );
-        }
-
-        // 3. Commit handling.
-        {
-            let cache = cache.clone();
-            let signatures = summary_waits.clone();
-            workers.push(
-                Worker::new("commit-decode")
-                    .abort_on_panic()
-                    .run(
-                        decode_inbox,
-                        move || CommitDecoder::new(cache).with_signatures(signatures),
-                        to_handler,
-                    )
-                    .spawn(),
-            );
-            let (chunks_out, settlements, waits, statuses) = (
-                to_resolver.clone(),
-                to_settlement.clone(),
-                checkpoint_waits.clone(),
-                statuses.clone(),
-            );
-            workers.push(
-                Worker::new("commit-handler")
-                    .abort_on_panic()
-                    .run(
-                        handler_inbox,
-                        move || CommitStage::new(start, chunks_out, settlements, waits, statuses),
-                        |()| {},
-                    )
-                    .spawn(),
-            );
-        }
-
-        // 4. Execution.
-        {
-            let (inputs, withdrawals) = (input_waits.clone(), to_funds.clone());
-            workers.push(
-                Worker::new("resolver")
-                    .abort_on_panic()
-                    .run(
-                        resolver_inbox,
-                        move || VersionResolver::new(inputs, withdrawals),
-                        |()| {},
-                    )
-                    .spawn(),
-            );
-            let availability = InputAvailability {
-                store: store.clone(),
-                generations: generations.clone(),
-            };
-            workers.push(
-                Worker::new("input-waiter")
-                    .abort_on_panic()
-                    .run(
-                        input_inbox,
-                        move || WaiterProcessor::new(availability),
-                        into(to_executor, "executor"),
-                    )
-                    .spawn(),
-            );
-            let (store_x, epoch_x, generations_x) =
-                (store.clone(), epoch.clone(), generations.clone());
-            let (inputs, effects, funds) =
-                (input_waits.clone(), effects_waits.clone(), to_funds.clone());
-            workers.push(
-                Worker::new("executor")
-                    .abort_on_panic()
-                    .run(
-                        executor_inbox,
-                        move || {
-                            Executor::new(store_x, epoch_x, generations_x, inputs, effects, funds)
-                        },
-                        |()| {},
-                    )
-                    .spawn(),
-            );
-            let availability = EffectsAvailability {
-                store: store.clone(),
-            };
-            let router = EffectsRouter {
-                settlement: to_settlement.clone(),
-            };
-            workers.push(
-                Worker::new("effects-waiter")
-                    .abort_on_panic()
-                    .run(
-                        effects_inbox,
-                        move || WaiterProcessor::new(availability),
-                        router,
-                    )
-                    .spawn(),
-            );
-        }
-
-        // 5. Settlement and funds.
-        {
-            let (store_s, chunks_s) = (store.clone(), chunks.clone());
-            let (effects, inputs, waits, funds) = (
-                effects_waits.clone(),
-                input_waits.clone(),
-                checkpoint_waits.clone(),
-                to_funds.clone(),
-            );
-            workers.push(
-                Worker::new("settlement")
-                    .abort_on_panic()
-                    .run(
-                        settlement_inbox,
-                        move || {
-                            SettlementScheduler::new(
-                                store_s, chunks_s, effects, inputs, waits, funds,
-                            )
-                        },
-                        |()| {},
-                    )
-                    .spawn(),
-            );
-            let (store_f, inputs) = (store.clone(), input_waits.clone());
-            workers.push(
-                Worker::new("funds")
-                    .abort_on_panic()
-                    .run(
-                        funds_inbox,
-                        move || FundsReserver::new(store_f, inputs),
-                        |()| {},
-                    )
-                    .spawn(),
-            );
-        }
-
-        // 6. Checkpointing.
-        {
-            let availability = ChunkAvailability {
-                chunks: chunks.clone(),
-            };
-            workers.push(
-                Worker::new("checkpoint-waiter")
-                    .abort_on_panic()
-                    .run(
-                        checkpoint_inbox,
-                        move || WaiterProcessor::new(availability),
-                        into(to_contents, "contents"),
-                    )
-                    .spawn(),
-            );
-            let (chunks_c, store_c, hasher, sequence) = (
-                chunks.clone(),
-                store.clone(),
-                to_hasher.clone(),
-                sequence_waits.clone(),
-            );
-            workers.push(
-                Worker::new("contents")
-                    .abort_on_panic()
-                    .run(
-                        contents_inbox,
-                        move || ContentsBuilder::new(chunks_c, store_c, hasher, sequence),
-                        |()| {},
-                    )
-                    .spawn(),
-            );
-            // Read at the end of the epoch, which is not wired yet. Folds from
-            // genesis until reconfiguration supplies the epoch's start.
-            let state_hashes = state_hashes.clone();
-            workers.push(
-                Worker::new("state-hasher")
-                    .abort_on_panic()
-                    .run(
-                        hasher_inbox,
-                        move || StateHasher::new(state_hashes, 0, StateHash::default()),
-                        |()| {},
-                    )
-                    .spawn(),
-            );
-            let availability = BuiltAvailability {
-                checkpoints: checkpoints.clone(),
-            };
-            workers.push(
-                Worker::new("sequence-waiter")
-                    .abort_on_panic()
-                    .run(
-                        sequence_inbox,
-                        move || WaiterProcessor::new(availability),
-                        into(to_summary, "summary"),
-                    )
-                    .spawn(),
-            );
-            let (checkpoints_s, key) = (checkpoints.clone(), protocol_key.clone());
-            let (sequence, summaries, consensus) = (
-                sequence_waits.clone(),
-                summary_waits.clone(),
-                consensus.clone(),
-            );
-            workers.push(
-                Worker::new("summary")
-                    .abort_on_panic()
-                    .run(
-                        summary_inbox,
-                        move || {
-                            SummaryBuilder::new(checkpoints_s, key, sequence, summaries, consensus)
-                        },
-                        |()| {},
-                    )
-                    .spawn(),
-            );
-            let availability = SummaryAvailability {
-                checkpoints: checkpoints.clone(),
-            };
-            workers.push(
-                Worker::new("summary-waiter")
-                    .abort_on_panic()
-                    .run(
-                        summary_waiter_inbox,
-                        move || WaiterProcessor::new(availability),
-                        into(to_aggregator, "aggregator"),
-                    )
-                    .spawn(),
-            );
-            let (checkpoints_a, state_sync) = (checkpoints.clone(), to_state_sync);
-            let committee = committee.clone();
-            workers.push(
-                Worker::new("aggregator")
-                    .abort_on_panic()
-                    .run(
-                        aggregator_inbox,
-                        move || {
-                            CheckpointAggregator::new(
-                                committee,
-                                checkpoints_a,
-                                next_to_certify,
-                                state_sync,
-                            )
-                        },
-                        into(to_committer, "committer"),
-                    )
-                    .spawn(),
-            );
-            let (store_c, checkpoints_c, chunks_c) =
-                (store.clone(), checkpoints.clone(), chunks.clone());
-            workers.push(
-                Worker::new("committer")
-                    .abort_on_panic()
-                    .run(
-                        committer_inbox,
-                        move || CheckpointCommitter::new(store_c, checkpoints_c, chunks_c),
-                        |()| {},
-                    )
-                    .spawn(),
-            );
-        }
-
-        Pipeline {
-            transactions,
-            votes,
-            commits,
-            effects: effects_waits,
-            statuses,
-            consensus: consensus.clone(),
+        let activity = Activity::new();
+        let (queues, inboxes) = wiring::queues(&activity);
+        let consensus = consensus(ConsensusOutput {
+            votes: queues.votes.clone(),
+            commits: queues.commits.clone(),
+        });
+        let parts = Arc::new(Parts {
             store: store.clone(),
             epoch: epoch.clone(),
-            certified,
-            cache,
-            generations,
-            chunks,
+            key: protocol_key.clone(),
+            committee: committee.clone(),
+            consensus: consensus.clone(),
+            cache: Arc::new(ConsensusTxCache::new()),
+            generations: Arc::new(GenerationTable::new()),
+            chunks: Arc::new(ChunkTable::new()),
             checkpoints,
-            state_hashes,
+            statuses: Arc::new(ConsensusTxStatusCache::new()),
+            state_hashes: Arc::new(StateHashes::new()),
+            start,
+            next_to_certify,
+            first_hashed: record.previous_checkpoint + 1,
+            root_state: record.root_state.clone(),
+        });
+        let (ended_sender, ended) = watch::channel(None);
+        let workers = wiring::spawn(parts.clone(), &queues, inboxes, state_sync, ended_sender);
+
+        Pipeline {
+            transactions: queues.transactions,
+            votes: queues.votes,
+            commits: queues.commits,
+            effects: queues.effects_waits,
+            statuses: parts.statuses.clone(),
+            consensus,
+            store: store.clone(),
+            epoch: epoch.clone(),
+            cache: parts.cache.clone(),
+            generations: parts.generations.clone(),
+            chunks: parts.chunks.clone(),
+            checkpoints: parts.checkpoints.clone(),
+            state_hashes: parts.state_hashes.clone(),
+            ended,
+            activity,
             _workers: workers,
         }
     }
 
-    /// The RPC service over this pipeline: submissions checked here and
-    /// submitted to consensus, waits answered from its effects and the
+    /// Blocks until every item ready anywhere in the pipeline is processed,
+    /// waiters' ready items included; items waiting on keys stay. Pushes
+    /// from outside (consensus, RPC) must have stopped.
+    pub fn drain(&self) {
+        self.activity.wait_idle();
+    }
+
+    /// What the RPC service uses of this pipeline: submissions checked here
+    /// and submitted to consensus, waits answered from its effects and the
     /// consensus statuses of its commits.
-    pub fn validator(&self) -> Validator {
-        Validator::new(self.epoch.clone(), self.transactions.clone()).with_consensus(Consensus {
-            client: self.consensus.clone(),
-            statuses: self.statuses.clone(),
-            effects: self.effects.clone(),
-            store: self.store.clone(),
+    pub fn handle(&self) -> Arc<EpochHandle> {
+        Arc::new(EpochHandle {
+            epoch: self.epoch.clone(),
+            transactions: self.transactions.clone(),
+            consensus: Consensus {
+                client: self.consensus.clone(),
+                statuses: self.statuses.clone(),
+                effects: self.effects.clone(),
+                store: self.store.clone(),
+            },
         })
     }
 }

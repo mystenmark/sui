@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Handling a decoded consensus commit (see `decode`), then executing it.
+//! Handling a decoded consensus commit (see `decode`).
 //!
 //! `CommitHandler` is the consensus handler: a replicated state machine. It
 //! reads only its input (decoded commits, the epoch's parameters) and state
@@ -10,10 +10,9 @@
 //! decides. It deduplicates by its own record of processed transactions,
 //! locks owned inputs in consensus order, dropping a transaction whose
 //! owned input an earlier one locked, and schedules the rest (`sequence`:
-//! the prologue, the protocol's order, shared-object ordinals). `ScheduleExecutor` then executes the schedule one
-//! transaction at a time, as `SubmitTransaction` executes them, skipping
-//! transactions executed already. Executing at the versions the ordinals
-//! name, the prologue transaction, and congestion control are not here yet.
+//! the prologue, the protocol's order, shared-object ordinals).
+//! `CommitStage` lays the schedule out in chunks and checkpoints for the
+//! pipeline. Congestion control is not here yet.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -23,50 +22,17 @@ use ::consensus::{BlockRef, TransactionIndex};
 use messages::base::ObjectRef;
 use workqueue::{Processor, Refusal, Refuse};
 
-use crate::checks;
-use crate::consensus::decode::{CommittedTransaction, DecodedCommit, DecodedRequest, OwnedInputs};
+use crate::consensus::decode::{CommittedTransaction, DecodedCommit, OwnedInputs};
 use crate::consensus::sequence::{
     Prologue, Schedule, Scheduled, Sequencer, SharedAccess, SharedOrdinal,
 };
 use crate::consensus::status::{ConsensusTxStatus, ConsensusTxStatusCache};
-use crate::epoch::{EpochParams, EpochState};
+use crate::epoch::EpochParams;
 use crate::pipeline::items::{
-    Chunk, ChunkSettlement, ExecutableTransaction, PendingCheckpoint, ScheduledEntry,
+    Chunk, ChunkSettlement, EpochClose, ExecutableTransaction, PendingCheckpoint, ScheduledEntry,
     SettlementInput, SystemKind, SystemTransaction,
 };
 use crate::pipeline::keys::{AccumulatorVersion, ChunkSettled, TxDigest};
-use crate::processors::{Outcome, execute_and_commit, executed};
-
-/// What became of each user transaction a commit carried.
-#[derive(Debug)]
-pub struct CommitOutcome {
-    pub commit_index: u32,
-    /// Those scheduled, in schedule order, then those dropped, in consensus
-    /// order, then the duplicates.
-    pub transactions: Vec<Committed>,
-    /// Transactions taken from the cache, and decoded again.
-    pub cache_hits: usize,
-    pub cache_misses: usize,
-}
-
-/// One user transaction of a commit.
-#[derive(Debug)]
-pub struct Committed {
-    pub block: BlockRef,
-    pub index: TransactionIndex,
-    pub digest: [u8; 32],
-    pub fate: Fate,
-}
-
-#[derive(Debug)]
-pub enum Fate {
-    /// Executed, or failed to.
-    Executed(Outcome),
-    /// Not executed: see `DropReason`.
-    Dropped(DropReason),
-    /// Processed in an earlier commit, or executed already.
-    Duplicate,
-}
 
 /// Why a committed transaction was dropped.
 #[derive(Debug)]
@@ -74,8 +40,7 @@ pub enum DropReason {
     /// Its owned input `object` was locked by `holder`, earlier in consensus
     /// order: the reference's `ObjectLockConflict`.
     LockConflict { object: ObjectRef, holder: TxDigest },
-    /// Its input objects are invalid (the handler), or failed the checks
-    /// when its turn came (`ScheduleExecutor`).
+    /// Its input objects are invalid.
     Inputs(validation::Error),
 }
 
@@ -96,23 +61,16 @@ pub struct HandledCommit {
     pub cache_misses: usize,
 }
 
-/// A handled commit, in the epoch it belongs to.
-pub struct HandledRequest {
-    pub epoch: Arc<EpochParams>,
-    pub commit: HandledCommit,
-}
-
 /// A full queue drops the commit; consensus replays commits not handled.
-impl Refuse for HandledRequest {
+impl Refuse for HandledCommit {
     fn refuse(self, _: Refusal) {}
 }
 
 /// The consensus handler. Its state is in memory for now; persisted later,
 /// it is written and read back only by the handler.
 ///
-/// Inward: `CommitDecoder`: `DecodedRequest`.
-/// Outward: `ScheduleExecutor` (today's serial path): `HandledRequest`. In
-/// the pipeline, `CommitStage` wraps it instead.
+/// Run inside `CommitStage`, which feeds it decoded commits and lays out
+/// what it decides.
 pub struct CommitHandler {
     /// The index of the last commit handled; 0 before the first.
     last_commit: u32,
@@ -234,121 +192,14 @@ impl CommitHandler {
     }
 }
 
-impl Processor for CommitHandler {
-    type Input = DecodedRequest;
-    type Output = HandledRequest;
-
-    fn process(&mut self, request: DecodedRequest) -> Option<HandledRequest> {
-        let commit = self.handle(&request.epoch, request.commit)?;
-        Some(HandledRequest {
-            epoch: request.epoch,
-            commit,
-        })
-    }
-}
-
-/// Executes handled commits against the store, serially in schedule order,
-/// which gives the versions the ordinals name.
-///
-/// Today's serial path, which the pipeline's resolver, input waiter and
-/// `Executor` replace.
-/// Inward: `CommitHandler`: `HandledRequest`.
-/// Outward: `CommitOutcome` to its sink.
-pub struct ScheduleExecutor {
-    store: Arc<store::Store>,
-    /// The epoch it executes in, with this node's executor.
-    epoch: Arc<EpochState>,
-}
-
-impl ScheduleExecutor {
-    pub fn new(store: Arc<store::Store>, epoch: Arc<EpochState>) -> ScheduleExecutor {
-        ScheduleExecutor { store, epoch }
-    }
-
-    /// Executes `commit`'s schedule. A transaction executed already (before
-    /// a restart, say) is a duplicate here; the prologue is not executed
-    /// yet.
-    pub fn execute(&mut self, commit: HandledCommit) -> CommitOutcome {
-        let epoch = &*self.epoch;
-        let HandledCommit {
-            commit_index,
-            schedule,
-            origins,
-            duplicates,
-            dropped,
-            cache_hits,
-            cache_misses,
-        } = commit;
-        let mut transactions =
-            Vec::with_capacity(schedule.len() + dropped.len() + duplicates.len());
-        for scheduled in schedule.transactions {
-            let Scheduled::User(transaction) = scheduled else {
-                continue;
-            };
-            let digest = transaction.get().0.digest().bytes;
-            let (block, index) = origins[&digest];
-            let fate = if executed(&self.store, &digest).is_some() {
-                Fate::Duplicate
-            } else {
-                match checks::check_inputs(epoch, &self.store, transaction) {
-                    Ok(checked) => Fate::Executed(execute_and_commit(&self.store, epoch, &checked)),
-                    Err(e) => Fate::Dropped(DropReason::Inputs(e)),
-                }
-            };
-            transactions.push(Committed {
-                block,
-                index,
-                digest,
-                fate,
-            });
-        }
-        transactions.extend(
-            dropped
-                .into_iter()
-                .map(|(block, index, digest, drop)| Committed {
-                    block,
-                    index,
-                    digest,
-                    fate: Fate::Dropped(drop),
-                }),
-        );
-        transactions.extend(
-            duplicates
-                .into_iter()
-                .map(|(block, index, digest)| Committed {
-                    block,
-                    index,
-                    digest,
-                    fate: Fate::Duplicate,
-                }),
-        );
-        CommitOutcome {
-            commit_index,
-            transactions,
-            cache_hits,
-            cache_misses,
-        }
-    }
-}
-
-impl Processor for ScheduleExecutor {
-    type Input = HandledRequest;
-    type Output = CommitOutcome;
-
-    /// # Panics
-    /// On a commit of another epoch: reconfiguration does not exist yet.
-    fn process(&mut self, request: HandledRequest) -> Option<CommitOutcome> {
-        assert!(
-            Arc::ptr_eq(&request.epoch, &self.epoch.params),
-            "a commit of the executor's epoch"
-        );
-        Some(self.execute(request.commit))
-    }
-}
-
 /// The accumulator root (`SUI_ACCUMULATOR_ROOT_OBJECT_ID`), which each
 /// chunk's settlement writes.
 const ACCUMULATOR_ROOT: messages::base::ObjectId = messages::base::ObjectId::from_u16(0xacc);
+
+/// The system state object, which the change-epoch transaction writes, and
+/// the version its sharing started at.
+const SYSTEM_STATE: messages::base::ObjectId = messages::base::ObjectId::from_u16(0x5);
+const SYSTEM_STATE_INITIAL_SHARED_VERSION: u64 = 1;
 
 /// What the epoch agreed on at its start that `CommitStage` needs, beyond
 /// `EpochParams`. Agreed like it, so reading it keeps the stage pure.
@@ -367,6 +218,10 @@ pub struct EpochStart {
     /// The root's version the epoch's first chunk reads: where version
     /// assignment starts it (`Store::start_version`).
     pub accumulator_root_version: u64,
+    /// The epoch ends with the first commit at or past
+    /// `epoch_start_timestamp_ms + epoch_duration_ms`.
+    pub epoch_start_timestamp_ms: u64,
+    pub epoch_duration_ms: u64,
 }
 
 /// What `CommitStage` decided about one commit, in emission order.
@@ -397,8 +252,10 @@ pub struct Decided {
 ///   no user transactions (the reference estimates each one's cost);
 /// - randomness: transactions using it are scheduled last in the commit's
 ///   chunks, not in chunks of their own;
-/// - the end of the epoch: no checkpoint is the last of its epoch, and a
-///   commit's timestamp is not clamped to the epoch's start.
+/// - the end of the epoch, beyond a stand-in: the first commit at or past the
+///   epoch's end time is its last, ending it at once, without draining
+///   deferred transactions or a close deadline; a commit's timestamp is not
+///   clamped to the epoch's start.
 ///
 /// Inward:
 /// - `CommitDecoder`: `DecodedRequest`.
@@ -414,6 +271,7 @@ pub struct Decided {
 /// by its position, and the committed leader round. Written, never read: the
 /// handler stays a state machine over its input.
 pub struct CommitStage {
+    epoch: Arc<EpochParams>,
     handler: CommitHandler,
     start: EpochStart,
     queue: CheckpointQueue,
@@ -421,6 +279,8 @@ pub struct CommitStage {
     /// The last commit decided. Accumulator versions count commits, so
     /// commits must come without gaps.
     last_commit: Option<u32>,
+    /// The epoch's last commit is decided: later ones schedule nothing.
+    closed: bool,
     /// The accumulator root's version the next chunk reads. Each chunk's
     /// barrier, its root's one exclusive writer and with the root its only
     /// input, writes the next version.
@@ -433,6 +293,7 @@ pub struct CommitStage {
 
 impl CommitStage {
     pub fn new(
+        epoch: Arc<EpochParams>,
         start: EpochStart,
         chunks: workqueue::Queue<Chunk>,
         settlements: workqueue::Queue<SettlementInput>,
@@ -440,6 +301,7 @@ impl CommitStage {
         statuses: Arc<ConsensusTxStatusCache>,
     ) -> CommitStage {
         CommitStage {
+            epoch,
             handler: CommitHandler::new(),
             start,
             queue: CheckpointQueue::new(
@@ -449,6 +311,7 @@ impl CommitStage {
             ),
             commit_times: CommitIntervalObserver::default(),
             last_commit: None,
+            closed: false,
             root_version: start.accumulator_root_version,
             chunks_out: chunks,
             settlements_out: settlements,
@@ -458,8 +321,12 @@ impl CommitStage {
     }
 
     /// Decides `commit` and lays it out in chunks and checkpoints, or
-    /// nothing if it was handled before.
-    pub fn decide(&mut self, epoch: &Arc<EpochParams>, commit: DecodedCommit) -> Option<Decided> {
+    /// nothing if it was handled before or follows the epoch's last.
+    pub fn decide(&mut self, commit: DecodedCommit) -> Option<Decided> {
+        let epoch = &self.epoch.clone();
+        if self.closed {
+            return None;
+        }
         let HandledCommit {
             mut schedule,
             origins,
@@ -517,8 +384,38 @@ impl CommitStage {
             });
         }
 
-        // 3. Chunks and checkpoints.
-        let mut decided = self.chunk(epoch, &prologue, entries, digests);
+        // 3. The epoch's last commit reserves the change-epoch transaction's
+        //    write of the system state, after every other.
+        let end = self
+            .start
+            .epoch_start_timestamp_ms
+            .saturating_add(self.start.epoch_duration_ms);
+        let close = (prologue.timestamp_ms >= end).then(|| {
+            self.closed = true;
+            let writes_before = entries
+                .iter()
+                .filter(|e| {
+                    e.shared.iter().any(|a| {
+                        a.id == SYSTEM_STATE
+                            && a.mutability
+                                == messages::transaction::SharedObjectMutability::Mutable
+                    })
+                })
+                .count();
+            vec![SharedAccess {
+                id: SYSTEM_STATE,
+                initial_shared_version: SYSTEM_STATE_INITIAL_SHARED_VERSION,
+                mutability: messages::transaction::SharedObjectMutability::Mutable,
+                ordinal: SharedOrdinal {
+                    round: prologue.round,
+                    writes_before: u32::try_from(writes_before)
+                        .expect("fewer than 2^32 transactions"),
+                },
+            }]
+        });
+
+        // 4. Chunks and checkpoints.
+        let mut decided = self.chunk(epoch, &prologue, entries, digests, close);
         decided.dropped = dropped;
         Some(decided)
     }
@@ -532,6 +429,7 @@ impl CommitStage {
         prologue: &Prologue,
         entries: Vec<ScheduledEntry>,
         digests: Vec<TxDigest>,
+        close: Option<Vec<SharedAccess>>,
     ) -> Decided {
         let config = &epoch.config;
         let max = usize::try_from(config.max_transactions_per_checkpoint())
@@ -561,7 +459,6 @@ impl CommitStage {
             let root_version = self.root_version;
             self.root_version += 1;
             decided.settlements.push(ChunkSettlement {
-                epoch: epoch.clone(),
                 version,
                 root_version,
                 last_of_commit: position + 1 == chunk_count,
@@ -583,7 +480,6 @@ impl CommitStage {
                 },
             });
             decided.chunks.push(Chunk {
-                epoch: epoch.clone(),
                 version,
                 root_version,
                 round: prologue.round,
@@ -594,16 +490,30 @@ impl CommitStage {
         }
         let min_interval = config.min_checkpoint_interval_ms.unwrap_or(0);
         flushed.extend(self.queue.flush(prologue.timestamp_ms, min_interval));
+        if close.is_some() {
+            flushed.extend(self.queue.flush_forced());
+        }
         decided.checkpoints = flushed
             .into_iter()
             .map(|f| PendingCheckpoint {
-                epoch: epoch.clone(),
                 seq: f.seq,
                 heights: f.heights,
                 timestamp_ms: f.timestamp_ms,
-                last_of_epoch: false,
+                close: None,
             })
             .collect();
+        if let Some(shared) = close {
+            let last = decided
+                .checkpoints
+                .last_mut()
+                .expect("the last commit cuts the epoch's last checkpoint");
+            last.close = Some(EpochClose {
+                version: AccumulatorVersion(u64::from(prologue.commit_index)),
+                round: prologue.round,
+                root_version: self.root_version,
+                shared,
+            });
+        }
         decided
     }
 
@@ -655,11 +565,10 @@ fn push<T>(queue: &workqueue::Queue<T>, item: T, name: &str) {
 }
 
 impl Processor for CommitStage {
-    type Input = DecodedRequest;
+    type Input = DecodedCommit;
     type Output = ();
 
-    fn process(&mut self, request: DecodedRequest) -> Option<()> {
-        let DecodedRequest { epoch, mut commit } = request;
+    fn process(&mut self, mut commit: DecodedCommit) -> Option<()> {
         let leader_round = commit.leader.round;
         let rejected = std::mem::take(&mut commit.rejected);
         let positions: Vec<(BlockRef, TransactionIndex)> = commit
@@ -667,7 +576,7 @@ impl Processor for CommitStage {
             .iter()
             .map(|t| (t.block, t.index))
             .collect();
-        let decided = self.decide(&epoch, commit)?;
+        let decided = self.decide(commit)?;
         // What became of each transaction, for its submitter: dropped, or
         // finalized (scheduled, or a duplicate of one that was).
         let dropped: HashSet<(BlockRef, TransactionIndex)> =
@@ -823,28 +732,18 @@ impl CommitIntervalObserver {
     }
 }
 
-/// The consensus commit prologue of a commit, as the reference's
-/// `ConsensusCommitInfo::create_consensus_commit_prologue_transaction`
-/// builds it: a `ConsensusCommitPrologueV4` system transaction listing no
-/// cancelled transactions.
+/// `prologue`'s `ConsensusCommitPrologueV4`, as the reference's
+/// `create_consensus_commit_prologue_transaction`: no cancelled transactions,
+/// and `additional_state_digest` over the commits through this one.
 pub fn prologue_transaction(
     prologue: &Prologue,
     additional_state_digest: &[u8; 32],
 ) -> SystemTransaction {
-    use messages::build::base::{
-        AdditionalConsensusStateDigest, ConsensusCommitDigest, Digest, ObjectDigest, ObjectId,
-        SequenceNumber, SuiAddress,
-    };
-    use messages::build::signature::{EmptySignInfo, GenericSignature};
+    use messages::build::base::{AdditionalConsensusStateDigest, ConsensusCommitDigest, Digest};
     use messages::build::system_transaction::{
         ConsensusCommitPrologueV4, ConsensusDeterminedVersionAssignments,
     };
-    use messages::build::transaction::{
-        GasData, Intent, IntentMessage, SenderSignedData, SenderSignedTransaction, Transaction,
-        TransactionData, TransactionDataV1, TransactionExpiration, TransactionKind,
-    };
-    /// `GAS_PRICE_FOR_SYSTEM_TX`.
-    const SYSTEM_GAS_PRICE: u64 = 1;
+    use messages::build::transaction::TransactionKind;
 
     let kind = TransactionKind::ConsensusCommitPrologueV4(ConsensusCommitPrologueV4 {
         epoch: prologue.epoch,
@@ -856,13 +755,73 @@ pub fn prologue_transaction(
             ConsensusDeterminedVersionAssignments::CancelledTransactionsV2(Vec::new()),
         additional_state_digest: AdditionalConsensusStateDigest(Digest(*additional_state_digest)),
     });
+    system_transaction(
+        kind,
+        SystemKind::Prologue {
+            round: prologue.round,
+        },
+    )
+}
+
+/// The change-epoch transaction ending `epoch`: an `EndOfEpochTransaction`
+/// of `ChangeEpoch` alone, starting epoch `epoch + 1` at
+/// `epoch_start_timestamp_ms` with `protocol_version` and no new system
+/// packages, and charging the epoch's gas totals `gas` (computation,
+/// storage, rebate, non-refundable).
+///
+/// Not yet: the other end-of-epoch kinds the reference includes when its
+/// protocol flags hold (R2.8 of `docs/reconfiguration_reference.md`).
+pub fn change_epoch_transaction(
+    epoch: u64,
+    protocol_version: u64,
+    gas: [u64; 4],
+    epoch_start_timestamp_ms: u64,
+) -> SystemTransaction {
+    use messages::build::base::ProtocolVersion;
+    use messages::build::system_transaction::{ChangeEpoch, EndOfEpochTransactionKind};
+    use messages::build::transaction::TransactionKind;
+
+    let [computation, storage, rebate, non_refundable] = gas;
+    let kind =
+        TransactionKind::EndOfEpochTransaction(vec![EndOfEpochTransactionKind::ChangeEpoch(
+            ChangeEpoch {
+                epoch: epoch + 1,
+                protocol_version: ProtocolVersion(protocol_version),
+                storage_charge: storage,
+                computation_charge: computation,
+                storage_rebate: rebate,
+                non_refundable_storage_fee: non_refundable,
+                epoch_start_timestamp_ms,
+                system_packages: Vec::new(),
+            },
+        )]);
+    system_transaction(kind, SystemKind::ChangeEpoch { epoch })
+}
+
+/// A system transaction of `kind`: sent by the zero address, with no gas
+/// and an all-zero signature, as the reference's `VerifiedTransaction::new_system_transaction`.
+fn system_transaction(
+    kind: messages::build::transaction::TransactionKind,
+    system: SystemKind,
+) -> SystemTransaction {
+    use messages::build::base::{
+        AccountAddress, Digest, ObjectDigest, ObjectId, SequenceNumber, SuiAddress,
+    };
+    use messages::build::signature::{EmptySignInfo, GenericSignature};
+    use messages::build::transaction::{
+        GasData, Intent, IntentMessage, SenderSignedData, SenderSignedTransaction, Transaction,
+        TransactionData, TransactionDataV1, TransactionExpiration,
+    };
+    /// `GAS_PRICE_FOR_SYSTEM_TX`.
+    const SYSTEM_GAS_PRICE: u64 = 1;
+
     let sender = SuiAddress([0; 32]);
     let data = TransactionData::V1(TransactionDataV1 {
         kind,
         sender,
         gas_data: GasData {
             payment: vec![(
-                ObjectId(messages::build::base::AccountAddress([0; 32])),
+                ObjectId(AccountAddress([0; 32])),
                 SequenceNumber(0),
                 ObjectDigest(Digest([0; 32])),
             )],
@@ -894,9 +853,7 @@ pub fn prologue_transaction(
         auth_signature: EmptySignInfo {},
     };
     SystemTransaction {
-        kind: SystemKind::Prologue {
-            round: prologue.round,
-        },
+        kind: system,
         bytes: bcs::to_bytes(&transaction).expect("a transaction serializes"),
         digest,
     }

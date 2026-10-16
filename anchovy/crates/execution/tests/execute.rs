@@ -4,7 +4,7 @@
 //! Genesis into a fresh store, then transactions executed one after another
 //! against its live objects, each committed before the next.
 
-use execution::{Execution, Outcome, genesis};
+use execution::{Outcome, Reference, genesis};
 use move_core_types::ident_str;
 use sui_protocol_config::{Chain, ProtocolVersion};
 use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
@@ -23,7 +23,7 @@ const SUI: u64 = 1_000_000_000;
 struct Node {
     _dir: tempfile::TempDir,
     store: store::Store,
-    execution: Execution,
+    execution: Reference,
     sender: SuiAddress,
     key: AccountKeyPair,
 }
@@ -32,7 +32,7 @@ impl Node {
     fn new() -> Node {
         let (sender, key) = get_key_pair::<AccountKeyPair>();
         let execution =
-            Execution::new(ProtocolVersion::MAX.as_u64(), Chain::Unknown, 0, 0, RGP).unwrap();
+            Reference::new(ProtocolVersion::MAX.as_u64(), Chain::Unknown, 0, 0, RGP).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let store = store::Store::open(dir.path()).unwrap();
         let objects = genesis::objects(&execution, &[(sender, 10 * SUI)]).unwrap();

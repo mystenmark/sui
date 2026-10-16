@@ -41,7 +41,6 @@ pub struct GasCharger<'a> {
 /// `Smash` when one or more user-provided payment methods have been combined into a single
 /// source.
 // One per transaction, so the variants' sizes don't matter.
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum PaymentMetadata<'a> {
     Unmetered,

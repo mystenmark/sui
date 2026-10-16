@@ -15,7 +15,10 @@
 
 use std::cell::RefCell;
 use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Select, Sender, TryRecvError, TrySendError};
 
@@ -71,18 +74,80 @@ impl<T: Refuse + Send> Sink<T> for Queue<T> {
 /// workers that drain it.
 pub fn queue<W>(capacity: usize) -> (Queue<W>, Inbox<W>) {
     let (items, inbox) = crossbeam_channel::bounded(capacity);
-    (Queue { items }, Inbox { items: inbox })
+    (
+        Queue {
+            items,
+            activity: None,
+        },
+        Inbox {
+            items: inbox,
+            activity: None,
+        },
+    )
+}
+
+/// The items a set of queues holds, or a worker has in hand: an item counts
+/// from its push until it is processed and what it emitted is pushed on.
+/// So none counts once every queue is empty and no worker is busy, and the
+/// set is idle: everything ready has been dealt with.
+#[derive(Clone, Default)]
+pub struct Activity {
+    items: Arc<AtomicUsize>,
+}
+
+impl Activity {
+    pub fn new() -> Activity {
+        Activity::default()
+    }
+
+    /// A bounded queue whose items count here.
+    pub fn queue<W>(&self, capacity: usize) -> (Queue<W>, Inbox<W>) {
+        let (items, inbox) = crossbeam_channel::bounded(capacity);
+        (
+            Queue {
+                items,
+                activity: Some(self.clone()),
+            },
+            Inbox {
+                items: inbox,
+                activity: Some(self.clone()),
+            },
+        )
+    }
+
+    /// Whether no item counts now.
+    pub fn is_idle(&self) -> bool {
+        self.items.load(Ordering::SeqCst) == 0
+    }
+
+    /// Blocks until no item counts. Pushes from outside the set can keep it
+    /// busy: stop them first.
+    pub fn wait_idle(&self) {
+        while !self.is_idle() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn begin(&self) {
+        self.items.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn end(&self) {
+        self.items.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// The sending side of a queue. Cheap to clone.
 pub struct Queue<W> {
     items: Sender<W>,
+    activity: Option<Activity>,
 }
 
 impl<W> Clone for Queue<W> {
     fn clone(&self) -> Self {
         Queue {
             items: self.items.clone(),
+            activity: self.activity.clone(),
         }
     }
 }
@@ -100,9 +165,18 @@ impl<W> Queue<W> {
     /// Queues `item`, or returns it at once if the queue is full. Never
     /// blocks, so a processor may push to a queue drained by its own thread.
     pub fn try_push(&self, item: W) -> Result<(), PushError<W>> {
-        self.items.try_send(item).map_err(|e| match e {
-            TrySendError::Full(item) => PushError::Full(item),
-            TrySendError::Disconnected(item) => PushError::Closed(item),
+        // Counted before it is queued, so it counts whenever it is there.
+        if let Some(activity) = &self.activity {
+            activity.begin();
+        }
+        self.items.try_send(item).map_err(|e| {
+            if let Some(activity) = &self.activity {
+                activity.end();
+            }
+            match e {
+                TrySendError::Full(item) => PushError::Full(item),
+                TrySendError::Disconnected(item) => PushError::Closed(item),
+            }
         })
     }
 }
@@ -111,20 +185,29 @@ impl<W> Queue<W> {
 /// every inbox is dropped. An inbox no worker drains fills up.
 pub struct Inbox<W> {
     items: Receiver<W>,
+    activity: Option<Activity>,
 }
 
 impl<W> Clone for Inbox<W> {
     fn clone(&self) -> Self {
         Inbox {
             items: self.items.clone(),
+            activity: self.activity.clone(),
         }
     }
 }
 
 impl<W> Inbox<W> {
-    /// Takes an item, if one is queued: for draining an inbox by hand.
+    /// Takes an item, if one is queued: for draining an inbox by hand. It
+    /// no longer counts as activity.
     pub fn try_pop(&self) -> Option<W> {
-        self.items.try_recv().ok()
+        let item = self.items.try_recv().ok();
+        if item.is_some()
+            && let Some(activity) = &self.activity
+        {
+            activity.end();
+        }
+        item
     }
 }
 
@@ -179,6 +262,7 @@ impl Worker {
     ) -> Worker {
         self.recipes.push(Box::new(Recipe {
             inbox: inbox.items,
+            activity: inbox.activity,
             make,
             sink,
         }));
@@ -230,6 +314,7 @@ trait Unbuilt: Send {
 
 struct Recipe<W, F, K> {
     inbox: Receiver<W>,
+    activity: Option<Activity>,
     make: F,
     sink: K,
 }
@@ -243,6 +328,7 @@ where
     fn build(self: Box<Self>, abort_on_panic: bool) -> Box<dyn Slot> {
         Box::new(Built {
             inbox: self.inbox,
+            activity: self.activity,
             stage: RefCell::new(((self.make)(), self.sink)),
             abort_on_panic,
         })
@@ -252,6 +338,7 @@ where
 /// A processor, its inbox and its sink, on the worker's thread.
 struct Built<P: Processor, K> {
     inbox: Receiver<P::Input>,
+    activity: Option<Activity>,
     // A cell, as the thread's `Select` borrows every inbox for as long as
     // the thread runs.
     stage: RefCell<(P, K)>,
@@ -289,6 +376,10 @@ impl<P: Processor, K: Sink<P::Output>> Slot for Built<P, K> {
                 if ran.is_err() && self.abort_on_panic {
                     // The panic hook has already reported it.
                     std::process::abort();
+                }
+                // What it emitted is pushed on, and counts there.
+                if let Some(activity) = &self.activity {
+                    activity.end();
                 }
                 Step::Ran
             }
@@ -634,5 +725,88 @@ mod tests {
             .spawn();
         drop(worker);
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    /// Passes each number on after a pause, keeping the odd ones: parked,
+    /// as a waiter keeps items whose keys have not resolved.
+    struct Slow {
+        kept: Vec<u32>,
+    }
+
+    impl Processor for Slow {
+        type Input = u32;
+        type Output = u32;
+
+        fn process(&mut self, n: u32) -> Option<u32> {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            if n % 2 == 1 {
+                self.kept.push(n);
+                return None;
+            }
+            Some(n)
+        }
+    }
+
+    /// Records what reaches it, slowly.
+    struct Record(Arc<Mutex<Vec<u32>>>);
+
+    impl Processor for Record {
+        type Input = u32;
+        type Output = ();
+
+        fn process(&mut self, n: u32) -> Option<()> {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            self.0.lock().unwrap().push(n);
+            None
+        }
+    }
+
+    #[test]
+    fn activity_is_idle_once_every_ready_item_is_processed() {
+        let activity = Activity::new();
+        let (first, first_inbox) = activity.queue::<u32>(64);
+        let (second, second_inbox) = activity.queue::<u32>(64);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let _workers = [
+            Worker::new("slow")
+                .run(
+                    first_inbox,
+                    || Slow { kept: Vec::new() },
+                    move |n| {
+                        second.try_push(n).unwrap();
+                    },
+                )
+                .spawn(),
+            Worker::new("record")
+                .run(second_inbox, move || Record(recorded), discard)
+                .spawn(),
+        ];
+        assert!(activity.is_idle());
+        for n in 0..20 {
+            first.try_push(n).unwrap();
+        }
+        assert!(!activity.is_idle());
+        activity.wait_idle();
+        // Every even number went through both stages; the odd ones are kept,
+        // which is not activity.
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..20).step_by(2).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn items_popped_by_hand_stop_counting() {
+        let activity = Activity::new();
+        let (queue, inbox) = activity.queue::<u32>(4);
+        queue.try_push(1).unwrap();
+        assert!(!activity.is_idle());
+        assert_eq!(inbox.try_pop(), Some(1));
+        assert!(activity.is_idle());
+        // A refused push never counted.
+        let (full, _inbox) = activity.queue::<u32>(1);
+        full.try_push(1).unwrap();
+        assert!(matches!(full.try_push(2), Err(PushError::Full(2))));
+        assert!(!activity.is_idle());
     }
 }

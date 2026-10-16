@@ -302,7 +302,6 @@ fn naive(world: &World) -> (Outcomes, Vec<BTreeMap<u8, u128>>) {
 /// Runs `world` through a ledger with events in a random order that
 /// respects causality, and returns each transaction's outcomes, and how
 /// many reservations were fulfilled before their version settled.
-#[allow(clippy::too_many_lines)]
 fn run(world: &World, rng: &mut StdRng, truth: &[BTreeMap<u8, u128>]) -> (Outcomes, usize) {
     let mut ledger = Ledger::new();
     let mut out = Vec::new();

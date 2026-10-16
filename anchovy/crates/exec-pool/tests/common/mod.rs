@@ -116,7 +116,7 @@ impl Node {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(store::Store::open(dir.path()).unwrap());
         let funded = vec![(sender.to_inner(), 10 * SUI); coins];
-        assert!(execution::genesis::init(&epoch.execution, &store, &funded).unwrap());
+        assert!(execution::genesis::init(epoch.execution.reference(), &store, &funded).unwrap());
         let generations = Arc::new(GenerationTable::new());
         let (inputs, notified_inputs) = workqueue::queue(1 << 16);
         let (effects, notified_effects) = workqueue::queue(1 << 16);
@@ -252,7 +252,6 @@ impl Node {
         resolved_base: Vec<(StreamId, u32, u32)>,
     ) -> Executable {
         let mut executable = Executable {
-            epoch: self.epoch.params.clone(),
             version: AccumulatorVersion(1),
             root_version: 1,
             reserved: Vec::new(),

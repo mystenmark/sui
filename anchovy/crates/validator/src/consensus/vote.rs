@@ -23,14 +23,14 @@ use tokio::sync::oneshot;
 use validation::inputs::{InputKind, input_objects};
 use validation::verify::SignerIndices;
 use waiter::{Command, WaitBatch};
-use workqueue::{Processor, Queue, Refusal, Refuse};
+use workqueue::{Processor, Refusal, Refuse};
 
 use crate::checks::{self, SignatureChecks, VerifiedTransaction};
 use crate::consensus::cache::{BlockEntries, CachedTransaction, ConsensusTxCache};
 use crate::consensus::decode::{checkpoint_signature, claimed_immutable};
 use crate::epoch::EpochState;
-use crate::pipeline::items::CheckpointSignature;
-use crate::pipeline::keys::LocalSummary;
+use crate::pipeline::items::{BuiltWaitItem, BuiltWaits};
+use crate::pipeline::keys::CheckpointBuilt;
 
 /// The reference's `dkg_v1::DKG_MESSAGES_MAX_SIZE`.
 const DKG_MESSAGES_MAX_SIZE: usize = 400_000;
@@ -45,9 +45,8 @@ const MAX_SHARE_SERIALIZED_BYTES: usize = 200 * 1024;
 /// to reject, or why the block is invalid.
 pub type Verdict = Result<Vec<TransactionIndex>, InvalidBlock>;
 
-/// A block to vote on, in the epoch it belongs to.
+/// A block to vote on, from the epoch's consensus.
 pub struct VoteRequest {
-    pub epoch: Arc<EpochState>,
     pub block: Block,
     pub reply: oneshot::Sender<Verdict>,
 }
@@ -85,17 +84,18 @@ impl From<validation::Error> for RejectReason {
 /// Inward: consensus (black box): `VoteRequest`.
 /// Outward:
 /// - consensus: the verdict, through the request's reply;
-/// - summary waiter, wait for: each checkpoint signature in a valid block,
-///   keyed by `LocalSummary(seq)`, once routed. Ahead of its commit, for
+/// - built waiter, wait for: each checkpoint signature in a valid block,
+///   keyed by `CheckpointBuilt(seq)`, once routed. Ahead of its commit, for
 ///   latency; the commit decoder routes it again, as a commit can arrive
 ///   without its blocks being voted on.
 ///
 /// Reads: the object store. Writes: the decoded-transaction cache.
 pub struct BlockVoter {
+    epoch: Arc<EpochState>,
     store: Arc<store::Store>,
     cache: Arc<ConsensusTxCache>,
     signatures: SignatureChecks,
-    checkpoint_signatures: Option<Queue<Command<LocalSummary, CheckpointSignature>>>,
+    checkpoint_signatures: Option<BuiltWaits>,
     bump: Bump,
 }
 
@@ -103,11 +103,16 @@ pub struct BlockVoter {
 const ARENA_BYTES: usize = 64 * 1024;
 
 impl BlockVoter {
-    pub fn new(store: Arc<store::Store>, cache: Arc<ConsensusTxCache>) -> BlockVoter {
+    pub fn new(
+        epoch: Arc<EpochState>,
+        store: Arc<store::Store>,
+        cache: Arc<ConsensusTxCache>,
+    ) -> BlockVoter {
         BlockVoter {
+            signatures: SignatureChecks::new(epoch.clone(), checks::GENERATION),
+            epoch,
             store,
             cache,
-            signatures: SignatureChecks::new(checks::GENERATION),
             checkpoint_signatures: None,
             bump: Bump::with_capacity(ARENA_BYTES),
         }
@@ -116,17 +121,15 @@ impl BlockVoter {
     /// Routes the checkpoint signatures of valid blocks to the summary
     /// waiter.
     #[must_use]
-    pub fn with_signatures(
-        mut self,
-        signatures: Queue<Command<LocalSummary, CheckpointSignature>>,
-    ) -> BlockVoter {
+    pub fn with_signatures(mut self, signatures: BuiltWaits) -> BlockVoter {
         self.checkpoint_signatures = Some(signatures);
         self
     }
 
     /// Votes on `block`: `verify_and_vote_batch`. A valid block's decoded
     /// transactions are cached.
-    pub fn vote(&mut self, epoch: &Arc<EpochState>, block: Block) -> Verdict {
+    pub fn vote(&mut self, block: Block) -> Verdict {
+        let epoch = &self.epoch.clone();
         let Block {
             reference,
             transactions,
@@ -175,7 +178,7 @@ impl BlockVoter {
                 Err(_) => rejects.push(index as TransactionIndex),
             }
         }
-        let verified = self.signatures.verify_batch(epoch, valid);
+        let verified = self.signatures.verify_batch(valid);
         for (i, verified) in verified.into_iter().enumerate() {
             let (index, claims) = &pending[i];
             match verified {
@@ -204,8 +207,8 @@ impl BlockVoter {
         };
         let mut batch = WaitBatch::new();
         for signature in transactions.iter().filter_map(checkpoint_signature) {
-            let key = LocalSummary(signature.seq);
-            batch.push(signature, [key]);
+            let key = CheckpointBuilt(signature.seq);
+            batch.push(BuiltWaitItem::Signature(signature), [key]);
         }
         if batch.is_empty() {
             return;
@@ -213,7 +216,7 @@ impl BlockVoter {
         // Inside the pipeline a full queue is a sizing bug, not load to
         // shed; a closed one means the pipeline is shutting down.
         if let Err(workqueue::PushError::Full(_)) = queue.try_push(Command::Wait(batch)) {
-            panic!("the summary waiter refused checkpoint signatures");
+            panic!("the built waiter refused checkpoint signatures");
         }
     }
 
@@ -278,12 +281,8 @@ impl Processor for BlockVoter {
     type Output = ();
 
     fn process(&mut self, request: VoteRequest) -> Option<()> {
-        let VoteRequest {
-            epoch,
-            block,
-            reply,
-        } = request;
-        let verdict = self.vote(&epoch, block);
+        let VoteRequest { block, reply } = request;
+        let verdict = self.vote(block);
         // Consensus may have stopped waiting; nothing to do then.
         let _ = reply.send(verdict);
         None

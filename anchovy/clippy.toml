@@ -1,0 +1,15 @@
+# Anchovy's clippy configuration. Clippy reads the first clippy.toml up from
+# a crate, so this replaces the sui repository's for anchovy's crates.
+
+# Epoch and gas parameters are passed whole, each its own argument.
+too-many-arguments-threshold = 20
+# The ported executor names its types in full.
+type-complexity-threshold = 500
+
+disallowed-methods = [
+    # Unbounded channels are for expert use only.
+    { path = "tokio::sync::mpsc::unbounded_channel", reason = "use a bounded channel instead" },
+    { path = "futures::channel::mpsc::unbounded", reason = "use a bounded channel instead" },
+    # Known to cause blocking issues.
+    { path = "futures::executor::block_on", reason = "use tokio::runtime::Runtime::block_on instead" },
+]

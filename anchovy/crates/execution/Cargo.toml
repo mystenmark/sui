@@ -7,6 +7,10 @@ publish = false
 
 # The one crate that links sui's executor and types: the rest of anchovy
 # keeps to its own, and converts here, at the boundary, through BCS.
+[features]
+# Executes every transaction with sui's executor too, which must agree.
+testing = []
+
 [dependencies]
 bcs.workspace = true
 containers.workspace = true

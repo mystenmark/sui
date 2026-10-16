@@ -55,7 +55,6 @@ fn command<'a>(
 
     // Unused results are dropped at the end of the command
     // The lengths are checked equal first, which `zip_debug_eq` would also check.
-    #[allow(clippy::disallowed_methods)]
     let dropped = {
         assert_invariant!(
             c.drop_values.len() == c.result_type.len(),

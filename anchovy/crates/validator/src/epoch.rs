@@ -1,8 +1,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! What the validator knows about the current epoch. Fixed at startup for
-//! now; replaced whole at reconfiguration later, so readers hold an `Arc`.
+//! What the validator knows about an epoch. Built for each epoch and held
+//! by `Arc` by everything that lives for it.
 
 use std::sync::Arc;
 
@@ -67,12 +67,15 @@ pub struct EpochState {
     pub params: Arc<EpochParams>,
     /// Verifies signatures under the epoch's protocol config and JWKs.
     pub verifier: Verifier,
-    /// Sui's executor, under sui's protocol config for the same version
-    /// and chain (`params.config` is anchovy's copy, which validation reads).
+    /// The epoch's executor: anchovy's, with sui's for what it does not
+    /// execute yet and as its oracle, under sui's protocol config for the
+    /// same version and chain (`params.config` is anchovy's copy, which
+    /// validation reads).
     pub execution: execution::Execution,
 }
 
 impl EpochState {
+    /// An epoch starting at time 0, as genesis-less tests need.
     pub fn new(
         chain: Chain,
         protocol_version: u64,
@@ -80,6 +83,30 @@ impl EpochState {
         chain_identifier: Digest,
         reference_gas_price: u64,
         committee_size: u32,
+        jwks: impl IntoIterator<Item = (JwkId, JWK)>,
+    ) -> EpochState {
+        EpochState::starting_at(
+            chain,
+            protocol_version,
+            epoch,
+            chain_identifier,
+            reference_gas_price,
+            committee_size,
+            0,
+            jwks,
+        )
+    }
+
+    /// An epoch whose transactions read `epoch_start_timestamp_ms` as its
+    /// start.
+    pub fn starting_at(
+        chain: Chain,
+        protocol_version: u64,
+        epoch: u64,
+        chain_identifier: Digest,
+        reference_gas_price: u64,
+        committee_size: u32,
+        epoch_start_timestamp_ms: u64,
         jwks: impl IntoIterator<Item = (JwkId, JWK)>,
     ) -> EpochState {
         let params = EpochParams::new(
@@ -95,11 +122,14 @@ impl EpochState {
             Chain::Testnet => execution::Chain::Testnet,
             Chain::Unknown => execution::Chain::Unknown,
         };
-        // No epoch start time until epochs exist: what transactions read
-        // as the epoch's timestamp is 0.
-        let execution =
-            execution::Execution::new(protocol_version, sui_chain, epoch, 0, reference_gas_price)
-                .expect("sui's executor supports every protocol version anchovy does");
+        let execution = execution::Execution::new(
+            protocol_version,
+            sui_chain,
+            epoch,
+            epoch_start_timestamp_ms,
+            reference_gas_price,
+        )
+        .expect("the executors support every protocol version anchovy does");
         EpochState {
             execution,
             verifier: Verifier::new(&params.config, chain, jwks),

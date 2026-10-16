@@ -18,7 +18,7 @@ use tonic::transport::Channel;
 use tonic::transport::server::TcpIncoming;
 use validator::Validator;
 use validator::epoch::EpochState;
-use validator::processors::{Processors, Request};
+use validator::processors::Request;
 use validator::proto::{RawSubmitTxRequest, RawValidatorSubmitStatus, SubmitTxType};
 use validator::service::validator_client::ValidatorClient;
 use workqueue::Queue;
@@ -30,9 +30,8 @@ fn cases() -> (Vec<Case>, Arc<EpochState>) {
 
 async fn serve(epoch: Arc<EpochState>) -> ValidatorClient<Channel> {
     let store = common::store(&epoch);
-    let processors = Processors::start(64, store.store.clone());
-    let queue = processors.transactions.clone();
-    serve_with(epoch, queue, (processors, store)).await
+    let (queue, worker) = common::submission(&epoch, &store.store, 64);
+    serve_with(epoch, queue, (worker, store)).await
 }
 
 /// Serves with `queue`; `processors` (whatever drains it) live as long as
@@ -44,9 +43,11 @@ async fn serve_with(
 ) -> ValidatorClient<Channel> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
-    let service = Validator::new(epoch, queue).into_service();
+    let store = common::store(&epoch);
+    let (current, consensus) = common::current(&epoch, queue, &store.store);
+    let service = Validator::over(current).into_service();
     tokio::spawn(async move {
-        let _processors = processors;
+        let _processors = (processors, consensus, store);
         tonic::transport::Server::builder()
             .add_service(service)
             .serve_with_incoming(TcpIncoming::from(listener))
@@ -189,9 +190,8 @@ async fn a_full_queue_between_processors_refuses_work() {
     let invalid = cases.iter().find(|c| c.label == "signed_system").unwrap();
     // A signature queue of no capacity, whose only reader is the validator's
     // own thread, never takes an item.
-    let (queue, inbox) = workqueue::queue(16);
     let store = common::store(&epoch);
-    let worker = Processors::worker(inbox, 0, store.store.clone()).spawn();
+    let (queue, worker) = common::submission(&epoch, &store.store, 0);
     let mut client = serve_with(epoch, queue, (worker, store)).await;
     let status = client
         .submit_transaction(submit(&[valid], SubmitTxType::Default))

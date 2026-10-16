@@ -17,6 +17,7 @@ use messages::transaction::{Reservation, SharedObjectMutability, TransactionData
 use messages::transaction::{WithdrawFrom, WithdrawalTypeArg};
 use messages::type_tag::TypeTag;
 use validator::consensus::sequence::SharedAccess;
+use validator::epoch::EpochParams;
 use validator::pipeline::items::{
     Chunk, Executable, ExecutableTransaction, FundsCommand, InputCommand, InputValue,
     ScheduledEntry, Withdrawal,
@@ -43,6 +44,7 @@ use workqueue::{Processor, PushError, Queue};
 ///   withdraws funds, a `Reservation` per account against the chunk's
 ///   version, in consensus order.
 pub struct VersionResolver {
+    epoch: Arc<EpochParams>,
     pub inputs: Queue<InputCommand>,
     pub withdrawals: Queue<FundsCommand>,
     /// Each stream's last scheduled generation: (round, generation). Only an
@@ -57,8 +59,13 @@ pub struct VersionResolver {
 }
 
 impl VersionResolver {
-    pub fn new(inputs: Queue<InputCommand>, withdrawals: Queue<FundsCommand>) -> VersionResolver {
+    pub fn new(
+        epoch: Arc<EpochParams>,
+        inputs: Queue<InputCommand>,
+        withdrawals: Queue<FundsCommand>,
+    ) -> VersionResolver {
         VersionResolver {
+            epoch,
             inputs,
             withdrawals,
             last_generation: HashMap::new(),
@@ -283,7 +290,6 @@ impl Processor for VersionResolver {
 
     fn process(&mut self, chunk: Chunk) -> Option<()> {
         let Chunk {
-            epoch,
             version,
             root_version,
             height,
@@ -293,7 +299,8 @@ impl Processor for VersionResolver {
         let mut batch = WaitBatch::with_capacity(entries.len(), entries.len() * 4);
         let mut withdrawals = Vec::new();
         for entry in entries {
-            let resolved_base = self.resolve(&entry, &epoch.chain_identifier);
+            let chain_identifier = self.epoch.chain_identifier;
+            let resolved_base = self.resolve(&entry, &chain_identifier);
             let reserved: Vec<keys::Reservation> = self
                 .amounts
                 .drain(..)
@@ -315,7 +322,6 @@ impl Processor for VersionResolver {
                 });
             }
             let executable = Executable {
-                epoch: epoch.clone(),
                 version,
                 root_version,
                 reserved,

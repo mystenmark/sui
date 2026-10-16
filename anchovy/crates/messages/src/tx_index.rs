@@ -200,7 +200,6 @@ fn push_command_packages(command: &Command<'_>, packages: &mut SliceWriter<'_, O
 
 impl<'a> TransactionIndex<'a> {
     // Long because it is kept as one sequence of steps over shared state.
-    #[allow(clippy::too_many_lines)]
     pub(crate) fn build<A: Alloc<'a>>(
         kind: &TransactionKind<'a>,
         gas_data: &GasData<'a>,

@@ -100,7 +100,6 @@ fn accumulator_writes(rng: &mut Rng, kind: u64) -> Vec<AccumulatorWriteV1> {
         .collect()
 }
 
-#[allow(clippy::too_many_lines)]
 fn run(seed: u64, coverage: &mut Coverage) {
     let mut rng = Rng(seed);
     let bump = Bump::with_capacity(1 << 16);

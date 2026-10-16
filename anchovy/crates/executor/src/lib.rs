@@ -8,7 +8,7 @@
 
 // Pedantic style lints would reshape code ported line for line from the reference; the
 // reference is held to sui's lints instead.
-#![allow(clippy::pedantic, clippy::too_many_arguments)]
+#![allow(clippy::pedantic)]
 
 pub mod accumulator_event;
 pub mod accumulator_root;

@@ -157,6 +157,24 @@ pub enum StoredExecutionTimeObservations {
     ),
 }
 
+impl StoredExecutionTimeObservations {
+    /// `StoredExecutionTimeObservations::chunk_observations`: the observations in chunks of
+    /// `chunk_size`, none if it is zero.
+    pub fn chunk_observations(&self, chunk_size: usize) -> Vec<Self> {
+        match self {
+            Self::V1(observations) => {
+                if chunk_size == 0 {
+                    return vec![];
+                }
+                observations
+                    .chunks(chunk_size)
+                    .map(|chunk| Self::V1(chunk.to_vec()))
+                    .collect()
+            }
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WriteAccumulatorStorageCost {
     pub storage_cost: u64,

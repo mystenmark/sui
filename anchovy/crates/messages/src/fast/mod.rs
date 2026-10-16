@@ -336,7 +336,6 @@ impl<'a> Writer<'a> {
     }
 
     // One arm per variant of a 42-variant enum.
-    #[allow(clippy::too_many_lines)]
     fn execution_error(&mut self, error: &ExecutionErrorKind<'_>) {
         use ExecutionErrorKind as E;
         match error {

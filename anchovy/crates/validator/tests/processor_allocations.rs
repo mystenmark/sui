@@ -11,10 +11,7 @@ mod common;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use std::sync::Arc;
-
 use tokio::sync::oneshot;
-use validator::epoch::EpochState;
 use validator::processors::{Request, SignatureVerifier, TransactionValidator};
 use workqueue::Processor;
 
@@ -45,13 +42,12 @@ static COUNTING: Counting = Counting;
 /// channel are the handler's, made before counting. Returns whether it was
 /// verified.
 fn process(
-    epoch: &Arc<EpochState>,
     validator: &mut TransactionValidator,
     verifier: &mut SignatureVerifier,
     case: &common::Case,
 ) -> (bool, usize) {
     let (reply, _verdict) = oneshot::channel();
-    let request = Request::new(epoch.clone(), vec![case.parse().unwrap()], reply);
+    let request = Request::new(vec![case.parse().unwrap()], reply);
     let before = ALLOCATIONS.with(Cell::get);
     let accepted = validator
         .process(request)
@@ -76,16 +72,16 @@ fn plain_signatures(case: &common::Case) -> bool {
 fn verifying_allocates_nothing_once_warm() {
     let (cases, epoch) = common::mainnet();
     let epoch = common::mainnet_epoch(epoch);
-    let mut validator = TransactionValidator::new();
-    let mut warm = SignatureVerifier::new();
+    let mut validator = TransactionValidator::new(epoch.clone());
+    let mut warm = SignatureVerifier::new(epoch.clone());
     for case in &cases {
-        process(&epoch, &mut validator, &mut warm, case);
+        process(&mut validator, &mut warm, case);
     }
     let mut accepted = 0;
     for case in &cases {
         // A cache that has not seen it, made before counting: it is verified.
-        let mut verifier = SignatureVerifier::new();
-        let (ok, allocations) = process(&epoch, &mut validator, &mut verifier, case);
+        let mut verifier = SignatureVerifier::new(epoch.clone());
+        let (ok, allocations) = process(&mut validator, &mut verifier, case);
         assert_eq!(verifier.cache_stats().0, 0);
         if ok && plain_signatures(case) {
             accepted += 1;
@@ -100,16 +96,16 @@ fn verifying_allocates_nothing_once_warm() {
 fn a_cache_hit_allocates_nothing() {
     let (cases, epoch) = common::mainnet();
     let epoch = common::mainnet_epoch(epoch);
-    let mut validator = TransactionValidator::new();
-    let mut verifier = SignatureVerifier::new();
+    let mut validator = TransactionValidator::new(epoch.clone());
+    let mut verifier = SignatureVerifier::new(epoch.clone());
     let accepted: Vec<_> = cases
         .iter()
-        .filter(|case| process(&epoch, &mut validator, &mut verifier, case).0)
+        .filter(|case| process(&mut validator, &mut verifier, case).0)
         .collect();
     assert!(!accepted.is_empty());
     let (hits, _) = verifier.cache_stats();
     for case in &accepted {
-        let (ok, allocations) = process(&epoch, &mut validator, &mut verifier, case);
+        let (ok, allocations) = process(&mut validator, &mut verifier, case);
         assert!(ok);
         assert_eq!(allocations, 0, "{}", case.label);
     }

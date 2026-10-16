@@ -126,8 +126,9 @@ pub fn validate_one(
     Ok(transaction.with_digest().relabel(&Witness(PhantomData)))
 }
 
-/// Signature verification, remembering what verified in the current epoch.
+/// Signature verification in one epoch, remembering what verified.
 pub struct SignatureChecks {
+    epoch: Arc<EpochState>,
     cache: SignatureCache,
     bump: Bump,
 }
@@ -136,10 +137,11 @@ pub struct SignatureChecks {
 const ARENA_BYTES: usize = 64 * 1024;
 
 impl SignatureChecks {
-    /// With a cache of `2 * generation` entries.
-    pub fn new(generation: usize) -> SignatureChecks {
+    /// In `epoch`, with a cache of `2 * generation` entries.
+    pub fn new(epoch: Arc<EpochState>, generation: usize) -> SignatureChecks {
         SignatureChecks {
-            cache: SignatureCache::new(generation),
+            cache: SignatureCache::new(epoch.params.epoch, generation),
+            epoch,
             bump: Bump::with_capacity(ARENA_BYTES),
         }
     }
@@ -149,16 +151,15 @@ impl SignatureChecks {
         self.cache.stats()
     }
 
-    /// Verifies each transaction's signatures in `epoch`, which must be the
-    /// one it was validated in, unless they verified before there: all
-    /// `Verified`, or the first failure.
+    /// Verifies each transaction's signatures, unless they verified before:
+    /// all `Verified`, or the first failure. Each must have been validated
+    /// in the same epoch.
     pub fn verify(
         &mut self,
-        epoch: &Arc<EpochState>,
         transactions: Vec<ValidTransaction>,
     ) -> Result<Vec<VerifiedTransaction>, validation::Error> {
         for transaction in &transactions {
-            self.verify_signatures(epoch, transaction)?;
+            self.verify_signatures(transaction)?;
         }
         Ok(Message::relabel_all(transactions, &Witness(PhantomData)))
     }
@@ -168,10 +169,9 @@ impl SignatureChecks {
     /// claim must name.
     pub fn verify_one(
         &mut self,
-        epoch: &Arc<EpochState>,
         transaction: ValidTransaction,
     ) -> Result<(VerifiedTransaction, SignerIndices), validation::Error> {
-        let indices = self.verify_signatures(epoch, &transaction)?;
+        let indices = self.verify_signatures(&transaction)?;
         Ok((transaction.relabel(&Witness(PhantomData)), indices))
     }
 
@@ -181,7 +181,6 @@ impl SignatureChecks {
     /// each transaction's Ed25519 signatures are verified on their own.
     pub fn verify_batch(
         &mut self,
-        epoch: &Arc<EpochState>,
         transactions: Vec<ValidTransaction>,
     ) -> Vec<Result<(VerifiedTransaction, SignerIndices), validation::Error>> {
         enum Prepared {
@@ -194,13 +193,14 @@ impl SignatureChecks {
             },
             Failed(validation::Error),
         }
+        let epoch = self.epoch.clone();
         // 1. Cache hits stand; the rest are checked, but for their Ed25519
         //    signatures' verification.
         let mut deferred = Vec::new();
         let prepared: Vec<Prepared> = transactions
             .iter()
             .map(|transaction| {
-                let (key, cached) = self.cache.lookup(epoch, transaction);
+                let (key, cached) = self.cache.lookup(transaction);
                 if let Some(indices) = cached {
                     return Prepared::Cached(indices);
                 }
@@ -239,7 +239,6 @@ impl SignatureChecks {
 
         // 3. The verified enter the cache. `prepared` has an entry per
         // transaction.
-        #[allow(clippy::disallowed_methods)]
         transactions
             .into_iter()
             .zip(prepared)
@@ -271,11 +270,10 @@ impl SignatureChecks {
 
     fn verify_signatures(
         &mut self,
-        epoch: &Arc<EpochState>,
         transaction: &ValidTransaction,
     ) -> Result<SignerIndices, validation::Error> {
-        let bump = &mut self.bump;
-        self.cache.verify(epoch, transaction, |signed| {
+        let (epoch, bump) = (&self.epoch, &mut self.bump);
+        self.cache.verify(transaction, |signed| {
             bump.reset();
             let (signatures, _) = sender_signed::deserialization_checks(signed, bump)?;
             // No aliases: they are object state, which does not exist yet.

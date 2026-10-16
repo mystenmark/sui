@@ -13,15 +13,13 @@ use messages::object::Object;
 
 use crate::checks::VerifiedTransaction;
 use crate::consensus::sequence::SharedAccess;
-use crate::epoch::EpochParams;
 use crate::pipeline::keys::{AccumulatorVersion, Reservation, StreamId, TxDigest};
-use crate::pipeline::tables::Generation;
+use crate::pipeline::tables::{BuiltCheckpoint, Generation};
 
 /// A transaction the pipeline executes: a user transaction from consensus,
 /// or a system transaction the pipeline builds.
 // Nearly every transaction is a user transaction: boxing it would cost an
 // allocation each to save space on the rare system one.
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ExecutableTransaction {
     User(VerifiedTransaction),
@@ -46,6 +44,9 @@ pub enum SystemKind {
     Settlement { height: u64, index: u32 },
     /// The accumulator barrier of the chunk at `height`.
     Barrier { height: u64 },
+    /// The change-epoch transaction ending `epoch`: the last of its last
+    /// checkpoint.
+    ChangeEpoch { epoch: u64 },
 }
 
 /// A scheduled transaction with its shared accesses and, for a user
@@ -61,7 +62,6 @@ pub struct ScheduledEntry {
 /// `CommitHandler` → `VersionResolver`.
 #[derive(Debug)]
 pub struct Chunk {
-    pub epoch: Arc<EpochParams>,
     /// The version the commit's transactions reserve funds against.
     pub version: AccumulatorVersion,
     /// The accumulator root's version the chunk's transactions are assigned
@@ -77,7 +77,6 @@ pub struct Chunk {
 /// What settling a chunk takes. `CommitHandler` → `SettlementScheduler`.
 #[derive(Debug, Clone)]
 pub struct ChunkSettlement {
-    pub epoch: Arc<EpochParams>,
     /// The version the commit's transactions reserve funds against; settling
     /// the commit's last chunk makes `version + 1`.
     pub version: AccumulatorVersion,
@@ -112,19 +111,32 @@ pub enum SettlementInput {
 /// (wait for `ChunkSettled` of each height) → `ContentsBuilder`.
 #[derive(Debug, Clone)]
 pub struct PendingCheckpoint {
-    pub epoch: Arc<EpochParams>,
     pub seq: u64,
     /// Its chunks' heights, in order.
     pub heights: Vec<u64>,
     pub timestamp_ms: u64,
-    pub last_of_epoch: bool,
+    /// Set on the epoch's last checkpoint only.
+    pub close: Option<EpochClose>,
+}
+
+/// What the commit handler reserved, in the epoch's last commit, for the
+/// change-epoch transaction that `EpochCloser` builds once everything else
+/// in the epoch has executed.
+#[derive(Debug, Clone)]
+pub struct EpochClose {
+    /// As the last commit's chunks'.
+    pub version: AccumulatorVersion,
+    pub round: u32,
+    /// The accumulator root's version after the last chunk's barrier.
+    pub root_version: u64,
+    /// Its shared accesses, after every other access of the epoch.
+    pub shared: Vec<SharedAccess>,
 }
 
 /// A transaction with its inputs as keys. `VersionResolver` or
 /// `SettlementScheduler` → input waiter → `Executor`.
 #[derive(Debug)]
 pub struct Executable {
-    pub epoch: Arc<EpochParams>,
     /// The version its commit reserves funds against.
     pub version: AccumulatorVersion,
     /// As `Chunk::root_version`.
@@ -229,6 +241,9 @@ pub enum EffectsWaitItem {
     /// A chunk's settlement and barrier transactions executed.
     /// `SettlementScheduler` → effects waiter → `SettlementScheduler`.
     SettlementExecuted { height: u64, digests: Vec<TxDigest> },
+    /// The change-epoch transaction executed. `EpochCloser` → effects waiter
+    /// → `EpochCloser`.
+    ChangeEpochExecuted,
 }
 
 /// A transaction's executed effects, as the chunk table and checkpointing
@@ -251,20 +266,21 @@ pub struct SettledChunk {
     pub effects: Vec<ExecutedEffects>,
 }
 
-/// A checkpoint's effects, for its state hash. `ContentsBuilder` →
-/// `StateHasher`.
+/// A checkpoint's effects, for its state hash. `ContentsBuilder`, or
+/// `EpochCloser` for the epoch's last → `StateHasher`.
 #[derive(Debug, Clone)]
 pub struct CheckpointEffects {
     pub seq: u64,
     pub effects: Vec<ExecutedEffects>,
+    /// The epoch's last checkpoint: its root goes to `EpochCloser`.
+    pub last_of_epoch: bool,
 }
 
 /// A checkpoint's contents, built without the previous checkpoint.
-/// `ContentsBuilder` → sequence waiter (wait for `CheckpointBuilt(seq - 1)`)
-/// → `SummaryBuilder`.
+/// `ContentsBuilder` → built waiter (wait for `CheckpointBuilt(seq - 1)`) →
+/// `EpochCloser` → `SummaryBuilder`.
 #[derive(Debug, Clone)]
 pub struct CheckpointContentsBuilt {
-    pub epoch: Arc<EpochParams>,
     pub pending: PendingCheckpoint,
     /// `CheckpointContents` BCS and digest.
     pub contents: Arc<[u8]>,
@@ -277,16 +293,91 @@ pub struct CheckpointContentsBuilt {
     /// The rounds of the checkpoint's randomness state updates, in order,
     /// for the summary's version-specific data.
     pub randomness_rounds: Vec<u64>,
+    /// The epoch's last checkpoint: built first without the change-epoch
+    /// transaction, with its effects kept for `EpochCloser` to build it
+    /// again with it; then with its end-of-epoch data.
+    pub last: Option<LastOfEpoch>,
+}
+
+/// What `EpochCloser` takes.
+#[derive(Debug)]
+pub enum EpochCloserInput {
+    /// Checkpoints whose previous one is built. Built waiter →
+    /// `EpochCloser`.
+    Built(Vec<CheckpointContentsBuilt>),
+    /// The change-epoch transaction executed. Effects waiter →
+    /// `EpochCloser`.
+    ChangeEpochExecuted,
+    /// The live object set's ECMH after the epoch's last checkpoint
+    /// (`StateHash` BCS). `StateHasher` → `EpochCloser`.
+    Root(Vec<u8>),
+}
+
+/// The epoch's last checkpoint, on its way through `EpochCloser`.
+#[derive(Debug, Clone)]
+pub enum LastOfEpoch {
+    /// Its effects, without the change-epoch transaction's.
+    Effects(Vec<ExecutedEffects>),
+    /// Built whole: its end-of-epoch data.
+    Closed(EndOfEpoch),
+}
+
+/// A last checkpoint's end-of-epoch data, from the system state the
+/// change-epoch transaction wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndOfEpoch {
+    /// Each member's protocol key and voting power, in committee order.
+    pub next_committee: Vec<([u8; 96], u64)>,
+    pub next_protocol_version: u64,
+    /// The live object set's ECMH after the checkpoint (`StateHash` BCS),
+    /// which the next epoch's root continues from.
+    pub root_state: Vec<u8>,
+    /// Its digest, the epoch's commitment, when the protocol commits it.
+    pub root_state_digest: Option<[u8; 32]>,
 }
 
 /// A checkpoint signature from consensus. `BlockVoter` and `CommitDecoder`
-/// → summary waiter (wait for `LocalSummary(seq)`) → `CheckpointAggregator`.
+/// → built waiter (wait for `CheckpointBuilt(seq)`) → `CheckpointAggregator`.
 #[derive(Debug, Clone)]
 pub struct CheckpointSignature {
     pub seq: u64,
     /// `CheckpointSignatureMessage` BCS.
     pub message: Arc<[u8]>,
 }
+
+/// What waits for this validator to build a checkpoint, keyed by
+/// `CheckpointBuilt(seq)` and resolved to the checkpoint built. The built
+/// waiter routes a ready item by kind.
+#[derive(Debug)]
+pub enum BuiltWaitItem {
+    /// A checkpoint's contents, waiting for the previous checkpoint.
+    /// `ContentsBuilder` → built waiter → `EpochCloser`.
+    Next(CheckpointContentsBuilt),
+    /// A signature, waiting for the summary it signs. `BlockVoter` and
+    /// `CommitDecoder` → built waiter → `CheckpointAggregator`.
+    Signature(CheckpointSignature),
+    /// A certified checkpoint, waiting for the local one to compare it
+    /// with. `CheckpointAggregator` → built waiter → fork check.
+    Certified {
+        certified: CertifiedCheckpoint,
+        local: Option<Arc<BuiltCheckpoint>>,
+    },
+}
+
+impl waiter::Receive<Arc<BuiltCheckpoint>> for BuiltWaitItem {
+    fn receive(&mut self, _: usize, built: Arc<BuiltCheckpoint>) {
+        if let BuiltWaitItem::Certified { local, .. } = self {
+            *local = Some(built);
+        }
+    }
+}
+
+/// What the built waiter takes.
+pub type BuiltCommand =
+    waiter::Command<crate::pipeline::keys::CheckpointBuilt, BuiltWaitItem, Arc<BuiltCheckpoint>>;
+
+/// The built waiter's queue.
+pub type BuiltWaits = workqueue::Queue<BuiltCommand>;
 
 /// A certified checkpoint. `CheckpointAggregator` → state sync, and →
 /// `CheckpointCommitter`, in sequence order.

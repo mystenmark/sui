@@ -70,12 +70,7 @@ pub struct Reservation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ChunkSettled(pub u64);
 
-/// The sequence waiter's key: checkpoint `seq` built. Available once the
-/// checkpoint store holds its summary.
+/// The built waiter's key: this validator built checkpoint `seq`. Available
+/// once the checkpoint store holds it, or committed it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CheckpointBuilt(pub u64);
-
-/// The summary waiter's key: this validator's summary of checkpoint `seq`.
-/// Available once the checkpoint store holds it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct LocalSummary(pub u64);

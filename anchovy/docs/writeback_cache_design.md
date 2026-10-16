@@ -219,7 +219,7 @@ with transactions from the checkpoint's contents. Feeding it from state
 sync instead of the aggregator is the likely end state.
 
 **Checkpoint signatures.** Certification stays its own processor
-(`CheckpointAggregator`) behind the summary waiter, as no signature order
+(`CheckpointAggregator`) behind the built waiter, as no signature order
 is needed. Signatures come from two places, as in the reference
 (`consensus_validator.rs`, commit 2dfd307272):
 - the block voter, from blocks as it votes on them, for latency;

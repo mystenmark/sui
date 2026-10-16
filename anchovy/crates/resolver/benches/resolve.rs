@@ -147,7 +147,7 @@ fn transactions(count: usize, objects: u64, rng: &mut Rng) -> Vec<Planned> {
 }
 
 /// The chunk of `round`, with ordinals counting exclusive writes.
-fn chunk(epoch: &Arc<EpochParams>, round: u32, transactions: &[Planned]) -> Chunk {
+fn chunk(round: u32, transactions: &[Planned]) -> Chunk {
     let mut writes: HashMap<u64, u32> = HashMap::new();
     let entries = transactions
         .iter()
@@ -186,7 +186,6 @@ fn chunk(epoch: &Arc<EpochParams>, round: u32, transactions: &[Planned]) -> Chun
         })
         .collect();
     Chunk {
-        epoch: epoch.clone(),
         version: AccumulatorVersion(u64::from(round)),
         root_version: 1,
         round,
@@ -203,12 +202,12 @@ fn resolve(epoch: &Arc<EpochParams>, rng: &mut Rng) {
             let transactions = transactions(chunk_size, objects, rng);
             let (inputs, inbox) = workqueue::queue(4);
             let (withdrawals, _) = workqueue::queue(4);
-            let mut resolver = VersionResolver::new(inputs, withdrawals);
+            let mut resolver = VersionResolver::new(epoch.clone(), inputs, withdrawals);
             let mut elapsed = Duration::ZERO;
             let mut allocations = 0;
             let rounds = 200;
             for round in 0..=rounds {
-                let chunk = chunk(epoch, round, &transactions);
+                let chunk = chunk(round, &transactions);
                 let before = ALLOCATIONS.load(Ordering::Relaxed);
                 let start = Instant::now();
                 resolver.process(chunk);

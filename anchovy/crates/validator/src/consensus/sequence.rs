@@ -56,7 +56,6 @@ pub struct Prologue {
 
 /// A transaction in a commit's schedule.
 // Nearly every entry is a user transaction; boxing them would allocate each.
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Scheduled {
     Prologue(Prologue),

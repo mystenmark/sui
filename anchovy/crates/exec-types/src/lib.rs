@@ -5,12 +5,7 @@
 //! the natives and the executor, as `sui-types` is by theirs.
 
 // Style-only lints that would reshape code ported line for line from the reference.
-#![allow(
-    clippy::doc_markdown,
-    clippy::single_match_else,
-    clippy::too_many_arguments,
-    clippy::too_many_lines
-)]
+#![allow(clippy::doc_markdown, clippy::single_match_else)]
 
 pub mod base;
 pub mod error;

@@ -109,6 +109,7 @@ fn main() {
                     epoch_rolling_gas: [1, 2, 3, 4],
                     last_height: 0,
                     timestamp_ms: 0,
+                    root_state: None,
                 });
                 keys.iter()
                     .map(|key| {

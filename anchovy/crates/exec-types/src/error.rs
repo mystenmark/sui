@@ -98,7 +98,6 @@ impl std::error::Error for ExecutionError<'_> {
 }
 
 // The reference truncates the index with `as`.
-#[allow(clippy::cast_possible_truncation)]
 pub fn command_argument_error(
     e: messages::execution_status::CommandArgumentError,
     arg_idx: usize,

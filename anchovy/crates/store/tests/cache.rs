@@ -153,10 +153,6 @@ const RACED: usize = 4;
 /// Transactions whose execution readers race.
 const TXS: u64 = 20_000;
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "one match over the model's operations"
-)]
 fn run_model(seed: u64, capacity: Capacity) {
     let pool = Pool::new();
     let dir = tempfile::tempdir().unwrap();

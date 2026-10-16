@@ -94,7 +94,6 @@ pub struct PlainTransactionWithClaims {
 /// check.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 // The reference's layout.
-#[allow(clippy::struct_excessive_bools)]
 pub struct TransactionDenyRules {
     pub object_deny_list: Vec<ObjectId>,
     pub package_deny_list: Vec<ObjectId>,

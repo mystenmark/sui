@@ -44,7 +44,7 @@ use sui_types::transaction::{
 };
 use validator::checks;
 use validator::consensus::commit::{CommitStage, EpochStart};
-use validator::consensus::decode::{CommittedTransaction, DecodedCommit, DecodedRequest};
+use validator::consensus::decode::{CommittedTransaction, DecodedCommit};
 use validator::epoch::EpochParams;
 use workqueue::Processor;
 
@@ -183,8 +183,11 @@ fn main() {
                 previous_timestamp_ms: 0,
                 accumulator_root_initial_shared_version: 1,
                 accumulator_root_version: 1,
+                epoch_start_timestamp_ms: 0,
+                epoch_duration_ms: u64::MAX,
             };
             let mut stage = CommitStage::new(
+                epoch.clone(),
                 start,
                 chunks,
                 settlements,
@@ -194,10 +197,7 @@ fn main() {
             let mut elapsed = Duration::ZERO;
             let mut allocations = 0;
             for index in 1..=rounds + 1 {
-                let request = DecodedRequest {
-                    epoch: epoch.clone(),
-                    commit: commit(index, &transactions(commit_size, objects, &mut rng)),
-                };
+                let request = commit(index, &transactions(commit_size, objects, &mut rng));
                 let before = ALLOCATIONS.load(Ordering::Relaxed);
                 let begin = Instant::now();
                 stage.process(request).unwrap();

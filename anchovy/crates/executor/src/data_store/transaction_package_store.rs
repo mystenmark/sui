@@ -25,7 +25,6 @@ use std::{cell::RefCell, sync::Arc};
 /// It is used to provide package loading (from storage) for the Move VM. Packages are views,
 /// borrowed from the store's messages or built in the arena, where the reference holds each in an
 /// `Rc` cloned from the store's.
-#[allow(clippy::type_complexity)]
 pub struct TransactionPackageStore<'a> {
     bump: &'a Bump,
     package_store: &'a dyn BackingPackageStore<'a>,

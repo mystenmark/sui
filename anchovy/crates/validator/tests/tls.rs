@@ -4,6 +4,8 @@
 //! The server over TLS, reached by a client configured as sui's is: TLS
 //! 1.3, server name `sui`, the network key pinned.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -107,7 +109,9 @@ async fn serve(key: NetworkKey) -> SocketAddr {
         // No genesis: these requests read no objects.
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(store::Store::open(dir.path()).unwrap());
-        validator::serve(listener, &key, epoch, store, std::future::pending())
+        let (transactions, _inbox) = workqueue::queue(1);
+        let (current, _consensus) = common::current(&epoch, transactions, &store);
+        validator::serve(listener, &key, current, std::future::pending())
             .await
             .unwrap();
     });

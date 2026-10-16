@@ -5,16 +5,11 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-[[bin]]
-name = "anchovy-validator"
-path = "src/main.rs"
-
 [dependencies]
 base64.workspace = true
 bcs.workspace = true
 blake2.workspace = true
 bytes.workspace = true
-clap.workspace = true
 consensus.workspace = true
 containers.workspace = true
 execution.workspace = true
@@ -36,6 +31,7 @@ waiter.workspace = true
 workqueue.workspace = true
 
 [dev-dependencies]
+execution = { workspace = true, features = ["testing"] }
 base64.workspace = true
 bcs.workspace = true
 sui-types.workspace = true
