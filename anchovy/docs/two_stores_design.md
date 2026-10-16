@@ -26,57 +26,62 @@ committer writes a certified checkpoint's outputs in one batch.
 
 ## Epoch store
 
-A new Tidehunter database per epoch, `<db>/epoch_<N>`, opened by
-`Epoch::start` and handed to the pipeline. After reconfiguration has written
-the next epoch's record and the old epoch is dropped, its directory is
-deleted (keeping the previous one, as the reference keeps a few).
+A directory per epoch, `<db>/epoch_<N>`, opened by `Epoch::start` and handed
+to the pipeline; after reconfiguration has written the next epoch's record
+and the old epoch is dropped, epochs before the previous one are deleted.
+Nothing in it is pruned: it is dropped with the epoch.
 
-On restart (decision 1, step one) the directory is deleted and re-created.
-Three sections, each its own keyspaces, each with its own writer type. A
-writer is not `Clone`, and is constructed once, when the store opens. Every
-section has cloneable readers.
+It holds two Tidehunter databases: `replayed`, what a replay of the epoch
+writes again, which a restart empties (decision 1, step one); and `kept`,
+what a replay could not rebuild, as the stores it was derived from have
+moved on. Within them, three sections, each its own keyspaces and its own
+writer.
 
 ### Consensus output: written only by the commit handler
 
-The `ConsensusOutput` writer is moved into `CommitStage`. Nothing else
-can write these keyspaces.
+The `ConsensusOutput` writer is made once, when the store opens, cannot be
+cloned, and is moved into `CommitStage`. The handler reads its pending
+writes, then the database, and writes one batch per commit.
 
 | Keyspace | Key → value | From |
 |---|---|---|
 | `processed` | transaction digest → () | `CommitHandler.processed` |
 | `locks` | object ref → transaction digest | `CommitHandler.locks` |
 | `streams` | stream → its last generation (round, k) | `VersionResolver.last_generation`, moved (decision 2) |
-| `commit` | () → the stage's state after a commit: last commit index, checkpoint queue (pending heights, timestamps, next height and sequence number), commit interval window, closed flag, accumulator root version | `CommitStage`, `CheckpointQueue`, `CommitIntervalObserver`; the reference's `last_consensus_stats_v2` |
 
-The commit handler writes one batch per commit: the commit's new processed
-digests and locks, and the `commit` record. Its in-memory state becomes
-an overlay over these keyspaces, holding only what is not yet durable.
+Step two adds `commit`: the stage's state after a commit (last commit index,
+checkpoint queue, commit interval window, closed flag, accumulator root
+version), the reference's `last_consensus_stats_v2`.
 
 ### Checkpoint builder state
 
-The `CheckpointBuilderTables` writer is shared only by the checkpoint
-processors (`SummaryBuilder`, `EpochCloser`, `StateHasher`).
+The `BuilderOutput` writer is made once, when the store opens, and given
+only to the checkpoint builder's parts: the checkpoint store (written by
+`SummaryBuilder`, and seeded with the previous epoch's last checkpoint) and
+the state hashes (written by `StateHasher`).
 
 | Keyspace | Key → value | From |
 |---|---|---|
-| `built` | seq → `BuiltCheckpoint` | `CheckpointStore` (built, not yet committed); the reference's builder summaries and locally computed checkpoints |
-| `state_hashes` | seq → ECMH, running root | `StateHashes` |
+| `built` | seq → `BuiltCheckpoint` | `CheckpointStore`; the reference's builder summaries and locally computed checkpoints |
+| `checkpoint_hashes` | seq → ECMH | `StateHashes` |
+| `roots` | seq → running root | `StateHashes` |
 
 ### Everything else
 
 | Keyspace | Key → value | From |
 |---|---|---|
-| `start_versions` | (id, initial shared version) → version, digest | the store's `start_versions`, which the executor records at a stream's first use |
-| `generations` | (stream, round, k) → generation | each stream's last generation pruned from the `GenerationTable` (decision 3) |
+| `chunks` | height → settled chunk | `ChunkTable`, written by `SettlementScheduler` |
+| `generations` | (stream, round, k) → generation | `GenerationTable`, written by `Executor` |
+| `start_versions` (in `kept`) | (id, initial shared version) → version, digest | the store's `start_versions`, which the executor records at a stream's first use |
 
 ### Kept in memory
 
-Bounded, or rebuilt by replay, so not stored: the decoded-transaction cache
-(bounded by GC depth), the consensus status cache (400 rounds), the
-signature caches, settlement and funds state (chunks and reservations in
-flight), the chunk table (pruned at each commit), the aggregator's pending
-signatures, the waiters and queues, and the executor's type cache. The
-package cache becomes bounded.
+Bounded, so not stored: the decoded-transaction cache (bounded by GC
+depth), the consensus status cache (400 rounds), the signature caches,
+settlement and funds state (chunks and reservations in flight), the
+aggregator's pending signatures, the waiters and queues. The executor's
+Move runtime keeps every package it resolves, so it is replaced, with the
+package and type caches filled from it, once it has resolved 1024.
 
 ## Decisions
 
@@ -98,26 +103,19 @@ package cache becomes bounded.
    commit handler, which attaches it to each access, so it becomes consensus
    output (a `streams` keyspace: stream → its last generation) and the
    resolver keeps no state.
-3. **Prune rather than store** the generation table and the per-checkpoint
-   state hashes, at each checkpoint commit. Every round before the
-   committed checkpoint's last chunk's has executed, so the generation table
-   drops those rounds. Each stream's last generation among them is still
-   read by later rounds until the stream is written again, and one per
-   stream touched in the epoch is unbounded, so it moves to the epoch store
-   (`generations`, in "everything else"). Lookups for pruned rounds read it
-   there, off the hot path.
+3. **No pruning in the epoch store.** It is dropped with the epoch, so
+   epoch state that grows without bound (generations, settled chunks,
+   built checkpoints, state hashes) is stored there whole.
 
 ## Order of work
 
-1. The epoch store: Tidehunter per epoch directory, the three sections and
-   their writer and reader types, opening, deletion, discard on restart.
+1. The epoch store: per-epoch directory, the sections and their writers,
+   opening, deletion, emptying on restart.
 2. Perpetual epoch records, replacing `meta/epochst`; start versions moved to
    the epoch store.
-3. Consensus output: processed digests, locks and the `commit` record through
-   the commit handler's writer; the round links moved from the resolver.
-4. Pruning (decision 3), and the Move runtime replaced, with the package and
-   type caches filled from it, once it has resolved 1024 packages: a
-   runtime keeps every package it resolves.
-5. Quarantine, flush at checkpoint commit, resume on restart, with builder
-   state: built checkpoints, which until then are bounded in memory by the
-   window between building and committing, and the `commit` record.
+3. Consensus output through the commit handler's writer; the round links
+   moved from the resolver.
+4. Execution, settlement and builder state in the epoch store (decision 3);
+   the Move runtime bounded.
+5. Quarantine, flush at checkpoint commit, resume on restart, with the
+   `commit` record.
