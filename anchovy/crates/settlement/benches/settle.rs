@@ -174,6 +174,8 @@ fn digest_of(executable: &Executable) -> [u8; 32] {
 fn bench_process(size: usize, effects: &[Vec<u8>]) {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(store::Store::open(dir.path()).unwrap());
+    let epochs = tempfile::tempdir().unwrap();
+    let (epoch_store, _, _) = validator::epoch_store::EpochStore::open(epochs.path(), 0);
     store
         .write_through(store::Commit {
             written: vec![store::Written {
@@ -210,7 +212,7 @@ fn bench_process(size: usize, effects: &[Vec<u8>]) {
     let mut scheduler = SettlementScheduler::new(
         epoch.clone(),
         store.clone(),
-        Arc::new(ChunkTable::new()),
+        Arc::new(ChunkTable::new(epoch_store)),
         effects_q,
         inputs_q,
         checkpoints_q,

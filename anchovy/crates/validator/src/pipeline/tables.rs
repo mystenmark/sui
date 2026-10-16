@@ -1,22 +1,19 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The tables availability checks read. Each is shared by its writer and
-//! its readers across threads; a writer records an entry before notifying
-//! its key, so a reader that finds no entry may wait for the key.
+//! The tables availability checks read, over the epoch store. Each is
+//! shared by its writer and its readers across threads; a writer records an
+//! entry before notifying its key, so a reader that finds no entry may wait
+//! for the key.
 
-use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use crate::epoch_store::EpochStore;
-use crate::pipeline::items::SettledChunk;
+use crate::epoch_store::{BuilderOutput, EpochStore};
+use crate::pipeline::items::{ExecutedEffects, SettledChunk};
 use crate::pipeline::keys::StreamId;
 
-type FastMap<K, V> = HashMap<K, V, foldhash::fast::RandomState>;
-
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    // Every critical section here is a single map operation, which leaves
-    // the map consistent even if it panicked.
+    // The lock guards no data, only makes a read and a write one step.
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -31,37 +28,27 @@ pub enum Generation {
     Ended { version: u64, transaction: [u8; 32] },
 }
 
-/// Stream generations by `(stream, round, generation)`. Written by
-/// `Executor` (owner: the exec-pool work), read by the input waiter's
-/// availability check and by `Executor` to resolve exact versions, pruned by
-/// `CheckpointCommitter` (`prune_below`).
+/// Stream generations by `(stream, round, generation)`, in the epoch
+/// store. Written by `Executor` (owner: the exec-pool work), read by the
+/// input waiter's availability check and by `Executor` to resolve exact
+/// versions.
 pub struct GenerationTable {
-    generations: Mutex<Generations>,
-    /// Where pruned generations that readers may still ask for are kept.
     store: EpochStore,
-}
-
-#[derive(Default)]
-struct Generations {
-    recorded: FastMap<(StreamId, u32, u32), Generation>,
-    /// Rounds below this are pruned: their generations are in the epoch
-    /// store, if a reader may still ask for them.
-    pruned_below: u32,
+    /// Makes `get_or_record`'s read and write one step.
+    recording: Mutex<()>,
 }
 
 impl GenerationTable {
     pub fn new(store: EpochStore) -> GenerationTable {
         GenerationTable {
-            generations: Mutex::default(),
             store,
+            recording: Mutex::new(()),
         }
     }
 
     /// Records generation `generation` of `stream` in `round`.
     pub fn record(&self, stream: StreamId, round: u32, generation: u32, value: Generation) {
-        lock(&self.generations)
-            .recorded
-            .insert((stream, round, generation), value);
+        self.store.put_generation(&stream, round, generation, value);
     }
 
     /// Generation `generation` of `stream` in `round`: the one recorded, or
@@ -73,87 +60,60 @@ impl GenerationTable {
         generation: u32,
         value: impl FnOnce() -> Generation,
     ) -> Generation {
-        *lock(&self.generations)
-            .recorded
-            .entry((stream, round, generation))
-            .or_insert_with(value)
+        let _recording = lock(&self.recording);
+        if let Some(recorded) = self.store.generation(&stream, round, generation) {
+            return recorded;
+        }
+        let value = value();
+        self.store.put_generation(&stream, round, generation, value);
+        value
     }
 
     /// Generation `generation` of `stream` in `round`, if recorded.
-    ///
-    /// # Panics
-    /// If it was pruned without being kept: no reader asks for one.
     pub fn get(&self, stream: StreamId, round: u32, generation: u32) -> Option<Generation> {
-        let generations = lock(&self.generations);
-        if let Some(found) = generations.recorded.get(&(stream, round, generation)) {
-            return Some(*found);
-        }
-        if round >= generations.pruned_below {
-            return None;
-        }
-        let kept = self.store.generation(&stream, round, generation);
-        assert!(
-            kept.is_some(),
-            "generation {generation} of {stream:?} in round {round} was pruned, not kept"
-        );
-        kept
-    }
-
-    /// Prunes the rounds below `round`, all of whose transactions have
-    /// executed. Each stream's last generation among them stays readable,
-    /// from the epoch store: a later round reads it until the stream is
-    /// written again. No other is read again.
-    pub fn prune_below(&self, round: u32) {
-        let mut generations = lock(&self.generations);
-        if round <= generations.pruned_below {
-            return;
-        }
-        let mut last: FastMap<StreamId, (u32, u32, Generation)> = FastMap::default();
-        for (&(stream, r, k), value) in &generations.recorded {
-            if r < round
-                && last
-                    .get(&stream)
-                    .is_none_or(|&(lr, lk, _)| (r, k) > (lr, lk))
-            {
-                last.insert(stream, (r, k, *value));
-            }
-        }
-        let kept: Vec<_> = last
-            .into_iter()
-            .map(|(stream, (r, k, value))| (stream, r, k, value))
-            .collect();
-        // Written before they leave memory, under the lock: a reader never
-        // finds them in neither.
-        self.store.put_generations(&kept);
-        generations.recorded.retain(|&(_, r, _), _| r >= round);
-        generations.pruned_below = round;
+        self.store.generation(&stream, round, generation)
     }
 }
 
-/// Settled chunks by height. Written by `SettlementScheduler` (owner: the
-/// settlement work), read by the checkpoint waiter's availability check and
-/// by `ContentsBuilder`, pruned by `CheckpointCommitter`.
-#[derive(Default)]
+/// Settled chunks by height, in the epoch store. Written by
+/// `SettlementScheduler` (owner: the settlement work), read by the
+/// checkpoint waiter's availability check and by `ContentsBuilder`.
 pub struct ChunkTable {
-    chunks: Mutex<FastMap<u64, Arc<SettledChunk>>>,
+    store: EpochStore,
 }
 
 impl ChunkTable {
-    pub fn new() -> ChunkTable {
-        ChunkTable::default()
+    pub fn new(store: EpochStore) -> ChunkTable {
+        ChunkTable { store }
     }
 
-    pub fn insert(&self, chunk: SettledChunk) {
-        lock(&self.chunks).insert(chunk.height, Arc::new(chunk));
+    pub fn insert(&self, chunk: &SettledChunk) {
+        let effects: Vec<_> = chunk
+            .effects
+            .iter()
+            .map(|e| (e.digest, e.effects_digest, &e.effects[..]))
+            .collect();
+        let encoded =
+            bcs::to_bytes(&(chunk.height, chunk.checkpoint_seq, effects)).expect("a chunk encodes");
+        self.store.put_chunk(chunk.height, encoded);
     }
 
     pub fn get(&self, height: u64) -> Option<Arc<SettledChunk>> {
-        lock(&self.chunks).get(&height).cloned()
-    }
-
-    /// Drops the chunks at or below `height`.
-    pub fn prune_through(&self, height: u64) {
-        lock(&self.chunks).retain(|&h, _| h > height);
+        let bytes = self.store.chunk(height)?;
+        let (height, checkpoint_seq, effects): (u64, u64, Vec<([u8; 32], [u8; 32], Vec<u8>)>) =
+            bcs::from_bytes(&bytes).expect("a stored chunk decodes");
+        Some(Arc::new(SettledChunk {
+            height,
+            checkpoint_seq,
+            effects: effects
+                .into_iter()
+                .map(|(digest, effects_digest, effects)| ExecutedEffects {
+                    digest,
+                    effects_digest,
+                    effects: effects.into(),
+                })
+                .collect(),
+        }))
     }
 }
 
@@ -224,48 +184,28 @@ impl BuiltCheckpoint {
     }
 }
 
-/// Checkpoints built, by sequence number. Written by `SummaryBuilder`
-/// (owner: the checkpoint work) and pruned by `CheckpointCommitter`; read by
-/// the built waiter's availability check.
-#[derive(Default)]
+/// Checkpoints built, by sequence number, in the epoch store's checkpoint
+/// builder state, with the previous epoch's last. Written by
+/// `SummaryBuilder` (owner: the checkpoint work); read by the built
+/// waiter's availability check, the aggregator and the committer.
 pub struct CheckpointStore {
-    built: Mutex<Built>,
-}
-
-#[derive(Default)]
-struct Built {
-    checkpoints: BTreeMap<u64, Arc<BuiltCheckpoint>>,
-    /// Every checkpoint below was built, and pruned.
-    pruned_below: u64,
+    store: EpochStore,
+    output: BuilderOutput,
 }
 
 impl CheckpointStore {
-    pub fn new() -> CheckpointStore {
-        CheckpointStore::default()
+    pub fn new(store: EpochStore, output: BuilderOutput) -> CheckpointStore {
+        CheckpointStore { store, output }
     }
 
     pub fn insert_built(&self, checkpoint: BuiltCheckpoint) -> Arc<BuiltCheckpoint> {
-        let checkpoint = Arc::new(checkpoint);
-        lock(&self.built)
-            .checkpoints
-            .insert(checkpoint.seq, checkpoint.clone());
-        checkpoint
+        self.output.put_built(checkpoint.seq, checkpoint.encode());
+        Arc::new(checkpoint)
     }
 
     pub fn built(&self, seq: u64) -> Option<Arc<BuiltCheckpoint>> {
-        lock(&self.built).checkpoints.get(&seq).cloned()
-    }
-
-    /// Whether checkpoint `seq` was built, though perhaps pruned since.
-    pub fn is_built(&self, seq: u64) -> bool {
-        let built = lock(&self.built);
-        seq < built.pruned_below || built.checkpoints.contains_key(&seq)
-    }
-
-    /// Drops the checkpoints below `seq`.
-    pub fn prune_below(&self, seq: u64) {
-        let mut built = lock(&self.built);
-        built.checkpoints = built.checkpoints.split_off(&seq);
-        built.pruned_below = built.pruned_below.max(seq);
+        self.store
+            .built(seq)
+            .map(|bytes| Arc::new(BuiltCheckpoint::decode(&bytes)))
     }
 }

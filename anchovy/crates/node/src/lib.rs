@@ -31,7 +31,7 @@ use validator::consensus::status::ConsensusTxStatusCache;
 use validator::consensus::vote::VoteRequest;
 use validator::current::EpochHandle;
 use validator::epoch::EpochState;
-use validator::epoch_store::{ConsensusOutput as OutputWriter, EpochStore};
+use validator::epoch_store::{BuilderOutput, ConsensusOutput as OutputWriter, EpochStore};
 use validator::pipeline::items::{CertifiedCheckpoint, EffectsWaitItem};
 use validator::pipeline::keys::EffectsKey;
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable, GenerationTable};
@@ -149,6 +149,7 @@ impl Pipeline {
         epoch: &Arc<EpochState>,
         epoch_store: &EpochStore,
         consensus_output: OutputWriter,
+        builder_output: BuilderOutput,
         protocol_key: &Arc<ProtocolKey>,
         committee: &Arc<Committee>,
         consensus: impl FnOnce(ConsensusOutput) -> TransactionClient,
@@ -156,7 +157,10 @@ impl Pipeline {
         record: &EpochRecord,
     ) -> Pipeline {
         let (first, start) = epoch_start(store, epoch_store, record);
-        let checkpoints = Arc::new(CheckpointStore::new());
+        let checkpoints = Arc::new(CheckpointStore::new(
+            epoch_store.clone(),
+            builder_output.clone(),
+        ));
         checkpoints.insert_built(first);
         let next_to_certify = store
             .committed_checkpoint()
@@ -179,10 +183,10 @@ impl Pipeline {
             consensus: consensus.clone(),
             cache: Arc::new(ConsensusTxCache::new()),
             generations: Arc::new(GenerationTable::new(epoch_store.clone())),
-            chunks: Arc::new(ChunkTable::new()),
+            chunks: Arc::new(ChunkTable::new(epoch_store.clone())),
             checkpoints,
             statuses: Arc::new(ConsensusTxStatusCache::new()),
-            state_hashes: Arc::new(StateHashes::new()),
+            state_hashes: Arc::new(StateHashes::new(epoch_store.clone(), builder_output)),
             start,
             next_to_certify,
             first_hashed: record.previous_checkpoint + 1,

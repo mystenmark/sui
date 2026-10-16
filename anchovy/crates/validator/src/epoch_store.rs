@@ -29,21 +29,23 @@ pub struct EpochStore {
 impl EpochStore {
     /// Epoch `epoch`'s store under `root`, what a replay writes again
     /// emptied: at the epoch's start, and on restart. With it, the one
-    /// writer of its consensus output, for the commit handler.
+    /// writer of its consensus output, for the commit handler, and the one
+    /// writer of its checkpoint builder state.
     ///
     /// # Panics
     /// If the database cannot be opened.
-    pub fn open(root: &Path, epoch: u64) -> (EpochStore, ConsensusOutput) {
+    pub fn open(root: &Path, epoch: u64) -> (EpochStore, ConsensusOutput, BuilderOutput) {
         let db = Arc::new(EpochDb::open(root, epoch).expect("the epoch's database opens"));
-        let output = ConsensusOutput {
+        let consensus = ConsensusOutput {
             db: db.clone(),
             pending: Pending::default(),
         };
+        let builder = BuilderOutput { db: db.clone() };
         let store = EpochStore {
             db,
             start_versions: Arc::new(Mutex::new(())),
         };
-        (store, output)
+        (store, consensus, builder)
     }
 
     pub fn epoch(&self) -> u64 {
@@ -94,34 +96,37 @@ impl EpochStore {
 }
 
 impl EpochStore {
-    /// Writes generations pruned from the generation table that readers may
-    /// still ask for: `(stream, round, generation, value)`.
+    /// Records generation `generation` of `stream` in `round`.
     ///
     /// # Panics
     /// If the database cannot be written.
-    pub fn put_generations(&self, generations: &[(StreamId, u32, u32, Generation)]) {
+    pub fn put_generation(
+        &self,
+        stream: &StreamId,
+        round: u32,
+        generation: u32,
+        value: Generation,
+    ) {
+        let (tag, version, bytes) = match value {
+            Generation::Version { version, digest } => (0, version, digest),
+            Generation::Ended {
+                version,
+                transaction,
+            } => (1, version, transaction),
+        };
+        let mut encoded = vec![tag];
+        encoded.extend_from_slice(&version.to_le_bytes());
+        encoded.extend_from_slice(&bytes);
         let mut batch = self.db.batch(&[Space::Generations]);
-        for (stream, round, generation, value) in generations {
-            let (tag, version, bytes) = match *value {
-                Generation::Version { version, digest } => (0, version, digest),
-                Generation::Ended {
-                    version,
-                    transaction,
-                } => (1, version, transaction),
-            };
-            let mut encoded = vec![tag];
-            encoded.extend_from_slice(&version.to_le_bytes());
-            encoded.extend_from_slice(&bytes);
-            batch.put(
-                Space::Generations,
-                generation_key(stream, *round, *generation).to_vec(),
-                encoded,
-            );
-        }
+        batch.put(
+            Space::Generations,
+            generation_key(stream, round, generation).to_vec(),
+            encoded,
+        );
         batch.commit().expect("the epoch's database writes");
     }
 
-    /// A generation `put_generations` wrote.
+    /// Generation `generation` of `stream` in `round`, if recorded.
     ///
     /// # Panics
     /// If the database cannot be read.
@@ -145,6 +150,96 @@ impl EpochStore {
                 transaction: bytes,
             },
         })
+    }
+
+    /// Records the chunk settled at `height`, encoded.
+    ///
+    /// # Panics
+    /// If the database cannot be written.
+    pub fn put_chunk(&self, height: u64, chunk: Vec<u8>) {
+        let mut batch = self.db.batch(&[Space::Chunks]);
+        batch.put(Space::Chunks, height.to_be_bytes().to_vec(), chunk);
+        batch.commit().expect("the epoch's database writes");
+    }
+
+    /// The chunk settled at `height`, as `put_chunk` wrote it.
+    ///
+    /// # Panics
+    /// If the database cannot be read.
+    pub fn chunk(&self, height: u64) -> Option<Vec<u8>> {
+        self.db
+            .get(Space::Chunks, &height.to_be_bytes())
+            .expect("the epoch's database reads")
+    }
+
+    /// Checkpoint `seq`, built here, as the builder wrote it.
+    ///
+    /// # Panics
+    /// If the database cannot be read.
+    pub fn built(&self, seq: u64) -> Option<Vec<u8>> {
+        self.db
+            .get(Space::Built, &seq.to_be_bytes())
+            .expect("the epoch's database reads")
+    }
+
+    /// Checkpoint `seq`'s state hash, as the builder wrote it.
+    ///
+    /// # Panics
+    /// If the database cannot be read.
+    pub fn checkpoint_hash(&self, seq: u64) -> Option<Vec<u8>> {
+        self.db
+            .get(Space::CheckpointHashes, &seq.to_be_bytes())
+            .expect("the epoch's database reads")
+    }
+
+    /// The root after checkpoint `seq`, as the builder wrote it.
+    ///
+    /// # Panics
+    /// If the database cannot be read.
+    pub fn root(&self, seq: u64) -> Option<Vec<u8>> {
+        self.db
+            .get(Space::Roots, &seq.to_be_bytes())
+            .expect("the epoch's database reads")
+    }
+}
+
+/// The epoch's checkpoint builder state, written through this writer only:
+/// it is made once, with the store, and cloned only for the checkpoint
+/// builder's parts.
+#[derive(Clone)]
+pub struct BuilderOutput {
+    db: Arc<EpochDb>,
+}
+
+impl BuilderOutput {
+    /// Records checkpoint `seq`, built here, encoded.
+    ///
+    /// # Panics
+    /// If the database cannot be written.
+    pub fn put_built(&self, seq: u64, checkpoint: Vec<u8>) {
+        self.put(Space::Built, seq, checkpoint);
+    }
+
+    /// Records checkpoint `seq`'s state hash.
+    ///
+    /// # Panics
+    /// If the database cannot be written.
+    pub fn put_checkpoint_hash(&self, seq: u64, hash: Vec<u8>) {
+        self.put(Space::CheckpointHashes, seq, hash);
+    }
+
+    /// Records the root after checkpoint `seq`.
+    ///
+    /// # Panics
+    /// If the database cannot be written.
+    pub fn put_root(&self, seq: u64, root: Vec<u8>) {
+        self.put(Space::Roots, seq, root);
+    }
+
+    fn put(&self, space: Space, seq: u64, value: Vec<u8>) {
+        let mut batch = self.db.batch(&[space]);
+        batch.put(space, seq.to_be_bytes().to_vec(), value);
+        batch.commit().expect("the epoch's database writes");
     }
 }
 

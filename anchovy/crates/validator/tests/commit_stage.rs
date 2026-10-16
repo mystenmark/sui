@@ -38,7 +38,7 @@ const ROOT_VERSION: u64 = 5;
 /// directory the store is in.
 fn consensus_output() -> (ConsensusOutput, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let (_, output) = EpochStore::open(dir.path(), 0);
+    let (_, output, _) = EpochStore::open(dir.path(), 0);
     (output, dir)
 }
 

@@ -92,7 +92,9 @@ fn main() {
             )
             .unwrap(),
         );
-        let checkpoints = Arc::new(CheckpointStore::new());
+        let epochs = tempfile::tempdir().unwrap();
+        let (epoch_store, _, builder) = validator::epoch_store::EpochStore::open(epochs.path(), 0);
+        let checkpoints = Arc::new(CheckpointStore::new(epoch_store, builder));
         let (state_sync, certified) = workqueue::queue(rounds + 1);
         let mut aggregator =
             CheckpointAggregator::new(committee, checkpoints.clone(), 0, state_sync);

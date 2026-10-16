@@ -177,6 +177,7 @@ fn system(executable: &Executable) -> &SystemTransaction {
 
 struct Harness {
     _dir: tempfile::TempDir,
+    _epochs: tempfile::TempDir,
     store: Arc<store::Store>,
     chunks: Arc<ChunkTable>,
     scheduler: SettlementScheduler,
@@ -191,7 +192,9 @@ impl Harness {
     fn new(checkpoint_capacity: usize, funds_capacity: usize) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(store::Store::open(dir.path()).unwrap());
-        let chunks = Arc::new(ChunkTable::new());
+        let epochs = tempfile::tempdir().unwrap();
+        let (epoch_store, _, _) = validator::epoch_store::EpochStore::open(epochs.path(), 0);
+        let chunks = Arc::new(ChunkTable::new(epoch_store));
         write(
             &store,
             ObjectId(support::ROOT),
@@ -213,6 +216,7 @@ impl Harness {
         );
         Harness {
             _dir: dir,
+            _epochs: epochs,
             store,
             chunks,
             scheduler,

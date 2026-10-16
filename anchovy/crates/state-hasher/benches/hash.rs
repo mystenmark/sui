@@ -59,12 +59,20 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
+/// Empty state hashes, over an epoch store in a directory kept alive with
+/// them.
+fn state_hashes() -> (Arc<StateHashes>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _, builder) = validator::epoch_store::EpochStore::open(dir.path(), 0);
+    (Arc::new(StateHashes::new(store, builder)), dir)
+}
+
 fn main() {
     let mut rng = Rng(0x2545_f491_4f6c_dd1d);
     println!("checkpoint  us/tx  ms/checkpoint  allocs/checkpoint");
     for size in [100, 1000] {
         let effects = checkpoint(&mut rng, size);
-        let hashes = Arc::new(StateHashes::new());
+        let (hashes, _dir) = state_hashes();
         let mut processor = StateHasher::new(hashes.clone(), 0, StateHash::default());
         let rounds: u32 = if size == 100 { 100 } else { 20 };
         let mut elapsed = Duration::ZERO;

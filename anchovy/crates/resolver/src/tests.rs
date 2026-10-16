@@ -44,7 +44,7 @@ const CHAIN: [u8; 32] = [0x5a; 32];
 /// with it.
 fn generation_table() -> (Arc<GenerationTable>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let (store, _) = validator::epoch_store::EpochStore::open(dir.path(), 0);
+    let (store, _, _) = validator::epoch_store::EpochStore::open(dir.path(), 0);
     (Arc::new(GenerationTable::new(store)), dir)
 }
 
@@ -161,7 +161,7 @@ fn generation(stream: StreamId, round: u32, generation: u32) -> InputKey {
 /// round's generation before the resolver sees it.
 fn handler() -> (CommitHandler, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let (_, output) = EpochStore::open(dir.path(), 0);
+    let (_, output, _) = EpochStore::open(dir.path(), 0);
     (CommitHandler::new(output), dir)
 }
 

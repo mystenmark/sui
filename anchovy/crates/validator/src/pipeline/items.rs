@@ -262,8 +262,6 @@ pub struct ExecutedEffects {
 #[derive(Debug, Clone)]
 pub struct SettledChunk {
     pub height: u64,
-    /// The round of the commit the chunk is from.
-    pub round: u32,
     pub checkpoint_seq: u64,
     pub effects: Vec<ExecutedEffects>,
 }
