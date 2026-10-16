@@ -4,7 +4,6 @@
 //! Turning a chunk's transactions into the keys their inputs wait on
 //! (`docs/consensus_pipeline.md`, Execution).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use containers::Bump;
@@ -13,7 +12,7 @@ use messages::Message;
 use messages::base::{ChainIdentifier, ObjectId};
 use messages::object::Object;
 use messages::transaction::{CallArg, Command as MoveCommand, ObjectArg, TransactionKind};
-use messages::transaction::{Reservation, SharedObjectMutability, TransactionData, TxState};
+use messages::transaction::{Reservation, TransactionData, TxState};
 use messages::transaction::{WithdrawFrom, WithdrawalTypeArg};
 use messages::type_tag::TypeTag;
 use validator::consensus::sequence::SharedAccess;
@@ -27,12 +26,11 @@ use validator::pipeline::tables::{Generation, GenerationTable};
 use waiter::{Availability, Command, WaitBatch};
 use workqueue::{Processor, PushError, Queue};
 
-/// In commit order, turns each scheduled transaction's inputs into input
-/// waiter keys: `ObjectVersion` for owned, immutable and receiving objects;
-/// `Package` for packages; `Generation` for a shared access at generation
-/// `k > 0`; for generation 0, the stream's last generation it scheduled in
-/// an earlier round, or `StreamLive` if none, after which the stream is at
-/// generation 0 of the round.
+/// Turns each scheduled transaction's inputs into input waiter keys:
+/// `ObjectVersion` for owned, immutable and receiving objects; `Package` for
+/// packages; `Generation` for a shared access at generation `k > 0`; for
+/// generation 0, the base the commit handler linked it to, the stream's last
+/// generation from an earlier round, or `StreamLive` if none.
 ///
 /// Inward:
 /// - `CommitStage`: `Chunk`.
@@ -47,11 +45,6 @@ pub struct VersionResolver {
     epoch: Arc<EpochParams>,
     pub inputs: Queue<InputCommand>,
     pub withdrawals: Queue<FundsCommand>,
-    /// Each stream's last scheduled generation: (round, generation). Only an
-    /// exclusive write moves it: readers and non-exclusive writers leave a
-    /// stream at its generation. A stream first seen live in round `r` is at
-    /// `(r, 0)`.
-    pub last_generation: HashMap<StreamId, (u32, u32)>,
     /// Scratch: one transaction's keys, its packages, and its withdrawals.
     keys: Vec<InputKey>,
     packages: Vec<ObjectId>,
@@ -68,7 +61,6 @@ impl VersionResolver {
             epoch,
             inputs,
             withdrawals,
-            last_generation: HashMap::new(),
             keys: Vec::new(),
             packages: Vec::new(),
             amounts: Vec::new(),
@@ -95,13 +87,8 @@ impl VersionResolver {
     }
 
     /// Pushes the keys of `shared`'s accesses to `keys`, with each
-    /// generation 0 it resolves to an earlier round's generation in
-    /// `resolved_base`, and records the generations its exclusive writes
-    /// produce. Accesses are in schedule order.
-    ///
-    /// # Panics
-    /// On a generation-0 access after an exclusive write of its stream in
-    /// the same round: the sequencer counts every earlier write.
+    /// generation 0 the commit handler linked to an earlier round's
+    /// generation in `resolved_base`.
     fn resolve_shared(
         &mut self,
         shared: &[SharedAccess],
@@ -112,44 +99,23 @@ impl VersionResolver {
                 id: access.id,
                 initial_shared_version: access.initial_shared_version,
             };
-            let round = access.ordinal.round;
-            let generation = access.ordinal.writes_before;
-            let key = if generation > 0 {
-                InputKey::Generation {
+            let key = match (access.ordinal.writes_before, access.base) {
+                (0, Some(base)) => {
+                    resolved_base.push((stream, base.round, base.writes_before));
+                    InputKey::Generation {
+                        stream,
+                        round: base.round,
+                        generation: base.writes_before,
+                    }
+                }
+                (0, None) => InputKey::StreamLive(stream),
+                (generation, _) => InputKey::Generation {
                     stream,
-                    round,
+                    round: access.ordinal.round,
                     generation,
-                }
-            } else {
-                match self.last_generation.get(&stream) {
-                    Some(&(base_round, base)) if base_round < round => {
-                        resolved_base.push((stream, base_round, base));
-                        InputKey::Generation {
-                            stream,
-                            round: base_round,
-                            generation: base,
-                        }
-                    }
-                    // Recorded by an earlier live access of this round.
-                    Some(&(base_round, 0)) if base_round == round => InputKey::StreamLive(stream),
-                    Some(_) => panic!(
-                        "generation 0 of {stream:?} in round {round} after a write in that round"
-                    ),
-                    None => {
-                        // Later rounds wait for generation 0, which the Executor
-                        // records when this round first touches the stream: none
-                        // of them executes before this round's live readers.
-                        self.last_generation.insert(stream, (round, 0));
-                        InputKey::StreamLive(stream)
-                    }
-                }
+                },
             };
             self.keys.push(key);
-            // A transaction writes a stream once, so its later accesses
-            // never see this.
-            if access.mutability == SharedObjectMutability::Mutable {
-                self.last_generation.insert(stream, (round, generation + 1));
-            }
         }
     }
 

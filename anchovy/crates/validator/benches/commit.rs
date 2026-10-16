@@ -46,9 +46,18 @@ use validator::checks;
 use validator::consensus::commit::{CommitStage, EpochStart};
 use validator::consensus::decode::{CommittedTransaction, DecodedCommit};
 use validator::epoch::EpochParams;
+use validator::epoch_store::{ConsensusOutput, EpochStore};
 use workqueue::Processor;
 
 struct Counting;
+
+/// The one writer of a fresh epoch store's consensus output, and the
+/// directory the store is in.
+fn consensus_output() -> (ConsensusOutput, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, output) = EpochStore::open(dir.path(), 0);
+    (output, dir)
+}
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 
@@ -186,9 +195,11 @@ fn main() {
                 epoch_start_timestamp_ms: 0,
                 epoch_duration_ms: u64::MAX,
             };
+            let (output, _dir) = consensus_output();
             let mut stage = CommitStage::new(
                 epoch.clone(),
                 start,
+                output,
                 chunks,
                 settlements,
                 checkpoints,

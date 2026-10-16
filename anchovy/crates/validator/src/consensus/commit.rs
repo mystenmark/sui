@@ -14,7 +14,6 @@
 //! `CommitStage` lays the schedule out in chunks and checkpoints for the
 //! pipeline. Congestion control is not here yet.
 
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -28,11 +27,12 @@ use crate::consensus::sequence::{
 };
 use crate::consensus::status::{ConsensusTxStatus, ConsensusTxStatusCache};
 use crate::epoch::EpochParams;
+use crate::epoch_store::ConsensusOutput;
 use crate::pipeline::items::{
     Chunk, ChunkSettlement, EpochClose, ExecutableTransaction, PendingCheckpoint, ScheduledEntry,
     SettlementInput, SystemKind, SystemTransaction,
 };
-use crate::pipeline::keys::{AccumulatorVersion, ChunkSettled, TxDigest};
+use crate::pipeline::keys::{AccumulatorVersion, ChunkSettled, StreamId, TxDigest};
 
 /// Why a committed transaction was dropped.
 #[derive(Debug)]
@@ -66,38 +66,37 @@ impl Refuse for HandledCommit {
     fn refuse(self, _: Refusal) {}
 }
 
-/// The consensus handler. Its state is in memory for now; persisted later,
-/// it is written and read back only by the handler.
+/// The consensus handler. What it decided, beyond the commit in hand, is
+/// the epoch store's consensus output, which it alone writes and reads:
+/// - the user transactions processed this epoch;
+/// - the owned references locked this epoch, and the transaction holding
+///   each: the reference's `owned_object_locked_transactions`;
+/// - each shared-object stream's last scheduled generation.
+///
+/// Each is only looked up, never iterated, so no order of theirs can reach
+/// an output.
 ///
 /// Run inside `CommitStage`, which feeds it decoded commits and lays out
 /// what it decides.
 pub struct CommitHandler {
     /// The index of the last commit handled; 0 before the first.
     last_commit: u32,
-    /// The digests of the user transactions processed so far. Only looked
-    /// up, never iterated, so its order cannot reach an output.
-    processed: HashSet<[u8; 32]>,
-    /// The owned references locked this epoch, and the transaction holding
-    /// each: the reference's `owned_object_locked_transactions`. Only looked
-    /// up, never iterated.
-    locks: HashMap<ObjectRef, TxDigest, foldhash::fast::RandomState>,
+    output: ConsensusOutput,
     sequencer: Sequencer,
 }
 
-impl Default for CommitHandler {
-    fn default() -> CommitHandler {
-        CommitHandler::new()
-    }
-}
-
 impl CommitHandler {
-    pub fn new() -> CommitHandler {
+    pub fn new(output: ConsensusOutput) -> CommitHandler {
         CommitHandler {
             last_commit: 0,
-            processed: HashSet::new(),
-            locks: HashMap::default(),
+            output,
             sequencer: Sequencer::new(),
         }
+    }
+
+    /// Writes what the commits handled since the last call decided.
+    pub fn finish(&mut self) {
+        self.output.commit();
     }
 
     /// Decides `commit`, or nothing if it was handled before. It takes only
@@ -136,10 +135,11 @@ impl CommitHandler {
         } in commit.transactions
         {
             let digest = transaction.get().0.digest().bytes;
-            if !self.processed.insert(digest) {
+            if self.output.is_processed(&digest) {
                 duplicates.push((block, index, digest));
                 continue;
             }
+            self.output.set_processed(digest);
             if let Err(drop) = self.lock(digest, owned) {
                 dropped.push((block, index, digest, drop));
                 continue;
@@ -149,8 +149,9 @@ impl CommitHandler {
         }
 
         // 3. The schedule: the prologue, the transactions in protocol order,
-        //    shared accesses with their ordinals.
-        let schedule = self.sequencer.schedule(&epoch.config, prologue, accepted);
+        //    shared accesses with their ordinals, linked to earlier rounds.
+        let mut schedule = self.sequencer.schedule(&epoch.config, prologue, accepted);
+        self.link(schedule.all_accesses_mut());
         Some(HandledCommit {
             commit_index: commit.commit_index,
             schedule,
@@ -168,27 +169,58 @@ impl CommitHandler {
     /// does not conflict with itself.
     fn lock(&mut self, digest: TxDigest, owned: OwnedInputs) -> Result<(), DropReason> {
         let owned = owned.map_err(DropReason::Inputs)?;
-        // Most transactions lock only their gas coin: one probe.
-        if let [object] = owned[..] {
-            return match self.locks.entry(object) {
-                Entry::Occupied(held) => Err(DropReason::LockConflict {
-                    object,
-                    holder: *held.get(),
-                }),
-                Entry::Vacant(free) => {
-                    free.insert(digest);
-                    Ok(())
-                }
-            };
-        }
         if let Some((object, holder)) = owned
             .iter()
-            .find_map(|r| self.locks.get(r).map(|holder| (*r, *holder)))
+            .find_map(|r| self.output.lock_holder(r).map(|holder| (*r, holder)))
         {
             return Err(DropReason::LockConflict { object, holder });
         }
-        self.locks.extend(owned.into_iter().map(|r| (r, digest)));
+        for object in owned {
+            self.output.set_lock(object, digest);
+        }
         Ok(())
+    }
+
+    /// Sets each generation-0 access's base, the stream's last generation
+    /// from an earlier round, and records the generations exclusive writes
+    /// produce. Accesses are in schedule order.
+    ///
+    /// # Panics
+    /// On a generation-0 access after an exclusive write of its stream in
+    /// the same round: the sequencer counts every earlier write.
+    pub fn link(&mut self, accesses: &mut [SharedAccess]) {
+        for access in accesses {
+            let stream = StreamId {
+                id: access.id,
+                initial_shared_version: access.initial_shared_version,
+            };
+            let round = access.ordinal.round;
+            let generation = access.ordinal.writes_before;
+            if generation == 0 {
+                match self.output.stream(&stream) {
+                    Some((base_round, base)) if base_round < round => {
+                        access.base = Some(SharedOrdinal {
+                            round: base_round,
+                            writes_before: base,
+                        });
+                    }
+                    // Recorded by an earlier live access of this round.
+                    Some((base_round, 0)) if base_round == round => {}
+                    Some(_) => panic!(
+                        "generation 0 of {stream:?} in round {round} after a write in that round"
+                    ),
+                    // Later rounds wait for generation 0, which the executor
+                    // records when this round first touches the stream: none
+                    // of them executes before this round's live readers.
+                    None => self.output.set_stream(stream, (round, 0)),
+                }
+            }
+            // A transaction writes a stream once, so its later accesses
+            // never see this.
+            if access.mutability == messages::transaction::SharedObjectMutability::Mutable {
+                self.output.set_stream(stream, (round, generation + 1));
+            }
+        }
     }
 }
 
@@ -295,6 +327,7 @@ impl CommitStage {
     pub fn new(
         epoch: Arc<EpochParams>,
         start: EpochStart,
+        output: ConsensusOutput,
         chunks: workqueue::Queue<Chunk>,
         settlements: workqueue::Queue<SettlementInput>,
         checkpoints: workqueue::Queue<waiter::Command<ChunkSettled, PendingCheckpoint>>,
@@ -302,7 +335,7 @@ impl CommitStage {
     ) -> CommitStage {
         CommitStage {
             epoch,
-            handler: CommitHandler::new(),
+            handler: CommitHandler::new(output),
             start,
             queue: CheckpointQueue::new(
                 start.previous_checkpoint,
@@ -402,7 +435,7 @@ impl CommitStage {
                     })
                 })
                 .count();
-            vec![SharedAccess {
+            let mut close = vec![SharedAccess {
                 id: SYSTEM_STATE,
                 initial_shared_version: SYSTEM_STATE_INITIAL_SHARED_VERSION,
                 mutability: messages::transaction::SharedObjectMutability::Mutable,
@@ -411,7 +444,10 @@ impl CommitStage {
                     writes_before: u32::try_from(writes_before)
                         .expect("fewer than 2^32 transactions"),
                 },
-            }]
+                base: None,
+            }];
+            self.handler.link(&mut close);
+            close
         });
 
         // 4. Chunks and checkpoints.
@@ -477,6 +513,8 @@ impl CommitStage {
                         round: prologue.round,
                         writes_before: u32::try_from(position).expect("fewer than 2^32 chunks"),
                     },
+                    // Settlement links the root's rounds.
+                    base: None,
                 },
             });
             decided.chunks.push(Chunk {
@@ -576,7 +614,9 @@ impl Processor for CommitStage {
             .iter()
             .map(|t| (t.block, t.index))
             .collect();
-        let decided = self.decide(commit)?;
+        let decided = self.decide(commit);
+        self.handler.finish();
+        let decided = decided?;
         // What became of each transaction, for its submitter: dropped, or
         // finalized (scheduled, or a duplicate of one that was).
         let dropped: HashSet<(BlockRef, TransactionIndex)> =

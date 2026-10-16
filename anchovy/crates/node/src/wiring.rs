@@ -24,7 +24,7 @@ use validator::consensus::decode::{CommitDecoder, CommitRequest, DecodedCommit};
 use validator::consensus::status::ConsensusTxStatusCache;
 use validator::consensus::vote::{BlockVoter, VoteRequest};
 use validator::epoch::EpochState;
-use validator::epoch_store::EpochStore;
+use validator::epoch_store::{ConsensusOutput as OutputWriter, EpochStore};
 use validator::pipeline::items::{
     BuiltCommand, BuiltWaits, CertifiedCheckpoint, CheckpointContentsBuilt, CheckpointEffects,
     CheckpointSignature, Chunk, EffectsWaitItem, EpochCloserInput, Executable, FundsCommand,
@@ -48,6 +48,7 @@ pub(crate) fn spawn(
     parts: Arc<Parts>,
     q: &Queues,
     i: Inboxes,
+    output: OutputWriter,
     state_sync: Queue<CertifiedCheckpoint>,
     ended: watch::Sender<Option<u64>>,
 ) -> Vec<WorkerHandle> {
@@ -62,7 +63,7 @@ pub(crate) fn spawn(
         // Consensus.
         w.one("voting",            i.votes,            |p, q| p.voter(q.built_waits),                                  drop),
         w.one("commit-decode",     i.commits,          |p, q| p.decoder(q.built_waits),                                into(&q.handler, "handler")),
-        w.one("commit-handler",    i.handler,          |p, q| p.commit_stage(q.resolver, q.settlement, q.checkpoint_waits), drop),
+        w.one("commit-handler",    i.handler,          move |p, q| p.commit_stage(output, q.resolver, q.settlement, q.checkpoint_waits), drop),
         // Execution.
         w.one("resolver",          i.resolver,         |p, q| p.resolver(q.input_waits, q.funds),                     drop),
         w.one("input-waiter",      i.input_waits,      |p, _| WaiterProcessor::new(p.input_availability()),           into(&q.executor, "executor")),
@@ -168,6 +169,7 @@ impl Parts {
 
     fn commit_stage(
         &self,
+        output: OutputWriter,
         resolver: Queue<Chunk>,
         settlement: Queue<SettlementInput>,
         checkpoint_waits: Queue<Command<ChunkSettled, PendingCheckpoint>>,
@@ -175,6 +177,7 @@ impl Parts {
         CommitStage::new(
             self.epoch.params.clone(),
             self.start,
+            output,
             resolver,
             settlement,
             checkpoint_waits,
