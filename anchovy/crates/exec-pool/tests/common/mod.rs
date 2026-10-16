@@ -118,7 +118,7 @@ impl Node {
         ));
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(store::Store::open(&dir.path().join("perpetual")).unwrap());
-        let (epoch_store, _) = EpochStore::open(&dir.path().join("epochs"), 0);
+        let (epoch_store, _, _) = EpochStore::open(&dir.path().join("epochs"), 0);
         let funded = vec![(sender.to_inner(), 10 * SUI); coins];
         assert!(execution::genesis::init(epoch.execution.reference(), &store, &funded).unwrap());
         let generations = Arc::new(GenerationTable::new(epoch_store.clone()));

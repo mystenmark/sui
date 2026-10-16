@@ -594,7 +594,7 @@ impl Network {
                         .filter(|h| self.pipeline().chunks.get(*h).is_some())
                         .collect::<Vec<_>>(),
                     (0..=seq + 2)
-                        .filter(|s| self.pipeline().checkpoints.is_built(*s))
+                        .filter(|s| self.pipeline().checkpoints.built(*s).is_some())
                         .collect::<Vec<_>>(),
                 );
                 std::thread::sleep(Duration::from_millis(2));
@@ -1312,7 +1312,12 @@ fn checkpoints_of_several_commits() {
     // Commits until checkpoint 2 is cut and built.
     wait_for("checkpoint 2 to be built", || {
         network.commit(vec![]);
-        network.pipeline().checkpoints.is_built(2).then_some(())
+        network
+            .pipeline()
+            .checkpoints
+            .built(2)
+            .is_some()
+            .then_some(())
     });
     network.certify(2);
     let mut listed = HashSet::new();

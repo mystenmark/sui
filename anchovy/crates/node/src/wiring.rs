@@ -266,7 +266,6 @@ impl Parts {
     fn built_availability(&self) -> BuiltAvailability {
         BuiltAvailability {
             checkpoints: self.checkpoints.clone(),
-            store: self.store.clone(),
         }
     }
 
@@ -313,14 +312,7 @@ impl Parts {
     }
 
     fn committer(&self, ended: watch::Sender<Option<u64>>) -> CheckpointCommitter {
-        CheckpointCommitter::new(
-            self.store.clone(),
-            self.checkpoints.clone(),
-            self.chunks.clone(),
-            self.generations.clone(),
-            self.state_hashes.clone(),
-            ended,
-        )
+        CheckpointCommitter::new(self.store.clone(), self.checkpoints.clone(), ended)
     }
 }
 

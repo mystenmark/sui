@@ -211,12 +211,14 @@ impl Epoch {
             Committee::new(record.epoch, record.committee.iter().copied())
                 .expect("the epoch's committee is valid"),
         );
-        let (epoch_store, consensus_output) = EpochStore::open(&perpetual.epochs, record.epoch);
+        let (epoch_store, consensus_output, builder_output) =
+            EpochStore::open(&perpetual.epochs, record.epoch);
         let pipeline = Pipeline::start(
             &perpetual.store,
             &state,
             &epoch_store,
             consensus_output,
+            builder_output,
             &perpetual.protocol_key,
             &committee,
             |output| consensus(&state, output),

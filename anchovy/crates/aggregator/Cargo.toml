@@ -17,6 +17,7 @@ workqueue.workspace = true
 [dev-dependencies]
 bcs.workspace = true
 sui-types.workspace = true
+tempfile.workspace = true
 
 [[bench]]
 name = "aggregate"

@@ -101,7 +101,7 @@ impl Rng {
 /// with it.
 fn generation_table() -> (Arc<GenerationTable>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let (store, _) = validator::epoch_store::EpochStore::open(dir.path(), 0);
+    let (store, _, _) = validator::epoch_store::EpochStore::open(dir.path(), 0);
     (Arc::new(GenerationTable::new(store)), dir)
 }
 

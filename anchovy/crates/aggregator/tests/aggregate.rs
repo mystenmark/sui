@@ -29,6 +29,8 @@ struct Setup {
     /// What the aggregator handed on, and what state sync got.
     committer: Vec<CertifiedCheckpoint>,
     state_sync: Inbox<CertifiedCheckpoint>,
+    /// The epoch store the checkpoints are in.
+    _epochs: tempfile::TempDir,
 }
 
 /// An aggregator whose next checkpoint to certify is `next`.
@@ -48,7 +50,9 @@ fn setup(size: usize, next: u64) -> Setup {
     )
     .unwrap();
     assert_eq!(committee.quorum_threshold(), sui.quorum_threshold());
-    let checkpoints = Arc::new(CheckpointStore::new());
+    let epochs = tempfile::tempdir().unwrap();
+    let (epoch_store, _, builder) = validator::epoch_store::EpochStore::open(epochs.path(), 0);
+    let checkpoints = Arc::new(CheckpointStore::new(epoch_store, builder));
     let (to_state_sync, state_sync) = workqueue::queue(16);
     let aggregator = CheckpointAggregator::new(
         Arc::new(committee),
@@ -63,6 +67,7 @@ fn setup(size: usize, next: u64) -> Setup {
         aggregator,
         committer: Vec::new(),
         state_sync,
+        _epochs: epochs,
     }
 }
 

@@ -11,29 +11,24 @@ use messages::base::Digest;
 use messages::checkpoint::{CheckpointContents, VersionedCheckpointContents};
 use messages::fast::Bump;
 use messages::reader::Reader;
-use state_hasher::StateHashes;
 use tokio::sync::watch;
 use validator::pipeline::items::CertifiedCheckpoint;
-use validator::pipeline::tables::{CheckpointStore, ChunkTable, GenerationTable};
+use validator::pipeline::tables::CheckpointStore;
 use workqueue::Processor;
 
 /// Commits each certified checkpoint's transactions from the writeback
 /// cache to the database, with its record, certificate and the committed
-/// watermark, in one batch; then prunes what only uncommitted checkpoints
-/// need. Once the epoch's last checkpoint has committed, says so: the epoch
-/// is over. The start of a `CheckpointExecutor`.
+/// watermark, in one batch. Once the epoch's last checkpoint has committed,
+/// says so: the epoch is over. The start of a `CheckpointExecutor`.
 ///
 /// Inward: `CheckpointAggregator`: `Vec<CertifiedCheckpoint>`, in sequence
 /// order.
 ///
-/// Reads and prunes: the checkpoint store, the chunk table, the generation
-/// table, the state hashes. Writes: the object store, as its only committer.
+/// Reads: the checkpoint store. Writes: the object store, as its only
+/// committer.
 pub struct CheckpointCommitter {
     store: Arc<store::Store>,
     checkpoints: Arc<CheckpointStore>,
-    chunks: Arc<ChunkTable>,
-    generations: Arc<GenerationTable>,
-    state_hashes: Arc<StateHashes>,
     /// The epoch's last checkpoint, once committed.
     ended: watch::Sender<Option<u64>>,
     bump: Bump,
@@ -43,17 +38,11 @@ impl CheckpointCommitter {
     pub fn new(
         store: Arc<store::Store>,
         checkpoints: Arc<CheckpointStore>,
-        chunks: Arc<ChunkTable>,
-        generations: Arc<GenerationTable>,
-        state_hashes: Arc<StateHashes>,
         ended: watch::Sender<Option<u64>>,
     ) -> CheckpointCommitter {
         CheckpointCommitter {
             store,
             checkpoints,
-            chunks,
-            generations,
-            state_hashes,
             ended,
             bump: Bump::with_capacity(super::ARENA),
         }
@@ -75,17 +64,6 @@ impl CheckpointCommitter {
             built.encode(),
             certified.summary.to_vec(),
         );
-        // The next summary is built over this one.
-        self.checkpoints.prune_below(seq);
-        // Every chunk through the last has executed, so every commit of an
-        // earlier round than the last chunk's.
-        let last = self
-            .chunks
-            .get(built.last_height)
-            .expect("a committed checkpoint's chunks have settled");
-        self.generations.prune_below(last.round);
-        self.chunks.prune_through(built.last_height);
-        self.state_hashes.prune_below(seq);
         if built.root_state.is_some() {
             self.ended.send_replace(Some(seq));
         }

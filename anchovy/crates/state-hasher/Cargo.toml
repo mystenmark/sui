@@ -13,6 +13,7 @@ validator.workspace = true
 workqueue.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 sui-types.workspace = true
 
 [[bench]]

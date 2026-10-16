@@ -14,6 +14,7 @@ use messages::fast::Bump;
 use messages::reader::Reader;
 use workqueue::{Processor, Queue};
 
+use validator::epoch_store::{BuilderOutput, EpochStore};
 use validator::pipeline::items::{CheckpointEffects, EpochCloserInput, ExecutedEffects};
 
 /// The reference's `GlobalStateHash`: an ECMH over object digests.
@@ -86,68 +87,58 @@ pub fn accumulate(effects: &[ExecutedEffects], bump: &mut Bump) -> StateHash {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    // Every critical section is a single map operation, which leaves the
-    // maps consistent even if it panicked.
+    // The critical section is one assignment, which leaves the value
+    // consistent even if it panicked.
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-#[derive(Default)]
-struct Hashes {
-    checkpoints: BTreeMap<u64, StateHash>,
-    roots: BTreeMap<u64, StateHash>,
-}
-
-/// The epoch's state hashes, shared between `StateHasher` (the only writer)
-/// and their readers: the end of the epoch reads the running root through
-/// the epoch's last checkpoint (its ECMH digest is the epoch's live object
-/// set commitment), and the checkpoint executor reads per-checkpoint
-/// hashes.
+/// The epoch's state hashes, in the epoch store's checkpoint builder state,
+/// shared between `StateHasher` (the only writer) and their readers: the
+/// end of the epoch reads the running root through the epoch's last
+/// checkpoint (its ECMH digest is the epoch's live object set commitment),
+/// and the checkpoint executor reads per-checkpoint hashes.
 ///
 /// A checkpoint's hash is recorded as soon as it is computed; its running
 /// root only after every earlier root of the epoch, so `root(seq)` present
 /// means every root before it is too.
-#[derive(Default)]
 pub struct StateHashes {
-    hashes: Mutex<Hashes>,
+    store: EpochStore,
+    output: BuilderOutput,
+    /// The last checkpoint folded into the root, and the root after it.
+    latest: Mutex<Option<(u64, StateHash)>>,
 }
 
 impl StateHashes {
-    pub fn new() -> StateHashes {
-        StateHashes::default()
+    pub fn new(store: EpochStore, output: BuilderOutput) -> StateHashes {
+        StateHashes {
+            store,
+            output,
+            latest: Mutex::new(None),
+        }
     }
 
     /// What checkpoint `seq`'s effects added and removed, if computed.
     pub fn checkpoint(&self, seq: u64) -> Option<StateHash> {
-        lock(&self.hashes).checkpoints.get(&seq).cloned()
+        self.store.checkpoint_hash(seq).map(|bytes| decode(&bytes))
     }
 
     /// The live object set's hash after checkpoint `seq`, if folded.
     pub fn root(&self, seq: u64) -> Option<StateHash> {
-        lock(&self.hashes).roots.get(&seq).cloned()
+        self.store.root(seq).map(|bytes| decode(&bytes))
     }
 
     /// The last checkpoint folded into the root, and the root after it.
     pub fn latest_root(&self) -> Option<(u64, StateHash)> {
-        lock(&self.hashes)
-            .roots
-            .last_key_value()
-            .map(|(seq, root)| (*seq, root.clone()))
+        lock(&self.latest).clone()
     }
 
-    /// Drops the hashes and roots of checkpoints below `seq`, which have
-    /// committed: their readers are done with them.
-    pub fn prune_below(&self, seq: u64) {
-        let mut hashes = lock(&self.hashes);
-        hashes.checkpoints = hashes.checkpoints.split_off(&seq);
-        hashes.roots = hashes.roots.split_off(&seq);
-    }
-
-    fn insert_checkpoint(&self, seq: u64, hash: StateHash) {
-        lock(&self.hashes).checkpoints.insert(seq, hash);
+    fn insert_checkpoint(&self, seq: u64, hash: &StateHash) {
+        self.output.put_checkpoint_hash(seq, encode(hash));
     }
 
     fn insert_root(&self, seq: u64, root: StateHash) {
-        lock(&self.hashes).roots.insert(seq, root);
+        self.output.put_root(seq, encode(&root));
+        *lock(&self.latest) = Some((seq, root));
     }
 }
 
@@ -217,7 +208,7 @@ impl Processor for StateHasher {
             "checkpoint {seq} hashed twice"
         );
         let hash = accumulate(&effects.effects, &mut self.bump);
-        self.hashes.insert_checkpoint(seq, hash.clone());
+        self.hashes.insert_checkpoint(seq, &hash);
         self.pending.insert(seq, (hash, effects.last_of_epoch));
         while let Some((hash, last_of_epoch)) = self.pending.remove(&self.next) {
             self.root.union(&hash);

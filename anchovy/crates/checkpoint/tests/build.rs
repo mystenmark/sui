@@ -26,6 +26,7 @@ use sui_types::messages_checkpoint::{
 use sui_types::messages_consensus::{ConsensusTransaction, ConsensusTransactionKind};
 use sui_types::transaction::SenderSignedData as SuiSigned;
 use validator::epoch::EpochParams;
+use validator::epoch_store::{BuilderOutput, EpochStore};
 use validator::pipeline::items::{
     BuiltWaitItem, CheckpointContentsBuilt, ExecutedEffects, PendingCheckpoint, SettledChunk,
 };
@@ -37,7 +38,10 @@ use workqueue::{Inbox, Processor, queue};
 struct Mainnet {
     checkpoint: Message<CheckpointData<'static>>,
     store: Arc<Store>,
+    epoch_store: EpochStore,
+    builder: BuilderOutput,
     _dir: tempfile::TempDir,
+    _epochs: tempfile::TempDir,
 }
 
 impl Mainnet {
@@ -65,10 +69,15 @@ impl Mainnet {
                 })
                 .unwrap();
         }
+        let epochs = tempfile::tempdir().unwrap();
+        let (epoch_store, _, builder) = EpochStore::open(epochs.path(), 0);
         Mainnet {
             checkpoint,
             store,
+            epoch_store,
+            builder,
             _dir: dir,
+            _epochs: epochs,
         }
     }
 
@@ -91,14 +100,13 @@ impl Mainnet {
 
     /// The checkpoint's effects in chunks at `heights`, split at `split`.
     fn chunks(&self, heights: [u64; 2], split: usize) -> Arc<ChunkTable> {
-        let chunks = Arc::new(ChunkTable::new());
+        let chunks = Arc::new(ChunkTable::new(self.epoch_store.clone()));
         let mut effects = self.effects();
         let rest = effects.split_off(split);
         let [first, second] = heights;
         for (height, effects) in [(first, effects), (second, rest)] {
-            chunks.insert(SettledChunk {
+            chunks.insert(&SettledChunk {
                 height,
-                round: 0,
                 checkpoint_seq: self.summary().sequence_number,
                 effects,
             });
@@ -383,7 +391,7 @@ fn out_of_order_checkpoints_summarize_in_order() {
     let s = m.summary();
     let epoch = params(ProtocolVersion::MAX.as_u64(), s.epoch);
     // Checkpoints 11, 12 and 13 of one or two chunks each.
-    let chunks = Arc::new(ChunkTable::new());
+    let chunks = Arc::new(ChunkTable::new(m.epoch_store.clone()));
     let effects = m.effects();
     let groups = [
         &effects[0..5],
@@ -392,14 +400,16 @@ fn out_of_order_checkpoints_summarize_in_order() {
         &effects[12..14],
     ];
     for (height, group) in groups.iter().enumerate() {
-        chunks.insert(SettledChunk {
+        chunks.insert(&SettledChunk {
             height: height as u64,
-            round: 0,
             checkpoint_seq: 0,
             effects: group.to_vec(),
         });
     }
-    let checkpoints = Arc::new(CheckpointStore::new());
+    let checkpoints = Arc::new(CheckpointStore::new(
+        m.epoch_store.clone(),
+        m.builder.clone(),
+    ));
     checkpoints.insert_built(previous(10, s.epoch, [9; 32], 100, [1, 2, 3, 4]));
 
     let (to_hasher, hasher_inbox) = queue(16);
@@ -414,7 +424,6 @@ fn out_of_order_checkpoints_summarize_in_order() {
     );
     let mut waiter = WaiterProcessor::new(BuiltAvailability {
         checkpoints: checkpoints.clone(),
-        store: m.store.clone(),
     });
     let mut summary =
         SummaryBuilder::new(epoch.clone(), checkpoints.clone(), key(), built, consensus);
