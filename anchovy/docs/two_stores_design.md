@@ -31,6 +31,7 @@ A new Tidehunter database per epoch, `<db>/epoch_<N>`, opened by
 the next epoch's record and the old epoch is dropped, its directory is
 deleted (keeping the previous one, as the reference keeps a few).
 
+On restart (decision 1, step one) the directory is deleted and re-created.
 Three sections, each its own keyspaces, each with its own writer type. A
 writer is not `Clone`, and is constructed once, when the store opens. Every
 section has cloneable readers.
@@ -44,6 +45,7 @@ can write these keyspaces.
 |---|---|---|
 | `processed` | transaction digest → () | `CommitHandler.processed` |
 | `locks` | object ref → transaction digest | `CommitHandler.locks` |
+| `streams` | stream → its last generation (round, k) | `VersionResolver.last_generation`, moved (decision 2) |
 | `commit` | () → the stage's state after a commit: last commit index, checkpoint queue (pending heights, timestamps, next height and sequence number), commit interval window, closed flag, accumulator root version | `CommitStage`, `CheckpointQueue`, `CommitIntervalObserver`; the reference's `last_consensus_stats_v2` |
 
 The commit handler writes one batch per commit: the commit's new processed
@@ -65,7 +67,6 @@ processors (`SummaryBuilder`, `EpochCloser`, `StateHasher`).
 | Keyspace | Key → value | From |
 |---|---|---|
 | `start_versions` | (id, initial shared version) → version, digest | the store's `start_versions`, which the executor records at a stream's first use |
-| `generations` | (stream, round, k) → generation | `GenerationTable` (see open question 3) |
 
 ### Kept in memory
 
@@ -76,49 +77,39 @@ flight), the chunk table (pruned at each commit), the aggregator's pending
 signatures, the waiters and queues, and the executor's type cache. The
 package cache becomes bounded.
 
-## Crash consistency: open question 1
+## Decisions
 
-Today a restart replays the epoch's commits from its first. The epoch store
-can support either:
-
-- **A. Discard and replay.** On restart the epoch's directory is deleted and
-  re-created, and the epoch replays from its start as today. The epoch store
-  is written eagerly. It bounds memory without touching restart.
-- **B. Quarantine and resume** (the reference). The consensus output and
-  builder writers keep their batches in memory until a certified checkpoint
-  covering them commits. Then they flush through the last commit whose
-  checkpoint queue had drained (the reference's `1ad56a6b81`), in one batch
-  with the `commit` record. On restart consensus replays from that record's
-  commit, and the stages start from the stored state, not the epoch's start.
-  The store never holds output of a forked local view.
-
-B is what the strict separation is for. But it changes how every stage
-starts: settlement, funds, the resolver and the state hasher must resume
-mid-epoch from stored state too.
-
-## Open questions
-
-1. **Restart**: A or B (above). A recommended first, as its own step, with B
-   to follow. Most of the work (the stores, the writer split) is common.
-2. **The resolver's per-stream state** (`VersionResolver.last_generation`)
-   is a function of the commit handler's output, but it is computed
-   downstream. Either the commit handler numbers generations itself, which
-   makes it consensus output written by the handler, or it stays the
-   resolver's, in "everything else". The first is cleaner under B.
-3. **Prune rather than store**: the generation table only needs entries a
-   transaction not yet executed can read, and the state hashes only the
-   running root once a checkpoint has committed. Pruning them at checkpoint
-   commit keeps them in memory and off the input waiter's hot path.
-   Recommended: prune both; the `generations` keyspace then goes.
+1. **Restart: discard and replay first, then quarantine and resume.** Step
+   one writes the epoch store eagerly. On restart the epoch's directory is
+   deleted and re-created, and the epoch replays from its start, as today.
+   This bounds memory without touching restart. Step two is the
+   reference's quarantine. The consensus output and builder writers keep
+   their batches in memory until a certified checkpoint covering them
+   commits. They then flush through the last commit whose checkpoint queue
+   had drained (the reference's `1ad56a6b81`), in one batch with the
+   `commit` record. On restart, consensus replays from that commit and every
+   stage starts from stored state, so the store never holds output of a
+   forked local view.
+2. **The commit handler links rounds.** A shared access's ordinal is
+   (round, writes before it in the round). Generation 0 of a round also
+   needs the stream's last generation from an earlier round. The resolver
+   keeps that today (`VersionResolver.last_generation`). It moves into the
+   commit handler, which attaches it to each access, so it becomes consensus
+   output (a `streams` keyspace: stream → its last generation) and the
+   resolver keeps no state.
+3. **Prune rather than store** the generation table (entries no unexecuted
+   transaction can read) and the per-checkpoint state hashes (all but the
+   running root, once a checkpoint commits). Both stay in memory, off the
+   input waiter's hot path, and the `generations` keyspace goes.
 
 ## Order of work
 
-1. The epoch store crate or module: Tidehunter per epoch directory, the
-   three sections and their writer and reader types, opening and deletion.
+1. The epoch store: Tidehunter per epoch directory, the three sections and
+   their writer and reader types, opening, deletion, discard on restart.
 2. Perpetual epoch records, replacing `meta/epochst`; start versions moved to
    the epoch store.
 3. Consensus output: processed digests, locks and the `commit` record through
-   the commit handler's writer.
+   the commit handler's writer; the round links moved from the resolver.
 4. Builder state: built checkpoints and state hashes.
-5. Pruning (question 3) and a bounded package cache.
-6. If B: quarantine, flush at checkpoint commit, resume on restart.
+5. Pruning (decision 3) and a bounded package cache.
+6. Quarantine, flush at checkpoint commit, resume on restart.
