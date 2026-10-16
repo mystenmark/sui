@@ -37,24 +37,55 @@ pub fn parse(transaction: &[u8]) -> Result<Message<Transaction<'static, DigestRe
     Message::parse(transaction.to_vec()).map_err(|(e, _)| Error::Native(format!("{e:?}")))
 }
 
+/// Packages a runtime may resolve before it is replaced, by default: it keeps every package it
+/// resolves, so this bounds its memory however many packages an epoch's transactions use.
+const MAX_PACKAGES: usize = 1024;
+
 /// Anchovy's executor for one epoch.
 pub struct NativeExecution {
-    /// The transactions' arena, reset after each: execution is serial, so the lock is
-    /// uncontended.
-    arena: std::sync::Mutex<Bump>,
+    /// Execution is serial, so the lock is uncontended.
+    state: std::sync::Mutex<State>,
     /// Built once from `config`: the natives' costs are fixed for the epoch.
     natives_cost_table: natives::NativesCostTable,
-    /// The types and layouts the VM computed in the epoch. It must not outlive the epoch, at
-    /// whose end the system packages change in place.
-    type_cache: Arc<TypeCache>,
-    /// The packages `move_vm` resolved, filled from it only.
-    package_cache: Arc<PackageCache>,
+    /// Packages a runtime may resolve before it is replaced.
+    max_packages: usize,
     config: ProtocolConfig,
-    move_vm: Arc<MoveRuntime>,
     metrics: Arc<ExecutionMetrics>,
     epoch: u64,
     epoch_start_timestamp_ms: u64,
     reference_gas_price: u64,
+}
+
+/// What execution keeps between transactions.
+struct State {
+    /// The transactions' arena, reset after each.
+    arena: Bump,
+    runtime: Runtime,
+}
+
+/// A Move runtime, and the caches filled from it: replaced together.
+struct Runtime {
+    move_vm: Arc<MoveRuntime>,
+    /// The packages `move_vm` resolved, filled from it only.
+    package_cache: Arc<PackageCache>,
+    /// The types and layouts the VM computed. It must not outlive the epoch, at whose end the
+    /// system packages change in place.
+    type_cache: Arc<TypeCache>,
+}
+
+impl Runtime {
+    fn new(config: &ProtocolConfig) -> Result<Runtime> {
+        let move_vm = executor::adapter::new_move_runtime(
+            natives::all_natives(/* silent */ true, config),
+            config,
+        )
+        .map_err(|e| Error::Native(e.0))?;
+        Ok(Runtime {
+            move_vm: Arc::new(move_vm),
+            package_cache: Arc::new(PackageCache::new()),
+            type_cache: Arc::new(TypeCache::new()),
+        })
+    }
 }
 
 impl NativeExecution {
@@ -65,23 +96,26 @@ impl NativeExecution {
         epoch_start_timestamp_ms: u64,
         reference_gas_price: u64,
     ) -> Result<NativeExecution> {
-        let move_vm = executor::adapter::new_move_runtime(
-            natives::all_natives(/* silent */ true, &config),
-            &config,
-        )
-        .map_err(|e| Error::Native(e.0))?;
         Ok(NativeExecution {
-            arena: std::sync::Mutex::new(Bump::with_capacity(ARENA_CAPACITY)),
+            state: std::sync::Mutex::new(State {
+                arena: Bump::with_capacity(ARENA_CAPACITY),
+                runtime: Runtime::new(&config)?,
+            }),
             natives_cost_table: natives::NativesCostTable::from_protocol_config(&config),
-            type_cache: Arc::new(TypeCache::new()),
-            package_cache: Arc::new(PackageCache::new()),
+            max_packages: MAX_PACKAGES,
             config,
-            move_vm: Arc::new(move_vm),
             metrics,
             epoch,
             epoch_start_timestamp_ms,
             reference_gas_price,
         })
+    }
+
+    /// Replaces the runtime once it has resolved more than `max` packages.
+    #[must_use]
+    pub fn with_max_packages(mut self, max: usize) -> NativeExecution {
+        self.max_packages = max;
+        self
     }
 
     /// Executes `transaction` (`SenderSignedData` BCS, whose inputs passed the input checks)
@@ -118,9 +152,11 @@ impl NativeExecution {
         funds: Funds,
         assigned_accumulator: Option<u64>,
     ) -> Result<Outcome> {
-        let mut arena = self.arena.lock().expect("the arena's lock is not poisoned");
+        let mut state = self.state.lock().expect("the state's lock is not poisoned");
+        let State { arena, runtime } = &mut *state;
         let outcome = self.execute_in(
-            &arena,
+            arena,
+            runtime,
             store,
             data,
             transaction,
@@ -134,6 +170,9 @@ impl NativeExecution {
         } else {
             arena.reset();
         }
+        if runtime.package_cache.len() > self.max_packages {
+            *runtime = Runtime::new(&self.config).expect("a runtime builds as it did at the start");
+        }
         outcome
     }
 
@@ -141,6 +180,7 @@ impl NativeExecution {
     fn execute_in<S: TxState + HasDigest>(
         &self,
         bump: &Bump,
+        runtime: &Runtime,
         store: &store::Store,
         data: &TransactionData<'_, S>,
         transaction: &[u8],
@@ -209,7 +249,7 @@ impl NativeExecution {
             None,
             *data.sender(),
             digest,
-            &self.move_vm,
+            &runtime.move_vm,
             &self.epoch,
             self.epoch_start_timestamp_ms,
             &self.config,
@@ -217,8 +257,8 @@ impl NativeExecution {
             false,
             early,
             Some(&self.natives_cost_table),
-            Some(&self.type_cache),
-            Some(&self.package_cache),
+            Some(&runtime.type_cache),
+            Some(&runtime.package_cache),
         );
 
         let written = inner_store.written.values().map(written).collect();

@@ -35,6 +35,15 @@ impl PackageCache {
         packages.get(id).cloned()
     }
 
+    /// How many packages it holds.
+    pub fn len(&self) -> usize {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     fn insert(&self, id: ObjectId, package: Arc<VerifiedPackage>) {
         let mut packages = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         packages.insert(id, package);
