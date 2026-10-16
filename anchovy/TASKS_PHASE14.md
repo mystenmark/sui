@@ -13,12 +13,14 @@ in memory.
   - checkpoint builder state;
   - everything else.
 
-## Status: design drafted, open questions with the user
+## Status: design agreed; implementing step 1
 
 ## Steps
 
 1. Survey: every store, table and stateful structure anchovy has today,
    and the reference's perpetual, epoch and checkpoint databases, with
    their write discipline (sub-agents).
-2. Design: `docs/two_stores_design.md`. To be agreed.
+2. Design: `docs/two_stores_design.md`. Agreed: discard-and-replay first,
+   then quarantine; the commit handler links rounds; prune generations and
+   state hashes in memory.
 3. Implementation, in the design's order of work.
