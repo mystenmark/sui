@@ -6,6 +6,7 @@
 //! the running epoch, and state sync. Per epoch: everything in `Epoch`,
 //! which dropping stops and joins.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use aggregator::Committee;
@@ -15,6 +16,7 @@ use messages::base::Digest;
 use protocol_config::Chain;
 use validator::current::CurrentEpoch;
 use validator::epoch::EpochState;
+use validator::epoch_store::EpochStore;
 use validator::pipeline::items::CertifiedCheckpoint;
 use validator::pipeline::tables::BuiltCheckpoint;
 use workqueue::Queue;
@@ -126,11 +128,13 @@ impl EpochRecord {
     /// # Panics
     /// If the store cannot be read or has no genesis.
     pub fn load(store: &store::Store) -> EpochRecord {
-        let bytes = store
+        let (epoch, bytes) = store
             .epoch_start()
             .expect("the store reads")
             .expect("genesis wrote the first epoch's start");
-        EpochRecord::decode(&bytes)
+        let record = EpochRecord::decode(&bytes);
+        assert_eq!(record.epoch, epoch, "an epoch's record is keyed by it");
+        record
     }
 }
 
@@ -161,6 +165,8 @@ pub fn genesis(
 /// What the node keeps across epochs.
 pub struct Perpetual {
     pub store: Arc<store::Store>,
+    /// Where each epoch's store is kept, until the epoch after next.
+    pub epochs: PathBuf,
     pub current: CurrentEpoch,
     /// To state sync, which owns the other end: certified checkpoints.
     pub state_sync: Queue<CertifiedCheckpoint>,
@@ -205,9 +211,11 @@ impl Epoch {
             Committee::new(record.epoch, record.committee.iter().copied())
                 .expect("the epoch's committee is valid"),
         );
+        let epoch_store = EpochStore::open(&perpetual.epochs, record.epoch);
         let pipeline = Pipeline::start(
             &perpetual.store,
             &state,
+            &epoch_store,
             &perpetual.protocol_key,
             &committee,
             |output| consensus(&state, output),
@@ -290,7 +298,10 @@ pub fn reconfigure(store: &store::Store) {
         0,
         "nothing uncommitted outlives its epoch"
     );
-    store.commit_epoch_start(EpochRecord::new(state, last, root_state).encode());
+    store.commit_epoch_start(
+        state.epoch,
+        EpochRecord::new(state, last, root_state).encode(),
+    );
 }
 
 /// The node: what lives for good, and the epoch running now.
@@ -358,6 +369,9 @@ impl Node {
         epoch.drain();
         drop(epoch);
         reconfigure(&self.perpetual.store);
+        let next = EpochRecord::load(&self.perpetual.store).epoch;
+        store::epoch::prune_before(&self.perpetual.epochs, next)
+            .expect("old epochs' stores are deleted");
     }
 
     /// Runs epoch after epoch, for good, starting each one's consensus with

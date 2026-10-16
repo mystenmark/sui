@@ -244,6 +244,7 @@ fn an_executed_transaction_republishes_its_generation_from_its_effects() {
     let mut executor = Executor::new(
         node.store.clone(),
         node.epoch.clone(),
+        node.epoch_store.clone(),
         node.generations.clone(),
         inputs,
         effects,

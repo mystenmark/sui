@@ -8,6 +8,7 @@ pub mod codec;
 pub mod consensus;
 pub mod current;
 pub mod epoch;
+pub mod epoch_store;
 pub mod pipeline;
 pub mod processors;
 pub mod proto;

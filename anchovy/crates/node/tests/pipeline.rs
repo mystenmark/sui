@@ -152,7 +152,7 @@ impl Network {
         record_panics();
         let (sender, key) = get_key_pair::<AccountKeyPair>();
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(store::Store::open(dir.path()).unwrap());
+        let store = Arc::new(store::Store::open(&dir.path().join("perpetual")).unwrap());
         let genesis = genesis::build(sender, coins, 10 * SUI, epoch_duration_ms);
         execution::genesis::commit(&store, &genesis.objects).unwrap();
         node::epoch::genesis(
@@ -172,6 +172,7 @@ impl Network {
         let lanes = (normal, priority);
         let perpetual = Perpetual {
             store,
+            epochs: dir.path().join("epochs"),
             current: CurrentEpoch::new(),
             state_sync: state_sync.0.clone(),
             chain: CHAIN,
@@ -265,6 +266,7 @@ impl Network {
         // The epoch's workers hold the store: stopped first, it closes.
         let Perpetual {
             store,
+            epochs,
             current,
             protocol_key,
             chain_identifier,
@@ -277,12 +279,13 @@ impl Network {
             "only the node holds the store"
         );
         drop(store);
-        let store = Arc::new(store::Store::open(self.dir.path()).unwrap());
+        let store = Arc::new(store::Store::open(&self.dir.path().join("perpetual")).unwrap());
         // Checkpoints certified and not committed are certified again.
         let committed = store.committed_checkpoint().unwrap().unwrap();
         self.certified.retain(|seq, _| *seq <= committed);
         self.node = Some(Node::new(Perpetual {
             store,
+            epochs,
             current: CurrentEpoch::new(),
             state_sync: self.state_sync.0.clone(),
             chain: CHAIN,

@@ -31,6 +31,7 @@ use validator::consensus::status::ConsensusTxStatusCache;
 use validator::consensus::vote::VoteRequest;
 use validator::current::EpochHandle;
 use validator::epoch::EpochState;
+use validator::epoch_store::EpochStore;
 use validator::pipeline::items::{CertifiedCheckpoint, EffectsWaitItem};
 use validator::pipeline::keys::EffectsKey;
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable, GenerationTable};
@@ -88,8 +89,11 @@ pub struct ConsensusOutput {
 /// # Panics
 /// If the store cannot be read or written, lacks `previous`, or has no
 /// shared accumulator root.
-fn epoch_start(store: &store::Store, record: &EpochRecord) -> (BuiltCheckpoint, EpochStart) {
-    let epoch = record.epoch;
+fn epoch_start(
+    store: &store::Store,
+    epoch_store: &EpochStore,
+    record: &EpochRecord,
+) -> (BuiltCheckpoint, EpochStart) {
     let checkpoint = BuiltCheckpoint::decode(
         &store
             .checkpoint(record.previous_checkpoint)
@@ -111,9 +115,8 @@ fn epoch_start(store: &store::Store, record: &EpochRecord) -> (BuiltCheckpoint, 
     };
     // Version assignment starts here, as for any shared object: the
     // commit handler numbers each chunk's root version from it.
-    let accumulator_root_version = store
-        .start_version(epoch, &root, initial_shared_version)
-        .expect("the store reads and writes")
+    let accumulator_root_version = epoch_store
+        .start_version(store, &root, initial_shared_version)
         .expect("the accumulator root exists")
         .version;
     let start = EpochStart {
@@ -144,13 +147,14 @@ impl Pipeline {
     pub fn start(
         store: &Arc<store::Store>,
         epoch: &Arc<EpochState>,
+        epoch_store: &EpochStore,
         protocol_key: &Arc<ProtocolKey>,
         committee: &Arc<Committee>,
         consensus: impl FnOnce(ConsensusOutput) -> TransactionClient,
         state_sync: Queue<CertifiedCheckpoint>,
         record: &EpochRecord,
     ) -> Pipeline {
-        let (first, start) = epoch_start(store, record);
+        let (first, start) = epoch_start(store, epoch_store, record);
         let checkpoints = Arc::new(CheckpointStore::new());
         checkpoints.insert_built(first);
         let next_to_certify = store
@@ -168,6 +172,7 @@ impl Pipeline {
         let parts = Arc::new(Parts {
             store: store.clone(),
             epoch: epoch.clone(),
+            epoch_store: epoch_store.clone(),
             key: protocol_key.clone(),
             committee: committee.clone(),
             consensus: consensus.clone(),
