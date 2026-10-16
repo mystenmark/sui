@@ -7,6 +7,7 @@
 
 mod cache;
 mod db;
+pub mod epoch;
 
 pub use cache::{Capacity, Store};
 
