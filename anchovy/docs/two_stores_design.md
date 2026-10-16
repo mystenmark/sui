@@ -67,6 +67,7 @@ processors (`SummaryBuilder`, `EpochCloser`, `StateHasher`).
 | Keyspace | Key → value | From |
 |---|---|---|
 | `start_versions` | (id, initial shared version) → version, digest | the store's `start_versions`, which the executor records at a stream's first use |
+| `generations` | (stream, round, k) → generation | each stream's last generation pruned from the `GenerationTable` (decision 3) |
 
 ### Kept in memory
 
@@ -97,10 +98,14 @@ package cache becomes bounded.
    commit handler, which attaches it to each access, so it becomes consensus
    output (a `streams` keyspace: stream → its last generation) and the
    resolver keeps no state.
-3. **Prune rather than store** the generation table (entries no unexecuted
-   transaction can read) and the per-checkpoint state hashes (all but the
-   running root, once a checkpoint commits). Both stay in memory, off the
-   input waiter's hot path, and the `generations` keyspace goes.
+3. **Prune rather than store** the generation table and the per-checkpoint
+   state hashes, at each checkpoint commit. Every round before the
+   committed checkpoint's last chunk's has executed, so the generation table
+   drops those rounds. Each stream's last generation among them is still
+   read by later rounds until the stream is written again, and one per
+   stream touched in the epoch is unbounded, so it moves to the epoch store
+   (`generations`, in "everything else"). Lookups for pruned rounds read it
+   there, off the hot path.
 
 ## Order of work
 
@@ -110,6 +115,9 @@ package cache becomes bounded.
    the epoch store.
 3. Consensus output: processed digests, locks and the `commit` record through
    the commit handler's writer; the round links moved from the resolver.
-4. Builder state: built checkpoints and state hashes.
-5. Pruning (decision 3) and a bounded package cache.
-6. Quarantine, flush at checkpoint commit, resume on restart.
+4. Pruning (decision 3), and the Move runtime replaced, with the package and
+   type caches filled from it, once it has resolved 1024 packages: a
+   runtime keeps every package it resolves.
+5. Quarantine, flush at checkpoint commit, resume on restart, with builder
+   state: built checkpoints, which until then are bounded in memory by the
+   window between building and committing, and the `commit` record.

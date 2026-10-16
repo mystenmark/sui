@@ -13,7 +13,7 @@ in memory.
   - checkpoint builder state;
   - everything else.
 
-## Status: design agreed; implementing step 1
+## Status: discard-and-replay done (steps 1-4); quarantine next
 
 ## Steps
 
@@ -24,3 +24,27 @@ in memory.
    then quarantine; the commit handler links rounds; prune generations and
    state hashes in memory.
 3. Implementation, in the design's order of work.
+
+## Progress
+
+1. The epoch store: per-epoch directory of two Tidehunter databases,
+   `replayed` (emptied on restart) and `kept` (start versions); old epochs
+   deleted after reconfiguration. Done.
+2. Perpetual epoch records by epoch; start versions in the epoch store.
+   Done.
+3. Consensus output: processed digests, owned locks and stream links through
+   the commit handler's writer, one batch per commit; the resolver keeps no
+   state. Done.
+4. Generation table and state hashes pruned at checkpoint commit, each
+   stream's last pruned generation kept in the epoch store; the Move runtime
+   replaced past 1024 packages. Done.
+5. Quarantine and resume, with builder state. Next.
+
+Notes:
+- The test suite takes about 60s, from about 40s: each test opens epoch
+  stores, and Tidehunter databases opened in parallel contend. Isolated,
+  tests are as fast as before.
+- nextest occasionally reports a test as leaky under load, apparently
+  Tidehunter's background threads outliving the test by its 100ms leak
+  timeout.
+
