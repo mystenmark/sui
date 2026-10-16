@@ -61,7 +61,7 @@ fn is_unmetered(gas_data: &GasData<'_>) -> bool {
 }
 
 /// `TransactionKind::is_system_tx`.
-fn is_system_tx(transaction_kind: &TransactionKind<'_>) -> bool {
+pub fn is_system_tx(transaction_kind: &TransactionKind<'_>) -> bool {
     // Keep this as an exhaustive match so that we can't forget to update it.
     match transaction_kind {
         TransactionKind::ChangeEpoch(_)

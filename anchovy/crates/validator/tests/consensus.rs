@@ -49,7 +49,7 @@ impl Node {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(store::Store::open(dir.path()).unwrap());
         let funded = [(sender.to_inner(), 10 * SUI)];
-        assert!(execution::genesis::init(&epoch.execution, &store, &funded).unwrap());
+        assert!(execution::genesis::init(epoch.execution.reference(), &store, &funded).unwrap());
         Node {
             _dir: dir,
             epoch,

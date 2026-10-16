@@ -31,6 +31,7 @@ waiter.workspace = true
 workqueue.workspace = true
 
 [dev-dependencies]
+execution = { workspace = true, features = ["testing"] }
 base64.workspace = true
 bcs.workspace = true
 sui-types.workspace = true

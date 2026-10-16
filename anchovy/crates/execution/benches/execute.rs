@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use execution::native::NativeExecution;
-use execution::{Execution, Outcome, genesis};
+use execution::{Outcome, Reference, genesis};
 use move_core_types::ident_str;
 use sui_protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
 use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
@@ -59,7 +59,7 @@ const SUI: u64 = 1_000_000_000;
 // One per run, so the variants' sizes don't matter.
 enum Executor {
     Native(NativeExecution),
-    Reference(Execution),
+    Reference(Reference),
 }
 
 impl Executor {
@@ -79,7 +79,7 @@ struct Setup {
     accounts: Vec<(SuiAddress, ObjectRef)>,
 }
 
-fn setup(reference: &Execution, n: usize) -> Setup {
+fn setup(reference: &Reference, n: usize) -> Setup {
     let (_, key) = get_key_pair::<AccountKeyPair>();
     let accounts: Vec<SuiAddress> = (0..=n)
         .map(|i| {
@@ -124,7 +124,7 @@ fn sign(data: TransactionData, key: &AccountKeyPair) -> Vec<u8> {
 }
 
 /// Publishes `object_basics` from the last account, with sui's executor; its package id.
-fn publish(setup: &mut Setup, reference: &Execution) -> ObjectID {
+fn publish(setup: &mut Setup, reference: &Reference) -> ObjectID {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../../crates/sui-core/src/unit_tests/data/object_basics");
     let package = sui_move_build::BuildConfig::new_for_testing()
@@ -153,7 +153,7 @@ fn publish(setup: &mut Setup, reference: &Execution) -> ObjectID {
         .0
 }
 
-fn transactions(setup: &mut Setup, reference: &Execution, workload: &str) -> Vec<Vec<u8>> {
+fn transactions(setup: &mut Setup, reference: &Reference, workload: &str) -> Vec<Vec<u8>> {
     match workload {
         "transfer" => setup
             .accounts
@@ -223,7 +223,7 @@ fn main() {
         .unwrap_or(2000);
 
     let reference =
-        Execution::new(ProtocolVersion::MAX.as_u64(), Chain::Unknown, 0, 0, RGP).unwrap();
+        Reference::new(ProtocolVersion::MAX.as_u64(), Chain::Unknown, 0, 0, RGP).unwrap();
     println!("executor   workload  txs    execute µs/tx  commit µs/tx  allocs/tx (execute)");
     for workload in &workloads {
         for name in &executors {
@@ -239,7 +239,7 @@ fn main() {
                     .unwrap(),
                 ),
                 _ => Executor::Reference(
-                    Execution::new(ProtocolVersion::MAX.as_u64(), Chain::Unknown, 0, 0, RGP)
+                    Reference::new(ProtocolVersion::MAX.as_u64(), Chain::Unknown, 0, 0, RGP)
                         .unwrap(),
                 ),
             };

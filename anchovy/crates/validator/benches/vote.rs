@@ -123,7 +123,7 @@ fn main() {
         .iter()
         .map(|(sender, _)| (sender.to_inner(), 10 * SUI))
         .collect();
-    assert!(execution::genesis::init(&epoch.execution, &store, &funded).unwrap());
+    assert!(execution::genesis::init(epoch.execution.reference(), &store, &funded).unwrap());
 
     let transactions = signed_transfers(&store, &senders);
     let blocks: Vec<Block> = transactions

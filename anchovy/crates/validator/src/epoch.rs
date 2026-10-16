@@ -67,8 +67,10 @@ pub struct EpochState {
     pub params: Arc<EpochParams>,
     /// Verifies signatures under the epoch's protocol config and JWKs.
     pub verifier: Verifier,
-    /// Sui's executor, under sui's protocol config for the same version
-    /// and chain (`params.config` is anchovy's copy, which validation reads).
+    /// The epoch's executor: anchovy's, with sui's for what it does not
+    /// execute yet and as its oracle, under sui's protocol config for the
+    /// same version and chain (`params.config` is anchovy's copy, which
+    /// validation reads).
     pub execution: execution::Execution,
 }
 
@@ -127,7 +129,7 @@ impl EpochState {
             epoch_start_timestamp_ms,
             reference_gas_price,
         )
-        .expect("sui's executor supports every protocol version anchovy does");
+        .expect("the executors support every protocol version anchovy does");
         EpochState {
             execution,
             verifier: Verifier::new(&params.config, chain, jwks),

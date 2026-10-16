@@ -14,6 +14,7 @@ waiter.workspace = true
 workqueue.workspace = true
 
 [dev-dependencies]
+execution = { workspace = true, features = ["testing"] }
 bcs.workspace = true
 consensus.workspace = true
 move-core-types.workspace = true

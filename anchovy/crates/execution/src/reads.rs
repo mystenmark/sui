@@ -74,6 +74,13 @@ impl<'a> StoreReads<'a> {
     ) -> Result<Option<Object<'a>>, store::Error> {
         Ok(self.keep(self.store.object(id, version)?, None))
     }
+
+    /// An object the caller holds, as BCS.
+    pub fn parse(&self, bytes: &[u8]) -> Result<Object<'a>, crate::Error> {
+        let object = messages::Message::parse(bytes.to_vec())
+            .map_err(|(e, _)| crate::Error::Native(format!("an object does not parse: {e:?}")))?;
+        Ok(self.keep(Some(object), None).expect("kept"))
+    }
 }
 
 impl<'a> ObjectStore<'a> for StoreReads<'a> {

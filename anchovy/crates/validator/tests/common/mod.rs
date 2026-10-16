@@ -90,7 +90,7 @@ pub struct TestStore {
 pub fn store(epoch: &EpochState) -> TestStore {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(store::Store::open(dir.path()).unwrap());
-    execution::genesis::init(&epoch.execution, &store, &[]).unwrap();
+    execution::genesis::init(epoch.execution.reference(), &store, &[]).unwrap();
     TestStore { _dir: dir, store }
 }
 

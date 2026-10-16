@@ -21,6 +21,7 @@ waiter.workspace = true
 workqueue.workspace = true
 
 [dev-dependencies]
+execution = { workspace = true, features = ["testing"] }
 bcs.workspace = true
 sui-protocol-config.workspace = true
 sui-types.workspace = true

@@ -23,6 +23,7 @@ execution.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+execution = { workspace = true, features = ["testing"] }
 bcs.workspace = true
 sui-genesis-builder.workspace = true
 sui-config.workspace = true

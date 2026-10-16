@@ -48,7 +48,7 @@ pub trait Objects {
 pub enum InputKind<'a> {
     Package(ObjectId),
     ImmOrOwned(&'a ObjectRef),
-    Shared(&'a SharedObjectArg),
+    Shared(SharedObjectArg),
 }
 
 impl InputKind<'_> {
@@ -73,13 +73,45 @@ fn not_found(id: &ObjectId, version: Option<u64>) -> Error {
 }
 
 /// The reference's `TransactionData::input_objects`: the inputs' objects, in
-/// order and none twice; then the packages commands name, in id order; then
-/// the gas coins. Coin reservations and receiving objects are not inputs.
+/// order and none twice; then the packages commands name, in id order; then,
+/// but for a system transaction, the gas coins. Coin reservations and
+/// receiving objects are not inputs.
+///
+/// A system transaction's inputs are the shared object it updates. Not yet:
+/// the epoch change's and the end-of-epoch transactions', which anchovy's
+/// executor does not execute.
 pub fn input_objects<'a>(
     data: &TransactionData<'a, impl TxState>,
 ) -> Result<Vec<InputKind<'a>>, Error> {
-    let TransactionKind::ProgrammableTransaction(pt) = data.kind() else {
-        return Ok(vec![]);
+    let system = |id: u16, initial_shared_version: u64| {
+        Ok(vec![InputKind::Shared(SharedObjectArg::new(
+            ObjectId::from_u16(id),
+            initial_shared_version,
+            SharedObjectMutability::Mutable,
+        ))])
+    };
+    let (pt, is_system) = match data.kind() {
+        TransactionKind::ProgrammableTransaction(pt) => (pt, false),
+        TransactionKind::ProgrammableSystemTransaction(pt) => (pt, true),
+        TransactionKind::ConsensusCommitPrologue(_)
+        | TransactionKind::ConsensusCommitPrologueV2(_)
+        | TransactionKind::ConsensusCommitPrologueV3(_)
+        | TransactionKind::ConsensusCommitPrologueV4(_) => return system(CLOCK, 1),
+        TransactionKind::RandomnessStateUpdate(update) => {
+            return system(
+                RANDOMNESS_STATE,
+                update.randomness_obj_initial_shared_version,
+            );
+        }
+        TransactionKind::AuthenticatorStateUpdate(update) => {
+            return system(
+                AUTHENTICATOR_STATE,
+                update.authenticator_obj_initial_shared_version,
+            );
+        }
+        TransactionKind::ChangeEpoch(_)
+        | TransactionKind::Genesis(_)
+        | TransactionKind::EndOfEpochTransaction(_) => return Ok(vec![]),
     };
     let mut inputs = Vec::new();
     for arg in pt.inputs {
@@ -87,7 +119,7 @@ pub fn input_objects<'a>(
             CallArg::Object(ObjectArg::ImmOrOwnedObject(r)) if !r.is_coin_reservation() => {
                 inputs.push(InputKind::ImmOrOwned(r));
             }
-            CallArg::Object(ObjectArg::SharedObject(s)) => inputs.push(InputKind::Shared(s)),
+            CallArg::Object(ObjectArg::SharedObject(s)) => inputs.push(InputKind::Shared(**s)),
             _ => {}
         }
     }
@@ -117,15 +149,22 @@ pub fn input_objects<'a>(
         }
     }
     inputs.extend(packages.into_iter().map(InputKind::Package));
-    inputs.extend(
-        data.gas_data()
-            .payment
-            .iter()
-            .filter(|r| !r.is_coin_reservation())
-            .map(InputKind::ImmOrOwned),
-    );
+    if !is_system {
+        inputs.extend(
+            data.gas_data()
+                .payment
+                .iter()
+                .filter(|r| !r.is_coin_reservation())
+                .map(InputKind::ImmOrOwned),
+        );
+    }
     Ok(inputs)
 }
+
+/// The system objects system transactions update.
+const CLOCK: u16 = 0x6;
+const AUTHENTICATOR_STATE: u16 = 0x7;
+const RANDOMNESS_STATE: u16 = 0x8;
 
 /// Every package a type names.
 fn type_packages(t: &TypeTag<'_>, packages: &mut BTreeSet<ObjectId>) {
@@ -496,7 +535,7 @@ fn check_one_object(owner: &SuiAddress, input: &Input<'_>) -> Result<(), Error> 
                 }
             }
         }
-        InputKind::Shared(s) => check_shared(owner, id, object, s)?,
+        InputKind::Shared(s) => check_shared(owner, id, object, &s)?,
     }
     Ok(())
 }

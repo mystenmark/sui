@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use execution::native::NativeExecution;
-use execution::{Execution, Outcome, genesis};
+use execution::{Reference, genesis};
 use move_core_types::ident_str;
 use sui_protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
 use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
@@ -25,7 +25,7 @@ const SUI: u64 = 1_000_000_000;
 struct Node {
     _dir: tempfile::TempDir,
     store: store::Store,
-    reference: Execution,
+    reference: Reference,
     native: NativeExecution,
     sender: SuiAddress,
     key: AccountKeyPair,
@@ -35,7 +35,7 @@ impl Node {
     fn new() -> Node {
         let (sender, key) = get_key_pair::<AccountKeyPair>();
         let reference =
-            Execution::new(ProtocolVersion::MAX.as_u64(), Chain::Unknown, 0, 0, RGP).unwrap();
+            Reference::new(ProtocolVersion::MAX.as_u64(), Chain::Unknown, 0, 0, RGP).unwrap();
         let native = NativeExecution::new(
             ProtocolConfig::get_for_version(ProtocolVersion::MAX, Chain::Unknown),
             Arc::new(ExecutionMetrics::new(&prometheus::Registry::new())),
@@ -74,41 +74,10 @@ impl Node {
         let reference = self.reference.execute(&self.store, &bytes).unwrap();
         let native = self.native.execute_bytes(&self.store, &bytes).unwrap();
         let effects: TransactionEffects = bcs::from_bytes(&reference.effects).unwrap();
-        assert_same(&reference, &native, &effects);
+        execution::assert_same(&reference, &native);
         self.store.write_through(reference.commit).unwrap();
         effects
     }
-}
-
-fn assert_same(reference: &Outcome, native: &Outcome, effects: &TransactionEffects) {
-    if native.effects != reference.effects {
-        let native_effects: Result<TransactionEffects, _> = bcs::from_bytes(&native.effects);
-        panic!("effects differ:\nreference {effects:#?}\nnative {native_effects:#?}");
-    }
-    let written = |o: &Outcome| {
-        let mut w: Vec<_> = o
-            .commit
-            .written
-            .iter()
-            .map(|w| (w.id, w.version, w.digest, w.bytes.clone()))
-            .collect();
-        w.sort();
-        w
-    };
-    assert_eq!(written(native), written(reference), "written objects");
-    let removed = |o: &Outcome| {
-        let mut r = o.commit.removed.clone();
-        r.sort_by_key(|removed| removed.id.0);
-        r
-    };
-    assert_eq!(removed(native), removed(reference), "removed objects");
-    let (n, r) = (
-        native.commit.executed.as_ref().unwrap(),
-        reference.commit.executed.as_ref().unwrap(),
-    );
-    assert_eq!(n.digest, r.digest);
-    assert_eq!(n.effects_digest, r.effects_digest);
-    assert_eq!(n.events, r.events, "events");
 }
 
 #[test]
