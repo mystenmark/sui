@@ -24,8 +24,10 @@ use validator::pipeline::tables::BuiltCheckpoint;
 
 pub struct Genesis {
     pub objects: Vec<Object>,
+    #[allow(dead_code, reason = "not every test crate runs the pipeline")]
     pub checkpoint: BuiltCheckpoint,
     /// The genesis checkpoint's digest.
+    #[allow(dead_code, reason = "not every test crate runs the pipeline")]
     pub chain_identifier: [u8; 32],
     /// The test account's gas coins, by id.
     #[allow(dead_code, reason = "not every test crate spends them")]

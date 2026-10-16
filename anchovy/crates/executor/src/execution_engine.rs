@@ -5,34 +5,58 @@
 //! path is left out). Execution takes the transaction and its loaded inputs
 //! (`ExecutionInputs`); effects come out as `messages::fast` bytes.
 
+use crate::accumulator_root::sui_type;
+use crate::adapter::new_move_runtime;
 use crate::data_store::cached_package_store::PackageCache;
 use crate::error::{ExecutionError, ExecutionErrorKind};
+use crate::execution::is_system_package;
 use crate::execution::{ExecutionTiming, ResultWithTimings};
 use crate::execution_mode::{self, ExecutionMode};
 use crate::execution_params::ExecutionOrEarlyError;
 use crate::gas::{SuiGasStatus, SuiGasStatusAPI};
 use crate::gas_charger::{GasCharger, PaymentKind, PaymentMethod};
 use crate::inputs::ExecutionInputs;
-use crate::ptb_builder::{CLOCK_MUT, ProgrammableTransactionBuilder};
+use crate::ptb_builder::{CLOCK_MUT, ProgrammableTransactionBuilder, SUI_SYSTEM_MUT};
 use crate::static_programmable_transactions as SPT;
 use crate::storage::UnsettledObjectFundsRead;
 use crate::temporary_store::{InnerTemporaryStore, TemporaryStore};
 use crate::transaction::is_gasless_transaction;
 use containers::{Bump, Vec};
 use exec_types::assert_invariant;
-use exec_types::base::{EpochId, SUI_RANDOMNESS_STATE_OBJECT_ID};
-use exec_types::object::Object;
+use exec_types::base::{
+    EpochId, SUI_AUTHENTICATOR_STATE_OBJECT_ID, SUI_BRIDGE_OBJECT_ID,
+    SUI_RANDOMNESS_STATE_OBJECT_ID,
+};
+use exec_types::object::{OBJECT_START_VERSION, Object};
 use exec_types::storage::BackingStore;
 use exec_types::tx_context::TxContext;
-use messages::base::{Digest, ObjectId, SuiAddress, TransactionDigest};
+use messages::base::{
+    ChainIdentifier, Digest, ObjectId, SequenceNumber, SuiAddress, TransactionDigest,
+};
 use messages::effects::GasCostSummary;
 use messages::execution_status::ExecutionStatus;
 use messages::fast::Built;
-use messages::transaction::{CallArg, GasData, ObjectArg, SharedObjectMutability, TransactionKind};
+use messages::system_transaction::{
+    AuthenticatorStateUpdate, ChangeEpoch, EndOfEpochTransactionKind,
+    StoredExecutionTimeObservations,
+};
+use messages::transaction::{
+    Argument, CallArg, Command, GasData, ObjectArg, ProgrammableTransaction, SharedObjectArg,
+    SharedObjectMutability, TransactionKind,
+};
+use move_binary_format::CompiledModule;
 use move_vm_runtime::runtime::MoveRuntime;
 use std::{cell::RefCell, rc::Rc, sync::Arc};
-use sui_protocol_config::{LimitThresholdCrossed, ProtocolConfig, check_limit_by_meter};
+use sui_protocol_config::{
+    LimitThresholdCrossed, PerObjectCongestionControlMode, ProtocolConfig, check_limit_by_meter,
+};
+use sui_types::bridge::{BRIDGE_COMMITTEE_MINIMAL_VOTING_POWER, BridgeChainId};
+use sui_types::digests::{get_mainnet_chain_identifier, get_testnet_chain_identifier};
 use sui_types::metrics::ExecutionMetrics;
+
+const SUI_FRAMEWORK_PACKAGE_ID: ObjectId = ObjectId::from_u16(0x2);
+const SUI_SYSTEM_PACKAGE_ID: ObjectId = ObjectId::from_u16(0x3);
+const SUI_BRIDGE_PACKAGE_ID: ObjectId = ObjectId::from_u16(0xb);
 
 /// Whether `InsufficientFundsForWithdraw` appears anywhere in the early-error list.
 fn any_error_is_insufficient_funds_for_withdraw(
@@ -824,6 +848,24 @@ fn execution_loop<'a, Mode: ExecutionMode>(
 ) -> ResultWithTimings<'a, (), ExecutionError<'a>> {
     let no_timings = || Vec::new_in(bump);
     let result = match transaction_kind {
+        TransactionKind::ChangeEpoch(change_epoch) => {
+            let builder = ProgrammableTransactionBuilder::new(bump);
+            advance_epoch(
+                bump,
+                builder,
+                change_epoch.get(),
+                temporary_store,
+                store,
+                tx_ctx,
+                move_vm,
+                gas_charger,
+                protocol_config,
+                metrics,
+                options,
+            )
+            .map_err(|e| (e, no_timings()))?;
+            Ok(((), no_timings()))
+        }
         TransactionKind::Genesis(objects) => {
             if tx_ctx.borrow().epoch() != 0 {
                 panic!("BUG: Genesis Transactions can only be executed in epoch 0");
@@ -952,16 +994,126 @@ fn execution_loop<'a, Mode: ExecutionMode>(
             .map_err(|e| (e, no_timings()))?;
             Ok(((), no_timings()))
         }
-        // The epoch change, the end-of-epoch transactions and authenticator state updates come
-        // with the system transactions' port.
-        TransactionKind::ChangeEpoch(_)
-        | TransactionKind::EndOfEpochTransaction(_)
-        | TransactionKind::AuthenticatorStateUpdate(_) => Err((
-            ExecutionError::invariant_violation(
-                "epoch change and authenticator state transactions are not yet executed",
-            ),
-            no_timings(),
-        )),
+        TransactionKind::EndOfEpochTransaction(txns) => {
+            let mut builder = ProgrammableTransactionBuilder::new(bump);
+            let len = txns.len();
+            for (i, tx) in txns.iter().enumerate() {
+                match *tx {
+                    EndOfEpochTransactionKind::ChangeEpoch(change_epoch) => {
+                        assert_eq!(i, len - 1);
+                        advance_epoch(
+                            bump,
+                            builder,
+                            change_epoch.get(),
+                            temporary_store,
+                            store,
+                            tx_ctx,
+                            move_vm,
+                            gas_charger,
+                            protocol_config,
+                            metrics,
+                            options,
+                        )
+                        .map_err(|e| (e, no_timings()))?;
+                        // As the reference: this returns before the consistency check below.
+                        return Ok(((), no_timings()));
+                    }
+                    EndOfEpochTransactionKind::AuthenticatorStateCreate => {
+                        assert!(protocol_config.enable_jwk_consensus_updates());
+                        builder = setup_authenticator_state_create(builder);
+                    }
+                    EndOfEpochTransactionKind::AuthenticatorStateExpire {
+                        min_epoch,
+                        authenticator_obj_initial_shared_version,
+                    } => {
+                        assert!(protocol_config.enable_jwk_consensus_updates());
+
+                        // TODO: it would be nice if a failure of this function didn't cause
+                        // safe mode.
+                        builder = setup_authenticator_state_expire(
+                            builder,
+                            min_epoch,
+                            authenticator_obj_initial_shared_version,
+                        );
+                    }
+                    EndOfEpochTransactionKind::RandomnessStateCreate => {
+                        assert!(protocol_config.random_beacon());
+                        builder = setup_randomness_state_create(builder);
+                    }
+                    EndOfEpochTransactionKind::DenyListStateCreate => {
+                        assert!(protocol_config.enable_coin_deny_list());
+                        builder = setup_coin_deny_list_state_create(builder);
+                    }
+                    EndOfEpochTransactionKind::BridgeStateCreate(chain_id) => {
+                        assert!(protocol_config.bridge());
+                        builder = setup_bridge_create(builder, chain_id);
+                    }
+                    EndOfEpochTransactionKind::BridgeCommitteeInit(bridge_shared_version) => {
+                        assert!(protocol_config.bridge());
+                        assert!(protocol_config.should_try_to_finalize_bridge_committee());
+                        builder = setup_bridge_committee_update(builder, bridge_shared_version);
+                    }
+                    EndOfEpochTransactionKind::StoreExecutionTimeObservations(estimates) => {
+                        if let PerObjectCongestionControlMode::ExecutionTimeEstimate(params) =
+                            protocol_config.per_object_congestion_control_mode()
+                        {
+                            let chunk_size = params.observations_chunk_size.expect(
+                                "observation chunking is enabled at all protocol versions handled \
+                                 by this execution layer",
+                            );
+                            builder = setup_store_execution_time_estimates(
+                                builder,
+                                &estimates,
+                                chunk_size as usize,
+                            );
+                        }
+                    }
+                    EndOfEpochTransactionKind::AccumulatorRootCreate => {
+                        assert!(protocol_config.create_root_accumulator_object());
+                        builder = setup_accumulator_root_create(builder);
+                    }
+                    EndOfEpochTransactionKind::WriteAccumulatorStorageCost { storage_cost } => {
+                        assert!(protocol_config.enable_accumulators());
+                        builder = setup_write_accumulator_storage_cost(builder, storage_cost);
+                    }
+                    EndOfEpochTransactionKind::CoinRegistryCreate => {
+                        assert!(protocol_config.enable_coin_registry());
+                        builder = setup_coin_registry_create(builder);
+                    }
+                    EndOfEpochTransactionKind::DisplayRegistryCreate => {
+                        assert!(protocol_config.enable_display_registry());
+                        builder = setup_display_registry_create(builder);
+                    }
+                    EndOfEpochTransactionKind::AddressAliasStateCreate => {
+                        assert!(protocol_config.address_aliases());
+                        builder = setup_address_alias_state_create(builder);
+                    }
+                    EndOfEpochTransactionKind::ForwardingAddressRegistryCreate => {
+                        assert!(protocol_config.create_forwarding_address_registry());
+                        builder = setup_forwarding_address_registry_create(builder);
+                    }
+                }
+            }
+            unreachable!(
+                "EndOfEpochTransactionKind::ChangeEpoch should be the last transaction in the list"
+            )
+        }
+        TransactionKind::AuthenticatorStateUpdate(auth_state_update) => {
+            setup_authenticator_state_update(
+                bump,
+                auth_state_update.get(),
+                temporary_store,
+                store,
+                tx_ctx,
+                move_vm,
+                gas_charger,
+                protocol_config,
+                metrics,
+                options,
+            )
+            .map_err(|e| (e, no_timings()))?;
+            Ok(((), no_timings()))
+        }
     }?;
     temporary_store
         .check_execution_results_consistency()
@@ -1083,4 +1235,545 @@ fn setup_randomness_state_update<'a>(
     )
     .map_err(|(e, _)| e)?;
     Ok(())
+}
+
+/// `AdvanceEpochParams`.
+#[derive(Debug)]
+struct AdvanceEpochParams {
+    epoch: u64,
+    next_protocol_version: u64,
+    storage_charge: u64,
+    computation_charge: u64,
+    storage_rebate: u64,
+    non_refundable_storage_fee: u64,
+    storage_fund_reinvest_rate: u64,
+    reward_slashing_rate: u64,
+    epoch_start_timestamp_ms: u64,
+}
+
+/// `0x2::balance::create_staking_rewards<SUI>` of `amount`.
+fn create_rewards(builder: &mut ProgrammableTransactionBuilder<'_>, amount: u64) -> Argument {
+    let bump = builder.bump();
+    let amount = builder.input(CallArg::Pure(builder.bcs(&amount))).unwrap();
+    builder.programmable_move_call(
+        SUI_FRAMEWORK_PACKAGE_ID,
+        "balance",
+        "create_staking_rewards",
+        containers::alloc_slice_copy(bump, &[sui_type(bump)]),
+        &[amount],
+    )
+}
+
+fn mint_epoch_rewards_in_pt(
+    builder: &mut ProgrammableTransactionBuilder<'_>,
+    params: &AdvanceEpochParams,
+) -> (Argument, Argument) {
+    // Create storage rewards.
+    let storage_rewards = create_rewards(builder, params.storage_charge);
+    // Create computation rewards.
+    let computation_rewards = create_rewards(builder, params.computation_charge);
+    (storage_rewards, computation_rewards)
+}
+
+fn construct_advance_epoch_pt<'a>(
+    mut builder: ProgrammableTransactionBuilder<'a>,
+    params: &AdvanceEpochParams,
+) -> Result<ProgrammableTransaction<'a>, ExecutionError<'a>> {
+    let bump = builder.bump();
+    // Step 1: Create storage and computation rewards.
+    let (storage_rewards, computation_rewards) = mint_epoch_rewards_in_pt(&mut builder, params);
+
+    // Step 2: Advance the epoch.
+    let mut arguments = Vec::with_capacity_in(10, bump);
+    arguments.push(storage_rewards);
+    arguments.push(computation_rewards);
+    let call_arg_arguments = [
+        CallArg::Object(ObjectArg::SharedObject(&SUI_SYSTEM_MUT)),
+        CallArg::Pure(builder.bcs(&params.epoch)),
+        CallArg::Pure(builder.bcs(&params.next_protocol_version)),
+        CallArg::Pure(builder.bcs(&params.storage_rebate)),
+        CallArg::Pure(builder.bcs(&params.non_refundable_storage_fee)),
+        CallArg::Pure(builder.bcs(&params.storage_fund_reinvest_rate)),
+        CallArg::Pure(builder.bcs(&params.reward_slashing_rate)),
+        CallArg::Pure(builder.bcs(&params.epoch_start_timestamp_ms)),
+    ]
+    .into_iter()
+    .map(|a| builder.input(a))
+    .collect::<Result<std::vec::Vec<_>, _>>();
+
+    assert_invariant!(
+        call_arg_arguments.is_ok(),
+        "Unable to generate args for advance_epoch transaction!"
+    );
+
+    arguments.extend(call_arg_arguments.unwrap());
+
+    let storage_rebates = builder.programmable_move_call(
+        SUI_SYSTEM_PACKAGE_ID,
+        "sui_system",
+        "advance_epoch",
+        &[],
+        &arguments,
+    );
+
+    // Step 3: Destroy the storage rebates.
+    builder.programmable_move_call(
+        SUI_FRAMEWORK_PACKAGE_ID,
+        "balance",
+        "destroy_storage_rebates",
+        containers::alloc_slice_copy(bump, &[sui_type(bump)]),
+        &[storage_rebates],
+    );
+    Ok(builder.finish())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn advance_epoch<'a>(
+    bump: &'a Bump,
+    builder: ProgrammableTransactionBuilder<'a>,
+    change_epoch: &ChangeEpoch<'a>,
+    temporary_store: &mut TemporaryStore<'a>,
+    store: &'a dyn BackingStore<'a>,
+    tx_ctx: Rc<RefCell<TxContext>>,
+    move_vm: &Arc<MoveRuntime>,
+    gas_charger: &mut GasCharger<'a>,
+    protocol_config: &'a ProtocolConfig,
+    metrics: Arc<ExecutionMetrics>,
+    options: SPT::ExecuteOptions<'_>,
+) -> Result<(), ExecutionError<'a>> {
+    let params = AdvanceEpochParams {
+        epoch: change_epoch.epoch,
+        next_protocol_version: change_epoch.protocol_version,
+        storage_charge: change_epoch.storage_charge,
+        computation_charge: change_epoch.computation_charge,
+        storage_rebate: change_epoch.storage_rebate,
+        non_refundable_storage_fee: change_epoch.non_refundable_storage_fee,
+        storage_fund_reinvest_rate: protocol_config.storage_fund_reinvest_rate(),
+        reward_slashing_rate: protocol_config.reward_slashing_rate(),
+        epoch_start_timestamp_ms: change_epoch.epoch_start_timestamp_ms,
+    };
+    let advance_epoch_pt = construct_advance_epoch_pt(builder, &params)?;
+    let result = SPT::execute_with_options::<execution_mode::System>(
+        bump,
+        protocol_config,
+        metrics.clone(),
+        move_vm,
+        temporary_store,
+        store,
+        tx_ctx.clone(),
+        gas_charger,
+        None,
+        advance_epoch_pt,
+        SPT::ExecuteOptions {
+            type_cache: None,
+            ..options
+        },
+    );
+
+    if let Err((err, _)) = &result {
+        // The reference switches to safe mode: it drops the writes, resets the storage rebate,
+        // and advances the system state natively. Safe mode is not ported.
+        panic!("the advance epoch transaction failed, and safe mode is not ported: {err:?}");
+    }
+
+    let new_vm = new_move_runtime(
+        natives::all_natives(/* silent */ true, protocol_config),
+        protocol_config,
+    )
+    .expect("Failed to create new MoveRuntime");
+    process_system_packages(
+        bump,
+        change_epoch,
+        temporary_store,
+        store,
+        tx_ctx,
+        &new_vm,
+        gas_charger,
+        protocol_config,
+        metrics,
+        options,
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_system_packages<'a>(
+    bump: &'a Bump,
+    change_epoch: &ChangeEpoch<'a>,
+    temporary_store: &mut TemporaryStore<'a>,
+    store: &'a dyn BackingStore<'a>,
+    tx_ctx: Rc<RefCell<TxContext>>,
+    move_vm: &MoveRuntime,
+    gas_charger: &mut GasCharger<'a>,
+    protocol_config: &'a ProtocolConfig,
+    metrics: Arc<ExecutionMetrics>,
+    options: SPT::ExecuteOptions<'_>,
+) {
+    let digest = tx_ctx.borrow().digest();
+    let binary_config = protocol_config.binary_config(None);
+    for package in change_epoch.system_packages {
+        let deserialized_modules: std::vec::Vec<_> = package
+            .modules
+            .iter()
+            .map(|m| CompiledModule::deserialize_with_config(m, &binary_config).unwrap())
+            .collect();
+
+        if package.version == OBJECT_START_VERSION {
+            let publish_pt = {
+                let mut b = ProgrammableTransactionBuilder::new(bump);
+                b.command(Command::Publish(package.modules, package.dependencies));
+                b.finish()
+            };
+
+            SPT::execute_with_options::<execution_mode::System>(
+                bump,
+                protocol_config,
+                metrics.clone(),
+                move_vm,
+                temporary_store,
+                store,
+                tx_ctx.clone(),
+                gas_charger,
+                None,
+                publish_pt,
+                // The caches were filled by the epoch's VM, not this new one.
+                SPT::ExecuteOptions {
+                    type_cache: None,
+                    package_cache: None,
+                    ..options
+                },
+            )
+            .map_err(|(e, _)| e)
+            .expect("System Package Publish must succeed");
+        } else {
+            // The reference builds the package at `version` and then decrements it, so that the
+            // store can record the version growing by one in the effects.
+            let new_package = Object::new_from_package(
+                crate::move_package::new_system(
+                    bump,
+                    package.version - 1,
+                    &deserialized_modules,
+                    package.dependencies,
+                ),
+                digest,
+            );
+            assert!(is_system_package(&new_package.id()));
+
+            // upgrade of a previously existing framework module
+            temporary_store.upgrade_system_package(new_package);
+        }
+    }
+}
+
+fn setup_authenticator_state_create(
+    mut builder: ProgrammableTransactionBuilder<'_>,
+) -> ProgrammableTransactionBuilder<'_> {
+    builder
+        .move_call(
+            SUI_FRAMEWORK_PACKAGE_ID,
+            "authenticator_state",
+            "create",
+            &[],
+            &[],
+        )
+        .expect("Unable to generate authenticator_state_create transaction!");
+    builder
+}
+
+fn setup_randomness_state_create(
+    mut builder: ProgrammableTransactionBuilder<'_>,
+) -> ProgrammableTransactionBuilder<'_> {
+    builder
+        .move_call(SUI_FRAMEWORK_PACKAGE_ID, "random", "create", &[], &[])
+        .expect("Unable to generate randomness_state_create transaction!");
+    builder
+}
+
+fn setup_bridge_create<'a>(
+    mut builder: ProgrammableTransactionBuilder<'a>,
+    chain_id: &ChainIdentifier,
+) -> ProgrammableTransactionBuilder<'a> {
+    // `UID::new(SUI_BRIDGE_OBJECT_ID).to_bcs_bytes()`: the id's bytes.
+    let bridge_uid = builder
+        .input(CallArg::Pure(builder.bcs(&SUI_BRIDGE_OBJECT_ID.0)))
+        .expect("Unable to create Bridge object UID!");
+
+    let bridge_chain_id = if chain_id.bytes == get_mainnet_chain_identifier().as_bytes()[..] {
+        BridgeChainId::SuiMainnet as u8
+    } else if chain_id.bytes == get_testnet_chain_identifier().as_bytes()[..] {
+        BridgeChainId::SuiTestnet as u8
+    } else {
+        // How do we distinguish devnet from other test envs?
+        BridgeChainId::SuiCustom as u8
+    };
+
+    let bridge_chain_id = builder.pure(&bridge_chain_id);
+    builder.programmable_move_call(
+        SUI_BRIDGE_PACKAGE_ID,
+        "bridge",
+        "create",
+        &[],
+        &[bridge_uid, bridge_chain_id],
+    );
+    builder
+}
+
+fn setup_bridge_committee_update(
+    mut builder: ProgrammableTransactionBuilder<'_>,
+    bridge_shared_version: SequenceNumber,
+) -> ProgrammableTransactionBuilder<'_> {
+    let bridge = builder
+        .shared_obj(
+            SUI_BRIDGE_OBJECT_ID,
+            bridge_shared_version,
+            SharedObjectMutability::Mutable,
+        )
+        .expect("Unable to create Bridge object arg!");
+    let system_state = builder
+        .obj(ObjectArg::SharedObject(&SUI_SYSTEM_MUT))
+        .expect("Unable to create System State object arg!");
+
+    let voting_power = builder.programmable_move_call(
+        SUI_SYSTEM_PACKAGE_ID,
+        "sui_system",
+        "validator_voting_powers",
+        &[],
+        &[system_state],
+    );
+
+    // Hardcoding min stake participation to 75.00%
+    // TODO: We need to set a correct value or make this configurable.
+    let min_stake_participation_percentage = builder
+        .input(CallArg::Pure(
+            builder.bcs(&BRIDGE_COMMITTEE_MINIMAL_VOTING_POWER),
+        ))
+        .unwrap();
+
+    builder.programmable_move_call(
+        SUI_BRIDGE_PACKAGE_ID,
+        "bridge",
+        "init_bridge_committee",
+        &[],
+        &[bridge, voting_power, min_stake_participation_percentage],
+    );
+    builder
+}
+
+#[allow(clippy::too_many_arguments)]
+fn setup_authenticator_state_update<'a>(
+    bump: &'a Bump,
+    update: &AuthenticatorStateUpdate<'a>,
+    temporary_store: &mut TemporaryStore<'a>,
+    store: &'a dyn BackingStore<'a>,
+    tx_ctx: Rc<RefCell<TxContext>>,
+    move_vm: &Arc<MoveRuntime>,
+    gas_charger: &mut GasCharger<'a>,
+    protocol_config: &'a ProtocolConfig,
+    metrics: Arc<ExecutionMetrics>,
+    options: SPT::ExecuteOptions<'_>,
+) -> Result<(), ExecutionError<'a>> {
+    let pt = {
+        let mut builder = ProgrammableTransactionBuilder::new(bump);
+        let authenticator_state = containers::alloc(
+            bump,
+            SharedObjectArg::new(
+                SUI_AUTHENTICATOR_STATE_OBJECT_ID,
+                update.authenticator_obj_initial_shared_version,
+                SharedObjectMutability::Mutable,
+            ),
+        );
+        // The owned form, which serializes as the reference's `Vec<ActiveJwk>`.
+        let new_active_jwks: std::vec::Vec<messages::build::system_transaction::ActiveJwk> =
+            update.new_active_jwks.iter().map(Into::into).collect();
+        let new_active_jwks = builder.bcs(&new_active_jwks);
+        let res = builder.move_call(
+            SUI_FRAMEWORK_PACKAGE_ID,
+            "authenticator_state",
+            "update_authenticator_state",
+            &[],
+            &[
+                CallArg::Object(ObjectArg::SharedObject(authenticator_state)),
+                CallArg::Pure(new_active_jwks),
+            ],
+        );
+        assert_invariant!(
+            res.is_ok(),
+            "Unable to generate authenticator_state_update transaction!"
+        );
+        builder.finish()
+    };
+    SPT::execute_with_options::<execution_mode::System>(
+        bump,
+        protocol_config,
+        metrics,
+        move_vm,
+        temporary_store,
+        store,
+        tx_ctx,
+        gas_charger,
+        None,
+        pt,
+        SPT::ExecuteOptions {
+            type_cache: None,
+            ..options
+        },
+    )
+    .map_err(|(e, _)| e)?;
+    Ok(())
+}
+
+fn setup_authenticator_state_expire(
+    mut builder: ProgrammableTransactionBuilder<'_>,
+    min_epoch: u64,
+    authenticator_obj_initial_shared_version: SequenceNumber,
+) -> ProgrammableTransactionBuilder<'_> {
+    let authenticator_state = containers::alloc(
+        builder.bump(),
+        SharedObjectArg::new(
+            SUI_AUTHENTICATOR_STATE_OBJECT_ID,
+            authenticator_obj_initial_shared_version,
+            SharedObjectMutability::Mutable,
+        ),
+    );
+    let min_epoch = builder.bcs(&min_epoch);
+    builder
+        .move_call(
+            SUI_FRAMEWORK_PACKAGE_ID,
+            "authenticator_state",
+            "expire_jwks",
+            &[],
+            &[
+                CallArg::Object(ObjectArg::SharedObject(authenticator_state)),
+                CallArg::Pure(min_epoch),
+            ],
+        )
+        .expect("Unable to generate authenticator_state_expire transaction!");
+    builder
+}
+
+fn setup_coin_deny_list_state_create(
+    mut builder: ProgrammableTransactionBuilder<'_>,
+) -> ProgrammableTransactionBuilder<'_> {
+    builder
+        .move_call(SUI_FRAMEWORK_PACKAGE_ID, "deny_list", "create", &[], &[])
+        .expect("Unable to generate coin_deny_list_create transaction!");
+    builder
+}
+
+fn setup_store_execution_time_estimates<'a>(
+    mut builder: ProgrammableTransactionBuilder<'a>,
+    estimates: &StoredExecutionTimeObservations<'_>,
+    chunk_size: usize,
+) -> ProgrammableTransactionBuilder<'a> {
+    let system_state = builder
+        .obj(ObjectArg::SharedObject(&SUI_SYSTEM_MUT))
+        .unwrap();
+
+    // The owned form, which serializes as the reference's.
+    let estimates =
+        messages::build::system_transaction::StoredExecutionTimeObservations::from(estimates);
+    let estimate_chunks = estimates.chunk_observations(chunk_size);
+
+    let chunk_bytes: std::vec::Vec<std::vec::Vec<u8>> = estimate_chunks
+        .into_iter()
+        .map(|chunk| bcs::to_bytes(&chunk).unwrap())
+        .collect();
+
+    let chunks_arg = builder.pure(&chunk_bytes);
+
+    builder.programmable_move_call(
+        SUI_SYSTEM_PACKAGE_ID,
+        "sui_system",
+        "store_execution_time_estimates_v2",
+        &[],
+        &[system_state, chunks_arg],
+    );
+    builder
+}
+
+fn setup_accumulator_root_create(
+    mut builder: ProgrammableTransactionBuilder<'_>,
+) -> ProgrammableTransactionBuilder<'_> {
+    builder
+        .move_call(SUI_FRAMEWORK_PACKAGE_ID, "accumulator", "create", &[], &[])
+        .expect("Unable to generate accumulator_root_create transaction!");
+    builder
+}
+
+fn setup_write_accumulator_storage_cost(
+    mut builder: ProgrammableTransactionBuilder<'_>,
+    storage_cost: u64,
+) -> ProgrammableTransactionBuilder<'_> {
+    let system_state = builder
+        .obj(ObjectArg::SharedObject(&SUI_SYSTEM_MUT))
+        .unwrap();
+    let storage_cost_arg = builder.pure(&storage_cost);
+    builder.programmable_move_call(
+        SUI_SYSTEM_PACKAGE_ID,
+        "sui_system",
+        "write_accumulator_storage_cost",
+        &[],
+        &[system_state, storage_cost_arg],
+    );
+    builder
+}
+
+fn setup_coin_registry_create(
+    mut builder: ProgrammableTransactionBuilder<'_>,
+) -> ProgrammableTransactionBuilder<'_> {
+    builder
+        .move_call(
+            SUI_FRAMEWORK_PACKAGE_ID,
+            "coin_registry",
+            "create",
+            &[],
+            &[],
+        )
+        .expect("Unable to generate coin_registry_create transaction!");
+    builder
+}
+
+fn setup_display_registry_create(
+    mut builder: ProgrammableTransactionBuilder<'_>,
+) -> ProgrammableTransactionBuilder<'_> {
+    builder
+        .move_call(
+            SUI_FRAMEWORK_PACKAGE_ID,
+            "display_registry",
+            "create",
+            &[],
+            &[],
+        )
+        .expect("Unable to generate display_registry_create transaction!");
+    builder
+}
+
+fn setup_address_alias_state_create(
+    mut builder: ProgrammableTransactionBuilder<'_>,
+) -> ProgrammableTransactionBuilder<'_> {
+    builder
+        .move_call(
+            SUI_FRAMEWORK_PACKAGE_ID,
+            "address_alias",
+            "create",
+            &[],
+            &[],
+        )
+        .expect("Unable to generate address_alias_state_create transaction!");
+    builder
+}
+
+fn setup_forwarding_address_registry_create(
+    mut builder: ProgrammableTransactionBuilder<'_>,
+) -> ProgrammableTransactionBuilder<'_> {
+    builder
+        .move_call(
+            SUI_FRAMEWORK_PACKAGE_ID,
+            "forwarding_address",
+            "create",
+            &[],
+            &[],
+        )
+        .expect("Unable to generate forwarding_address_registry_create transaction!");
+    builder
 }

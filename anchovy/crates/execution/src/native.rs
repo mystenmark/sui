@@ -19,9 +19,7 @@ use executor::inputs::{ExecutionInputs, InputObjectKind, InputState, LoadedInput
 use executor::static_programmable_transactions::type_cache::TypeCache;
 use executor::storage::EmptyUnsettledObjectFunds;
 use messages::base::{ObjectId, TransactionDigest};
-use messages::transaction::{
-    DigestReady, HasDigest, Transaction, TransactionData, TransactionKind, TxState,
-};
+use messages::transaction::{DigestReady, HasDigest, Transaction, TransactionData, TxState};
 use messages::{Kept, Message};
 use move_vm_runtime::runtime::MoveRuntime;
 use sui_protocol_config::ProtocolConfig;
@@ -37,18 +35,6 @@ const ARENA_CAPACITY: usize = 1 << 20;
 /// `transaction`, `SenderSignedData` BCS, parsed.
 pub fn parse(transaction: &[u8]) -> Result<Message<Transaction<'static, DigestReady>>> {
     Message::parse(transaction.to_vec()).map_err(|(e, _)| Error::Native(format!("{e:?}")))
-}
-
-/// Whether anchovy's executor executes transactions of `kind`. The epoch
-/// change, the end-of-epoch transactions and authenticator state updates
-/// await the system transactions' port.
-pub fn executes(kind: &TransactionKind<'_>) -> bool {
-    !matches!(
-        kind,
-        TransactionKind::ChangeEpoch(_)
-            | TransactionKind::EndOfEpochTransaction(_)
-            | TransactionKind::AuthenticatorStateUpdate(_)
-    )
 }
 
 /// Anchovy's executor for one epoch.

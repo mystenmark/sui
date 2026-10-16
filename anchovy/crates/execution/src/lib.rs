@@ -79,8 +79,7 @@ impl From<SuiError> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// The pipeline's executor for one epoch: anchovy's, but for the
-/// transaction kinds it does not execute yet, which sui's executes.
+/// The pipeline's executor for one epoch: anchovy's.
 ///
 /// With the `testing` feature, sui's executes every transaction too, as an
 /// oracle: the outcomes must be identical.
@@ -138,15 +137,6 @@ impl Execution {
     ) -> Result<Outcome> {
         let parsed = native::parse(transaction)?;
         let data = parsed.get().0.data();
-        if !native::executes(data.kind()) {
-            return self.reference.execute_at(
-                store,
-                transaction,
-                provided,
-                funds,
-                assigned_accumulator,
-            );
-        }
         let outcome = self.native.execute_at(
             store,
             data,
