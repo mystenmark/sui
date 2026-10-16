@@ -398,7 +398,6 @@ pub fn execute_genesis_state_update<'a>(
     Ok(temporary_store.into_inner(containers::BTreeMap::new_in(bump)))
 }
 
-#[allow(clippy::large_enum_variant)]
 enum Outcome<'a> {
     Proceed {
         gas_charger: GasCharger<'a>,

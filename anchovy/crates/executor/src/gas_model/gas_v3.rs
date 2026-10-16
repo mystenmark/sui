@@ -94,7 +94,6 @@ pub struct SuiGasStatus {
 impl SuiGasStatus {
     /// The reference's private `new`, renamed: here `SuiGasStatus::new` is the public
     /// constructor that its version-dispatching wrapper had.
-    #[allow(clippy::too_many_arguments)]
     fn from_parts(
         move_gas_status: GasStatus,
         gas_budget: u64,

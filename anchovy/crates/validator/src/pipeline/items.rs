@@ -20,7 +20,6 @@ use crate::pipeline::tables::Generation;
 /// or a system transaction the pipeline builds.
 // Nearly every transaction is a user transaction: boxing it would cost an
 // allocation each to save space on the rare system one.
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ExecutableTransaction {
     User(VerifiedTransaction),

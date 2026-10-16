@@ -427,7 +427,6 @@ fn availability_reads_the_store_and_the_generation_table() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
 fn a_resolved_chunk_waits_in_the_input_waiter_until_its_keys_are_available() {
     let gas = coin(id(3), 1);
     let (store, _dir) = store(std::slice::from_ref(&gas));

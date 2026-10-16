@@ -159,7 +159,6 @@ impl Pipeline {
     /// stage's state. Transactions in committed checkpoints are found
     /// executed, and checkpoints up to the committed one are rebuilt but not
     /// certified again.
-    #[allow(clippy::too_many_lines)]
     pub fn start(
         store: &Arc<store::Store>,
         epoch: &Arc<EpochState>,

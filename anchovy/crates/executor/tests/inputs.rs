@@ -144,7 +144,6 @@ fn shared_input(s: &SharedInput) -> PortSharedInput {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn run(seed: u64) {
     let mut rng = Rng(seed);
     let bump = Bump::with_capacity(1 << 16);

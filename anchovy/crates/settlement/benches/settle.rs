@@ -171,7 +171,6 @@ fn digest_of(executable: &Executable) -> [u8; 32] {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn bench_process(size: usize, effects: &[Vec<u8>]) {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(store::Store::open(dir.path()).unwrap());

@@ -103,7 +103,6 @@ pub fn build(
     let built = if config.address_aliases() {
         let mut contents = messages::fast::ContentsBuilder::new_in(bump, effects.len());
         // The lengths are asserted equal above.
-        #[allow(clippy::disallowed_methods)]
         for (executed, transaction) in effects.iter().zip(transactions) {
             let mut signatures = containers::Vec::<UserSignature<'_>>::with_capacity_in(
                 transaction.tx_signatures().len(),

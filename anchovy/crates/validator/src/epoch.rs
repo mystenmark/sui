@@ -97,10 +97,6 @@ impl EpochState {
 
     /// An epoch whose transactions read `epoch_start_timestamp_ms` as its
     /// start.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the epoch's parameters, each its own"
-    )]
     pub fn starting_at(
         chain: Chain,
         protocol_version: u64,

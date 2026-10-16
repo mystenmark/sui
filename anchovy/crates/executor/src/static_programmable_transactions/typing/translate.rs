@@ -718,7 +718,6 @@ fn arguments<'a, Mode: ExecutionMode>(
     expected_tys: impl IntoIterator<Item = Type<'a>>,
 ) -> Result<Vec<'a, T::Argument<'a>>, ExecutionError<'a>> {
     let mut res = Vec::with_capacity_in(locations.len(), env.bump);
-    #[allow(clippy::disallowed_methods)]
     for (i, (location, expected_ty)) in locations
         .into_iter()
         // Intentional zip: expected_tys may be an infinite repeat iterator

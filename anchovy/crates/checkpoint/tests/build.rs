@@ -377,7 +377,6 @@ fn signature_transaction_verifies_in_sui() {
 /// summaries come out in order, each chained to the one before, through
 /// the sequence waiter.
 #[test]
-#[allow(clippy::too_many_lines)]
 fn out_of_order_checkpoints_summarize_in_order() {
     let m = Mainnet::load();
     let s = m.summary();

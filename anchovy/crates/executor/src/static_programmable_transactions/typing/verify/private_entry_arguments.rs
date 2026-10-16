@@ -414,7 +414,6 @@ pub fn verify<'a, Mode: ExecutionMode>(
 }
 
 // `zip` stands in for the reference's `zip_debug_eq`: the lengths are asserted first.
-#[allow(clippy::disallowed_methods)]
 fn command<'a, Mode: ExecutionMode>(
     env: &Env<'a, '_, '_, '_, '_, '_, Mode>,
     context: &mut Context<'a>,

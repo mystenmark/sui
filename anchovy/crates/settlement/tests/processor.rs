@@ -338,7 +338,6 @@ fn digests_of(effects: &[Vec<u8>]) -> Vec<TxDigest> {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
 fn settles_a_chunk_end_to_end() {
     let mut h = Harness::new(8, 8);
     let effects = support::fixed_chunk();

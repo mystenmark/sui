@@ -141,7 +141,6 @@ impl<'a> BitSet<'a> {
             self.words.resize(other.words.len(), 0);
         }
         // Extra words in `self` are unchanged, so zip may stop at the end of `other`.
-        #[allow(clippy::disallowed_methods)]
         let words = self.words.iter_mut().zip(&other.words);
         for (word, other_word) in words {
             *word |= other_word;
@@ -155,7 +154,6 @@ impl<'a> BitSet<'a> {
         mut f: impl FnMut(usize) -> anyhow::Result<bool>,
     ) -> anyhow::Result<bool> {
         // Missing words are zero, so the intersection ends with the shorter set.
-        #[allow(clippy::disallowed_methods)]
         let words = self.words.iter().zip(&other.words);
         for (word_index, (left, right)) in words.enumerate() {
             let mut common = left & right;
@@ -758,7 +756,6 @@ fn command(context: &mut Context, c: &T::Command) -> anyhow::Result<()> {
         results.len()
     );
     // The reference's `zip_debug_eq`; the lengths are equal by the check above.
-    #[allow(clippy::disallowed_methods)]
     context.add_result_values(
         results
             .into_iter()

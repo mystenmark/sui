@@ -126,7 +126,6 @@ impl Executor {
     /// # Panics
     /// On a store that fails, or a key the input waiter released it on
     /// without a value.
-    #[allow(clippy::too_many_lines)]
     fn execute(
         &mut self,
         executable: &Executable,

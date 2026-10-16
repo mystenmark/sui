@@ -247,7 +247,6 @@ impl CommitDecoder {
 
 /// A committed transaction that missed the cache, by the kinds routed.
 // Returned and matched at once, and nearly always a user transaction.
-#[allow(clippy::large_enum_variant)]
 enum Decoded {
     User(CachedTransaction),
     CheckpointSignature(CheckpointSignature),

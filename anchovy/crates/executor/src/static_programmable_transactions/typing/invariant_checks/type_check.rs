@@ -188,7 +188,6 @@ fn command<'a, Mode: ExecutionMode>(
                 arguments.len()
             );
             // The reference's `zip_debug_eq`; the lengths are equal by the check above.
-            #[allow(clippy::disallowed_methods)]
             for (arg, param) in arguments.iter().zip(parameters) {
                 argument(env, context, arg, param)?;
             }
@@ -198,7 +197,6 @@ fn command<'a, Mode: ExecutionMode>(
                 return_.len(),
                 result_tys.len()
             );
-            #[allow(clippy::disallowed_methods)]
             for (actual, expected) in return_.iter().zip(result_tys) {
                 anyhow::ensure!(
                     actual == expected,
@@ -322,7 +320,6 @@ fn command<'a, Mode: ExecutionMode>(
         result_tys.len()
     );
     // The reference's `zip_debug_eq`; the lengths are equal by the check above.
-    #[allow(clippy::disallowed_methods)]
     for (drop_value, result_ty) in c.drop_values.iter().copied().zip(result_tys) {
         // drop value ==> `ty: drop`
         assert_invariant!(

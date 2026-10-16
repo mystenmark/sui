@@ -210,7 +210,6 @@ pub struct Checked {
 }
 
 // Most steps are executions; boxing them would allocate for each.
-#[allow(clippy::large_enum_variant)]
 enum Step {
     Execute(InputsCheckedTransaction),
     Done(Outcome),

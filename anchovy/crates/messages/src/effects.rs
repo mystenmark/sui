@@ -28,7 +28,6 @@ impl GasCostSummary {
 
     /// What the payer is charged, net of the rebate: negative for a refund.
     // The reference casts with `as`.
-    #[allow(clippy::cast_possible_wrap)]
     pub fn net_gas_usage(&self) -> i64 {
         self.gas_used() as i64 - self.storage_rebate as i64
     }

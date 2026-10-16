@@ -149,7 +149,6 @@ fn row(name: &str, (time, allocations): (Duration, f64)) {
 
 /// The layers a transaction passes through, each on one thread.
 // A flat list of rows, one measurement each.
-#[allow(clippy::too_many_lines)]
 fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
     println!("single thread, per transaction:");
     let decoded: Vec<_> = txs.iter().map(decode).collect();

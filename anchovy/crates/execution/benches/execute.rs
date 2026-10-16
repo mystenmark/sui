@@ -57,7 +57,6 @@ const BUDGET: u64 = 50_000_000;
 const SUI: u64 = 1_000_000_000;
 
 // One per run, so the variants' sizes don't matter.
-#[allow(clippy::large_enum_variant)]
 enum Executor {
     Native(NativeExecution),
     Reference(Execution),

@@ -446,7 +446,6 @@ fn upgraded_package_versions_match() {
 
 /// Move calls with type arguments, including ones that fail in loading or typing.
 #[test]
-#[allow(clippy::too_many_lines, clippy::many_single_char_names)]
 fn generic_calls_match() {
     use move_core_types::language_storage::{StructTag, TypeTag};
     use sui_types::transaction::{Argument, Command};

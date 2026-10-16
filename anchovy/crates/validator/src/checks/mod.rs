@@ -239,7 +239,6 @@ impl SignatureChecks {
 
         // 3. The verified enter the cache. `prepared` has an entry per
         // transaction.
-        #[allow(clippy::disallowed_methods)]
         transactions
             .into_iter()
             .zip(prepared)
