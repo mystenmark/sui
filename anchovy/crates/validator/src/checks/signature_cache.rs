@@ -1,12 +1,10 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Transactions whose signatures verified in the current epoch, so that a
+//! Transactions whose signatures verified in the epoch, so that a
 //! resubmission is not verified again: the reference's
 //! `SignatureVerifier::signed_data_cache`. See
 //! `IMPLEMENTATION_PLAN_PHASE6.md`, "Verified-signature cache".
-
-use std::sync::Arc;
 
 use blake2::Blake2b;
 use blake2::digest::consts::U32;
@@ -17,7 +15,6 @@ use messages::base::Digest;
 use messages::transaction::{GenericSignature, Intent, SenderSignedData, Transaction};
 
 use super::Valid;
-use crate::epoch::EpochState;
 use validation::verify::SignerIndices;
 
 /// Entries per generation. An entry survives at least this many later
@@ -27,10 +24,11 @@ pub const GENERATION: usize = 100_000;
 /// Versioned, and apart from every other use of the hash.
 const DOMAIN: &[u8] = b"anchovy verified signatures v1\0";
 
+/// One epoch's: verification reads the epoch number, protocol config and
+/// JWKs, so a cache lives no longer than its epoch.
 pub(crate) struct SignatureCache {
-    /// What the entries were verified under, once there are any.
-    /// Verification reads the epoch number, protocol config and JWKs from it.
-    epoch: Option<Arc<EpochState>>,
+    /// The epoch's number, part of each key.
+    epoch: u64,
     /// Each verified transaction's signer indices, by key.
     current: HashMap<Digest, SignerIndices, DigestHasher>,
     previous: HashMap<Digest, SignerIndices, DigestHasher>,
@@ -41,10 +39,10 @@ pub(crate) struct SignatureCache {
 
 impl SignatureCache {
     /// Holds up to `2 * generation` entries, allocated here and never grown.
-    pub(crate) fn new(generation: usize) -> SignatureCache {
+    pub(crate) fn new(epoch: u64, generation: usize) -> SignatureCache {
         let table = || HashMap::with_capacity_and_hasher(generation, DigestHasher::new());
         SignatureCache {
-            epoch: None,
+            epoch,
             current: table(),
             previous: table(),
             generation,
@@ -53,23 +51,22 @@ impl SignatureCache {
         }
     }
 
-    /// `verify`'s verdict on `transaction`'s signatures in `epoch`, which is
-    /// `Ok` without calling it if they verified before in that epoch.
+    /// `verify`'s verdict on `transaction`'s signatures, which is `Ok`
+    /// without calling it if they verified before.
     ///
     /// The key is computed from the message, whose view cannot be changed
     /// and whose digest was computed from its own bytes, and `verify` is
     /// handed that same view: what is cached is what was verified. Only a
     /// `Valid` transaction gets here: verification does not repeat
-    /// validation. `verify` must depend on nothing but the view and
-    /// `epoch`. In particular it takes no aliases: they would have to be in
+    /// validation. `verify` must depend on nothing but the view and the
+    /// epoch. In particular it takes no aliases: they would have to be in
     /// the key.
     pub(crate) fn verify(
         &mut self,
-        epoch: &Arc<EpochState>,
         transaction: &Message<Transaction<'static, Valid>>,
         verify: impl FnOnce(&SenderSignedData<'_, Valid>) -> Result<SignerIndices, validation::Error>,
     ) -> Result<SignerIndices, validation::Error> {
-        let (key, cached) = self.lookup(epoch, transaction);
+        let (key, cached) = self.lookup(transaction);
         if let Some(indices) = cached {
             return Ok(indices);
         }
@@ -78,20 +75,14 @@ impl SignatureCache {
         Ok(indices)
     }
 
-    /// The transaction's key, and its signer indices if it verified before
-    /// in `epoch`. For verifying outside `verify`, as a batch does: what
-    /// verifies then goes in with `insert`.
+    /// The transaction's key, and its signer indices if it verified before.
+    /// For verifying outside `verify`, as a batch does: what verifies then
+    /// goes in with `insert`.
     pub(crate) fn lookup(
         &mut self,
-        epoch: &Arc<EpochState>,
         transaction: &Message<Transaction<'static, Valid>>,
     ) -> (Digest, Option<SignerIndices>) {
-        if !self.epoch.as_ref().is_some_and(|e| Arc::ptr_eq(e, epoch)) {
-            self.epoch = Some(epoch.clone());
-            self.current.clear();
-            self.previous.clear();
-        }
-        let key = key(epoch.params.epoch, &transaction.get().0);
+        let key = key(self.epoch, &transaction.get().0);
         let cached = self
             .current
             .get(&key)
@@ -163,21 +154,8 @@ mod tests {
 
     use messages::checkpoint::CheckpointData;
     use messages::transaction::DigestReady;
-    use protocol_config::{Chain, ProtocolVersion};
 
     use super::*;
-
-    fn epoch(number: u64) -> Arc<EpochState> {
-        Arc::new(EpochState::new(
-            Chain::Unknown,
-            ProtocolVersion::MAX.as_u64(),
-            number,
-            Digest::new([0x11; 32]),
-            1000,
-            4,
-            [],
-        ))
-    }
 
     fn checkpoint() -> Message<CheckpointData<'static>> {
         let mut bytes =
@@ -205,12 +183,11 @@ mod tests {
     /// Verifies through `cache`; whether the verification ran.
     fn verified(
         cache: &mut SignatureCache,
-        epoch: &Arc<EpochState>,
         transaction: &Message<Transaction<'static, Valid>>,
     ) -> bool {
         let ran = Cell::new(false);
         cache
-            .verify(epoch, transaction, |_| {
+            .verify(transaction, |_| {
                 ran.set(true);
                 Ok(SignerIndices::default())
             })
@@ -219,44 +196,25 @@ mod tests {
     }
 
     #[test]
-    fn another_epoch_empties_the_cache() {
-        let transactions = transactions();
-        let transaction = &transactions[0];
-        let first = epoch(5);
-        let mut cache = SignatureCache::new(8);
-        assert!(verified(&mut cache, &first, transaction));
-        assert!(!verified(&mut cache, &first, transaction));
-        // Another epoch, even with the same number: verified again.
-        let second = epoch(5);
-        assert!(verified(&mut cache, &second, transaction));
-        // And the first epoch's entries are gone.
-        assert!(verified(&mut cache, &first, transaction));
-    }
-
-    #[test]
     fn an_entry_outlives_a_generation_of_insertions_and_hits_evict_nothing() {
         let t = transactions();
         assert!(t.len() >= 5);
-        let epoch = epoch(5);
-        let mut cache = SignatureCache::new(2);
+        let mut cache = SignatureCache::new(5, 2);
         // 0 and 1, then 2 rotates them into the previous generation.
         for transaction in &t[..3] {
-            assert!(verified(&mut cache, &epoch, transaction));
+            assert!(verified(&mut cache, transaction));
         }
         // Hits, however many, insert nothing.
         for _ in 0..10 {
-            assert!(!verified(&mut cache, &epoch, &t[0]));
-            assert!(!verified(&mut cache, &epoch, &t[1]));
+            assert!(!verified(&mut cache, &t[0]));
+            assert!(!verified(&mut cache, &t[1]));
         }
         // 0 has seen two insertions since (2 and 3); the next rotation, at 4,
         // ends it.
-        assert!(verified(&mut cache, &epoch, &t[3]));
-        assert!(!verified(&mut cache, &epoch, &t[0]));
-        assert!(verified(&mut cache, &epoch, &t[4]));
-        assert!(
-            verified(&mut cache, &epoch, &t[0]),
-            "evicted, so verified again"
-        );
+        assert!(verified(&mut cache, &t[3]));
+        assert!(!verified(&mut cache, &t[0]));
+        assert!(verified(&mut cache, &t[4]));
+        assert!(verified(&mut cache, &t[0]), "evicted, so verified again");
         assert!(cache.current.len() + cache.previous.len() <= 4);
     }
 
@@ -264,23 +222,12 @@ mod tests {
     /// over, never grows either table.
     #[test]
     fn the_tables_never_grow() {
-        let t = transactions();
-        let mut cache = SignatureCache::new(4);
+        let mut cache = SignatureCache::new(5, 4);
         let capacities = (cache.current.capacity(), cache.previous.capacity());
-        for round in 0..20_u64 {
-            // Another epoch number for each round: new keys, same transactions.
-            let epoch = Arc::new(EpochState::new(
-                Chain::Unknown,
-                ProtocolVersion::MAX.as_u64(),
-                round,
-                Digest::new([0x11; 32]),
-                1000,
-                4,
-                [],
-            ));
-            for transaction in &t {
-                verified(&mut cache, &epoch, transaction);
-            }
+        for n in 0..100_u64 {
+            let mut key = [0; 32];
+            key[..8].copy_from_slice(&n.to_le_bytes());
+            cache.insert(Digest::new(key), SignerIndices::default());
         }
         let after = (cache.current.capacity(), cache.previous.capacity());
         // The tables may have swapped places.
@@ -291,10 +238,9 @@ mod tests {
     #[test]
     fn a_failure_is_not_cached() {
         let transactions = transactions();
-        let epoch = epoch(5);
-        let mut cache = SignatureCache::new(8);
+        let mut cache = SignatureCache::new(5, 8);
         for _ in 0..2 {
-            let refused = cache.verify(&epoch, &transactions[0], |_| {
+            let refused = cache.verify(&transactions[0], |_| {
                 Err(validation::Error::new(
                     validation::ErrorKind::InvalidSignature,
                     "refused",

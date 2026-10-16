@@ -9,15 +9,19 @@ publish = false
 blake2.workspace = true
 consensus.workspace = true
 containers.workspace = true
+execution.workspace = true
 fastcrypto.workspace = true
 messages.workspace = true
 protocol-config.workspace = true
+state-hasher.workspace = true
 store.workspace = true
+tokio.workspace = true
 validator.workspace = true
 waiter.workspace = true
 workqueue.workspace = true
 
 [dev-dependencies]
+execution = { workspace = true, features = ["testing"] }
 bcs.workspace = true
 sui-protocol-config.workspace = true
 sui-types.workspace = true

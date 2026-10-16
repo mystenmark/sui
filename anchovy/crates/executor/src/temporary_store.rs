@@ -1054,7 +1054,6 @@ impl<'a> TemporaryStore<'a> {
             "a storage rebate for each written object"
         );
         // The lengths are checked equal above, which `zip_debug_eq` would also check.
-        #[allow(clippy::disallowed_methods)]
         for (object, old_storage_rebate) in self
             .execution_results
             .written_objects

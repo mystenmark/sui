@@ -6,13 +6,13 @@ license.workspace = true
 publish = false
 
 [dependencies]
+bcs.workspace = true
 fastcrypto.workspace = true
 messages.workspace = true
 validator.workspace = true
 workqueue.workspace = true
 
 [dev-dependencies]
-bcs.workspace = true
 sui-types.workspace = true
 
 [[bench]]

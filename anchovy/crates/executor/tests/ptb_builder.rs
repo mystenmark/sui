@@ -23,7 +23,6 @@ fn parse<'a, T>(
 }
 
 // The lengths are checked equal before each zip.
-#[allow(clippy::disallowed_methods)]
 fn assert_same(
     bump: &Bump,
     port: messages::transaction::ProgrammableTransaction<'_>,

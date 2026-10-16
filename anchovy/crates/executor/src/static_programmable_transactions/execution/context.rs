@@ -1729,7 +1729,6 @@ where
     // Dev Inspect tracking
     //
 
-    #[allow(clippy::type_complexity)]
     pub fn argument_updates(
         &mut self,
         args: Vec<'a, T::Argument<'a>>,
@@ -1744,7 +1743,6 @@ where
         Ok(updates)
     }
 
-    #[allow(clippy::type_complexity)]
     fn argument_update(
         &mut self,
         sp!(_, (arg, ty)): T::Argument<'a>,
@@ -2893,7 +2891,6 @@ pub fn fetch_packages<'ctx, 'a>(
 
 /// `sui_types::storage::get_package_objects`: the packages, or the ids that are not packages in
 /// the store.
-#[allow(clippy::type_complexity)]
 fn get_package_objects<'ctx, 'a>(
     bump: &'a Bump,
     store: &dyn BackingPackageStore<'a>,
@@ -3041,7 +3038,6 @@ fn assert_expected_move_object_type<'a>(
        actual: {actual:?} vs expected: {expected:?}",
     );
     // Lengths checked above.
-    #[allow(clippy::disallowed_methods)]
     for (actual_ty, expected_ty) in actual_type_arguments.iter().zip(expected_type_arguments) {
         assert_expected_type(actual_ty, expected_ty)?;
     }
@@ -3102,7 +3098,6 @@ fn assert_expected_data_type<'a>(
        actual: {actual:?} vs expected: {expected:?}",
     );
     // Lengths checked above.
-    #[allow(clippy::disallowed_methods)]
     for (actual_ty, expected_ty) in actual_type_arguments
         .iter()
         .zip(expected_type_arguments.iter())

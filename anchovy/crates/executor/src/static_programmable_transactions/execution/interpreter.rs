@@ -220,7 +220,6 @@ fn execute_command<'a, Mode: ExecutionMode>(
                 "object values and types mismatch"
             );
             // Lengths checked above.
-            #[allow(clippy::disallowed_methods)]
             for (object_value, ty) in object_values.into_iter().zip(object_tys) {
                 // TODO should we just call a Move function?
                 let recipient =
@@ -363,7 +362,6 @@ fn execute_command<'a, Mode: ExecutionMode>(
     context.charge_command(is_move_call, num_args, result.len())?;
     let mut kept = Vec::with_capacity_in(result.len(), bump);
     // Lengths checked above.
-    #[allow(clippy::disallowed_methods)]
     kept.extend(
         result
             .into_iter()

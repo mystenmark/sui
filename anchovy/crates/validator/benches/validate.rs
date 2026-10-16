@@ -8,6 +8,9 @@
 //! and gRPC, valid transactions go on to the input checks, against an empty
 //! store, where the first object read rejects them.
 
+#[path = "../tests/common/mod.rs"]
+mod common;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::net::SocketAddr;
@@ -28,7 +31,7 @@ use tonic::transport::Channel;
 use tonic::transport::server::TcpIncoming;
 use validator::Validator;
 use validator::epoch::EpochState;
-use validator::processors::{Processors, Request, SignatureVerifier, TransactionValidator};
+use validator::processors::{Request, SignatureVerifier, TransactionValidator};
 use validator::proto::{RawSubmitTxRequest, RawValidatorHealthRequest, SubmitTxType};
 use validator::service::validator_client::ValidatorClient;
 use workqueue::Processor;
@@ -149,7 +152,6 @@ fn row(name: &str, (time, allocations): (Duration, f64)) {
 
 /// The layers a transaction passes through, each on one thread.
 // A flat list of rows, one measurement each.
-#[allow(clippy::too_many_lines)]
 fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
     println!("single thread, per transaction:");
     let decoded: Vec<_> = txs.iter().map(decode).collect();
@@ -309,12 +311,12 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
             }
         }),
     );
-    let mut validator = TransactionValidator::new();
-    let mut verifier = SignatureVerifier::new();
+    let mut validator = TransactionValidator::new(epoch.clone());
+    let mut verifier = SignatureVerifier::new(epoch.clone());
     let mut both = |verifier: &mut SignatureVerifier, txs: &[Bytes]| {
         for bytes in txs {
             let (reply, _verdict) = oneshot::channel();
-            let request = Request::new(epoch.clone(), vec![decode(bytes)], reply);
+            let request = Request::new(vec![decode(bytes)], reply);
             let accepted = validator
                 .process(request)
                 .and_then(|valid| verifier.process(valid))
@@ -326,7 +328,7 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
         "decode + both processors, cache cold",
         per_tx(txs, 5, |txs| {
             // Its two tables' allocation is timed too: ~5 ns a transaction.
-            both(&mut SignatureVerifier::new(), txs);
+            both(&mut SignatureVerifier::new(epoch.clone()), txs);
         }),
     );
     row(
@@ -395,7 +397,7 @@ fn pool(
     rounds: usize,
 ) -> (f64, Duration) {
     let (_dir, store) = empty_store();
-    let processors = Processors::start(1 << 16, store);
+    let (transactions, _worker) = common::submission(epoch, &store, 1 << 16);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .build()
@@ -405,7 +407,7 @@ fn pool(
         let start = Instant::now();
         let handles: Vec<_> = (0..tasks)
             .map(|t| {
-                let queue = processors.transactions.clone();
+                let queue = transactions.clone();
                 let txs = txs.clone();
                 let epoch = epoch.clone();
                 tokio::spawn(async move {
@@ -421,7 +423,7 @@ fn pool(
                         let (reply, verdict) = oneshot::channel();
                         let transaction = decode(&txs[i % txs.len()]);
                         if queue
-                            .try_push(Request::new(epoch.clone(), vec![transaction], reply))
+                            .try_push(Request::new(vec![transaction], reply))
                             .is_err()
                         {
                             panic!("queue full");
@@ -482,7 +484,7 @@ fn empty_store() -> (tempfile::TempDir, Arc<store::Store>) {
 /// Stops a benchmark server: its runtime, then its processors.
 struct Guard {
     runtime: Option<tokio::runtime::Runtime>,
-    processors: Option<Processors>,
+    processors: Option<Box<dyn std::any::Any>>,
     _dir: tempfile::TempDir,
 }
 impl Drop for Guard {
@@ -500,8 +502,10 @@ fn server(epoch: &Arc<EpochState>, workers: usize) -> (SocketAddr, impl Drop) {
         .build()
         .unwrap();
     let (dir, store) = empty_store();
-    let processors = Processors::start(1 << 16, store);
-    let service = Validator::new(epoch.clone(), processors.transactions.clone()).into_service();
+    let (transactions, worker) = common::submission(epoch, &store, 1 << 16);
+    let (current, consensus) = common::current(epoch, transactions, &store);
+    let processors: Box<dyn std::any::Any> = Box::new((worker, consensus));
+    let service = Validator::over(current).into_service();
     let listener = runtime
         .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
         .unwrap();

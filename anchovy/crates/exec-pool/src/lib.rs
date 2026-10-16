@@ -16,8 +16,9 @@ use messages::transaction::SharedObjectMutability;
 use validator::consensus::sequence::SharedAccess;
 use validator::epoch::EpochState;
 use validator::pipeline::items::{
-    EffectsWaitItem, Executable, ExecutableTransaction, FundsCommand, InputCommand, InputValue,
-    ReservationStatus, Settle, SettlementInput, SystemKind, SystemTransaction,
+    EffectsWaitItem, EpochCloserInput, Executable, ExecutableTransaction, FundsCommand,
+    InputCommand, InputValue, ReservationStatus, Settle, SettlementInput, SystemKind,
+    SystemTransaction,
 };
 use validator::pipeline::keys::{AccumulatorVersion, EffectsKey, InputKey, StreamId, TxDigest};
 use validator::pipeline::tables::{Generation, GenerationTable};
@@ -123,10 +124,8 @@ impl Executor {
     /// what it produced, and pushes the keys it resolves.
     ///
     /// # Panics
-    /// On a transaction of another epoch (reconfiguration does not exist
-    /// yet), a store that fails, or a key the input waiter released it on
+    /// On a store that fails, or a key the input waiter released it on
     /// without a value.
-    #[allow(clippy::too_many_lines)]
     fn execute(
         &mut self,
         executable: &Executable,
@@ -134,10 +133,6 @@ impl Executor {
         effects_keys: &mut Vec<EffectsKey>,
         deposits: &mut Vec<Settle>,
     ) {
-        assert!(
-            Arc::ptr_eq(&executable.epoch, &self.epoch.params),
-            "a transaction of the executor's epoch"
-        );
         let entry = &executable.entry;
         let (digest, bytes): (TxDigest, &[u8]) = match &entry.transaction {
             ExecutableTransaction::User(transaction) => {
@@ -559,13 +554,15 @@ impl Availability<EffectsKey> for EffectsAvailability {
 
 /// Where the effects waiter's ready items go, by kind: a `wait_for_effects`
 /// is woken, to read the effects from the store; a chunk's effects, or its
-/// settlements', go to `SettlementScheduler`. Runs on the effects waiter's
-/// thread.
+/// settlements', go to `SettlementScheduler`; the change-epoch
+/// transaction's, to `EpochCloser`. Runs on the effects waiter's thread.
 ///
 /// Inward: effects waiter, ready: `Vec<EffectsWaitItem>`.
-/// Outward: replies; `SettlementScheduler`: `SettlementInput`.
+/// Outward: replies; `SettlementScheduler`: `SettlementInput`;
+/// `EpochCloser`: `EpochCloserInput::ChangeEpochExecuted`.
 pub struct EffectsRouter {
     pub settlement: Queue<SettlementInput>,
+    pub epoch_closer: Queue<EpochCloserInput>,
 }
 
 impl Sink<Vec<EffectsWaitItem>> for EffectsRouter {
@@ -586,6 +583,11 @@ impl Sink<Vec<EffectsWaitItem>> for EffectsRouter {
                     SettlementInput::SettlementExecuted { height, digests },
                     "settlement",
                 ),
+                EffectsWaitItem::ChangeEpochExecuted => push(
+                    &self.epoch_closer,
+                    EpochCloserInput::ChangeEpochExecuted,
+                    "epoch closer",
+                ),
             }
         }
     }
@@ -605,8 +607,6 @@ mod tests {
     };
     use messages::build::execution_status::ExecutionStatus;
     use messages::build::type_tag::TypeTag;
-    use protocol_config::Chain;
-    use validator::epoch::EpochParams;
     use validator::pipeline::items::{ScheduledEntry, SystemKind, SystemTransaction};
     use validator::pipeline::keys::Reservation;
 
@@ -658,14 +658,6 @@ mod tests {
     fn executable(reserved: &[(u8, u64)]) -> Executable {
         let version = AccumulatorVersion(7);
         Executable {
-            epoch: Arc::new(EpochParams::new(
-                Chain::Unknown,
-                protocol_config::ProtocolVersion::MAX.as_u64(),
-                0,
-                messages::base::Digest::ZERO,
-                1000,
-                4,
-            )),
             version,
             root_version: 1,
             reserved: reserved

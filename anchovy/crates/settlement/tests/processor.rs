@@ -62,7 +62,6 @@ fn chunk(
     digests: Vec<TxDigest>,
 ) -> ChunkSettlement {
     ChunkSettlement {
-        epoch: epoch(),
         version: AccumulatorVersion(version),
         root_version: ROOT_VERSION,
         last_of_commit: last,
@@ -203,6 +202,7 @@ impl Harness {
         let (checkpoints_queue, checkpoints) = workqueue::queue(checkpoint_capacity);
         let (funds_q, funds) = workqueue::queue(funds_capacity);
         let scheduler = SettlementScheduler::new(
+            epoch(),
             store.clone(),
             chunks.clone(),
             effects_q,
@@ -338,7 +338,6 @@ fn digests_of(effects: &[Vec<u8>]) -> Vec<TxDigest> {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
 fn settles_a_chunk_end_to_end() {
     let mut h = Harness::new(8, 8);
     let effects = support::fixed_chunk();

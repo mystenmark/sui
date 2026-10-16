@@ -95,7 +95,6 @@ fn add_prologue(
     );
 }
 
-#[allow(clippy::too_many_lines)]
 fn reference_settlements(
     effects: &[TransactionEffects],
     max_updates: Option<u32>,

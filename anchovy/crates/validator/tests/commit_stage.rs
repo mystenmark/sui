@@ -23,7 +23,7 @@ use sui_types::transaction::{
 };
 use validator::checks;
 use validator::consensus::commit::{CommitStage, Decided, EpochStart};
-use validator::consensus::decode::{CommittedTransaction, DecodedCommit, DecodedRequest};
+use validator::consensus::decode::{CommittedTransaction, DecodedCommit};
 use validator::epoch::EpochParams;
 use validator::pipeline::items::{
     Chunk, ExecutableTransaction, PendingCheckpoint, SettlementInput, SystemKind,
@@ -53,7 +53,7 @@ struct Outputs {
     checkpoints: Inbox<waiter::Command<ChunkSettled, PendingCheckpoint>>,
 }
 
-fn stage() -> (CommitStage, Outputs) {
+fn stage(epoch: &Arc<EpochParams>) -> (CommitStage, Outputs) {
     let (chunks, chunk_inbox) = workqueue::queue(1024);
     let (settlements, settlement_inbox) = workqueue::queue(1024);
     let (checkpoints, checkpoint_inbox) = workqueue::queue(1024);
@@ -63,9 +63,12 @@ fn stage() -> (CommitStage, Outputs) {
         previous_timestamp_ms: 0,
         accumulator_root_initial_shared_version: ROOT_VERSION,
         accumulator_root_version: ROOT_VERSION,
+        epoch_start_timestamp_ms: 0,
+        epoch_duration_ms: u64::MAX,
     };
     (
         CommitStage::new(
+            epoch.clone(),
             start,
             chunks,
             settlements,
@@ -182,7 +185,7 @@ fn summary(decided: &Decided) -> String {
     let checkpoints: Vec<_> = decided
         .checkpoints
         .iter()
-        .map(|c| (c.seq, &c.heights, c.timestamp_ms, c.last_of_epoch))
+        .map(|c| (c.seq, &c.heights, c.timestamp_ms, c.close.is_some()))
         .collect();
     format!("{chunks:?} {settlements:?} {checkpoints:?}")
 }
@@ -205,15 +208,13 @@ fn reference_state_digest(timestamps: &VecDeque<u64>) -> AdditionalConsensusStat
 #[test]
 fn the_prologue_is_sui_s_byte_for_byte() {
     let epoch = epoch(10_000, 0);
-    let (mut stage, _outputs) = stage();
+    let (mut stage, _outputs) = stage(&epoch);
     let mut window = VecDeque::new();
     // Past the window of 10 commits, the oldest timestamps drop out.
     for i in 1..=13u32 {
         let timestamp = 1_000 * u64::from(i) + u64::from(i * i);
         let round = 2 * i;
-        let decided = stage
-            .decide(&epoch, commit(i, round, timestamp, &[]))
-            .unwrap();
+        let decided = stage.decide(commit(i, round, timestamp, &[])).unwrap();
         if window.len() == 10 {
             window.pop_front();
         }
@@ -240,9 +241,9 @@ fn the_prologue_is_sui_s_byte_for_byte() {
 #[test]
 fn chunks_split_at_the_limit_and_checkpoints_follow_the_previous_epoch() {
     let epoch = epoch(3, 0);
-    let (mut stage, _outputs) = stage();
+    let (mut stage, _outputs) = stage(&epoch);
     let users = transactions(7, 0);
-    let decided = stage.decide(&epoch, commit(1, 4, 100, &users)).unwrap();
+    let decided = stage.decide(commit(1, 4, 100, &users)).unwrap();
 
     // The prologue and 7 transactions: chunks of 3, 3 and 2.
     let sizes: Vec<_> = decided.chunks.iter().map(|c| c.entries.len()).collect();
@@ -297,7 +298,7 @@ fn chunks_split_at_the_limit_and_checkpoints_follow_the_previous_epoch() {
     assert_eq!(origins.len(), 8);
 
     // Heights and sequence numbers carry on into the next commit.
-    let decided = stage.decide(&epoch, commit(2, 6, 200, &[])).unwrap();
+    let decided = stage.decide(commit(2, 6, 200, &[])).unwrap();
     assert_eq!(
         (decided.chunks[0].height, decided.chunks[0].checkpoint_seq),
         (4, 14)
@@ -308,13 +309,11 @@ fn chunks_split_at_the_limit_and_checkpoints_follow_the_previous_epoch() {
 #[test]
 fn commits_share_a_checkpoint_until_the_interval_passes() {
     let epoch = epoch(100, 200);
-    let (mut stage, _outputs) = stage();
+    let (mut stage, _outputs) = stage(&epoch);
     let mut cut = Vec::new();
     for (i, timestamp) in [(1, 100), (2, 150), (3, 250), (4, 300)] {
         let users = transactions(2, i.into());
-        let decided = stage
-            .decide(&epoch, commit(i, 2 * i, timestamp, &users))
-            .unwrap();
+        let decided = stage.decide(commit(i, 2 * i, timestamp, &users)).unwrap();
         assert_eq!(decided.chunks.len(), 1);
         assert_eq!(
             decided.chunks[0].checkpoint_seq,
@@ -347,16 +346,16 @@ fn stages_decide_alike() {
     let timestamps = [0, 60, 120, 400];
     let nth = |i: usize| commit(i as u32 + 1, 3 * i as u32 + 1, timestamps[i], &commits(i));
 
-    let (mut first, _a) = stage();
+    let (mut first, _a) = stage(&epoch);
     let once: Vec<_> = (0..4)
-        .map(|i| summary(&first.decide(&epoch, nth(i)).unwrap()))
+        .map(|i| summary(&first.decide(nth(i)).unwrap()))
         .collect();
 
-    let (mut second, _b) = stage();
+    let (mut second, _b) = stage(&epoch);
     let mut replayed = Vec::new();
     for i in 0..4 {
-        replayed.push(summary(&second.decide(&epoch, nth(i)).unwrap()));
-        assert!(second.decide(&epoch, nth(i)).is_none());
+        replayed.push(summary(&second.decide(nth(i)).unwrap()));
+        assert!(second.decide(nth(i)).is_none());
     }
     assert_eq!(once, replayed);
 }
@@ -364,13 +363,9 @@ fn stages_decide_alike() {
 #[test]
 fn the_stage_emits_chunks_settlements_and_checkpoint_waits() {
     let epoch = epoch(4, 0);
-    let (mut stage, outputs) = stage();
+    let (mut stage, outputs) = stage(&epoch);
     let users = transactions(5, 0);
-    let request = DecodedRequest {
-        epoch: epoch.clone(),
-        commit: commit(1, 2, 50, &users),
-    };
-    assert_eq!(stage.process(request), Some(()));
+    assert_eq!(stage.process(commit(1, 2, 50, &users)), Some(()));
 
     let mut chunks = Vec::new();
     while let Some(chunk) = outputs.chunks.try_pop() {
@@ -404,13 +399,8 @@ fn the_stage_emits_chunks_settlements_and_checkpoint_waits() {
         .unwrap();
     assert_eq!(ready.len(), 1);
     assert_eq!((ready[0].seq, ready[0].timestamp_ms), (11, 50));
-    assert!(Arc::ptr_eq(&ready[0].epoch, &epoch));
 
     // A commit handled before emits nothing.
-    let request = DecodedRequest {
-        epoch,
-        commit: commit(1, 2, 50, &users),
-    };
-    assert_eq!(stage.process(request), None);
+    assert_eq!(stage.process(commit(1, 2, 50, &users)), None);
     assert!(outputs.chunks.try_pop().is_none());
 }

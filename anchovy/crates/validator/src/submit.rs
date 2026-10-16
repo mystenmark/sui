@@ -29,6 +29,7 @@ use crate::processors::{Outcome, Request, executed};
 ///
 /// Reads: the object store (input checks, immutable-input claims).
 pub struct SubmitChecker {
+    epoch: Arc<EpochState>,
     pub store: Arc<store::Store>,
     bump: Bump,
 }
@@ -37,8 +38,9 @@ pub struct SubmitChecker {
 const ARENA_BYTES: usize = 16 * 1024;
 
 impl SubmitChecker {
-    pub fn new(store: Arc<store::Store>) -> SubmitChecker {
+    pub fn new(epoch: Arc<EpochState>, store: Arc<store::Store>) -> SubmitChecker {
         SubmitChecker {
+            epoch,
             store,
             bump: Bump::with_capacity(ARENA_BYTES),
         }
@@ -143,11 +145,11 @@ impl Processor for SubmitChecker {
 
     fn process(&mut self, request: Request<Verified>) -> Option<()> {
         let Request {
-            epoch,
             transactions,
             then: _,
             reply,
         } = request;
+        let epoch = self.epoch.clone();
         let mut outcomes = Vec::with_capacity(transactions.len());
         for transaction in &transactions {
             let digest = transaction.get().0.digest().bytes;

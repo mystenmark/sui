@@ -3,6 +3,8 @@
 
 //! Every route of an in-process server, through tonic's generated client.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -19,7 +21,6 @@ use tonic::transport::server::TcpIncoming;
 use validator::Validator;
 use validator::codec::{BcsCodec, Encoded};
 use validator::epoch::EpochState;
-use validator::processors::Processors;
 use validator::proto::{
     PingType, RawSubmitTxRequest, RawValidatorHealthRequest, RawValidatorHealthResponse,
     RawWaitForEffectsRequest, SubmitTxType,
@@ -41,11 +42,12 @@ async fn serve() -> SocketAddr {
     // No genesis: these requests read no objects.
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(store::Store::open(dir.path()).unwrap());
-    let processors = Processors::start(64, store);
-    let service = Validator::new(epoch, processors.transactions.clone()).into_service();
+    let (transactions, worker) = common::submission(&epoch, &store, 64);
+    let (current, consensus) = common::current(&epoch, transactions, &store);
+    let service = Validator::over(current).into_service();
     tokio::spawn(async move {
-        // The processors and their store live as long as the server.
-        let _processors = (processors, dir);
+        // The processors, consensus and store live as long as the server.
+        let _processors = (worker, consensus, dir);
         tonic::transport::Server::builder()
             .add_service(service)
             .serve_with_incoming(TcpIncoming::from(listener))

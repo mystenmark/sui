@@ -20,6 +20,7 @@ use std::collections::BTreeSet;
 use messages::Message;
 use messages::base::{ObjectDigest, ObjectId, ObjectRef, SuiAddress};
 use messages::object::{Data, MoveObjectType, Object, Owner};
+use messages::system_transaction::EndOfEpochTransactionKind;
 use messages::transaction::{
     CallArg, Command, ObjectArg, SenderSignedData, SharedObjectArg, SharedObjectMutability,
     TransactionData, TransactionKind, TxState,
@@ -48,7 +49,7 @@ pub trait Objects {
 pub enum InputKind<'a> {
     Package(ObjectId),
     ImmOrOwned(&'a ObjectRef),
-    Shared(&'a SharedObjectArg),
+    Shared(SharedObjectArg),
 }
 
 impl InputKind<'_> {
@@ -73,13 +74,54 @@ fn not_found(id: &ObjectId, version: Option<u64>) -> Error {
 }
 
 /// The reference's `TransactionData::input_objects`: the inputs' objects, in
-/// order and none twice; then the packages commands name, in id order; then
-/// the gas coins. Coin reservations and receiving objects are not inputs.
+/// order and none twice; then the packages commands name, in id order; then,
+/// but for a system transaction, the gas coins. Coin reservations and
+/// receiving objects are not inputs.
+///
+/// A system transaction's inputs are the shared objects it updates.
 pub fn input_objects<'a>(
     data: &TransactionData<'a, impl TxState>,
 ) -> Result<Vec<InputKind<'a>>, Error> {
-    let TransactionKind::ProgrammableTransaction(pt) = data.kind() else {
-        return Ok(vec![]);
+    let system =
+        |id: u16, initial_shared_version: u64| Ok(vec![shared_mut(id, initial_shared_version)]);
+    let (pt, is_system) = match data.kind() {
+        TransactionKind::ProgrammableTransaction(pt) => (pt, false),
+        TransactionKind::ProgrammableSystemTransaction(pt) => (pt, true),
+        TransactionKind::ConsensusCommitPrologue(_)
+        | TransactionKind::ConsensusCommitPrologueV2(_)
+        | TransactionKind::ConsensusCommitPrologueV3(_)
+        | TransactionKind::ConsensusCommitPrologueV4(_) => return system(CLOCK, 1),
+        TransactionKind::RandomnessStateUpdate(update) => {
+            return system(
+                RANDOMNESS_STATE,
+                update.randomness_obj_initial_shared_version,
+            );
+        }
+        TransactionKind::AuthenticatorStateUpdate(update) => {
+            return system(
+                AUTHENTICATOR_STATE,
+                update.authenticator_obj_initial_shared_version,
+            );
+        }
+        TransactionKind::ChangeEpoch(_) => return system(SYSTEM_STATE, 1),
+        TransactionKind::Genesis(_) => return Ok(vec![]),
+        TransactionKind::EndOfEpochTransaction(txns) => {
+            // Deduplicated, as transactions may share inputs, in a deterministic order.
+            let mut inputs: Vec<InputKind<'a>> = Vec::new();
+            for input in txns.iter().flat_map(end_of_epoch_inputs) {
+                if !inputs.contains(&input) {
+                    inputs.push(input);
+                }
+            }
+            let mut used = BTreeSet::new();
+            if !inputs.iter().all(|i| used.insert(i.id().0)) {
+                return Err(error(
+                    ErrorKind::DuplicateObjectRefInput,
+                    "an object is input twice",
+                ));
+            }
+            return Ok(inputs);
+        }
     };
     let mut inputs = Vec::new();
     for arg in pt.inputs {
@@ -87,7 +129,7 @@ pub fn input_objects<'a>(
             CallArg::Object(ObjectArg::ImmOrOwnedObject(r)) if !r.is_coin_reservation() => {
                 inputs.push(InputKind::ImmOrOwned(r));
             }
-            CallArg::Object(ObjectArg::SharedObject(s)) => inputs.push(InputKind::Shared(s)),
+            CallArg::Object(ObjectArg::SharedObject(s)) => inputs.push(InputKind::Shared(**s)),
             _ => {}
         }
     }
@@ -117,15 +159,64 @@ pub fn input_objects<'a>(
         }
     }
     inputs.extend(packages.into_iter().map(InputKind::Package));
-    inputs.extend(
-        data.gas_data()
-            .payment
-            .iter()
-            .filter(|r| !r.is_coin_reservation())
-            .map(InputKind::ImmOrOwned),
-    );
+    if !is_system {
+        inputs.extend(
+            data.gas_data()
+                .payment
+                .iter()
+                .filter(|r| !r.is_coin_reservation())
+                .map(InputKind::ImmOrOwned),
+        );
+    }
     Ok(inputs)
 }
+
+/// The reference's `EndOfEpochTransactionKind::input_objects`.
+fn end_of_epoch_inputs<'a>(kind: &EndOfEpochTransactionKind<'_>) -> Vec<InputKind<'a>> {
+    match *kind {
+        EndOfEpochTransactionKind::ChangeEpoch(_)
+        | EndOfEpochTransactionKind::StoreExecutionTimeObservations(_)
+        | EndOfEpochTransactionKind::WriteAccumulatorStorageCost { .. } => {
+            vec![shared_mut(SYSTEM_STATE, 1)]
+        }
+        EndOfEpochTransactionKind::AuthenticatorStateExpire {
+            authenticator_obj_initial_shared_version,
+            ..
+        } => vec![shared_mut(
+            AUTHENTICATOR_STATE,
+            authenticator_obj_initial_shared_version,
+        )],
+        EndOfEpochTransactionKind::BridgeCommitteeInit(bridge_version) => vec![
+            shared_mut(BRIDGE, bridge_version),
+            shared_mut(SYSTEM_STATE, 1),
+        ],
+        EndOfEpochTransactionKind::AuthenticatorStateCreate
+        | EndOfEpochTransactionKind::RandomnessStateCreate
+        | EndOfEpochTransactionKind::DenyListStateCreate
+        | EndOfEpochTransactionKind::BridgeStateCreate(_)
+        | EndOfEpochTransactionKind::AccumulatorRootCreate
+        | EndOfEpochTransactionKind::CoinRegistryCreate
+        | EndOfEpochTransactionKind::DisplayRegistryCreate
+        | EndOfEpochTransactionKind::AddressAliasStateCreate
+        | EndOfEpochTransactionKind::ForwardingAddressRegistryCreate => vec![],
+    }
+}
+
+/// A system object, shared at `initial_shared_version`, as a mutable input.
+fn shared_mut<'a>(id: u16, initial_shared_version: u64) -> InputKind<'a> {
+    InputKind::Shared(SharedObjectArg::new(
+        ObjectId::from_u16(id),
+        initial_shared_version,
+        SharedObjectMutability::Mutable,
+    ))
+}
+
+/// The system objects system transactions update.
+const SYSTEM_STATE: u16 = 0x5;
+const CLOCK: u16 = 0x6;
+const AUTHENTICATOR_STATE: u16 = 0x7;
+const RANDOMNESS_STATE: u16 = 0x8;
+const BRIDGE: u16 = 0x9;
 
 /// Every package a type names.
 fn type_packages(t: &TypeTag<'_>, packages: &mut BTreeSet<ObjectId>) {
@@ -496,7 +587,7 @@ fn check_one_object(owner: &SuiAddress, input: &Input<'_>) -> Result<(), Error> 
                 }
             }
         }
-        InputKind::Shared(s) => check_shared(owner, id, object, s)?,
+        InputKind::Shared(s) => check_shared(owner, id, object, &s)?,
     }
     Ok(())
 }

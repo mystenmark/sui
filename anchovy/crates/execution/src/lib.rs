@@ -1,15 +1,17 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Execution with sui's executor, over the store. The one crate that links
-//! `sui-execution` and `sui-types`: transactions come in, and outputs go
-//! out, as the reference's BCS, which the rest of anchovy reads with its
+//! Execution over the store, with anchovy's executor (`native`), and with
+//! sui's (`Reference`), the oracle it is tested against. The one crate that
+//! links `sui-execution` and `sui-types`: transactions come in, and outputs
+//! go out, as the reference's BCS, which the rest of anchovy reads with its
 //! own views.
 
 pub mod genesis;
 pub mod native;
 pub mod reads;
 mod store_view;
+pub mod system_state;
 
 use std::sync::Arc;
 
@@ -77,16 +79,97 @@ impl From<SuiError> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// The pipeline's executor for one epoch: anchovy's.
+///
+/// With the `testing` feature, sui's executes every transaction too, as an
+/// oracle: the outcomes must be identical.
+pub struct Execution {
+    native: native::NativeExecution,
+    reference: Reference,
+}
+
+impl Execution {
+    pub fn new(
+        protocol_version: u64,
+        chain: Chain,
+        epoch: u64,
+        epoch_start_timestamp_ms: u64,
+        reference_gas_price: u64,
+    ) -> Result<Execution> {
+        let reference = Reference::new(
+            protocol_version,
+            chain,
+            epoch,
+            epoch_start_timestamp_ms,
+            reference_gas_price,
+        )?;
+        let native = native::NativeExecution::new(
+            reference.config.clone(),
+            reference.metrics.clone(),
+            epoch,
+            epoch_start_timestamp_ms,
+            reference_gas_price,
+        )?;
+        Ok(Execution { native, reference })
+    }
+
+    /// Sui's executor for the epoch, which genesis runs on.
+    pub fn reference(&self) -> &Reference {
+        &self.reference
+    }
+
+    /// As `Reference::execute`.
+    pub fn execute(&self, store: &store::Store, transaction: &[u8]) -> Result<Outcome> {
+        self.execute_at(store, transaction, &[], Funds::MaybeSufficient, None)
+    }
+
+    /// As `Reference::execute_at`.
+    ///
+    /// # Panics
+    /// With the `testing` feature, if sui's executor's outcome differs.
+    pub fn execute_at(
+        &self,
+        store: &store::Store,
+        transaction: &[u8],
+        provided: &[(messages::base::ObjectId, Input<'_>)],
+        funds: Funds,
+        assigned_accumulator: Option<u64>,
+    ) -> Result<Outcome> {
+        let parsed = native::parse(transaction)?;
+        let data = parsed.get().0.data();
+        let outcome = self.native.execute_at(
+            store,
+            data,
+            transaction,
+            provided,
+            funds,
+            assigned_accumulator,
+        )?;
+        #[cfg(feature = "testing")]
+        assert_same(
+            &self.reference.execute_at(
+                store,
+                transaction,
+                provided,
+                funds,
+                assigned_accumulator,
+            )?,
+            &outcome,
+        );
+        Ok(outcome)
+    }
+}
+
 /// Sui's executor for one epoch: its protocol config (sui's own crate, not
 /// anchovy's copy, which validation uses) and what execution reads of the
 /// epoch.
-pub struct Execution {
+pub struct Reference {
     config: ProtocolConfig,
     executor: Arc<dyn Executor + Send + Sync>,
     metrics: Arc<ExecutionMetrics>,
     epoch: u64,
     epoch_start_timestamp_ms: u64,
-    reference_gas_price: u64,
+    rgp: u64,
 }
 
 /// What executing a transaction produced: its effects, as BCS, and what
@@ -143,24 +226,24 @@ impl Executed {
     }
 }
 
-impl Execution {
+impl Reference {
     pub fn new(
         protocol_version: u64,
         chain: Chain,
         epoch: u64,
         epoch_start_timestamp_ms: u64,
         reference_gas_price: u64,
-    ) -> Result<Execution> {
+    ) -> Result<Reference> {
         let config = ProtocolConfig::get_for_version(ProtocolVersion::new(protocol_version), chain);
         let executor = sui_execution::executor(&config, true)?;
         let metrics = Arc::new(ExecutionMetrics::new(&prometheus::Registry::new()));
-        Ok(Execution {
+        Ok(Reference {
             config,
             executor,
             metrics,
             epoch,
             epoch_start_timestamp_ms,
-            reference_gas_price,
+            rgp: reference_gas_price,
         })
     }
 
@@ -202,12 +285,7 @@ impl Execution {
         let gas_status = if data.kind().is_system_tx() {
             SuiGasStatus::new_unmetered(&self.config)
         } else {
-            SuiGasStatus::new(
-                data.gas_budget(),
-                data.gas_price(),
-                self.reference_gas_price,
-                &self.config,
-            )?
+            SuiGasStatus::new(data.gas_budget(), data.gas_price(), self.rgp, &self.config)?
         };
         let accumulator_version = if self.config.enable_accumulators() {
             accumulator_version(&view)?.map(|live| ConsensusObjectVersion {
@@ -288,6 +366,39 @@ impl Execution {
             },
         })
     }
+}
+
+/// Panics unless `native` is `reference`: the same effects, objects written
+/// and removed, and events.
+pub fn assert_same(reference: &Outcome, native: &Outcome) {
+    if native.effects != reference.effects {
+        let reference: std::result::Result<TransactionEffects, _> =
+            bcs::from_bytes(&reference.effects);
+        let native: std::result::Result<TransactionEffects, _> = bcs::from_bytes(&native.effects);
+        panic!("effects differ:\nreference {reference:#?}\nnative {native:#?}");
+    }
+    let written = |o: &Outcome| {
+        let mut w: Vec<_> = o
+            .commit
+            .written
+            .iter()
+            .map(|w| (w.id, w.version, w.digest, w.bytes.clone()))
+            .collect();
+        w.sort();
+        w
+    };
+    assert_eq!(written(native), written(reference), "written objects");
+    let removed = |o: &Outcome| {
+        let mut r = o.commit.removed.clone();
+        r.sort_by_key(|removed| removed.id.0);
+        r
+    };
+    assert_eq!(removed(native), removed(reference), "removed objects");
+    let executed = |o: &Outcome| {
+        let e = o.commit.executed.as_ref().expect("an outcome executed");
+        (e.digest, e.effects_digest, e.events.clone())
+    };
+    assert_eq!(executed(native), executed(reference), "digests and events");
 }
 
 /// The transaction with digest `transaction`, if it executed: read back

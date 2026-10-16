@@ -43,6 +43,9 @@ sui-framework = { path = "../crates/sui-framework" }
 sui-protocol-config = { path = "../crates/sui-protocol-config" }
 sui-move-build = { path = "../crates/sui-move-build" }
 sui-types = { path = "../crates/sui-types" }
+# Builds a genesis with a system state and validators, for tests.
+sui-genesis-builder = { path = "../crates/sui-genesis-builder" }
+sui-config = { path = "../crates/sui-config" }
 move-core-types = { path = "../external-crates/move/crates/move-core-types" }
 move-binary-format = { path = "../external-crates/move/crates/move-binary-format" }
 move-vm-runtime = { path = "../external-crates/move/crates/move-vm-runtime" }
@@ -140,6 +143,16 @@ module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
+# Deliberate in pipeline items, whose large variant is nearly always the one
+# in use: boxing it would allocate per item.
+large_enum_variant = "allow"
+# Length alone is not a reason to split a function: a state machine's match,
+# a test's scenario, a pipeline's wiring each read best whole.
+too_many_lines = "allow"
+# Wire formats and test fixtures.
+struct_excessive_bools = "allow"
+many_single_char_names = "allow"
+cast_possible_wrap = "allow"
 
 # Dependencies optimized in dev and test builds: zkLogin's proof check
 # (arkworks) is otherwise far too slow for the reference vectors.

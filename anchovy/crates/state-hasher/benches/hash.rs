@@ -71,6 +71,7 @@ fn main() {
         let mut allocations = 0;
         for seq in 0..=u64::from(rounds) {
             let item = CheckpointEffects {
+                last_of_epoch: false,
                 seq,
                 effects: effects.clone(),
             };

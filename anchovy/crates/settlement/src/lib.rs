@@ -20,6 +20,7 @@ use messages::execution_status::ExecutionStatus;
 use messages::object::Data;
 use messages::transaction::{SharedObjectMutability, TransactionKind};
 use validator::consensus::sequence::{SharedAccess, SharedOrdinal};
+use validator::epoch::EpochParams;
 use validator::pipeline::items::ChunkSettlement;
 use validator::pipeline::items::{
     EffectsWaitItem, Executable, ExecutableTransaction, ExecutedEffects, FundsCommand,
@@ -155,6 +156,7 @@ struct Pending {
 /// Reads: the object store (effects, the first transaction, to tell a
 /// prologue, and the balances settled). Writes: the chunk table.
 pub struct SettlementScheduler {
+    epoch: Arc<EpochParams>,
     store: Arc<store::Store>,
     chunks: Arc<ChunkTable>,
     effects: Queue<Command<EffectsKey, EffectsWaitItem>>,
@@ -174,6 +176,7 @@ pub struct SettlementScheduler {
 
 impl SettlementScheduler {
     pub fn new(
+        epoch: Arc<EpochParams>,
         store: Arc<store::Store>,
         chunks: Arc<ChunkTable>,
         effects: Queue<Command<EffectsKey, EffectsWaitItem>>,
@@ -182,6 +185,7 @@ impl SettlementScheduler {
         funds: Queue<FundsCommand>,
     ) -> SettlementScheduler {
         SettlementScheduler {
+            epoch,
             store,
             chunks,
             effects,
@@ -237,7 +241,7 @@ impl SettlementScheduler {
             .iter()
             .map(|d| executed(&self.store, d))
             .collect();
-        let keep = chunk.epoch.config.disable_effects_tx_dependencies();
+        let keep = self.epoch.config.disable_effects_tx_dependencies();
         let prologue_first = !keep && self.is_prologue(chunk.digests.first());
         let views: Vec<&TransactionEffects<'_>> = effects.iter().map(Message::get).collect();
         let order = causal::checkpoint_order(&views, prologue_first, keep);
@@ -299,8 +303,8 @@ impl SettlementScheduler {
             builder.add(i as u64, e.get());
         }
         let kinds = builder.build(
-            chunk.epoch.config.max_updates_per_settlement_txn,
-            chunk.epoch.epoch,
+            self.epoch.config.max_updates_per_settlement_txn,
+            self.epoch.epoch,
             chunk.root.initial_shared_version,
             height,
         );
@@ -356,7 +360,7 @@ impl SettlementScheduler {
         settlements: Vec<Effects>,
     ) {
         let kind = settle::barrier(
-            chunk.epoch.epoch,
+            self.epoch.epoch,
             chunk.root.initial_shared_version,
             height,
             settlements.len() as u64,
@@ -523,7 +527,6 @@ fn executable(
         _ => Vec::new(),
     };
     let executable = Executable {
-        epoch: chunk.epoch.clone(),
         version: chunk.version,
         root_version: chunk.root_version,
         reserved: Vec::new(),

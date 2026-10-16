@@ -263,7 +263,6 @@ impl<'a> Context<'a> {
 /// - Values are not used after being moved
 /// - Reference safety is upheld (no dangling references)
 // `zip` stands in for the reference's `zip_debug_eq`: the lengths are asserted first.
-#[allow(clippy::disallowed_methods)]
 pub fn verify<'a, Mode: ExecutionMode>(
     env: &Env<'a, '_, '_, '_, '_, '_, Mode>,
     ast: &T::Transaction<'a>,
@@ -596,7 +595,6 @@ fn write_ref<'a>(
 }
 
 // `zip` stands in for the reference's `zip_debug_eq`: the lengths are debug-asserted first.
-#[allow(clippy::disallowed_methods)]
 fn call<'a>(
     context: &mut Context<'a>,
     arg_values: Vec<'a, Value>,

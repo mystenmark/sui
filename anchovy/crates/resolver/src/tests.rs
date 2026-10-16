@@ -59,7 +59,11 @@ fn resolver() -> (VersionResolver, Inbox<InputCommand>) {
 fn resolver_with_funds() -> (VersionResolver, Inbox<InputCommand>, FundsInbox) {
     let (inputs, inbox) = workqueue::queue(16);
     let (withdrawals, funds) = workqueue::queue(16);
-    (VersionResolver::new(inputs, withdrawals), inbox, funds)
+    (
+        VersionResolver::new(epoch(), inputs, withdrawals),
+        inbox,
+        funds,
+    )
 }
 
 fn stream(n: u8) -> StreamId {
@@ -423,7 +427,6 @@ fn availability_reads_the_store_and_the_generation_table() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
 fn a_resolved_chunk_waits_in_the_input_waiter_until_its_keys_are_available() {
     let gas = coin(id(3), 1);
     let (store, _dir) = store(std::slice::from_ref(&gas));
@@ -442,7 +445,6 @@ fn a_resolved_chunk_waits_in_the_input_waiter_until_its_keys_are_available() {
     );
     spend.shared = vec![access(clock, Immutable, 1, 1)];
     let chunk = Chunk {
-        epoch: epoch(),
         version: AccumulatorVersion(7),
         root_version: 1,
         round: 1,
@@ -523,7 +525,6 @@ fn a_resolved_chunk_waits_in_the_input_waiter_until_its_keys_are_available() {
 
     // The next round's prologue reads the clock as this one left it.
     let next = Chunk {
-        epoch: epoch(),
         version: AccumulatorVersion(7),
         root_version: 1,
         round: 2,
@@ -546,7 +547,6 @@ fn a_resolved_chunk_waits_in_the_input_waiter_until_its_keys_are_available() {
 fn an_empty_chunk_waits_for_nothing() {
     let (mut resolver, inbox) = resolver();
     let chunk = Chunk {
-        epoch: epoch(),
         version: AccumulatorVersion(7),
         root_version: 1,
         round: 1,
@@ -698,7 +698,6 @@ fn a_withdrawing_transaction_waits_on_its_reservations_instead_of_its_inputs() {
     };
     let digest = transaction.get().0.digest().bytes;
     let chunk = Chunk {
-        epoch: epoch(),
         version: AccumulatorVersion(7),
         root_version: 1,
         round: 1,

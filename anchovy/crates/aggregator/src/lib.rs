@@ -15,10 +15,12 @@ use fastcrypto::traits::{AggregateAuthenticator, ToFromBytes, VerifyingKey};
 use messages::base::Digest;
 use roaring::RoaringBitmap;
 use tracing::{error, warn};
-use validator::pipeline::items::{CertifiedCheckpoint, CheckpointSignature};
-use validator::pipeline::keys::LocalSummary;
+use validator::pipeline::items::{
+    BuiltWaitItem, BuiltWaits, CertifiedCheckpoint, CheckpointSignature,
+};
+use validator::pipeline::keys::CheckpointBuilt;
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore};
-use waiter::Availability;
+use waiter::{Command, WaitBatch};
 use workqueue::{Processor, Queue};
 
 /// Voting power, as sui's committee counts it.
@@ -425,11 +427,13 @@ impl Pending {
 /// use it sooner.
 ///
 /// Inward:
-/// - summary waiter, ready: `Vec<CheckpointSignature>` (signatures wait
+/// - built waiter, ready: `Vec<CheckpointSignature>` (signatures wait
 ///   there until this validator has built the checkpoint).
 ///
 /// Outward:
 /// - state sync (black box): `CertifiedCheckpoint`;
+/// - built waiter, wait for: `BuiltWaitItem::Certified`, keyed by
+///   `CheckpointBuilt(seq)`, for the fork check;
 /// - `CheckpointCommitter`: `Vec<CertifiedCheckpoint>`, in sequence order.
 ///
 /// Reads: the checkpoint store.
@@ -437,6 +441,8 @@ pub struct CheckpointAggregator {
     committee: Arc<Committee>,
     checkpoints: Arc<CheckpointStore>,
     state_sync: Queue<CertifiedCheckpoint>,
+    /// Where certified checkpoints wait to be checked for a fork, once wired.
+    fork_checks: Option<BuiltWaits>,
     /// The checkpoint to certify next; every earlier one is certified.
     next: u64,
     pending: BTreeMap<u64, Pending>,
@@ -454,10 +460,18 @@ impl CheckpointAggregator {
             committee,
             checkpoints,
             state_sync,
+            fork_checks: None,
             next,
             pending: BTreeMap::new(),
             scratch: Vec::new(),
         }
+    }
+
+    /// Sends each checkpoint certified to be checked against the local one.
+    #[must_use]
+    pub fn with_fork_checks(mut self, built: BuiltWaits) -> CheckpointAggregator {
+        self.fork_checks = Some(built);
+        self
     }
 
     fn add(&mut self, signature: &CheckpointSignature, certified: &mut Vec<CertifiedCheckpoint>) {
@@ -489,7 +503,7 @@ impl CheckpointAggregator {
             let local = self
                 .checkpoints
                 .built(seq)
-                .expect("the summary waiter releases signatures once the summary is built");
+                .expect("the built waiter releases signatures once the summary is built");
             Pending::new(local, committee)
         });
         if signed.summary != pending.local.summary.as_slice() {
@@ -518,6 +532,21 @@ impl CheckpointAggregator {
             if self.state_sync.try_push(checkpoint.clone()).is_err() {
                 warn!(seq, "state sync refused a certified checkpoint");
             }
+            if let Some(built) = &self.fork_checks {
+                let mut wait = WaitBatch::with_capacity(1, 1);
+                wait.push(
+                    BuiltWaitItem::Certified {
+                        certified: checkpoint.clone(),
+                        local: None,
+                    },
+                    [CheckpointBuilt(seq)],
+                );
+                // Inside the pipeline a full queue is a sizing bug; a closed
+                // one means the pipeline is shutting down.
+                if let Err(workqueue::PushError::Full(_)) = built.try_push(Command::Wait(wait)) {
+                    panic!("the built waiter refused a certified checkpoint");
+                }
+            }
             certified.push(checkpoint);
         }
     }
@@ -533,21 +562,5 @@ impl Processor for CheckpointAggregator {
             self.add(signature, &mut certified);
         }
         (!certified.is_empty()).then_some(certified)
-    }
-}
-
-/// The summary waiter's availability check: a summary the checkpoint store
-/// holds as built, or held before pruning it.
-pub struct SummaryAvailability {
-    pub checkpoints: Arc<CheckpointStore>,
-}
-
-impl Availability<LocalSummary> for SummaryAvailability {
-    fn check(&mut self, keys: &[LocalSummary], found: &mut Vec<Option<()>>) {
-        found.clear();
-        found.extend(
-            keys.iter()
-                .map(|k| self.checkpoints.is_built(k.0).then_some(())),
-        );
     }
 }

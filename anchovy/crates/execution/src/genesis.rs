@@ -16,10 +16,10 @@ use sui_types::object::{MoveObject, Object, Owner};
 use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
 use sui_types::transaction::CheckedInputObjects;
 
-use crate::{Error, Execution, Result};
+use crate::{Error, Reference, Result};
 
 /// Every genesis object, in no particular order.
-pub fn objects(execution: &Execution, allocations: &[(SuiAddress, u64)]) -> Result<Vec<Object>> {
+pub fn objects(execution: &Reference, allocations: &[(SuiAddress, u64)]) -> Result<Vec<Object>> {
     let genesis = TransactionDigest::genesis_marker();
     let mut objects: Vec<Object> = sui_framework::BuiltInFramework::genesis_objects().collect();
     objects.extend(system_objects(execution, objects.clone())?);
@@ -33,7 +33,7 @@ pub fn objects(execution: &Execution, allocations: &[(SuiAddress, u64)]) -> Resu
 }
 
 /// The system objects execution reads, at the epoch's protocol version.
-fn system_objects(execution: &Execution, packages: Vec<Object>) -> Result<Vec<Object>> {
+fn system_objects(execution: &Reference, packages: Vec<Object>) -> Result<Vec<Object>> {
     let config = execution.protocol_config();
     let mut builder = ProgrammableTransactionBuilder::new();
     let create = |builder: &mut ProgrammableTransactionBuilder, module| {
@@ -71,7 +71,7 @@ fn system_objects(execution: &Execution, packages: Vec<Object>) -> Result<Vec<Ob
 /// Writes genesis, with gas coins for `allocations` (address, amount), into
 /// `store` unless it has one; whether it wrote it.
 pub fn init(
-    execution: &Execution,
+    execution: &Reference,
     store: &store::Store,
     allocations: &[([u8; 32], u64)],
 ) -> Result<bool> {

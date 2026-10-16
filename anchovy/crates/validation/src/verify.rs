@@ -33,7 +33,6 @@ use crate::{Error, ErrorKind};
 /// `SignatureVerifier` holds it: the active JWKs and the verification
 /// settings of the protocol config.
 // The flags are the reference's `VerifyParams`, one per protocol setting.
-#[allow(clippy::struct_excessive_bools)]
 pub struct Verifier {
     jwks: imbl::HashMap<JwkId, JWK>,
     supported_providers: Vec<OIDCProvider>,
@@ -584,7 +583,7 @@ fn verify_multisig(
     // shorter: signatures past the set bits are ignored.
     let indices = (0..10u16).filter(|i| m.bitmap & (1 << i) != 0);
     let mut weight: u16 = 0;
-    #[allow(clippy::disallowed_methods)] // Truncating is the reference's behavior.
+    // Truncating is the reference's behavior.
     for (sig, i) in m.sigs.iter().zip(indices) {
         let Some((pk, w)) = m.multisig_pk.pk_map.get(usize::from(i)) else {
             return Err(invalid("bitmap names a missing key"));

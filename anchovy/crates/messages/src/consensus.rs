@@ -329,7 +329,6 @@ impl<'a> PlainTransactionWithClaims<'a> {
 /// are not checked for either.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 // The reference's layout.
-#[allow(clippy::struct_excessive_bools)]
 pub struct TransactionDenyRules<'a> {
     pub object_deny_list: &'a [ObjectId],
     pub package_deny_list: &'a [ObjectId],
