@@ -4,11 +4,9 @@
 //! The handlers. They decode, hand work to processors and await it; none
 //! does transaction work on the RPC runtime. Health answers.
 //!
-//! Submission checks each transaction on the processors. Over the pipeline
-//! (`Validator::with_consensus`) it then submits the rest to consensus and
-//! answers with their positions; a client then waits for each with
-//! `wait_for_effects`. Without consensus, the processors execute each
-//! transaction and answer with its effects.
+//! Submission checks each transaction on the epoch's processors, then
+//! submits the rest to consensus and answers with their positions; a client
+//! then waits for each with `wait_for_effects`.
 //!
 //! The rest need more of storage, which does not exist yet. Pings are among
 //! them, since a ping's answer is a consensus position and then that
@@ -79,19 +77,6 @@ pub struct Consensus {
 }
 
 impl Validator {
-    /// A standalone validator's server, over processors that execute, in
-    /// one epoch for good.
-    pub fn new(
-        epoch: Arc<EpochState>,
-        transactions: Queue<processors::Request<DigestPending>>,
-    ) -> Validator {
-        Validator::over(CurrentEpoch::fixed(EpochHandle {
-            epoch,
-            transactions,
-            consensus: None,
-        }))
-    }
-
     /// The server over whichever epoch runs.
     pub fn over(current: CurrentEpoch) -> Validator {
         Validator { current }
@@ -102,9 +87,6 @@ impl Validator {
     async fn retry(&self, failure: Failure, epoch: &Arc<EpochHandle>) -> Result<(), Status> {
         match failure {
             Failure::Status(status) => Err(status),
-            Failure::EpochEnded if !self.current.reconfigures() => {
-                Err(Status::unavailable("shutting down"))
-            }
             Failure::EpochEnded => {
                 self.current.ended(epoch).await;
                 Ok(())
@@ -144,10 +126,7 @@ impl Validator {
             .collect();
         let mut positions = Vec::new();
         if !bundle.is_empty() {
-            let consensus = epoch
-                .consensus
-                .as_ref()
-                .expect("only the pipeline's processors ready transactions to submit");
+            let consensus = &epoch.consensus;
             // What becomes of the block is the status cache's to report, for
             // any position, so its receiver is not kept.
             let (block, indices, _) = consensus
@@ -352,7 +331,7 @@ impl validator_server::Validator for Validator {
     /// and verifies them on the processors, and fails the request if any is
     /// invalid, as the reference does. Then answers each: executed already,
     /// rejected by its input checks, or submitted to consensus, with its
-    /// position (without consensus, executed now).
+    /// position.
     async fn submit_transaction(
         &self,
         request: Request<RawSubmitTxRequest>,
@@ -401,9 +380,7 @@ impl validator_server::Validator for Validator {
         };
         loop {
             let epoch = self.current.get().await;
-            let Some(consensus) = &epoch.consensus else {
-                return Err(Status::unimplemented("waiting needs consensus"));
-            };
+            let consensus = &epoch.consensus;
             // A position from an earlier epoch has no status here: its
             // effects answer.
             let position = position.filter(|p| p.epoch == epoch.epoch.params.epoch);

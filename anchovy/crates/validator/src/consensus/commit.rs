@@ -1,7 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Handling a decoded consensus commit (see `decode`), then executing it.
+//! Handling a decoded consensus commit (see `decode`).
 //!
 //! `CommitHandler` is the consensus handler: a replicated state machine. It
 //! reads only its input (decoded commits, the epoch's parameters) and state
@@ -10,10 +10,9 @@
 //! decides. It deduplicates by its own record of processed transactions,
 //! locks owned inputs in consensus order, dropping a transaction whose
 //! owned input an earlier one locked, and schedules the rest (`sequence`:
-//! the prologue, the protocol's order, shared-object ordinals). `ScheduleExecutor` then executes the schedule one
-//! transaction at a time, as `SubmitTransaction` executes them, skipping
-//! transactions executed already. Executing at the versions the ordinals
-//! name, the prologue transaction, and congestion control are not here yet.
+//! the prologue, the protocol's order, shared-object ordinals).
+//! `CommitStage` lays the schedule out in chunks and checkpoints for the
+//! pipeline. Congestion control is not here yet.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -23,50 +22,17 @@ use ::consensus::{BlockRef, TransactionIndex};
 use messages::base::ObjectRef;
 use workqueue::{Processor, Refusal, Refuse};
 
-use crate::checks;
 use crate::consensus::decode::{CommittedTransaction, DecodedCommit, OwnedInputs};
 use crate::consensus::sequence::{
     Prologue, Schedule, Scheduled, Sequencer, SharedAccess, SharedOrdinal,
 };
 use crate::consensus::status::{ConsensusTxStatus, ConsensusTxStatusCache};
-use crate::epoch::{EpochParams, EpochState};
+use crate::epoch::EpochParams;
 use crate::pipeline::items::{
     Chunk, ChunkSettlement, EpochClose, ExecutableTransaction, PendingCheckpoint, ScheduledEntry,
     SettlementInput, SystemKind, SystemTransaction,
 };
 use crate::pipeline::keys::{AccumulatorVersion, ChunkSettled, TxDigest};
-use crate::processors::{Outcome, execute_and_commit, executed};
-
-/// What became of each user transaction a commit carried.
-#[derive(Debug)]
-pub struct CommitOutcome {
-    pub commit_index: u32,
-    /// Those scheduled, in schedule order, then those dropped, in consensus
-    /// order, then the duplicates.
-    pub transactions: Vec<Committed>,
-    /// Transactions taken from the cache, and decoded again.
-    pub cache_hits: usize,
-    pub cache_misses: usize,
-}
-
-/// One user transaction of a commit.
-#[derive(Debug)]
-pub struct Committed {
-    pub block: BlockRef,
-    pub index: TransactionIndex,
-    pub digest: [u8; 32],
-    pub fate: Fate,
-}
-
-#[derive(Debug)]
-pub enum Fate {
-    /// Executed, or failed to.
-    Executed(Outcome),
-    /// Not executed: see `DropReason`.
-    Dropped(DropReason),
-    /// Processed in an earlier commit, or executed already.
-    Duplicate,
-}
 
 /// Why a committed transaction was dropped.
 #[derive(Debug)]
@@ -74,8 +40,7 @@ pub enum DropReason {
     /// Its owned input `object` was locked by `holder`, earlier in consensus
     /// order: the reference's `ObjectLockConflict`.
     LockConflict { object: ObjectRef, holder: TxDigest },
-    /// Its input objects are invalid (the handler), or failed the checks
-    /// when its turn came (`ScheduleExecutor`).
+    /// Its input objects are invalid.
     Inputs(validation::Error),
 }
 
@@ -104,9 +69,8 @@ impl Refuse for HandledCommit {
 /// The consensus handler. Its state is in memory for now; persisted later,
 /// it is written and read back only by the handler.
 ///
-/// Inward: `CommitDecoder`: `DecodedRequest`.
-/// Outward: `ScheduleExecutor` (today's serial path): `HandledRequest`. In
-/// the pipeline, `CommitStage` wraps it instead.
+/// Run inside `CommitStage`, which feeds it decoded commits and lays out
+/// what it decides.
 pub struct CommitHandler {
     /// The index of the last commit handled; 0 before the first.
     last_commit: u32,
@@ -225,114 +189,6 @@ impl CommitHandler {
         }
         self.locks.extend(owned.into_iter().map(|r| (r, digest)));
         Ok(())
-    }
-}
-
-/// `CommitHandler` on a worker, in one epoch.
-pub struct HandlerStage {
-    pub epoch: Arc<EpochParams>,
-    pub handler: CommitHandler,
-}
-
-impl Processor for HandlerStage {
-    type Input = DecodedCommit;
-    type Output = HandledCommit;
-
-    fn process(&mut self, commit: DecodedCommit) -> Option<HandledCommit> {
-        self.handler.handle(&self.epoch, commit)
-    }
-}
-
-/// Executes handled commits against the store, serially in schedule order,
-/// which gives the versions the ordinals name.
-///
-/// Today's serial path, which the pipeline's resolver, input waiter and
-/// `Executor` replace.
-/// Inward: `CommitHandler`: `HandledCommit`.
-/// Outward: `CommitOutcome` to its sink.
-pub struct ScheduleExecutor {
-    store: Arc<store::Store>,
-    /// The epoch it executes in, with this node's executor.
-    epoch: Arc<EpochState>,
-}
-
-impl ScheduleExecutor {
-    pub fn new(store: Arc<store::Store>, epoch: Arc<EpochState>) -> ScheduleExecutor {
-        ScheduleExecutor { store, epoch }
-    }
-
-    /// Executes `commit`'s schedule. A transaction executed already (before
-    /// a restart, say) is a duplicate here; the prologue is not executed
-    /// yet.
-    pub fn execute(&mut self, commit: HandledCommit) -> CommitOutcome {
-        let epoch = &*self.epoch;
-        let HandledCommit {
-            commit_index,
-            schedule,
-            origins,
-            duplicates,
-            dropped,
-            cache_hits,
-            cache_misses,
-        } = commit;
-        let mut transactions =
-            Vec::with_capacity(schedule.len() + dropped.len() + duplicates.len());
-        for scheduled in schedule.transactions {
-            let Scheduled::User(transaction) = scheduled else {
-                continue;
-            };
-            let digest = transaction.get().0.digest().bytes;
-            let (block, index) = origins[&digest];
-            let fate = if executed(&self.store, &digest).is_some() {
-                Fate::Duplicate
-            } else {
-                match checks::check_inputs(epoch, &self.store, transaction) {
-                    Ok(checked) => Fate::Executed(execute_and_commit(&self.store, epoch, &checked)),
-                    Err(e) => Fate::Dropped(DropReason::Inputs(e)),
-                }
-            };
-            transactions.push(Committed {
-                block,
-                index,
-                digest,
-                fate,
-            });
-        }
-        transactions.extend(
-            dropped
-                .into_iter()
-                .map(|(block, index, digest, drop)| Committed {
-                    block,
-                    index,
-                    digest,
-                    fate: Fate::Dropped(drop),
-                }),
-        );
-        transactions.extend(
-            duplicates
-                .into_iter()
-                .map(|(block, index, digest)| Committed {
-                    block,
-                    index,
-                    digest,
-                    fate: Fate::Duplicate,
-                }),
-        );
-        CommitOutcome {
-            commit_index,
-            transactions,
-            cache_hits,
-            cache_misses,
-        }
-    }
-}
-
-impl Processor for ScheduleExecutor {
-    type Input = HandledCommit;
-    type Output = CommitOutcome;
-
-    fn process(&mut self, commit: HandledCommit) -> Option<CommitOutcome> {
-        Some(self.execute(commit))
     }
 }
 

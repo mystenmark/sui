@@ -199,3 +199,63 @@ impl Pipeline {
         self.verifier.cache_stats()
     }
 }
+
+/// The pipeline's submission processors on one worker over `store`, in
+/// `epoch`: validation, signature verification behind a queue of
+/// `signatures` requests, then the input checks. Its validation queue.
+pub fn submission(
+    epoch: &Arc<EpochState>,
+    store: &Arc<store::Store>,
+    signatures: usize,
+) -> (
+    workqueue::Queue<validator::processors::Request<DigestPending>>,
+    workqueue::WorkerHandle,
+) {
+    use validator::processors::{SignatureVerifier, TransactionValidator};
+    use validator::submit::SubmitChecker;
+    let (transactions, validation) = workqueue::queue(1024);
+    let (to_verify, verification) = workqueue::queue(signatures);
+    let (to_check, checks) = workqueue::queue(1024);
+    let (validating, verifying, checking) = (epoch.clone(), epoch.clone(), epoch.clone());
+    let store = store.clone();
+    let worker = workqueue::Worker::new("submission")
+        .run(
+            validation,
+            move || TransactionValidator::new(validating),
+            to_verify,
+        )
+        .run(
+            verification,
+            move || SignatureVerifier::new(verifying),
+            to_check,
+        )
+        .run(checks, move || SubmitChecker::new(checking, store), |()| {})
+        .spawn();
+    (transactions, worker)
+}
+
+/// `epoch` as the running epoch, its submissions going to `transactions`:
+/// what the gRPC server serves. Its consensus takes no submissions: the
+/// returned value keeps its lanes, unread.
+pub fn current(
+    epoch: &Arc<EpochState>,
+    transactions: workqueue::Queue<validator::processors::Request<DigestPending>>,
+    store: &Arc<store::Store>,
+) -> (validator::current::CurrentEpoch, impl Send + 'static) {
+    use validator::current::{CurrentEpoch, EpochHandle};
+    use validator::server::Consensus;
+    let (client, normal, priority) = consensus::TransactionClient::new(16);
+    let (effects, effects_inbox) = workqueue::queue(16);
+    let current = CurrentEpoch::new();
+    current.set(Arc::new(EpochHandle {
+        epoch: epoch.clone(),
+        transactions,
+        consensus: Consensus {
+            client,
+            statuses: Arc::new(validator::consensus::status::ConsensusTxStatusCache::new()),
+            effects,
+            store: store.clone(),
+        },
+    }));
+    (current, (normal, priority, effects_inbox))
+}

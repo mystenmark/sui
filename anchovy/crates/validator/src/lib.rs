@@ -24,21 +24,15 @@ pub mod service {
 }
 
 /// Serves the API over TLS on `listener` until `shutdown` completes, over
-/// `store`. The processors stop once the server has.
+/// whichever epoch `current` runs.
 pub async fn serve(
     listener: tokio::net::TcpListener,
     key: &tls::NetworkKey,
-    epoch: std::sync::Arc<epoch::EpochState>,
-    store: std::sync::Arc<store::Store>,
+    current: current::CurrentEpoch,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
-    let processors =
-        processors::Processors::start(processors::VALIDATION_QUEUE, epoch.clone(), store);
-    let validator = Validator::new(epoch, processors.transactions.clone());
-    let served = tonic::transport::Server::builder()
-        .add_service(validator.into_service())
+    tonic::transport::Server::builder()
+        .add_service(Validator::over(current).into_service())
         .serve_with_incoming_shutdown(tls::incoming(listener, tls::server_config(key)), shutdown)
-        .await;
-    drop(processors);
-    served
+        .await
 }

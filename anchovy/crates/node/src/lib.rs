@@ -626,12 +626,12 @@ impl Pipeline {
         Arc::new(EpochHandle {
             epoch: self.epoch.clone(),
             transactions: self.transactions.clone(),
-            consensus: Some(Consensus {
+            consensus: Consensus {
                 client: self.consensus.clone(),
                 statuses: self.statuses.clone(),
                 effects: self.effects.clone(),
                 store: self.store.clone(),
-            }),
+            },
         })
     }
 }

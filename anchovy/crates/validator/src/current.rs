@@ -20,18 +20,14 @@ pub struct EpochHandle {
     pub epoch: Arc<EpochState>,
     /// Submissions, into the epoch's processors.
     pub transactions: Queue<processors::Request<DigestPending>>,
-    /// Submission to consensus and waiting for effects, over the pipeline;
-    /// none for the standalone validator, whose processors execute.
-    pub consensus: Option<Consensus>,
+    /// Submission to consensus and waiting for effects.
+    pub consensus: Consensus,
 }
 
 /// The running epoch, if any. Cloned handles see the same epoch.
 #[derive(Clone)]
 pub struct CurrentEpoch {
     sender: Arc<watch::Sender<Option<Arc<EpochHandle>>>>,
-    /// False for a node that never reconfigures: a closed queue then means
-    /// shutting down, not the epoch ending.
-    reconfigures: bool,
 }
 
 impl CurrentEpoch {
@@ -39,15 +35,6 @@ impl CurrentEpoch {
     pub fn new() -> CurrentEpoch {
         CurrentEpoch {
             sender: Arc::new(watch::Sender::new(None)),
-            reconfigures: true,
-        }
-    }
-
-    /// `handle`'s epoch, for good.
-    pub fn fixed(handle: EpochHandle) -> CurrentEpoch {
-        CurrentEpoch {
-            sender: Arc::new(watch::Sender::new(Some(Arc::new(handle)))),
-            reconfigures: false,
         }
     }
 
@@ -58,10 +45,6 @@ impl CurrentEpoch {
     /// No epoch runs until the next `set`.
     pub fn clear(&self) {
         self.sender.send_replace(None);
-    }
-
-    pub fn reconfigures(&self) -> bool {
-        self.reconfigures
     }
 
     /// The running epoch, waiting while none runs.
