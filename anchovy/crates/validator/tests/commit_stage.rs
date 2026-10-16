@@ -25,6 +25,7 @@ use validator::checks;
 use validator::consensus::commit::{CommitStage, Decided, EpochStart};
 use validator::consensus::decode::{CommittedTransaction, DecodedCommit};
 use validator::epoch::EpochParams;
+use validator::epoch_store::{ConsensusOutput, EpochStore};
 use validator::pipeline::items::{
     Chunk, ExecutableTransaction, PendingCheckpoint, SettlementInput, SystemKind,
 };
@@ -32,6 +33,14 @@ use validator::pipeline::keys::ChunkSettled;
 use workqueue::{Inbox, Processor};
 
 const ROOT_VERSION: u64 = 5;
+
+/// The one writer of a fresh epoch store's consensus output, and the
+/// directory the store is in.
+fn consensus_output() -> (ConsensusOutput, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, output) = EpochStore::open(dir.path(), 0);
+    (output, dir)
+}
 
 fn epoch(max_transactions: u64, min_interval_ms: u64) -> Arc<EpochParams> {
     let mut epoch = EpochParams::new(
@@ -51,6 +60,8 @@ struct Outputs {
     chunks: Inbox<Chunk>,
     settlements: Inbox<SettlementInput>,
     checkpoints: Inbox<waiter::Command<ChunkSettled, PendingCheckpoint>>,
+    /// The epoch store the stage writes.
+    _dir: tempfile::TempDir,
 }
 
 fn stage(epoch: &Arc<EpochParams>) -> (CommitStage, Outputs) {
@@ -66,10 +77,12 @@ fn stage(epoch: &Arc<EpochParams>) -> (CommitStage, Outputs) {
         epoch_start_timestamp_ms: 0,
         epoch_duration_ms: u64::MAX,
     };
+    let (output, dir) = consensus_output();
     (
         CommitStage::new(
             epoch.clone(),
             start,
+            output,
             chunks,
             settlements,
             checkpoints,
@@ -79,6 +92,7 @@ fn stage(epoch: &Arc<EpochParams>) -> (CommitStage, Outputs) {
             chunks: chunk_inbox,
             settlements: settlement_inbox,
             checkpoints: checkpoint_inbox,
+            _dir: dir,
         },
     )
 }

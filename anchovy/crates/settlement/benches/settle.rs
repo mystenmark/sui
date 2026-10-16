@@ -236,6 +236,7 @@ fn bench_process(size: usize, effects: &[Vec<u8>]) {
                     round: height as u32,
                     writes_before: 0,
                 },
+                base: None,
             },
         };
         scheduler.process(SettlementInput::Chunk(chunk.clone()));

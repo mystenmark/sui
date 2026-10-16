@@ -45,7 +45,7 @@ fn a_start_version_is_fixed_at_the_first_assignment() {
     };
     let objects = Store::open(&dir.path().join("perpetual")).unwrap();
     {
-        let store = EpochStore::open(&epochs, 0);
+        let (store, _) = EpochStore::open(&epochs, 0);
         assert_eq!(store.start_version(&objects, &id, 1), None);
         objects.write_through(write(3)).unwrap();
         assert_eq!(store.start_version(&objects, &id, 1), Some(at(3)));
@@ -56,8 +56,8 @@ fn a_start_version_is_fixed_at_the_first_assignment() {
     }
     objects.write_through(write(7)).unwrap();
     // Reopened, as on restart.
-    let store = EpochStore::open(&epochs, 0);
+    let (store, _) = EpochStore::open(&epochs, 0);
     assert_eq!(store.start_version(&objects, &id, 1), Some(at(3)));
-    let next = EpochStore::open(&epochs, 1);
+    let (next, _) = EpochStore::open(&epochs, 1);
     assert_eq!(next.start_version(&objects, &id, 1), Some(at(7)));
 }

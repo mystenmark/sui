@@ -172,6 +172,7 @@ fn chunk(round: u32, transactions: &[Planned]) -> Chunk {
                             round,
                             writes_before,
                         },
+                        base: None,
                     }
                 })
                 .collect();

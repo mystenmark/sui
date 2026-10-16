@@ -31,7 +31,7 @@ use validator::consensus::status::ConsensusTxStatusCache;
 use validator::consensus::vote::VoteRequest;
 use validator::current::EpochHandle;
 use validator::epoch::EpochState;
-use validator::epoch_store::EpochStore;
+use validator::epoch_store::{ConsensusOutput as OutputWriter, EpochStore};
 use validator::pipeline::items::{CertifiedCheckpoint, EffectsWaitItem};
 use validator::pipeline::keys::EffectsKey;
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable, GenerationTable};
@@ -148,6 +148,7 @@ impl Pipeline {
         store: &Arc<store::Store>,
         epoch: &Arc<EpochState>,
         epoch_store: &EpochStore,
+        consensus_output: OutputWriter,
         protocol_key: &Arc<ProtocolKey>,
         committee: &Arc<Committee>,
         consensus: impl FnOnce(ConsensusOutput) -> TransactionClient,
@@ -188,7 +189,14 @@ impl Pipeline {
             root_state: record.root_state.clone(),
         });
         let (ended_sender, ended) = watch::channel(None);
-        let workers = wiring::spawn(parts.clone(), &queues, inboxes, state_sync, ended_sender);
+        let workers = wiring::spawn(
+            parts.clone(),
+            &queues,
+            inboxes,
+            consensus_output,
+            state_sync,
+            ended_sender,
+        );
 
         Pipeline {
             transactions: queues.transactions,

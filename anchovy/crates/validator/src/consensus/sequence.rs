@@ -42,6 +42,11 @@ pub struct SharedAccess {
     pub initial_shared_version: u64,
     pub mutability: SharedObjectMutability,
     pub ordinal: SharedOrdinal,
+    /// At generation 0, the stream's last generation from an earlier round,
+    /// which the access reads, as (round, generation); none if it reads the
+    /// stream live (first scheduled this epoch, or read live earlier this
+    /// round). Unused at a later generation. Set by the commit handler.
+    pub base: Option<SharedOrdinal>,
 }
 
 /// What building a commit's consensus commit prologue takes.
@@ -77,6 +82,11 @@ impl Schedule {
     pub fn accesses(&self, i: usize) -> &[SharedAccess] {
         let start = i.checked_sub(1).map_or(0, |j| self.ends[j] as usize);
         &self.accesses[start..self.ends[i] as usize]
+    }
+
+    /// Every transaction's shared accesses, in schedule order.
+    pub fn all_accesses_mut(&mut self) -> &mut [SharedAccess] {
+        &mut self.accesses
     }
 
     pub fn len(&self) -> usize {
@@ -138,6 +148,7 @@ impl Sequencer {
                 round,
                 writes_before: 0,
             },
+            base: None,
         };
         Self::count(&mut self.writes, 0, std::iter::once(&clock));
         schedule.accesses.push(clock);
@@ -187,6 +198,7 @@ impl Sequencer {
                         round,
                         writes_before: self.writes.get(&stream).map_or(0, |w| w.count),
                     },
+                    base: None,
                 });
             }
             let index = u32::try_from(position + 1).expect("fewer than 2^32 transactions");
