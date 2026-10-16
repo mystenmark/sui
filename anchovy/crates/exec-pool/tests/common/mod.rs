@@ -29,6 +29,7 @@ use sui_types::transaction::{
 use validator::checks::{self, VerifiedTransaction};
 use validator::consensus::sequence::{SharedAccess, SharedOrdinal};
 use validator::epoch::EpochState;
+use validator::epoch_store::EpochStore;
 use validator::pipeline::items::{
     EffectsWaitItem, Executable, ExecutableTransaction, FundsCommand, InputCommand, InputValue,
     ScheduledEntry,
@@ -46,6 +47,7 @@ pub struct Node {
     _dir: tempfile::TempDir,
     pub epoch: Arc<EpochState>,
     pub store: Arc<store::Store>,
+    pub epoch_store: EpochStore,
     pub generations: Arc<GenerationTable>,
     pub sender: SuiAddress,
     key: AccountKeyPair,
@@ -114,7 +116,8 @@ impl Node {
             [],
         ));
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(store::Store::open(dir.path()).unwrap());
+        let store = Arc::new(store::Store::open(&dir.path().join("perpetual")).unwrap());
+        let epoch_store = EpochStore::open(&dir.path().join("epochs"), 0);
         let funded = vec![(sender.to_inner(), 10 * SUI); coins];
         assert!(execution::genesis::init(epoch.execution.reference(), &store, &funded).unwrap());
         let generations = Arc::new(GenerationTable::new());
@@ -124,6 +127,7 @@ impl Node {
         let executor = Executor::new(
             store.clone(),
             epoch.clone(),
+            epoch_store.clone(),
             generations.clone(),
             inputs,
             effects,
@@ -133,6 +137,7 @@ impl Node {
             _dir: dir,
             epoch,
             store,
+            epoch_store,
             generations,
             sender,
             key,

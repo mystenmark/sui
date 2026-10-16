@@ -24,6 +24,7 @@ use validator::consensus::decode::{CommitDecoder, CommitRequest, DecodedCommit};
 use validator::consensus::status::ConsensusTxStatusCache;
 use validator::consensus::vote::{BlockVoter, VoteRequest};
 use validator::epoch::EpochState;
+use validator::epoch_store::EpochStore;
 use validator::pipeline::items::{
     BuiltCommand, BuiltWaits, CertifiedCheckpoint, CheckpointContentsBuilt, CheckpointEffects,
     CheckpointSignature, Chunk, EffectsWaitItem, EpochCloserInput, Executable, FundsCommand,
@@ -136,6 +137,7 @@ queues! {
 pub(crate) struct Parts {
     pub store: Arc<store::Store>,
     pub epoch: Arc<EpochState>,
+    pub epoch_store: EpochStore,
     pub key: Arc<ProtocolKey>,
     pub committee: Arc<Committee>,
     pub consensus: TransactionClient,
@@ -200,6 +202,7 @@ impl Parts {
         Executor::new(
             self.store.clone(),
             self.epoch.clone(),
+            self.epoch_store.clone(),
             self.generations.clone(),
             inputs,
             effects,
