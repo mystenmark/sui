@@ -27,9 +27,9 @@ use sui_types::messages_consensus::{ConsensusTransaction, ConsensusTransactionKi
 use sui_types::transaction::SenderSignedData as SuiSigned;
 use validator::epoch::EpochParams;
 use validator::pipeline::items::{
-    CheckpointContentsBuilt, ExecutedEffects, PendingCheckpoint, SettledChunk,
+    BuiltWaitItem, CheckpointContentsBuilt, ExecutedEffects, PendingCheckpoint, SettledChunk,
 };
-use validator::pipeline::keys::LocalSummary;
+use validator::pipeline::keys::CheckpointBuilt;
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable};
 use waiter::{Command, WaiterProcessor};
 use workqueue::{Inbox, Processor, queue};
@@ -375,7 +375,7 @@ fn signature_transaction_verifies_in_sui() {
 
 /// Pending checkpoints arriving out of order are built at once, and their
 /// summaries come out in order, each chained to the one before, through
-/// the sequence waiter.
+/// the built waiter.
 #[test]
 fn out_of_order_checkpoints_summarize_in_order() {
     let m = Mainnet::load();
@@ -401,35 +401,40 @@ fn out_of_order_checkpoints_summarize_in_order() {
     checkpoints.insert_built(previous(10, s.epoch, [9; 32], 100, [1, 2, 3, 4]));
 
     let (to_hasher, hasher_inbox) = queue(16);
-    let (sequence, sequence_inbox) = queue(16);
-    let (summaries, summaries_inbox) = queue(16);
+    let (built, built_inbox) = queue(16);
     let (consensus, _normal, mut signatures) = consensus::TransactionClient::new(16);
     let mut contents = ContentsBuilder::new(
         epoch.clone(),
         chunks,
         m.store.clone(),
         to_hasher,
-        sequence.clone(),
+        built.clone(),
     );
     let mut waiter = WaiterProcessor::new(BuiltAvailability {
         checkpoints: checkpoints.clone(),
+        store: m.store.clone(),
     });
-    let mut summary = SummaryBuilder::new(
-        epoch.clone(),
-        checkpoints.clone(),
-        key(),
-        sequence,
-        summaries,
-        consensus,
-    );
+    let mut summary =
+        SummaryBuilder::new(epoch.clone(), checkpoints.clone(), key(), built, consensus);
 
-    // Runs the sequence waiter and the summary builder until quiet; returns
-    // the sequence numbers summarized, in order.
-    let mut settle = |waiter: &mut WaiterProcessor<_, _, _>| -> Vec<u64> {
+    // Runs the built waiter and the summary builder until quiet; returns the
+    // sequence numbers summarized, in order. Records the checkpoints the
+    // summary builder resolved.
+    let mut resolved = Vec::new();
+    let mut settle = |waiter: &mut WaiterProcessor<_, _, _, _>| -> Vec<u64> {
         let mut summarized = Vec::new();
-        while let Some(command) = sequence_inbox.try_pop() {
+        while let Some(command) = built_inbox.try_pop() {
+            if let Command::Resolve(keys) = &command {
+                resolved.extend(keys.iter().map(|(CheckpointBuilt(seq), _)| *seq));
+            }
             if let Some(ready) = waiter.process(command) {
-                let ready: Vec<CheckpointContentsBuilt> = ready;
+                let ready: Vec<CheckpointContentsBuilt> = ready
+                    .into_iter()
+                    .map(|item| match item {
+                        BuiltWaitItem::Next(built) => built,
+                        other => panic!("only contents wait here: {other:?}"),
+                    })
+                    .collect();
                 summarized.extend(ready.iter().map(|b| b.pending.seq));
                 summary.process(ready);
             }
@@ -468,14 +473,7 @@ fn out_of_order_checkpoints_summarize_in_order() {
         previous = built;
     }
 
-    let mut notified = Vec::new();
-    for command in drain(&summaries_inbox) {
-        let Command::Resolve(keys) = command else {
-            panic!("the summary builder only notifies the summary waiter");
-        };
-        notified.extend(keys.into_iter().map(|(LocalSummary(seq), ())| seq));
-    }
-    assert_eq!(notified, vec![11, 12, 13]);
+    assert_eq!(resolved, vec![11, 12, 13]);
 
     // Each on the priority lane, alone.
     let signed: Vec<u64> = std::iter::from_fn(|| signatures.try_recv().ok())

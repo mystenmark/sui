@@ -41,7 +41,7 @@ use crate::{contents_of, push, summary};
 /// upgrades (the next epoch keeps the protocol version).
 ///
 /// Inward:
-/// - sequence waiter, ready: `EpochCloserInput::Built`;
+/// - built waiter, ready: `EpochCloserInput::Built`;
 /// - effects waiter, ready: `EpochCloserInput::ChangeEpochExecuted`;
 /// - `StateHasher`: `EpochCloserInput::Root`.
 ///

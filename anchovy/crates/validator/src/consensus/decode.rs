@@ -17,8 +17,8 @@ use workqueue::{Processor, Refusal, Refuse};
 use crate::checks::{self, VerifiedTransaction};
 use crate::consensus::cache::{CachedTransaction, ConsensusTxCache};
 use crate::epoch::EpochParams;
-use crate::pipeline::items::CheckpointSignature;
-use crate::pipeline::keys::LocalSummary;
+use crate::pipeline::items::{BuiltWaitItem, BuiltWaits, CheckpointSignature};
+use crate::pipeline::keys::CheckpointBuilt;
 
 /// A commit to decode, from the epoch's consensus.
 pub struct CommitRequest {
@@ -121,15 +121,15 @@ impl Refuse for DecodedCommit {
 ///
 /// Outward:
 /// - `CommitHandler` / `CommitStage`: `DecodedRequest`;
-/// - summary waiter, wait for: each committed checkpoint signature
-///   (`CheckpointSignature`), keyed by `LocalSummary(seq)`, once routed.
+/// - built waiter, wait for: each committed checkpoint signature
+///   (`CheckpointSignature`), keyed by `CheckpointBuilt(seq)`, once routed.
 ///
 /// Reads and evicts: the decoded-transaction cache.
 pub struct CommitDecoder {
     epoch: Arc<EpochParams>,
     cache: Arc<ConsensusTxCache>,
     /// Where committed checkpoint signatures go; unrouted until set.
-    signatures: Option<workqueue::Queue<waiter::Command<LocalSummary, CheckpointSignature>>>,
+    signatures: Option<BuiltWaits>,
 }
 
 impl CommitDecoder {
@@ -141,18 +141,15 @@ impl CommitDecoder {
         }
     }
 
-    /// Routes committed checkpoint signatures to the summary waiter.
+    /// Routes committed checkpoint signatures to the built waiter.
     #[must_use]
-    pub fn with_signatures(
-        mut self,
-        signatures: workqueue::Queue<waiter::Command<LocalSummary, CheckpointSignature>>,
-    ) -> CommitDecoder {
+    pub fn with_signatures(mut self, signatures: BuiltWaits) -> CommitDecoder {
         self.signatures = Some(signatures);
         self
     }
 
     /// The commit's accepted user transactions: what a quorum rejected is
-    /// skipped, checkpoint signatures go to the summary waiter if routed,
+    /// skipped, checkpoint signatures go to the built waiter if routed,
     /// and other kinds are left out. Then the cache drops the blocks of
     /// rounds consensus no longer commits.
     pub fn decode(&mut self, commit: CommittedSubDag) -> DecodedCommit {
@@ -207,8 +204,8 @@ impl CommitDecoder {
                         }
                         Decoded::CheckpointSignature(signature) => {
                             if self.signatures.is_some() {
-                                let key = LocalSummary(signature.seq);
-                                signatures.push(signature, [key]);
+                                let key = CheckpointBuilt(signature.seq);
+                                signatures.push(BuiltWaitItem::Signature(signature), [key]);
                             }
                             continue;
                         }
@@ -232,7 +229,7 @@ impl CommitDecoder {
             if let Err(workqueue::PushError::Full(_)) =
                 queue.try_push(waiter::Command::Wait(signatures))
             {
-                panic!("the summary waiter refused checkpoint signatures");
+                panic!("the built waiter refused checkpoint signatures");
             }
         }
 

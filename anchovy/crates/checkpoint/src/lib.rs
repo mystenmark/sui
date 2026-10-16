@@ -5,10 +5,10 @@
 //! once the previous checkpoint is built (`docs/consensus_pipeline.md`,
 //! Checkpointing).
 
+mod built;
 mod close;
 mod commit;
 pub mod contents;
-mod fork;
 mod key;
 pub mod summary;
 
@@ -21,17 +21,17 @@ use messages::fast::Bump;
 use messages::transaction::SenderSignedData;
 use validator::epoch::EpochParams;
 use validator::pipeline::items::{
-    CheckpointContentsBuilt, CheckpointEffects, CheckpointSignature, ExecutedEffects, ForkCheck,
+    BuiltWaitItem, BuiltWaits, CheckpointContentsBuilt, CheckpointEffects, ExecutedEffects,
     LastOfEpoch, PendingCheckpoint,
 };
-use validator::pipeline::keys::{CheckpointBuilt, ChunkSettled, LocalSummary};
+use validator::pipeline::keys::{CheckpointBuilt, ChunkSettled};
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable};
 use waiter::{Availability, Command, WaitBatch};
 use workqueue::{Processor, Queue};
 
+pub use built::{BuiltAvailability, BuiltRouter, check_fork};
 pub use close::EpochCloser;
 pub use commit::CheckpointCommitter;
-pub use fork::{LocalCheckpoints, check_forks};
 pub use key::ProtocolKey;
 
 /// Arena for one checkpoint's parsed effects and contents; a larger
@@ -63,7 +63,7 @@ fn push<T>(queue: &Queue<T>, item: T, name: &str) {
 ///
 /// Outward:
 /// - `StateHasher`: `CheckpointEffects`, but the epoch's last checkpoint's;
-/// - sequence waiter, wait for: `CheckpointContentsBuilt`, keyed by
+/// - built waiter, wait for: `BuiltWaitItem::Next`, keyed by
 ///   `CheckpointBuilt(seq - 1)`.
 ///
 /// Reads: the chunk table; the object store's transactions, for their
@@ -74,7 +74,7 @@ pub struct ContentsBuilder {
     chunks: Arc<ChunkTable>,
     store: Arc<store::Store>,
     hasher: Queue<CheckpointEffects>,
-    sequence: Queue<Command<CheckpointBuilt, CheckpointContentsBuilt>>,
+    built: BuiltWaits,
     bump: Bump,
 }
 
@@ -84,14 +84,14 @@ impl ContentsBuilder {
         chunks: Arc<ChunkTable>,
         store: Arc<store::Store>,
         hasher: Queue<CheckpointEffects>,
-        sequence: Queue<Command<CheckpointBuilt, CheckpointContentsBuilt>>,
+        built: BuiltWaits,
     ) -> ContentsBuilder {
         ContentsBuilder {
             epoch,
             chunks,
             store,
             hasher,
-            sequence,
+            built,
             bump: Bump::with_capacity(ARENA),
         }
     }
@@ -172,9 +172,12 @@ impl Processor for ContentsBuilder {
                     "hasher",
                 );
             }
-            waits.push(built, seq.checked_sub(1).map(CheckpointBuilt));
+            waits.push(
+                BuiltWaitItem::Next(built),
+                seq.checked_sub(1).map(CheckpointBuilt),
+            );
         }
-        push(&self.sequence, Command::Wait(waits), "sequence waiter");
+        push(&self.built, Command::Wait(waits), "built waiter");
         Some(())
     }
 }
@@ -186,23 +189,19 @@ impl Processor for ContentsBuilder {
 /// (`CheckpointCommitter`).
 ///
 /// Inward:
-/// - sequence waiter, ready: `Vec<CheckpointContentsBuilt>`.
+/// - built waiter, through `EpochCloser`: `Vec<CheckpointContentsBuilt>`.
 ///
 /// Outward:
-/// - sequence waiter, notify: `CheckpointBuilt(seq)`, releasing `seq + 1`;
-/// - summary waiter, notify: `LocalSummary(seq)`;
-/// - fork waiter, resolve: `CheckpointBuilt(seq)`, to the checkpoint built;
+/// - built waiter, resolve: `CheckpointBuilt(seq)`, to the checkpoint built,
+///   releasing `seq + 1`, its signatures and its certificate's fork check;
 /// - consensus (black box): its checkpoint signature, at high priority.
 ///
 /// Reads and writes: the checkpoint store.
 pub struct SummaryBuilder {
     epoch: Arc<EpochParams>,
-    /// Resolves each built checkpoint for the fork check, once wired.
-    fork_waiter: Option<Queue<Command<CheckpointBuilt, ForkCheck, Arc<BuiltCheckpoint>>>>,
     checkpoints: Arc<CheckpointStore>,
     key: Arc<ProtocolKey>,
-    sequence: Queue<Command<CheckpointBuilt, CheckpointContentsBuilt>>,
-    summaries: Queue<Command<LocalSummary, CheckpointSignature>>,
+    built: BuiltWaits,
     consensus: TransactionClient,
     bump: Bump,
 }
@@ -212,30 +211,17 @@ impl SummaryBuilder {
         epoch: Arc<EpochParams>,
         checkpoints: Arc<CheckpointStore>,
         key: Arc<ProtocolKey>,
-        sequence: Queue<Command<CheckpointBuilt, CheckpointContentsBuilt>>,
-        summaries: Queue<Command<LocalSummary, CheckpointSignature>>,
+        built: BuiltWaits,
         consensus: TransactionClient,
     ) -> SummaryBuilder {
         SummaryBuilder {
             epoch,
-            fork_waiter: None,
             checkpoints,
             key,
-            sequence,
-            summaries,
+            built,
             consensus,
             bump: Bump::with_capacity(4096),
         }
-    }
-
-    /// Resolves each built checkpoint for the fork check.
-    #[must_use]
-    pub fn with_fork_waiter(
-        mut self,
-        fork_waiter: Queue<Command<CheckpointBuilt, ForkCheck, Arc<BuiltCheckpoint>>>,
-    ) -> SummaryBuilder {
-        self.fork_waiter = Some(fork_waiter);
-        self
     }
 }
 
@@ -244,7 +230,7 @@ impl Processor for SummaryBuilder {
     type Output = ();
 
     fn process(&mut self, ready: Vec<CheckpointContentsBuilt>) -> Option<()> {
-        let mut built_seqs = Vec::with_capacity(ready.len());
+        let mut resolved = Vec::with_capacity(ready.len());
         let mut signatures = Vec::with_capacity(ready.len());
         for built in ready {
             let seq = built.pending.seq;
@@ -277,32 +263,13 @@ impl Processor for SummaryBuilder {
                     _ => None,
                 },
             };
-            self.checkpoints.insert_built(checkpoint);
-            built_seqs.push(seq);
+            let checkpoint = self.checkpoints.insert_built(checkpoint);
+            resolved.push((CheckpointBuilt(seq), checkpoint));
         }
-        // Every summary is in the checkpoint store: notify.
-        if let Some(fork_waiter) = &self.fork_waiter {
-            let resolved = built_seqs
-                .iter()
-                .map(|&seq| {
-                    let built = self.checkpoints.built(seq).expect("just built");
-                    (CheckpointBuilt(seq), built)
-                })
-                .collect();
-            push(fork_waiter, Command::Resolve(resolved), "fork waiter");
-        }
-        push(
-            &self.summaries,
-            Command::notify(built_seqs.iter().copied().map(LocalSummary)),
-            "summary waiter",
-        );
-        push(
-            &self.sequence,
-            Command::notify(built_seqs.into_iter().map(CheckpointBuilt)),
-            "sequence waiter",
-        );
+        // Every summary is in the checkpoint store: resolve.
+        push(&self.built, Command::Resolve(resolved), "built waiter");
         for signature in signatures {
-            // Where it is included is not needed: the summary waiter waits for
+            // Where it is included is not needed: the built waiter waits for
             // whatever signatures consensus commits. Failing only as
             // consensus shuts down, when nothing is left to sign for.
             let _ = self
@@ -323,21 +290,5 @@ impl Availability<ChunkSettled> for ChunkAvailability {
     fn check(&mut self, keys: &[ChunkSettled], found: &mut Vec<Option<()>>) {
         found.clear();
         found.extend(keys.iter().map(|k| self.chunks.get(k.0).map(|_| ())));
-    }
-}
-
-/// The sequence waiter's availability check: a checkpoint the checkpoint
-/// store holds as built (including the previous epoch's last).
-pub struct BuiltAvailability {
-    pub checkpoints: Arc<CheckpointStore>,
-}
-
-impl Availability<CheckpointBuilt> for BuiltAvailability {
-    fn check(&mut self, keys: &[CheckpointBuilt], found: &mut Vec<Option<()>>) {
-        found.clear();
-        found.extend(
-            keys.iter()
-                .map(|k| self.checkpoints.is_built(k.0).then_some(())),
-        );
     }
 }

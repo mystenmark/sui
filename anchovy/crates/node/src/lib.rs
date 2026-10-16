@@ -19,10 +19,10 @@ use tokio::sync::watch;
 
 use std::sync::Arc;
 
-use aggregator::{CheckpointAggregator, Committee, SummaryAvailability};
+use aggregator::{CheckpointAggregator, Committee};
 use checkpoint::{
-    BuiltAvailability, CheckpointCommitter, ChunkAvailability, ContentsBuilder, EpochCloser,
-    LocalCheckpoints, ProtocolKey, SummaryBuilder, check_forks,
+    BuiltAvailability, BuiltRouter, CheckpointCommitter, ChunkAvailability, ContentsBuilder,
+    EpochCloser, ProtocolKey, SummaryBuilder,
 };
 use consensus::TransactionClient;
 use exec_pool::{EffectsAvailability, EffectsRouter, Executor};
@@ -36,7 +36,7 @@ use validator::consensus::status::ConsensusTxStatusCache;
 use validator::consensus::vote::{BlockVoter, VoteRequest};
 use validator::current::EpochHandle;
 use validator::epoch::EpochState;
-use validator::pipeline::items::{CertifiedCheckpoint, EffectsWaitItem, EpochCloserInput};
+use validator::pipeline::items::{CertifiedCheckpoint, EffectsWaitItem};
 use validator::pipeline::keys::EffectsKey;
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable, GenerationTable};
 use validator::processors::{Request, SignatureVerifier, TransactionValidator};
@@ -214,9 +214,7 @@ impl Pipeline {
         let (input_waits, input_inbox) = activity.queue(QUEUE);
         let (effects_waits, effects_inbox) = activity.queue(QUEUE);
         let (checkpoint_waits, checkpoint_inbox) = activity.queue(QUEUE);
-        let (sequence_waits, sequence_inbox) = activity.queue(QUEUE);
-        let (summary_waits, summary_waiter_inbox) = activity.queue(QUEUE);
-        let (fork_waits, fork_inbox) = activity.queue(QUEUE);
+        let (built_waits, built_inbox) = activity.queue(QUEUE);
 
         let mut workers = Vec::new();
 
@@ -249,7 +247,7 @@ impl Pipeline {
         // 2. Voting.
         {
             let (epoch, store, cache) = (epoch.clone(), store.clone(), cache.clone());
-            let signatures = summary_waits.clone();
+            let signatures = built_waits.clone();
             workers.push(
                 Worker::new("voting")
                     .abort_on_panic()
@@ -265,7 +263,7 @@ impl Pipeline {
         // 3. Commit handling.
         {
             let (params, cache) = (epoch.params.clone(), cache.clone());
-            let signatures = summary_waits.clone();
+            let signatures = built_waits.clone();
             workers.push(
                 Worker::new("commit-decode")
                     .abort_on_panic()
@@ -420,18 +418,18 @@ impl Pipeline {
                     .spawn(),
             );
             let params_c = epoch.params.clone();
-            let (chunks_c, store_c, hasher, sequence) = (
+            let (chunks_c, store_c, hasher, built) = (
                 chunks.clone(),
                 store.clone(),
                 to_hasher.clone(),
-                sequence_waits.clone(),
+                built_waits.clone(),
             );
             workers.push(
                 Worker::new("contents")
                     .abort_on_panic()
                     .run(
                         contents_inbox,
-                        move || ContentsBuilder::new(params_c, chunks_c, store_c, hasher, sequence),
+                        move || ContentsBuilder::new(params_c, chunks_c, store_c, hasher, built),
                         |()| {},
                     )
                     .spawn(),
@@ -455,18 +453,19 @@ impl Pipeline {
             );
             let availability = BuiltAvailability {
                 checkpoints: checkpoints.clone(),
+                store: store.clone(),
+            };
+            let router = BuiltRouter {
+                epoch_closer: to_closer.clone(),
+                aggregator: to_aggregator,
             };
             workers.push(
-                Worker::new("sequence-waiter")
+                Worker::new("built-waiter")
                     .abort_on_panic()
                     .run(
-                        sequence_inbox,
+                        built_inbox,
                         move || WaiterProcessor::new(availability),
-                        {
-                            let closer = into(to_closer.clone(), "epoch closer");
-                            let mut closer = closer;
-                            move |ready| closer(EpochCloserInput::Built(ready))
-                        },
+                        router,
                     )
                     .spawn(),
             );
@@ -499,14 +498,10 @@ impl Pipeline {
                     .spawn(),
             );
             let params_summary = epoch.params.clone();
-            let (checkpoints_s, key, fork_waits_s) = (
+            let (checkpoints_s, key, built, consensus) = (
                 checkpoints.clone(),
                 protocol_key.clone(),
-                fork_waits.clone(),
-            );
-            let (sequence, summaries, consensus) = (
-                sequence_waits.clone(),
-                summary_waits.clone(),
+                built_waits.clone(),
                 consensus.clone(),
             );
             workers.push(
@@ -519,26 +514,11 @@ impl Pipeline {
                                 params_summary,
                                 checkpoints_s,
                                 key,
-                                sequence,
-                                summaries,
+                                built,
                                 consensus,
                             )
-                            .with_fork_waiter(fork_waits_s)
                         },
                         |()| {},
-                    )
-                    .spawn(),
-            );
-            let availability = SummaryAvailability {
-                checkpoints: checkpoints.clone(),
-            };
-            workers.push(
-                Worker::new("summary-waiter")
-                    .abort_on_panic()
-                    .run(
-                        summary_waiter_inbox,
-                        move || WaiterProcessor::new(availability),
-                        into(to_aggregator, "aggregator"),
                     )
                     .spawn(),
             );
@@ -556,23 +536,9 @@ impl Pipeline {
                                 next_to_certify,
                                 state_sync,
                             )
-                            .with_fork_waiter(fork_waits)
+                            .with_fork_checks(built_waits)
                         },
                         into(to_committer, "committer"),
-                    )
-                    .spawn(),
-            );
-            let availability = LocalCheckpoints {
-                checkpoints: checkpoints.clone(),
-                store: store.clone(),
-            };
-            workers.push(
-                Worker::new("fork-waiter")
-                    .abort_on_panic()
-                    .run(
-                        fork_inbox,
-                        move || WaiterProcessor::new(availability),
-                        check_forks,
                     )
                     .spawn(),
             );

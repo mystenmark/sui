@@ -14,7 +14,7 @@ use messages::object::Object;
 use crate::checks::VerifiedTransaction;
 use crate::consensus::sequence::SharedAccess;
 use crate::pipeline::keys::{AccumulatorVersion, Reservation, StreamId, TxDigest};
-use crate::pipeline::tables::Generation;
+use crate::pipeline::tables::{BuiltCheckpoint, Generation};
 
 /// A transaction the pipeline executes: a user transaction from consensus,
 /// or a system transaction the pipeline builds.
@@ -277,8 +277,8 @@ pub struct CheckpointEffects {
 }
 
 /// A checkpoint's contents, built without the previous checkpoint.
-/// `ContentsBuilder` → sequence waiter (wait for `CheckpointBuilt(seq - 1)`)
-/// → `SummaryBuilder`.
+/// `ContentsBuilder` → built waiter (wait for `CheckpointBuilt(seq - 1)`) →
+/// `EpochCloser` → `SummaryBuilder`.
 #[derive(Debug, Clone)]
 pub struct CheckpointContentsBuilt {
     pub pending: PendingCheckpoint,
@@ -302,7 +302,7 @@ pub struct CheckpointContentsBuilt {
 /// What `EpochCloser` takes.
 #[derive(Debug)]
 pub enum EpochCloserInput {
-    /// Checkpoints whose previous one is built. Sequence waiter →
+    /// Checkpoints whose previous one is built. Built waiter →
     /// `EpochCloser`.
     Built(Vec<CheckpointContentsBuilt>),
     /// The change-epoch transaction executed. Effects waiter →
@@ -337,7 +337,7 @@ pub struct EndOfEpoch {
 }
 
 /// A checkpoint signature from consensus. `BlockVoter` and `CommitDecoder`
-/// → summary waiter (wait for `LocalSummary(seq)`) → `CheckpointAggregator`.
+/// → built waiter (wait for `CheckpointBuilt(seq)`) → `CheckpointAggregator`.
 #[derive(Debug, Clone)]
 pub struct CheckpointSignature {
     pub seq: u64,
@@ -345,20 +345,37 @@ pub struct CheckpointSignature {
     pub message: Arc<[u8]>,
 }
 
-/// A certified checkpoint waiting for the one this validator built, to
-/// compare them. `CheckpointAggregator` → fork waiter (wait for
-/// `CheckpointBuilt(seq)`, resolved to the local checkpoint) → fork check.
+/// What waits for this validator to build a checkpoint, keyed by
+/// `CheckpointBuilt(seq)` and resolved to the checkpoint built. The built
+/// waiter routes a ready item by kind.
 #[derive(Debug)]
-pub struct ForkCheck {
-    pub certified: CertifiedCheckpoint,
-    pub local: Option<Arc<crate::pipeline::tables::BuiltCheckpoint>>,
+pub enum BuiltWaitItem {
+    /// A checkpoint's contents, waiting for the previous checkpoint.
+    /// `ContentsBuilder` → built waiter → `EpochCloser`.
+    Next(CheckpointContentsBuilt),
+    /// A signature, waiting for the summary it signs. `BlockVoter` and
+    /// `CommitDecoder` → built waiter → `CheckpointAggregator`.
+    Signature(CheckpointSignature),
+    /// A certified checkpoint, waiting for the local one to compare it
+    /// with. `CheckpointAggregator` → built waiter → fork check.
+    Certified {
+        certified: CertifiedCheckpoint,
+        local: Option<Arc<BuiltCheckpoint>>,
+    },
 }
 
-impl waiter::Receive<Arc<crate::pipeline::tables::BuiltCheckpoint>> for ForkCheck {
-    fn receive(&mut self, _: usize, local: Arc<crate::pipeline::tables::BuiltCheckpoint>) {
-        self.local = Some(local);
+impl waiter::Receive<Arc<BuiltCheckpoint>> for BuiltWaitItem {
+    fn receive(&mut self, _: usize, built: Arc<BuiltCheckpoint>) {
+        if let BuiltWaitItem::Certified { local, .. } = self {
+            *local = Some(built);
+        }
     }
 }
+
+/// The built waiter's queue.
+pub type BuiltWaits = workqueue::Queue<
+    waiter::Command<crate::pipeline::keys::CheckpointBuilt, BuiltWaitItem, Arc<BuiltCheckpoint>>,
+>;
 
 /// A certified checkpoint. `CheckpointAggregator` → state sync, and →
 /// `CheckpointCommitter`, in sequence order.

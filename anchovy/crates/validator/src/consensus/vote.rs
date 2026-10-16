@@ -23,14 +23,14 @@ use tokio::sync::oneshot;
 use validation::inputs::{InputKind, input_objects};
 use validation::verify::SignerIndices;
 use waiter::{Command, WaitBatch};
-use workqueue::{Processor, Queue, Refusal, Refuse};
+use workqueue::{Processor, Refusal, Refuse};
 
 use crate::checks::{self, SignatureChecks, VerifiedTransaction};
 use crate::consensus::cache::{BlockEntries, CachedTransaction, ConsensusTxCache};
 use crate::consensus::decode::{checkpoint_signature, claimed_immutable};
 use crate::epoch::EpochState;
-use crate::pipeline::items::CheckpointSignature;
-use crate::pipeline::keys::LocalSummary;
+use crate::pipeline::items::{BuiltWaitItem, BuiltWaits};
+use crate::pipeline::keys::CheckpointBuilt;
 
 /// The reference's `dkg_v1::DKG_MESSAGES_MAX_SIZE`.
 const DKG_MESSAGES_MAX_SIZE: usize = 400_000;
@@ -84,8 +84,8 @@ impl From<validation::Error> for RejectReason {
 /// Inward: consensus (black box): `VoteRequest`.
 /// Outward:
 /// - consensus: the verdict, through the request's reply;
-/// - summary waiter, wait for: each checkpoint signature in a valid block,
-///   keyed by `LocalSummary(seq)`, once routed. Ahead of its commit, for
+/// - built waiter, wait for: each checkpoint signature in a valid block,
+///   keyed by `CheckpointBuilt(seq)`, once routed. Ahead of its commit, for
 ///   latency; the commit decoder routes it again, as a commit can arrive
 ///   without its blocks being voted on.
 ///
@@ -95,7 +95,7 @@ pub struct BlockVoter {
     store: Arc<store::Store>,
     cache: Arc<ConsensusTxCache>,
     signatures: SignatureChecks,
-    checkpoint_signatures: Option<Queue<Command<LocalSummary, CheckpointSignature>>>,
+    checkpoint_signatures: Option<BuiltWaits>,
     bump: Bump,
 }
 
@@ -121,10 +121,7 @@ impl BlockVoter {
     /// Routes the checkpoint signatures of valid blocks to the summary
     /// waiter.
     #[must_use]
-    pub fn with_signatures(
-        mut self,
-        signatures: Queue<Command<LocalSummary, CheckpointSignature>>,
-    ) -> BlockVoter {
+    pub fn with_signatures(mut self, signatures: BuiltWaits) -> BlockVoter {
         self.checkpoint_signatures = Some(signatures);
         self
     }
@@ -210,8 +207,8 @@ impl BlockVoter {
         };
         let mut batch = WaitBatch::new();
         for signature in transactions.iter().filter_map(checkpoint_signature) {
-            let key = LocalSummary(signature.seq);
-            batch.push(signature, [key]);
+            let key = CheckpointBuilt(signature.seq);
+            batch.push(BuiltWaitItem::Signature(signature), [key]);
         }
         if batch.is_empty() {
             return;
@@ -219,7 +216,7 @@ impl BlockVoter {
         // Inside the pipeline a full queue is a sizing bug, not load to
         // shed; a closed one means the pipeline is shutting down.
         if let Err(workqueue::PushError::Full(_)) = queue.try_push(Command::Wait(batch)) {
-            panic!("the summary waiter refused checkpoint signatures");
+            panic!("the built waiter refused checkpoint signatures");
         }
     }
 

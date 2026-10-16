@@ -166,7 +166,7 @@ impl BuiltCheckpoint {
 
 /// Checkpoints built, by sequence number. Written by `SummaryBuilder`
 /// (owner: the checkpoint work) and pruned by `CheckpointCommitter`; read by
-/// the sequence and summary waiters' availability checks.
+/// the built waiter's availability check.
 #[derive(Default)]
 pub struct CheckpointStore {
     built: Mutex<Built>,
@@ -184,10 +184,12 @@ impl CheckpointStore {
         CheckpointStore::default()
     }
 
-    pub fn insert_built(&self, checkpoint: BuiltCheckpoint) {
+    pub fn insert_built(&self, checkpoint: BuiltCheckpoint) -> Arc<BuiltCheckpoint> {
+        let checkpoint = Arc::new(checkpoint);
         lock(&self.built)
             .checkpoints
-            .insert(checkpoint.seq, Arc::new(checkpoint));
+            .insert(checkpoint.seq, checkpoint.clone());
+        checkpoint
     }
 
     pub fn built(&self, seq: u64) -> Option<Arc<BuiltCheckpoint>> {

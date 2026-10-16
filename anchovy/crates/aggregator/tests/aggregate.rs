@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use aggregator::{CheckpointAggregator, Committee, CommitteeError, SummaryAvailability};
+use aggregator::{CheckpointAggregator, Committee, CommitteeError};
 use sui_types::committee::Committee as SuiCommittee;
 use sui_types::crypto::{AuthorityKeyPair, AuthorityQuorumSignInfo, KeypairTraits};
 use sui_types::digests::CheckpointContentsDigest;
@@ -17,9 +17,7 @@ use sui_types::messages_checkpoint::{
     SignedCheckpointSummary,
 };
 use validator::pipeline::items::{CertifiedCheckpoint, CheckpointSignature};
-use validator::pipeline::keys::LocalSummary;
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore};
-use waiter::{Command, WaitBatch, WaiterProcessor};
 use workqueue::{Inbox, Processor};
 
 struct Setup {
@@ -401,40 +399,4 @@ fn a_committee_rejects_bad_and_repeated_keys() {
         Committee::new(0, [(name, 1), (name, 2)]).err(),
         Some(CommitteeError::Duplicate)
     );
-}
-
-#[test]
-fn a_signature_waits_for_its_summary_then_certifies() {
-    let mut s = setup(4, 5);
-    let local = summary(5, 0);
-    let mut waiter = WaiterProcessor::new(SummaryAvailability {
-        checkpoints: s.checkpoints.clone(),
-    });
-    let mut batch = WaitBatch::new();
-    for i in 0..3 {
-        batch.push(s.signature(&local, i), [LocalSummary(5)]);
-    }
-    assert!(waiter.process(Command::Wait(batch)).is_none());
-
-    build(&s.checkpoints, &local);
-    let ready = waiter
-        .process(Command::notify(vec![LocalSummary(5)]))
-        .unwrap();
-    assert_eq!(ready.len(), 3);
-    s.feed(ready);
-    assert_eq!(s.take_certified()[0].seq, 5);
-
-    // Once built, a signature is ready at once.
-    let mut batch = WaitBatch::new();
-    batch.push(s.signature(&local, 3), [LocalSummary(5)]);
-    assert_eq!(waiter.process(Command::Wait(batch)).unwrap().len(), 1);
-
-    // And once pruned, so a late signature is dropped, not parked forever.
-    s.checkpoints.prune_below(6);
-    assert!(s.checkpoints.built(5).is_none());
-    let mut batch = WaitBatch::new();
-    batch.push(s.signature(&local, 3), [LocalSummary(5)]);
-    let late = waiter.process(Command::Wait(batch)).unwrap();
-    s.feed(late);
-    assert!(s.take_certified().is_empty());
 }
