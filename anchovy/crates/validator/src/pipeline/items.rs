@@ -372,10 +372,12 @@ impl waiter::Receive<Arc<BuiltCheckpoint>> for BuiltWaitItem {
     }
 }
 
+/// What the built waiter takes.
+pub type BuiltCommand =
+    waiter::Command<crate::pipeline::keys::CheckpointBuilt, BuiltWaitItem, Arc<BuiltCheckpoint>>;
+
 /// The built waiter's queue.
-pub type BuiltWaits = workqueue::Queue<
-    waiter::Command<crate::pipeline::keys::CheckpointBuilt, BuiltWaitItem, Arc<BuiltCheckpoint>>,
->;
+pub type BuiltWaits = workqueue::Queue<BuiltCommand>;
 
 /// A certified checkpoint. `CheckpointAggregator` → state sync, and →
 /// `CheckpointCommitter`, in sequence order.
