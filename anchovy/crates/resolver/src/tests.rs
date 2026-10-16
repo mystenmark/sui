@@ -40,6 +40,14 @@ use SharedObjectMutability::{Immutable, Mutable, NonExclusiveWrite};
 /// The chain identifier, which masks coin reservations' account ids.
 const CHAIN: [u8; 32] = [0x5a; 32];
 
+/// An empty generation table, over an epoch store in a directory kept alive
+/// with it.
+fn generation_table() -> (Arc<GenerationTable>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _) = validator::epoch_store::EpochStore::open(dir.path(), 0);
+    (Arc::new(GenerationTable::new(store)), dir)
+}
+
 fn epoch() -> Arc<EpochParams> {
     Arc::new(EpochParams::new(
         Chain::Unknown,
@@ -270,7 +278,7 @@ fn a_later_round_waits_for_the_generation_zero_of_a_live_round() {
     assert_eq!(base, [(s, 6, 1)]);
 
     let (store, _dir) = store(&[coin(ObjectID::new(s.id.0), 3)]);
-    let generations = Arc::new(GenerationTable::new());
+    let (generations, _generations_dir) = generation_table();
     let mut availability = InputAvailability {
         store,
         generations: generations.clone(),
@@ -454,7 +462,7 @@ fn availability_reads_the_store_and_the_generation_table() {
         coin(package, 1),
         coin(ObjectID::new(s.id.0), 4),
     ]);
-    let generations = Arc::new(GenerationTable::new());
+    let (generations, _generations_dir) = generation_table();
     generations.record(
         s,
         1,
@@ -517,7 +525,7 @@ fn availability_reads_the_store_and_the_generation_table() {
 fn a_resolved_chunk_waits_in_the_input_waiter_until_its_keys_are_available() {
     let gas = coin(id(3), 1);
     let (store, _dir) = store(std::slice::from_ref(&gas));
-    let generations = Arc::new(GenerationTable::new());
+    let (generations, _generations_dir) = generation_table();
     let mut waiter = Waiter::new(InputAvailability {
         store: store.clone(),
         generations: generations.clone(),

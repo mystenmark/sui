@@ -317,6 +317,8 @@ impl Parts {
             self.store.clone(),
             self.checkpoints.clone(),
             self.chunks.clone(),
+            self.generations.clone(),
+            self.state_hashes.clone(),
             ended,
         )
     }

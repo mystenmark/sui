@@ -237,7 +237,7 @@ fn an_executed_transaction_republishes_its_generation_from_its_effects() {
 
     // A restart: the generation table is empty; the replayed writer is not
     // executed again, but its generation is recorded again.
-    node.generations = Arc::new(GenerationTable::new());
+    node.generations = Arc::new(GenerationTable::new(node.epoch_store.clone()));
     let (inputs, _) = workqueue::queue(16);
     let (effects, notified) = workqueue::queue(16);
     let (funds, _) = workqueue::queue(16);

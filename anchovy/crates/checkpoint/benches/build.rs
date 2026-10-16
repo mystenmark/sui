@@ -185,6 +185,7 @@ fn main() {
         for (height, effects) in [(0, effects), (1, rest)] {
             chunks.insert(SettledChunk {
                 height,
+                round: 0,
                 checkpoint_seq: 1,
                 effects,
             });
