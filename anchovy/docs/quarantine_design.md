@@ -130,7 +130,7 @@ outputs a crash lost, and replay would never regenerate them.
 | `CommitHandler` | processed, locks and streams through the quarantine | cq:780-825 |
 | resolver | no state | |
 | executor | generations from the store; committed transactions skipped and re-published | esi:560-574 |
-| settlement | empty: replay starts at a drained point, so the first chunk opens a checkpoint, at offset 0 | ss:140-147 |
+| settlement, and the chunk table | empty: replay starts at a drained point, so the first chunk opens a checkpoint, at offset 0. The chunk table is in memory, as the reference's pending checkpoints are (`62091e97ff`) | ss:140-147 |
 | funds | the first chunk's version as settled, its balances read at their versions | esi:169-193 |
 | contents and summary builders | the checkpoint before the first pending one, from the perpetual store (committed) | cp:1883-1905 |
 | state hasher | the root after that checkpoint, from `roots`, else the epoch record's | gsh:506-533 |
@@ -144,13 +144,6 @@ outputs a crash lost, and replay would never regenerate them.
   from the last one. Anchovy commits a checkpoint's record with its outputs,
   in one perpetual batch. So committed checkpoints are that table, and the
   reference's two-watermark cases (cp:3017-3022) do not arise.
-- **Settled chunks in memory.** The reference keeps pending checkpoints in
-  memory only, rebuilt by replay (`62091e97ff`). Anchovy's settled chunks
-  are those checkpoints' contents. Only checkpoints not yet committed read
-  them, and after a restart replay settles them again. Stored, they would be
-  written and never read back. So the chunk table returns to memory, as a
-  window pruned at each commit: a decision for the user, as it reverses
-  moving it into the epoch store.
 - **Generations**, above.
 
 ## Order of work

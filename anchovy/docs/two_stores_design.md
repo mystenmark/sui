@@ -70,7 +70,6 @@ the state hashes (written by `StateHasher`).
 
 | Keyspace | Key → value | From |
 |---|---|---|
-| `chunks` | height → settled chunk | `ChunkTable`, written by `SettlementScheduler` |
 | `generations` | (stream, round, k) → generation | `GenerationTable`, written by `Executor` |
 | `start_versions` (in `kept`) | (id, initial shared version) → version, digest | the store's `start_versions`, which the executor records at a stream's first use |
 
@@ -78,8 +77,9 @@ the state hashes (written by `StateHasher`).
 
 Bounded, so not stored: the decoded-transaction cache (bounded by GC
 depth), the consensus status cache (400 rounds), the signature caches,
-settlement and funds state (chunks and reservations in flight), the
-aggregator's pending signatures, the waiters and queues. The executor's
+settlement and funds state (chunks and reservations in flight), the chunk
+table (pruned as checkpoints commit), the aggregator's pending signatures,
+the waiters and queues. The executor's
 Move runtime keeps every package it resolves, so it is replaced, with the
 package and type caches filled from it, once it has resolved 1024.
 
@@ -103,9 +103,11 @@ package and type caches filled from it, once it has resolved 1024.
    commit handler, which attaches it to each access, so it becomes consensus
    output (a `streams` keyspace: stream → its last generation) and the
    resolver keeps no state.
-3. **No pruning in the epoch store.** It is dropped with the epoch, so
-   epoch state that grows without bound (generations, settled chunks,
-   built checkpoints, state hashes) is stored there whole.
+3. **Where state lives.** Bounded state stays in memory, pruned as it
+   always was. Epoch state that grows without bound (generations, built
+   checkpoints, state hashes) goes in the epoch store, whole: it is dropped
+   with the epoch, so nothing in it is pruned. Epoch state never goes in
+   the perpetual store.
 
 ## Order of work
 
@@ -115,7 +117,7 @@ package and type caches filled from it, once it has resolved 1024.
    the epoch store.
 3. Consensus output through the commit handler's writer; the round links
    moved from the resolver.
-4. Execution, settlement and builder state in the epoch store (decision 3);
-   the Move runtime bounded.
+4. Generations and builder state in the epoch store (decision 3); the Move
+   runtime bounded.
 5. Quarantine, flush at checkpoint commit, resume on restart, with the
    `commit` record.
