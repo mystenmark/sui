@@ -162,7 +162,7 @@ fn generation(stream: StreamId, round: u32, generation: u32) -> InputKey {
 fn handler() -> (CommitHandler, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let (_, output, _) = EpochStore::open(dir.path(), 0);
-    (CommitHandler::new(output), dir)
+    (CommitHandler::new(output, 0), dir)
 }
 
 /// `entry`'s keys and resolved bases, its accesses linked by `handler`.
@@ -471,6 +471,8 @@ fn availability_reads_the_store_and_the_generation_table() {
             version: 4,
             digest: [0; 32],
         },
+        [0; 32],
+        true,
     );
     generations.record(
         s,
@@ -480,6 +482,8 @@ fn availability_reads_the_store_and_the_generation_table() {
             version: 5,
             transaction: [0; 32],
         },
+        [0; 32],
+        true,
     );
     let mut availability = InputAvailability { store, generations };
     let keys = [
@@ -587,6 +591,8 @@ fn a_resolved_chunk_waits_in_the_input_waiter_until_its_keys_are_available() {
             version: 2,
             digest: [0; 32],
         },
+        [0; 32],
+        true,
     );
     waiter.resolve([(
         generation(clock, 1, 1),

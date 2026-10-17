@@ -284,6 +284,8 @@ fn availability(rng: &mut Rng) {
                 version: 2,
                 digest: [0; 32],
             },
+            [0; 32],
+            true,
         );
     }
     let mut check = InputAvailability {

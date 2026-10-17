@@ -6,7 +6,7 @@
 //! (`store::epoch`), in three sections: consensus output, written only by
 //! the commit handler; checkpoint builder state; and everything else.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -27,18 +27,25 @@ pub struct EpochStore {
 }
 
 impl EpochStore {
-    /// Epoch `epoch`'s store under `root`, what a replay writes again
-    /// emptied: at the epoch's start, and on restart. With it, the one
-    /// writer of its consensus output, for the commit handler, and the one
-    /// writer of its checkpoint builder state.
+    /// Epoch `epoch`'s store under `root`: made at the epoch's start,
+    /// reopened as it was on restart. With it, the one writer of its
+    /// consensus output, for the commit handler, and the one writer of its
+    /// checkpoint builder state.
     ///
     /// # Panics
     /// If the database cannot be opened.
     pub fn open(root: &Path, epoch: u64) -> (EpochStore, ConsensusOutput, BuilderOutput) {
         let db = Arc::new(EpochDb::open(root, epoch).expect("the epoch's database opens"));
         let consensus = ConsensusOutput {
-            db: db.clone(),
-            pending: Pending::default(),
+            quarantine: Arc::new(Mutex::new(Quarantine {
+                db: db.clone(),
+                open: Output::default(),
+                queued: std::collections::VecDeque::new(),
+                processed: HashMap::new(),
+                locks: HashMap::new(),
+                streams: HashMap::new(),
+                committed_height: 0,
+            })),
         };
         let builder = BuilderOutput { db: db.clone() };
         let store = EpochStore {
@@ -88,7 +95,7 @@ impl EpochStore {
         let live = objects.live(id).expect("the store reads")?;
         let mut value = live.version.to_le_bytes().to_vec();
         value.extend_from_slice(&live.digest.bytes);
-        let mut batch = self.db.batch(&[Space::StartVersions]);
+        let mut batch = self.db.batch();
         batch.put(Space::StartVersions, key.to_vec(), value);
         batch.commit().expect("the epoch's database writes");
         Some(live)
@@ -96,33 +103,29 @@ impl EpochStore {
 }
 
 impl EpochStore {
-    /// Records generation `generation` of `stream` in `round`.
+    /// Records generations: `(stream, round, generation, value)`.
     ///
     /// # Panics
     /// If the database cannot be written.
-    pub fn put_generation(
-        &self,
-        stream: &StreamId,
-        round: u32,
-        generation: u32,
-        value: Generation,
-    ) {
-        let (tag, version, bytes) = match value {
-            Generation::Version { version, digest } => (0, version, digest),
-            Generation::Ended {
-                version,
-                transaction,
-            } => (1, version, transaction),
-        };
-        let mut encoded = vec![tag];
-        encoded.extend_from_slice(&version.to_le_bytes());
-        encoded.extend_from_slice(&bytes);
-        let mut batch = self.db.batch(&[Space::Generations]);
-        batch.put(
-            Space::Generations,
-            generation_key(stream, round, generation).to_vec(),
-            encoded,
-        );
+    pub fn put_generations(&self, generations: &[(StreamId, u32, u32, Generation)]) {
+        let mut batch = self.db.batch();
+        for &(stream, round, generation, value) in generations {
+            let (tag, version, bytes) = match value {
+                Generation::Version { version, digest } => (0, version, digest),
+                Generation::Ended {
+                    version,
+                    transaction,
+                } => (1, version, transaction),
+            };
+            let mut encoded = vec![tag];
+            encoded.extend_from_slice(&version.to_le_bytes());
+            encoded.extend_from_slice(&bytes);
+            batch.put(
+                Space::Generations,
+                generation_key(&stream, round, generation).to_vec(),
+                encoded,
+            );
+        }
         batch.commit().expect("the epoch's database writes");
     }
 
@@ -216,8 +219,29 @@ impl BuilderOutput {
         self.put(Space::Roots, seq, root);
     }
 
+    /// Deletes the state hashes and roots of checkpoints above `seq`, the
+    /// committed one: at startup, so a checkpoint rebuilt differently, after
+    /// a fork, cannot keep a hash its old contents gave
+    /// (`state_hash_by_checkpoint`'s cleanup in the reference).
+    ///
+    /// # Panics
+    /// If the database cannot be read or written.
+    pub fn delete_state_hashes_above(&self, seq: u64) {
+        let mut batch = self.db.batch();
+        for space in [Space::CheckpointHashes, Space::Roots] {
+            for above in self
+                .db
+                .numbers_above(space, seq)
+                .expect("the epoch's database reads")
+            {
+                batch.delete(space, above.to_be_bytes().to_vec());
+            }
+        }
+        batch.commit().expect("the epoch's database writes");
+    }
+
     fn put(&self, space: Space, seq: u64, value: Vec<u8>) {
-        let mut batch = self.db.batch(&[space]);
+        let mut batch = self.db.batch();
         batch.put(space, seq.to_be_bytes().to_vec(), value);
         batch.commit().expect("the epoch's database writes");
     }
@@ -246,18 +270,56 @@ fn stream_key(id: &ObjectId, initial_shared_version: u64) -> [u8; 40] {
 /// by it alone, as this writer is made once, with the store, and cannot be
 /// cloned. Read back only by the commit handler too.
 ///
-/// Writes since the last `commit` are pending: read back from memory, and
-/// written together by `commit`, which the handler calls once per commit.
+/// A quarantine, as the reference's `ConsensusOutputQuarantine`: each
+/// commit's output stays in memory until the checkpoints covering it have
+/// committed, and is written then, so the store never holds output a crash
+/// could make the replay decide otherwise. Reads look in memory, then the
+/// store.
 pub struct ConsensusOutput {
-    db: Arc<EpochDb>,
-    pending: Pending,
+    quarantine: Arc<Mutex<Quarantine>>,
 }
 
+/// Tells the quarantine which checkpoints have committed: for the
+/// checkpoint committer.
+#[derive(Clone)]
+pub struct CommittedCheckpoints {
+    quarantine: Arc<Mutex<Quarantine>>,
+}
+
+struct Quarantine {
+    db: Arc<EpochDb>,
+    /// The commit being decided.
+    open: Output,
+    /// Decided commits not yet written, in commit order.
+    queued: std::collections::VecDeque<Output>,
+    /// The latest queued value of each key, and how many queued outputs
+    /// wrote it: a key leaves memory with the last of them, as the
+    /// reference's `RefCountedHashMap`.
+    processed: HashMap<TxDigest, usize>,
+    locks: HashMap<ObjectRef, (TxDigest, usize)>,
+    streams: HashMap<StreamId, ((u32, u32), usize)>,
+    /// The last chunk height of the last checkpoint committed.
+    committed_height: u64,
+}
+
+/// One commit's output.
 #[derive(Default)]
-struct Pending {
-    processed: HashSet<TxDigest>,
+struct Output {
+    processed: std::collections::HashSet<TxDigest>,
     locks: HashMap<ObjectRef, TxDigest>,
     streams: HashMap<StreamId, (u32, u32)>,
+    /// The commit stage's state after the commit, encoded.
+    record: Vec<u8>,
+    /// The last chunk height the commit assigned.
+    height: u64,
+    /// Whether no chunk waited for a checkpoint after the commit.
+    drained: bool,
+}
+
+fn lock_quarantine(quarantine: &Mutex<Quarantine>) -> std::sync::MutexGuard<'_, Quarantine> {
+    quarantine
+        .lock()
+        .expect("the quarantine's lock is not poisoned")
 }
 
 impl ConsensusOutput {
@@ -266,15 +328,19 @@ impl ConsensusOutput {
     /// # Panics
     /// If the database cannot be read.
     pub fn is_processed(&self, digest: &TxDigest) -> bool {
-        self.pending.processed.contains(digest)
-            || self
-                .db
+        let q = lock_quarantine(&self.quarantine);
+        q.open.processed.contains(digest)
+            || q.processed.contains_key(digest)
+            || q.db
                 .exists(Space::Processed, digest)
                 .expect("the epoch's database reads")
     }
 
     pub fn set_processed(&mut self, digest: TxDigest) {
-        self.pending.processed.insert(digest);
+        lock_quarantine(&self.quarantine)
+            .open
+            .processed
+            .insert(digest);
     }
 
     /// The transaction holding owned reference `object`'s lock, if any.
@@ -282,17 +348,23 @@ impl ConsensusOutput {
     /// # Panics
     /// If the database cannot be read.
     pub fn lock_holder(&self, object: &ObjectRef) -> Option<TxDigest> {
-        if let Some(holder) = self.pending.locks.get(object) {
+        let q = lock_quarantine(&self.quarantine);
+        if let Some(holder) = q.open.locks.get(object) {
             return Some(*holder);
         }
-        self.db
-            .get(Space::Locks, &lock_key(object))
+        if let Some((holder, _)) = q.locks.get(object) {
+            return Some(*holder);
+        }
+        q.db.get(Space::Locks, &lock_key(object))
             .expect("the epoch's database reads")
             .map(|v| v[..].try_into().expect("a 32-byte digest"))
     }
 
     pub fn set_lock(&mut self, object: ObjectRef, holder: TxDigest) {
-        self.pending.locks.insert(object, holder);
+        lock_quarantine(&self.quarantine)
+            .open
+            .locks
+            .insert(object, holder);
     }
 
     /// The stream's last scheduled generation, (round, generation), if a
@@ -301,50 +373,152 @@ impl ConsensusOutput {
     /// # Panics
     /// If the database cannot be read.
     pub fn stream(&self, stream: &StreamId) -> Option<(u32, u32)> {
-        if let Some(last) = self.pending.streams.get(stream) {
+        let q = lock_quarantine(&self.quarantine);
+        if let Some(last) = q.open.streams.get(stream) {
             return Some(*last);
         }
-        self.db
-            .get(
-                Space::Streams,
-                &stream_key(&stream.id, stream.initial_shared_version),
-            )
-            .expect("the epoch's database reads")
-            .map(|v| {
-                let word = |i: usize| u32::from_le_bytes(v[i..i + 4].try_into().expect("4 bytes"));
-                (word(0), word(4))
-            })
+        if let Some((last, _)) = q.streams.get(stream) {
+            return Some(*last);
+        }
+        q.db.get(
+            Space::Streams,
+            &stream_key(&stream.id, stream.initial_shared_version),
+        )
+        .expect("the epoch's database reads")
+        .map(|v| {
+            let word = |i: usize| u32::from_le_bytes(v[i..i + 4].try_into().expect("4 bytes"));
+            (word(0), word(4))
+        })
     }
 
     pub fn set_stream(&mut self, stream: StreamId, last: (u32, u32)) {
-        self.pending.streams.insert(stream, last);
+        lock_quarantine(&self.quarantine)
+            .open
+            .streams
+            .insert(stream, last);
     }
 
-    /// Writes everything pending, in one batch.
+    /// Ends the commit being decided: `record` is the commit stage's state
+    /// after it, `height` the last chunk height it assigned, and `drained`
+    /// whether no chunk waits for a checkpoint after it. Written once the
+    /// checkpoints through `height` have committed, and a drained commit at
+    /// or after it can be written too.
     ///
     /// # Panics
     /// If the database cannot be written.
-    pub fn commit(&mut self) {
-        let pending = std::mem::take(&mut self.pending);
-        let mut batch = self
+    pub fn finish_commit(&mut self, record: Vec<u8>, height: u64, drained: bool) {
+        let mut q = lock_quarantine(&self.quarantine);
+        let mut output = std::mem::take(&mut q.open);
+        output.record = record;
+        output.height = height;
+        output.drained = drained;
+        q.queue(output);
+        q.flush();
+    }
+
+    /// The commit stage's state after the last commit written, as
+    /// `finish_commit` took it: where a restart resumes.
+    ///
+    /// # Panics
+    /// If the database cannot be read.
+    pub fn record(&self) -> Option<Vec<u8>> {
+        lock_quarantine(&self.quarantine)
             .db
-            .batch(&[Space::Processed, Space::Locks, Space::Streams]);
-        for digest in pending.processed {
-            batch.put(Space::Processed, digest.to_vec(), Vec::new());
+            .get(Space::Commit, &[0])
+            .expect("the epoch's database reads")
+    }
+
+    /// The handle the checkpoint committer tells of each commit.
+    pub fn committed_checkpoints(&self) -> CommittedCheckpoints {
+        CommittedCheckpoints {
+            quarantine: self.quarantine.clone(),
         }
-        for (object, holder) in pending.locks {
-            batch.put(Space::Locks, lock_key(&object).to_vec(), holder.to_vec());
+    }
+}
+
+impl CommittedCheckpoints {
+    /// The checkpoints through the chunk at `height` have committed: writes
+    /// what they cover.
+    ///
+    /// # Panics
+    /// If the database cannot be written.
+    pub fn committed_through(&self, height: u64) {
+        let mut q = lock_quarantine(&self.quarantine);
+        q.committed_height = q.committed_height.max(height);
+        q.flush();
+    }
+}
+
+impl Quarantine {
+    fn queue(&mut self, output: Output) {
+        for digest in &output.processed {
+            *self.processed.entry(*digest).or_default() += 1;
         }
-        for (stream, (round, generation)) in pending.streams {
-            let mut value = round.to_le_bytes().to_vec();
-            value.extend_from_slice(&generation.to_le_bytes());
-            batch.put(
-                Space::Streams,
-                stream_key(&stream.id, stream.initial_shared_version).to_vec(),
-                value,
-            );
+        for (object, holder) in &output.locks {
+            let entry = self.locks.entry(*object).or_insert((*holder, 0));
+            *entry = (*holder, entry.1 + 1);
         }
+        for (stream, last) in &output.streams {
+            let entry = self.streams.entry(*stream).or_insert((*last, 0));
+            *entry = (*last, entry.1 + 1);
+        }
+        self.queued.push_back(output);
+    }
+
+    /// Writes the queued outputs whose checkpoints have committed, through
+    /// the last of them after which no chunk waited for a checkpoint: a
+    /// later one's chunks are in checkpoints only a replay from a drained
+    /// commit rebuilds (the reference's `1ad56a6b81`). One batch, with the
+    /// last record.
+    fn flush(&mut self) {
+        let covered = self
+            .queued
+            .iter()
+            .take_while(|o| o.height <= self.committed_height)
+            .count();
+        let Some(last) = self.queued.range(..covered).rposition(|o| o.drained) else {
+            return;
+        };
+        let mut batch = self.db.batch();
+        let mut record = Vec::new();
+        for output in self.queued.drain(..=last) {
+            for digest in output.processed {
+                batch.put(Space::Processed, digest.to_vec(), Vec::new());
+                release(&mut self.processed, &digest, |count| count);
+            }
+            for (object, holder) in output.locks {
+                batch.put(Space::Locks, lock_key(&object).to_vec(), holder.to_vec());
+                release(&mut self.locks, &object, |held| &mut held.1);
+            }
+            for (stream, (round, generation)) in output.streams {
+                let mut value = round.to_le_bytes().to_vec();
+                value.extend_from_slice(&generation.to_le_bytes());
+                batch.put(
+                    Space::Streams,
+                    stream_key(&stream.id, stream.initial_shared_version).to_vec(),
+                    value,
+                );
+                release(&mut self.streams, &stream, |last| &mut last.1);
+            }
+            record = output.record;
+        }
+        batch.put(Space::Commit, vec![0], record);
         batch.commit().expect("the epoch's database writes");
+    }
+}
+
+/// One fewer queued output holds `key`'s value; it leaves memory with the
+/// last.
+fn release<K: std::hash::Hash + Eq, V>(
+    map: &mut HashMap<K, V>,
+    key: &K,
+    count: impl Fn(&mut V) -> &mut usize,
+) {
+    let value = map.get_mut(key).expect("a queued key is counted");
+    let count = count(value);
+    *count -= 1;
+    if *count == 0 {
+        map.remove(key);
     }
 }
 

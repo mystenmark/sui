@@ -392,7 +392,7 @@ fn committer(node: &Node) -> Committer {
     let (output, dir) = consensus_output();
     Committer {
         decoder: CommitDecoder::new(node.epoch.params.clone(), node.cache.clone()),
-        handler: CommitHandler::new(output),
+        handler: CommitHandler::new(output, 0),
         _dir: dir,
     }
 }
@@ -608,7 +608,7 @@ fn handlers_decide_alike_whatever_has_executed() {
     let decide = || {
         let mut decoder = CommitDecoder::new(node.epoch.params.clone(), node.cache.clone());
         let (output, _dir) = consensus_output();
-        let mut handler = CommitHandler::new(output);
+        let mut handler = CommitHandler::new(output, 0);
         commits
             .iter()
             .map(|c| {

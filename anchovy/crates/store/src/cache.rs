@@ -587,6 +587,11 @@ impl Store {
     }
 
     /// How many transactions are written and not committed.
+    /// Whether the transaction with `digest` executed and has not committed.
+    pub fn is_uncommitted(&self, digest: &Digest) -> bool {
+        self.uncommitted(digest).is_some()
+    }
+
     pub fn uncommitted_transactions(&self) -> usize {
         self.uncommitted.iter().map(|s| lock(s).len()).sum()
     }

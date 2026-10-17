@@ -24,7 +24,7 @@ use validator::consensus::decode::{CommitDecoder, CommitRequest, DecodedCommit};
 use validator::consensus::status::ConsensusTxStatusCache;
 use validator::consensus::vote::{BlockVoter, VoteRequest};
 use validator::epoch::EpochState;
-use validator::epoch_store::{ConsensusOutput as OutputWriter, EpochStore};
+use validator::epoch_store::{CommittedCheckpoints, ConsensusOutput as OutputWriter, EpochStore};
 use validator::pipeline::items::{
     BuiltCommand, BuiltWaits, CertifiedCheckpoint, CheckpointContentsBuilt, CheckpointEffects,
     CheckpointSignature, Chunk, EffectsWaitItem, EpochCloserInput, Executable, FundsCommand,
@@ -53,6 +53,7 @@ pub(crate) fn spawn(
     ended: watch::Sender<Option<u64>>,
 ) -> Vec<WorkerHandle> {
     let w = Spawner { parts, queues: q.clone() };
+    let committed = output.committed_checkpoints();
     vec![
         // Submission.
         w.thread("submission")
@@ -80,7 +81,7 @@ pub(crate) fn spawn(
         w.one("epoch-closer",      i.closer,           |p, q| p.epoch_closer(q.resolver, q.effects_waits, q.hasher, q.summary), drop),
         w.one("summary",           i.summary,          |p, q| p.summary(q.built_waits),                               drop),
         w.one("aggregator",        i.aggregator,       move |p, q| p.aggregator(state_sync, q.built_waits),           into(&q.committer, "committer")),
-        w.one("committer",         i.committer,        move |p, _| p.committer(ended),                                drop),
+        w.one("committer",         i.committer,        move |p, _| p.committer(committed, ended),                     drop),
     ]
 }
 
@@ -311,11 +312,17 @@ impl Parts {
         .with_fork_checks(built)
     }
 
-    fn committer(&self, ended: watch::Sender<Option<u64>>) -> CheckpointCommitter {
+    fn committer(
+        &self,
+        committed: CommittedCheckpoints,
+        ended: watch::Sender<Option<u64>>,
+    ) -> CheckpointCommitter {
         CheckpointCommitter::new(
             self.store.clone(),
             self.checkpoints.clone(),
             self.chunks.clone(),
+            self.generations.clone(),
+            committed,
             ended,
         )
     }

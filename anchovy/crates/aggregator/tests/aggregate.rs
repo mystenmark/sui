@@ -52,7 +52,8 @@ fn setup(size: usize, next: u64) -> Setup {
     assert_eq!(committee.quorum_threshold(), sui.quorum_threshold());
     let epochs = tempfile::tempdir().unwrap();
     let (epoch_store, _, builder) = validator::epoch_store::EpochStore::open(epochs.path(), 0);
-    let checkpoints = Arc::new(CheckpointStore::new(epoch_store, builder));
+    let objects = Arc::new(store::Store::open(&epochs.path().join("perpetual")).unwrap());
+    let checkpoints = Arc::new(CheckpointStore::new(objects, 0, epoch_store, builder));
     let (to_state_sync, state_sync) = workqueue::queue(16);
     let aggregator = CheckpointAggregator::new(
         Arc::new(committee),

@@ -25,7 +25,7 @@ use messages::transaction::DigestPending;
 use state_hasher::StateHashes;
 use tokio::sync::watch;
 use validator::consensus::cache::ConsensusTxCache;
-use validator::consensus::commit::EpochStart;
+use validator::consensus::commit::{CommitRecord, EpochStart};
 use validator::consensus::decode::CommitRequest;
 use validator::consensus::status::ConsensusTxStatusCache;
 use validator::consensus::vote::VoteRequest;
@@ -71,6 +71,9 @@ pub struct Pipeline {
     pub state_hashes: Arc<StateHashes>,
     /// The epoch's last checkpoint, once committed: the epoch is over.
     pub ended: watch::Receiver<Option<u64>>,
+    /// The first commit consensus must deliver: the epoch's first, or after
+    /// a restart, the window of commits before the last one written.
+    pub replay_from: u32,
     /// What the epoch's queues hold, and its workers have in hand.
     activity: Activity,
 }
@@ -81,19 +84,16 @@ pub struct Pipeline {
 pub struct ConsensusOutput {
     pub votes: Queue<VoteRequest>,
     pub commits: Queue<CommitRequest>,
+    /// The first commit to deliver: consensus-core's replay point.
+    pub replay_from: u32,
 }
 
-/// The epoch's start: the checkpoint its first checkpoint follows,
-/// `previous`, and what the commit handler starts from.
+/// What the commit handler starts the epoch from.
 ///
 /// # Panics
 /// If the store cannot be read or written, lacks `previous`, or has no
 /// shared accumulator root.
-fn epoch_start(
-    store: &store::Store,
-    epoch_store: &EpochStore,
-    record: &EpochRecord,
-) -> (BuiltCheckpoint, EpochStart) {
+fn epoch_start(store: &store::Store, epoch_store: &EpochStore, record: &EpochRecord) -> EpochStart {
     let checkpoint = BuiltCheckpoint::decode(
         &store
             .checkpoint(record.previous_checkpoint)
@@ -119,7 +119,7 @@ fn epoch_start(
         .start_version(store, &root, initial_shared_version)
         .expect("the accumulator root exists")
         .version;
-    let start = EpochStart {
+    EpochStart {
         previous_checkpoint: checkpoint.seq,
         previous_height: checkpoint.last_height,
         previous_timestamp_ms: checkpoint.timestamp_ms,
@@ -127,8 +127,7 @@ fn epoch_start(
         accumulator_root_initial_shared_version: initial_shared_version,
         epoch_start_timestamp_ms: record.epoch_start_timestamp_ms,
         epoch_duration_ms: record.epoch_duration_ms,
-    };
-    (checkpoint, start)
+    }
 }
 
 impl Pipeline {
@@ -139,11 +138,12 @@ impl Pipeline {
     /// to the pipeline, and returns its client, as consensus-core's
     /// `ConsensusAuthority::start` does.
     ///
-    /// It starts from the epoch's start, so consensus must deliver the
-    /// epoch's commits from its first: replaying them rebuilds every
-    /// stage's state. Transactions in committed checkpoints are found
-    /// executed, and checkpoints up to the committed one are rebuilt but not
-    /// certified again.
+    /// It resumes after the last commit whose consensus output was written
+    /// (`docs/quarantine_design.md`), or from the epoch's start, so
+    /// consensus must deliver the commits from `replay_from`: replaying
+    /// them rebuilds every stage's state. Transactions in committed
+    /// checkpoints are found executed, and checkpoints up to the committed
+    /// one are rebuilt but not certified again.
     pub fn start(
         store: &Arc<store::Store>,
         epoch: &Arc<EpochState>,
@@ -156,23 +156,61 @@ impl Pipeline {
         state_sync: Queue<CertifiedCheckpoint>,
         record: &EpochRecord,
     ) -> Pipeline {
-        let (first, start) = epoch_start(store, epoch_store, record);
+        let start = epoch_start(store, epoch_store, record);
+        let committed_seq = store
+            .committed_checkpoint()
+            .expect("the store reads")
+            .expect("the genesis checkpoint is committed");
         let checkpoints = Arc::new(CheckpointStore::new(
+            store.clone(),
+            committed_seq,
             epoch_store.clone(),
             builder_output.clone(),
         ));
-        checkpoints.insert_built(first);
-        let next_to_certify = store
-            .committed_checkpoint()
-            .expect("the store reads")
-            .expect("the genesis checkpoint is committed")
-            + 1;
+        let next_to_certify = committed_seq + 1;
+
+        // Where the epoch resumes: after the last commit its consensus
+        // output was written through, else from its start.
+        let committed_height = BuiltCheckpoint::decode(
+            &store
+                .checkpoint(committed_seq)
+                .expect("the store reads")
+                .expect("the committed checkpoint is stored"),
+        )
+        .last_height;
+        consensus_output
+            .committed_checkpoints()
+            .committed_through(committed_height);
+        builder_output.delete_state_hashes_above(committed_seq);
+        let resumed = consensus_output
+            .record()
+            .map(|bytes| CommitRecord::decode(&bytes));
+        // The prior commits rebuild the commit interval observer.
+        let window = epoch
+            .params
+            .config
+            .get_consensus_commit_rate_estimation_window_size();
+        let replay_from = resumed.map_or(1, |r| (r.commit_index + 1).saturating_sub(window).max(1));
+        let state_hashes = Arc::new(StateHashes::new(epoch_store.clone(), builder_output));
+        let (first_hashed, root_state) = match resumed {
+            Some(r) if r.next_seq - 1 > record.previous_checkpoint => {
+                let root = state_hashes.committed_root(
+                    store,
+                    r.next_seq - 1,
+                    record.previous_checkpoint,
+                    &state_hasher::decode(&record.root_state),
+                );
+                (r.next_seq, state_hasher::encode(&root))
+            }
+            _ => (record.previous_checkpoint + 1, record.root_state.clone()),
+        };
 
         let activity = Activity::new();
         let (queues, inboxes) = wiring::queues(&activity);
         let consensus = consensus(ConsensusOutput {
             votes: queues.votes.clone(),
             commits: queues.commits.clone(),
+            replay_from,
         });
         let parts = Arc::new(Parts {
             store: store.clone(),
@@ -186,11 +224,11 @@ impl Pipeline {
             chunks: Arc::new(ChunkTable::new()),
             checkpoints,
             statuses: Arc::new(ConsensusTxStatusCache::new()),
-            state_hashes: Arc::new(StateHashes::new(epoch_store.clone(), builder_output)),
+            state_hashes,
             start,
             next_to_certify,
-            first_hashed: record.previous_checkpoint + 1,
-            root_state: record.root_state.clone(),
+            first_hashed,
+            root_state,
         });
         let (ended_sender, ended) = watch::channel(None);
         let workers = wiring::spawn(
@@ -217,6 +255,7 @@ impl Pipeline {
             checkpoints: parts.checkpoints.clone(),
             state_hashes: parts.state_hashes.clone(),
             ended,
+            replay_from,
             activity,
             _workers: workers,
         }

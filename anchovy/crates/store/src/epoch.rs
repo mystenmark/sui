@@ -3,14 +3,8 @@
 
 //! An epoch's database, discarded once the epoch is over: after the
 //! reference's `AuthorityEpochTables`. Raw bytes by keyspace; the pipeline's
-//! epoch store gives them types and decides who writes which.
-//!
-//! Each epoch has a directory of two Tidehunter databases:
-//! - `replayed`: what replaying the epoch's commits from its start writes
-//!   again (consensus output, checkpoint builder state, generations), so a
-//!   restart drops it;
-//! - `kept`: what a replay could not rebuild, as the stores it was derived
-//!   from have moved on (start versions).
+//! epoch store gives them types and decides who writes which. A directory
+//! per epoch, holding one Tidehunter database.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,6 +24,7 @@ pub enum Space {
     Processed,
     Locks,
     Streams,
+    Commit,
     // Checkpoint builder state.
     Built,
     CheckpointHashes,
@@ -40,22 +35,24 @@ pub enum Space {
 }
 
 impl Space {
-    const REPLAYED: [Space; 7] = [
+    const ALL: [Space; 9] = [
         Space::Processed,
         Space::Locks,
         Space::Streams,
+        Space::Commit,
         Space::Built,
         Space::CheckpointHashes,
         Space::Roots,
         Space::Generations,
+        Space::StartVersions,
     ];
-    const KEPT: [Space; 1] = [Space::StartVersions];
 
     fn name(self) -> &'static str {
         match self {
             Space::Processed => "processed",
             Space::Locks => "locks",
             Space::Streams => "streams",
+            Space::Commit => "commit",
             Space::Built => "built",
             Space::CheckpointHashes => "checkpoint_hashes",
             Space::Roots => "roots",
@@ -73,11 +70,8 @@ impl Space {
             Space::Streams | Space::StartVersions => 32 + 8,
             Space::Generations => 32 + 8 + 4 + 4,
             Space::Built | Space::CheckpointHashes | Space::Roots => 8,
+            Space::Commit => 1,
         }
-    }
-
-    fn replayed(self) -> bool {
-        Space::REPLAYED.contains(&self)
     }
 }
 
@@ -88,34 +82,34 @@ const PREFIX: &str = "epoch_";
 
 pub struct EpochDb {
     epoch: u64,
-    replayed: Arc<Tidehunter>,
-    kept: Arc<Tidehunter>,
+    db: Arc<Tidehunter>,
     /// By `Space` discriminant.
     spaces: Vec<KeySpace>,
 }
 
 impl EpochDb {
-    /// Epoch `epoch`'s database under `root`, its replayed part emptied:
-    /// opened at the epoch's start, and again on restart, when the epoch
-    /// replays from its start.
+    /// Epoch `epoch`'s database under `root`: made at the epoch's start,
+    /// reopened as it was on restart.
     pub fn open(root: &Path, epoch: u64) -> Result<EpochDb> {
-        let dir = epoch_dir(root, epoch);
-        let replayed_dir = dir.join("replayed");
-        if replayed_dir.exists() {
-            Tidehunter::drop_db(&replayed_dir).map_err(DbError::Io)?;
+        let path = epoch_dir(root, epoch);
+        std::fs::create_dir_all(&path).map_err(DbError::Io)?;
+        let mut shape = KeyShapeBuilder::new();
+        for space in Space::ALL {
+            shape.add_key_space(space.name(), space.key_len(), MUTEXES, KeyType::uniform(1));
         }
-        let replayed = open(&replayed_dir, &Space::REPLAYED)?;
-        let kept = open(&dir.join("kept"), &Space::KEPT)?;
-        let all = [Space::REPLAYED.as_slice(), Space::KEPT.as_slice()].concat();
-        let mut spaces = vec![None; all.len()];
-        for space in all {
-            let db = if space.replayed() { &replayed } else { &kept };
+        let db = Tidehunter::open(
+            &path,
+            shape.build(),
+            Arc::new(Config::default()),
+            Metrics::new(),
+        )?;
+        let mut spaces = vec![None; Space::ALL.len()];
+        for space in Space::ALL {
             spaces[space as usize] = Some(db.ks(space.name()));
         }
         Ok(EpochDb {
             epoch,
-            replayed,
-            kept,
+            db,
             spaces: spaces
                 .into_iter()
                 .map(|s| s.expect("every space"))
@@ -127,88 +121,60 @@ impl EpochDb {
         self.epoch
     }
 
-    fn db(&self, space: Space) -> &Arc<Tidehunter> {
-        if space.replayed() {
-            &self.replayed
-        } else {
-            &self.kept
-        }
-    }
-
     pub fn get(&self, space: Space, key: &[u8]) -> Result<Option<Vec<u8>>> {
         Ok(self
-            .db(space)
+            .db
             .get(self.spaces[space as usize], key)?
             .map(|v| v.to_vec()))
     }
 
     pub fn exists(&self, space: Space, key: &[u8]) -> Result<bool> {
-        Ok(self.db(space).exists(self.spaces[space as usize], key)?)
+        Ok(self.db.exists(self.spaces[space as usize], key)?)
     }
 
-    /// A batch over `spaces`, which must all be in one of the two
-    /// databases: a batch commits atomically within one.
-    ///
-    /// # Panics
-    /// If `spaces` span both databases.
-    pub fn batch(&self, spaces: &[Space]) -> EpochBatch<'_> {
-        let replayed = spaces.first().is_none_or(|s| s.replayed());
-        assert!(
-            spaces.iter().all(|s| s.replayed() == replayed),
-            "a batch is within one database"
-        );
-        let db = if replayed { &self.replayed } else { &self.kept };
+    /// The keys of `space`, whose keys are big-endian numbers, above `n`.
+    pub fn numbers_above(&self, space: Space, n: u64) -> Result<Vec<u64>> {
+        let mut entries = self.db.iterator(self.spaces[space as usize]);
+        entries.reverse();
+        let mut above = Vec::new();
+        for entry in entries {
+            let (key, _) = entry?;
+            let key = u64::from_be_bytes(key[..8].try_into().expect("an 8-byte key"));
+            if key <= n {
+                break;
+            }
+            above.push(key);
+        }
+        Ok(above)
+    }
+
+    /// Writes, committed atomically.
+    pub fn batch(&self) -> EpochBatch<'_> {
         EpochBatch {
             db: self,
-            replayed,
-            batch: db.write_batch(),
+            batch: self.db.write_batch(),
         }
     }
 }
 
-/// Writes to one of an epoch's databases, committed atomically.
+/// Writes to an epoch's database, committed atomically.
 pub struct EpochBatch<'a> {
     db: &'a EpochDb,
-    replayed: bool,
     batch: WriteBatch,
 }
 
 impl EpochBatch<'_> {
     pub fn put(&mut self, space: Space, key: Vec<u8>, value: Vec<u8>) {
-        assert_eq!(
-            space.replayed(),
-            self.replayed,
-            "{space:?} is not in this batch's database"
-        );
         self.batch.write(self.db.spaces[space as usize], key, value);
     }
 
     pub fn delete(&mut self, space: Space, key: Vec<u8>) {
-        assert_eq!(
-            space.replayed(),
-            self.replayed,
-            "{space:?} is not in this batch's database"
-        );
         self.batch.delete(self.db.spaces[space as usize], key);
     }
 
     pub fn commit(self) -> Result<()> {
         Ok(self.batch.commit()?)
     }
-}
-
-fn open(path: &Path, spaces: &[Space]) -> Result<Arc<Tidehunter>> {
-    std::fs::create_dir_all(path).map_err(DbError::Io)?;
-    let mut shape = KeyShapeBuilder::new();
-    for space in spaces {
-        shape.add_key_space(space.name(), space.key_len(), MUTEXES, KeyType::uniform(1));
-    }
-    Ok(Tidehunter::open(
-        path,
-        shape.build(),
-        Arc::new(Config::default()),
-        Metrics::new(),
-    )?)
 }
 
 fn epoch_dir(root: &Path, epoch: u64) -> PathBuf {
@@ -244,20 +210,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reopening_drops_the_replayed_part_and_keeps_the_rest() {
+    fn reopening_keeps_everything() {
         let root = tempfile::tempdir().unwrap();
         {
             let db = EpochDb::open(root.path(), 3).unwrap();
-            let mut batch = db.batch(&[Space::Processed]);
+            let mut batch = db.batch();
             batch.put(Space::Processed, vec![1; 32], vec![]);
-            batch.commit().unwrap();
-            let mut batch = db.batch(&[Space::StartVersions]);
             batch.put(Space::StartVersions, vec![2; 40], vec![7]);
             batch.commit().unwrap();
-            assert!(db.exists(Space::Processed, &[1; 32]).unwrap());
         }
         let db = EpochDb::open(root.path(), 3).unwrap();
-        assert!(!db.exists(Space::Processed, &[1; 32]).unwrap());
+        assert!(db.exists(Space::Processed, &[1; 32]).unwrap());
         assert_eq!(
             db.get(Space::StartVersions, &[2; 40]).unwrap(),
             Some(vec![7])
@@ -265,11 +228,16 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a batch is within one database")]
-    fn a_batch_cannot_span_both_databases() {
+    fn numbers_above_are_found_from_the_top() {
         let root = tempfile::tempdir().unwrap();
         let db = EpochDb::open(root.path(), 0).unwrap();
-        let _ = db.batch(&[Space::Locks, Space::StartVersions]);
+        let mut batch = db.batch();
+        for n in [3u64, 5, 300, 7] {
+            batch.put(Space::Roots, n.to_be_bytes().to_vec(), vec![]);
+        }
+        batch.commit().unwrap();
+        assert_eq!(db.numbers_above(Space::Roots, 5).unwrap(), [300, 7]);
+        assert!(db.numbers_above(Space::Roots, 300).unwrap().is_empty());
     }
 
     #[test]

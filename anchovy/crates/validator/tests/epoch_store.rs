@@ -78,27 +78,43 @@ fn version(v: u64) -> Generation {
     }
 }
 
-/// Generations recorded in one store are read back from it; another
-/// epoch's store has none.
+/// A generation is read back at once, and reaches the epoch store when its
+/// producer commits, or at once if it has: a restart finds only those.
 #[test]
-fn generations_are_kept_for_the_epoch() {
+fn generations_are_written_once_their_producer_commits() {
     let dir = tempfile::tempdir().unwrap();
-    let (store, _, _) = EpochStore::open(dir.path(), 0);
-    let table = GenerationTable::new(store);
+    let table = |dir: &tempfile::TempDir| {
+        let (store, _, _) = EpochStore::open(dir.path(), 0);
+        GenerationTable::new(store)
+    };
     let ended = Generation::Ended {
         version: 10,
         transaction: [7; 32],
     };
-    table.record(stream(1), 3, 1, version(2));
-    table.record(stream(2), 7, 1, ended);
+    {
+        let table = table(&dir);
+        table.record(stream(1), 3, 1, version(2), [1; 32], false);
+        table.record(stream(2), 7, 1, ended, [2; 32], false);
+        table.record(stream(3), 4, 1, version(5), [3; 32], true);
+        assert_eq!(table.get(stream(1), 3, 1), Some(version(2)));
+        assert_eq!(table.get(stream(2), 7, 1), Some(ended));
+        assert_eq!(table.get(stream(1), 3, 2), None);
+        table.commit(&[[1; 32]]);
+        assert_eq!(table.get(stream(1), 3, 1), Some(version(2)));
+        // A stream's start, recorded once.
+        assert_eq!(
+            table.get_or_record(stream(4), 3, 0, || version(8)),
+            version(8)
+        );
+        assert_eq!(
+            table.get_or_record(stream(4), 3, 0, || version(99)),
+            version(8)
+        );
+    }
+    // Reopened, as on restart.
+    let table = table(&dir);
     assert_eq!(table.get(stream(1), 3, 1), Some(version(2)));
-    assert_eq!(table.get(stream(2), 7, 1), Some(ended));
-    assert_eq!(table.get(stream(1), 3, 2), None);
-    // A concurrent recorder of the same generation finds the first value.
-    assert_eq!(
-        table.get_or_record(stream(1), 3, 1, || version(99)),
-        version(2)
-    );
-    let (next, _, _) = EpochStore::open(dir.path(), 1);
-    assert_eq!(GenerationTable::new(next).get(stream(1), 3, 1), None);
+    assert_eq!(table.get(stream(2), 7, 1), None);
+    assert_eq!(table.get(stream(3), 4, 1), Some(version(5)));
+    assert_eq!(table.get(stream(4), 3, 0), Some(version(8)));
 }

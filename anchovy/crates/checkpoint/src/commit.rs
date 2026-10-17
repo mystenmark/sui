@@ -12,24 +12,33 @@ use messages::checkpoint::{CheckpointContents, VersionedCheckpointContents};
 use messages::fast::Bump;
 use messages::reader::Reader;
 use tokio::sync::watch;
+use validator::epoch_store::CommittedCheckpoints;
 use validator::pipeline::items::CertifiedCheckpoint;
-use validator::pipeline::tables::{CheckpointStore, ChunkTable};
+use validator::pipeline::tables::{CheckpointStore, ChunkTable, GenerationTable};
 use workqueue::Processor;
 
 /// Commits each certified checkpoint's transactions from the writeback
 /// cache to the database, with its record, certificate and the committed
-/// watermark, in one batch. Once the epoch's last checkpoint has committed,
-/// says so: the epoch is over. The start of a `CheckpointExecutor`.
+/// watermark, in one batch. Then writes the epoch store's state that waited
+/// for the checkpoint: the generations its transactions produced, and the
+/// consensus output it covers. In that order, as the reference's
+/// `execute_checkpoint`: a crash between them leaves the epoch store behind
+/// the object store, which a replay catches up; the other order could leave
+/// it claiming outputs a crash lost. Once the epoch's last checkpoint has
+/// committed, says so: the epoch is over. The start of a `CheckpointExecutor`.
 ///
 /// Inward: `CheckpointAggregator`: `Vec<CertifiedCheckpoint>`, in sequence
 /// order.
 ///
 /// Reads: the checkpoint store. Prunes: the chunk table. Writes: the object
-/// store, as its only committer.
+/// store, as its only committer; the generation table's and the consensus
+/// output's committed state.
 pub struct CheckpointCommitter {
     store: Arc<store::Store>,
     checkpoints: Arc<CheckpointStore>,
     chunks: Arc<ChunkTable>,
+    generations: Arc<GenerationTable>,
+    consensus_output: CommittedCheckpoints,
     /// The epoch's last checkpoint, once committed.
     ended: watch::Sender<Option<u64>>,
     bump: Bump,
@@ -40,12 +49,16 @@ impl CheckpointCommitter {
         store: Arc<store::Store>,
         checkpoints: Arc<CheckpointStore>,
         chunks: Arc<ChunkTable>,
+        generations: Arc<GenerationTable>,
+        consensus_output: CommittedCheckpoints,
         ended: watch::Sender<Option<u64>>,
     ) -> CheckpointCommitter {
         CheckpointCommitter {
             store,
             checkpoints,
             chunks,
+            generations,
+            consensus_output,
             ended,
             bump: Bump::with_capacity(super::ARENA),
         }
@@ -67,7 +80,11 @@ impl CheckpointCommitter {
             built.encode(),
             certified.summary.to_vec(),
         );
+        let digests: Vec<[u8; 32]> = transactions.iter().map(|d| d.bytes).collect();
+        self.generations.commit(&digests);
+        self.consensus_output.committed_through(built.last_height);
         self.chunks.prune_through(built.last_height);
+        self.checkpoints.committed(seq);
         if built.root_state.is_some() {
             self.ended.send_replace(Some(seq));
         }

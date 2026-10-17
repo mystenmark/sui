@@ -14,8 +14,10 @@ use messages::fast::Bump;
 use messages::reader::Reader;
 use workqueue::{Processor, Queue};
 
+use messages::checkpoint::{CheckpointContents, ExecutionDigests, VersionedCheckpointContents};
 use validator::epoch_store::{BuilderOutput, EpochStore};
 use validator::pipeline::items::{CheckpointEffects, EpochCloserInput, ExecutedEffects};
+use validator::pipeline::tables::BuiltCheckpoint;
 
 /// The reference's `GlobalStateHash`: an ECMH over object digests.
 pub use fastcrypto::hash::EllipticCurveMultisetHash as StateHash;
@@ -132,6 +134,46 @@ impl StateHashes {
         lock(&self.latest).clone()
     }
 
+    /// The root after checkpoint `seq`, committed: as stored, or else
+    /// folded again from the last root stored before it (`epoch_root`
+    /// after `epoch_previous`, the previous epoch's last checkpoint, if
+    /// none), over the committed checkpoints' effects, and stored. The
+    /// hasher folds independently of commits, so a crash can leave a
+    /// committed checkpoint without its root; as the reference's executor,
+    /// which accumulates a checkpoint's root from its effects once
+    /// committed.
+    ///
+    /// # Panics
+    /// If a checkpoint after the last root stored, through `seq`, is not
+    /// committed with its effects.
+    pub fn committed_root(
+        &self,
+        store: &store::Store,
+        seq: u64,
+        epoch_previous: u64,
+        epoch_root: &StateHash,
+    ) -> StateHash {
+        let mut from = seq;
+        let mut root = loop {
+            if from == epoch_previous {
+                break epoch_root.clone();
+            }
+            if let Some(root) = self.root(from) {
+                break root;
+            }
+            from -= 1;
+        };
+        let mut bump = Bump::with_capacity(1 << 16);
+        for checkpoint in from + 1..=seq {
+            let effects = committed_effects(store, checkpoint, &mut bump);
+            let hash = accumulate(&effects, &mut bump);
+            self.insert_checkpoint(checkpoint, &hash);
+            root.union(&hash);
+            self.insert_root(checkpoint, root.clone());
+        }
+        root
+    }
+
     fn insert_checkpoint(&self, seq: u64, hash: &StateHash) {
         self.output.put_checkpoint_hash(seq, encode(hash));
     }
@@ -140,6 +182,41 @@ impl StateHashes {
         self.output.put_root(seq, encode(&root));
         *lock(&self.latest) = Some((seq, root));
     }
+}
+
+/// The effects of committed checkpoint `seq`'s transactions, in order.
+fn committed_effects(store: &store::Store, seq: u64, bump: &mut Bump) -> Vec<ExecutedEffects> {
+    let checkpoint = BuiltCheckpoint::decode(
+        &store
+            .checkpoint(seq)
+            .expect("the store reads")
+            .expect("the checkpoint is committed"),
+    );
+    bump.reset();
+    let mut r = Reader::new(&checkpoint.contents);
+    let contents = CheckpointContents::parse(&mut r, &mut BumpAlloc(bump))
+        .and_then(|c| r.finish().map(|()| c))
+        .expect("committed contents parse");
+    let digests: Vec<ExecutionDigests> = match contents.version {
+        VersionedCheckpointContents::V1 { transactions, .. } => transactions.to_vec(),
+        VersionedCheckpointContents::V2(transactions) => {
+            transactions.iter().map(|t| *t.digest).collect()
+        }
+    };
+    digests
+        .iter()
+        .map(|d| {
+            let effects = store
+                .effects(&d.effects)
+                .expect("the store reads")
+                .expect("a committed transaction's effects are stored");
+            ExecutedEffects {
+                digest: d.transaction.bytes,
+                effects_digest: d.effects.bytes,
+                effects: effects.get().bytes.into(),
+            }
+        })
+        .collect()
 }
 
 /// Computes each checkpoint's ECMH as its effects arrive (insert each
