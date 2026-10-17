@@ -35,11 +35,13 @@ in memory.
 3. Consensus output: processed digests, owned locks and stream links through
    the commit handler's writer, one batch per commit; the resolver keeps no
    state. Done.
-4. The generation table, settled chunks, built checkpoints and state hashes
-   in the epoch store, unpruned (the epoch store is dropped with the epoch);
-   the Move runtime replaced past 1024 packages. Done. (A first version
-   pruned in memory; replaced, as nothing in the epoch store needs pruning.)
-5. Quarantine and resume, with the `commit` record. Next, after its design.
+4. The generation table, built checkpoints and state hashes in the epoch
+   store, unpruned; settled chunks in memory, as they are bounded; the Move
+   runtime replaced past 1024 packages. Done. The rule: bounded state in
+   memory, unbounded epoch state in the epoch store, never epoch state in
+   the perpetual store.
+5. Quarantine and resume (`docs/quarantine_design.md`). Design written,
+   with the user.
 
 Notes:
 - The test suite takes about 60s, from about 40s: each test opens epoch
