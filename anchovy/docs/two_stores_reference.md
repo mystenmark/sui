@@ -118,3 +118,61 @@ uses fail with `EpochEnded`; old directories deleted by a pruner.
   revert at epoch end; `22f9fc9781` owned locks post-consensus only;
   `94bfdb24ad` `highest_committed_checkpoint`, because `HighestExecuted`
   lagged the durable objects after a crash.]
+
+## Restart
+
+Abbreviations beyond those above: `cm` `consensus_manager/mod.rs`, `svm`
+`authority/shared_object_version_manager.rs`, `esi`
+`execution_scheduler/execution_scheduler_impl.rs`, `ss`
+`execution_scheduler/settlement_scheduler.rs`, `gsh` `global_state_hasher.rs`,
+`co` `checkpoints/checkpoint_output.rs`.
+
+**Consensus handler.** `last_consensus_stats_v2` holds the last flushed
+commit's index and round, the highest checkpoint height it assigned, the
+last checkpoint flush timestamp and the last checkpoint sequence number
+assigned (aes:278-289). Consensus replays after the index, less a fixed
+window of prior commits (cm:345-352). Prior commits only rebuild the
+in-memory commit interval observer, which must be a pure function of
+commits, and whose digest is in every prologue, so a deviation forks
+(ch:212-219, 1024-1044). The checkpoint queue restarts from the stored
+height, flush timestamp and next sequence number, with nothing pending
+(ch:534-551, 807-853). A replayed commit is handled in full; execution
+drops transactions already executed (esi:560-574).
+
+**Shared versions.** Read from the quarantine, then the database
+(cq:780-801). An object first touched in the epoch is initialized from its
+live version and written to the database at once, before anything could
+write it, so a replay finds it though checkpoints have moved the object on
+(aes:2214-2256, svm:353-366).
+
+**Checkpoint builder.** Resumes after the last flushed builder summary's
+height (cp:1509-1522); sequence numbers come from the consensus handler
+(cp:2039); the previous summary from the quarantine, the database, or the
+previous epoch (cp:1883-1905). A rebuilt checkpoint whose digest differs
+from `locally_computed_checkpoints` is a fork (cp:1816-1840). Startup waits
+for the builder to rebuild what it had built (cp:3076-3115).
+
+**Execution.** The checkpoint executor resumes after `HighestExecuted`
+(cpe:250-280). Re-committing a checkpoint whose outputs are on disk skips
+transactions no longer dirty (wbc:1057-1083).
+
+**Settlement and funds.** The settlement scheduler restarts at offset 0,
+which a drained replay point makes right (ss:140-147). The funds withdraw
+scheduler starts from the accumulator root's version in the store
+(esi:169-193) and skips withdrawals at versions already settled
+(naive_scheduler.rs:105-180).
+
+**State hasher.** Hashes and running roots are written directly
+(aes:1376-1410); idempotent (gsh:398-419, 549-560). At startup, entries
+above max(last flushed builder summary, `HighestExecuted`) are deleted, so a
+rebuilt checkpoint cannot inherit a stale hash (cp:3014-3049).
+
+**Aggregator.** Pending signatures are in memory; certification resumes
+after the highest certified checkpoint (cp:2508-2518); replayed commits
+re-deliver signatures.
+
+**Commit order** (cpe:415-523): the perpetual batch (outputs, committed
+watermark), then the epoch batch (quarantine flush, builder summaries),
+then `HighestExecuted`. A crash between the first two replays from the
+earlier flushed commit; the other order would lose outputs consensus never
+replays.
