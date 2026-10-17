@@ -476,7 +476,13 @@ fn chunks_settle_in_height_order_with_offsets_and_root_generations() {
     // Chunks 10 and 11 are one commit's, 12 the next's.
     let c10 = chunk(10, (3, 0), (1, false), digests_of(&first));
     let c11 = chunk(11, (3, 1), (1, true), digests_of(&second));
-    let c12 = chunk(12, (5, 0), (2, true), digests_of(&third));
+    let mut c12 = chunk(12, (5, 0), (2, true), digests_of(&third));
+    // As the commit handler links it: to the root's last generation, of
+    // round 3.
+    c12.root.base = Some(SharedOrdinal {
+        round: 3,
+        writes_before: 2,
+    });
     for c in [&c10, &c11, &c12] {
         h.process(SettlementInput::Chunk(c.clone()));
     }

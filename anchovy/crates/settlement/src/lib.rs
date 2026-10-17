@@ -19,7 +19,7 @@ use messages::effects::{
 use messages::execution_status::ExecutionStatus;
 use messages::object::Data;
 use messages::transaction::{SharedObjectMutability, TransactionKind};
-use validator::consensus::sequence::{SharedAccess, SharedOrdinal};
+use validator::consensus::sequence::SharedAccess;
 use validator::epoch::EpochParams;
 use validator::pipeline::items::ChunkSettlement;
 use validator::pipeline::items::{
@@ -167,8 +167,9 @@ pub struct SettlementScheduler {
     accounts: BTreeSet<ObjectId>,
     /// Chunks not settled yet, by height: the first is the one settling.
     pending: BTreeMap<u64, Pending>,
-    /// The root ordinal of the last chunk seen.
-    last_root: Option<SharedOrdinal>,
+    /// Whether a chunk was seen: the first tells the funds reserver what is
+    /// settled.
+    started: bool,
     /// The checkpoint of the last chunk settled, and how many effects its
     /// chunks settled so far hold.
     offset: Option<(u64, u64)>,
@@ -194,14 +195,14 @@ impl SettlementScheduler {
             funds,
             accounts: BTreeSet::new(),
             pending: BTreeMap::new(),
-            last_root: None,
+            started: false,
             offset: None,
         }
     }
 
     fn chunk(&mut self, chunk: ChunkSettlement) {
-        let root = chunk.root.ordinal;
-        if self.last_root.is_none() {
+        if !self.started {
+            self.started = true;
             // Every chunk before the first one seen settled before this
             // run: the epoch's start.
             push(
@@ -214,14 +215,12 @@ impl SettlementScheduler {
                 "funds reserver",
             );
         }
-        let base = match self.last_root {
-            Some(last) if root.writes_before == 0 => {
-                assert!(last.round < root.round, "chunks come in root order");
-                Some((last.round, last.writes_before + 1))
-            }
+        // The commit handler links a round's first chunk to the root's last
+        // generation in an earlier round.
+        let base = match (chunk.root.ordinal.writes_before, chunk.root.base) {
+            (0, Some(base)) => Some((base.round, base.writes_before)),
             _ => None,
         };
-        self.last_root = Some(root);
         self.pending.insert(
             chunk.height,
             Pending {

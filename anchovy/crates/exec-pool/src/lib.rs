@@ -147,6 +147,12 @@ impl Executor {
         };
 
         let stored = self.stored_effects(digest);
+        // Executed and committed before a restart: its checkpoint will not
+        // commit again, so what it produced is written at once.
+        let committed = stored.is_some()
+            && !self
+                .store
+                .is_uncommitted(&messages::base::Digest::new(digest));
 
         // 1. Its inputs, from the values its keys resolved to: the shared
         //    accesses' first, in access order (as the resolver keys them),
@@ -250,7 +256,8 @@ impl Executor {
             let produced = produced(effects_v2, stream, self.resolved[i], digest);
             let round = access.ordinal.round;
             let generation = access.ordinal.writes_before + 1;
-            self.generations.record(stream, round, generation, produced);
+            self.generations
+                .record(stream, round, generation, produced, digest, committed);
             let object = match produced {
                 Generation::Version { version, .. } => Some(object_at(&access.id, version)),
                 Generation::Ended { .. } => None,

@@ -106,7 +106,8 @@ impl Setup {
     fn new() -> Setup {
         let dir = tempfile::tempdir().unwrap();
         let (epoch_store, _, builder) = EpochStore::open(dir.path(), 0);
-        let checkpoints = Arc::new(CheckpointStore::new(epoch_store, builder));
+        let objects = Arc::new(store::Store::open(&dir.path().join("perpetual")).unwrap());
+        let checkpoints = Arc::new(CheckpointStore::new(objects, 0, epoch_store, builder));
         let (epoch_closer, closer) = workqueue::queue(16);
         let (aggregator_queue, aggregator) = workqueue::queue(16);
         Setup {

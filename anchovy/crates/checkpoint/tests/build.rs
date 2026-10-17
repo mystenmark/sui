@@ -407,6 +407,8 @@ fn out_of_order_checkpoints_summarize_in_order() {
         });
     }
     let checkpoints = Arc::new(CheckpointStore::new(
+        m.store.clone(),
+        0,
         m.epoch_store.clone(),
         m.builder.clone(),
     ));

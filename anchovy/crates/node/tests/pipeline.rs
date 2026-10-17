@@ -308,7 +308,8 @@ impl Network {
         }
         self.start_epoch();
         let running = self.running();
-        for commit in &self.delivered {
+        let from = running.pipeline.replay_from;
+        for commit in self.delivered.iter().filter(|c| c.commit_index >= from) {
             assert!(
                 running
                     .pipeline

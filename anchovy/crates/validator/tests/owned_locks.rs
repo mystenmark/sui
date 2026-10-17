@@ -236,7 +236,7 @@ fn the_later_of_two_transactions_spending_one_object_in_a_commit_is_dropped() {
     let first = sender.transaction(random_object_ref(), &[object]);
     let second = sender.transaction(random_object_ref(), &[object]);
     let (output, _dir) = consensus_output();
-    let mut handler = CommitHandler::new(output);
+    let mut handler = CommitHandler::new(output, 0);
     let decided = handler
         .handle(&epoch, commit(1, &[(&first, &[]), (&second, &[])]))
         .unwrap();
@@ -261,7 +261,7 @@ fn a_shared_gas_coin_conflicts_like_any_owned_input() {
     let first = sender.transaction(gas, &[]);
     let second = sender.transaction(gas, &[random_object_ref()]);
     let (output, _dir) = consensus_output();
-    let decided = CommitHandler::new(output)
+    let decided = CommitHandler::new(output, 0)
         .handle(&epoch, commit(1, &[(&first, &[]), (&second, &[])]))
         .unwrap();
     assert_eq!(scheduled(&decided), vec![digest(&first)]);
@@ -282,7 +282,7 @@ fn a_lock_holds_across_commits_for_its_version_only() {
     let again = sender.transaction(random_object_ref(), &[object]);
     let later = sender.transaction(random_object_ref(), &[next]);
     let (output, _dir) = consensus_output();
-    let mut handler = CommitHandler::new(output);
+    let mut handler = CommitHandler::new(output, 0);
     let decided = handler.handle(&epoch, commit(1, &[(&first, &[])])).unwrap();
     assert_eq!(scheduled(&decided), vec![digest(&first)]);
     let decided = handler
@@ -308,7 +308,7 @@ fn inputs_claimed_immutable_are_not_locked() {
         .collect();
     let claim = [frozen];
     let (output, _dir) = consensus_output();
-    let decided = CommitHandler::new(output)
+    let decided = CommitHandler::new(output, 0)
         .handle(
             &epoch,
             commit(
@@ -346,7 +346,7 @@ fn a_transaction_with_invalid_inputs_is_dropped_and_locks_nothing() {
     let twice = sender.transaction(random_object_ref(), &[object, object]);
     let valid = sender.transaction(random_object_ref(), &[object]);
     let (output, _dir) = consensus_output();
-    let decided = CommitHandler::new(output)
+    let decided = CommitHandler::new(output, 0)
         .handle(&epoch, commit(1, &[(&twice, &[]), (&valid, &[])]))
         .unwrap();
     assert_eq!(scheduled(&decided), vec![digest(&valid)]);
@@ -395,10 +395,10 @@ fn handlers_fed_the_same_commits_decide_alike_and_a_replay_changes_nothing() {
             .collect()
     };
     let (output, _dir) = consensus_output();
-    let mut handler = CommitHandler::new(output);
+    let mut handler = CommitHandler::new(output, 0);
     let first = decide(&mut handler);
     let (other, _other_dir) = consensus_output();
-    assert_eq!(first, decide(&mut CommitHandler::new(other)));
+    assert_eq!(first, decide(&mut CommitHandler::new(other, 0)));
     // Consensus replays commits after a restart; those handled are skipped.
     for c in commits() {
         assert!(handler.handle(&epoch, c).is_none());
@@ -406,7 +406,7 @@ fn handlers_fed_the_same_commits_decide_alike_and_a_replay_changes_nothing() {
     // The first commit's first transaction took two objects; its second,
     // sharing one, lost it.
     let (output, _dir) = consensus_output();
-    let decided = CommitHandler::new(output)
+    let decided = CommitHandler::new(output, 0)
         .handle(&epoch, commits().remove(0))
         .unwrap();
     assert_eq!(scheduled(&decided)[0], digest(&transactions[0]));
