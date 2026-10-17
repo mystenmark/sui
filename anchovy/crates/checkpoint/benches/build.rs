@@ -175,17 +175,15 @@ fn main() {
     let key = ProtocolKey::from_private_bytes(&private).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::open(dir.path()).unwrap());
-    let epochs = tempfile::tempdir().unwrap();
-    let (epoch_store, _, _) = validator::epoch_store::EpochStore::open(epochs.path(), 0);
 
     println!("txs   contents ns/tx  allocs/tx  read ns/tx  allocs/tx  summary ns  allocs  sign ns");
     for size in [100, 1000] {
         let mut effects = executed(size, &store);
         let digests: Vec<Digest> = effects.iter().map(|e| Digest::new(e.digest)).collect();
         let rest = effects.split_off(size / 2);
-        let chunks = Arc::new(ChunkTable::new(epoch_store.clone()));
+        let chunks = Arc::new(ChunkTable::new());
         for (height, effects) in [(0, effects), (1, rest)] {
-            chunks.insert(&SettledChunk {
+            chunks.insert(SettledChunk {
                 height,
                 checkpoint_seq: 1,
                 effects,

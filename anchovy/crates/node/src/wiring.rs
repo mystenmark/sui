@@ -312,7 +312,12 @@ impl Parts {
     }
 
     fn committer(&self, ended: watch::Sender<Option<u64>>) -> CheckpointCommitter {
-        CheckpointCommitter::new(self.store.clone(), self.checkpoints.clone(), ended)
+        CheckpointCommitter::new(
+            self.store.clone(),
+            self.checkpoints.clone(),
+            self.chunks.clone(),
+            ended,
+        )
     }
 }
 

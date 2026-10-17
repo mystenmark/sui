@@ -183,7 +183,7 @@ impl Pipeline {
             consensus: consensus.clone(),
             cache: Arc::new(ConsensusTxCache::new()),
             generations: Arc::new(GenerationTable::new(epoch_store.clone())),
-            chunks: Arc::new(ChunkTable::new(epoch_store.clone())),
+            chunks: Arc::new(ChunkTable::new()),
             checkpoints,
             statuses: Arc::new(ConsensusTxStatusCache::new()),
             state_hashes: Arc::new(StateHashes::new(epoch_store.clone(), builder_output)),
