@@ -143,8 +143,28 @@ outputs a crash lost, and replay would never regenerate them.
   (`builder_checkpoint_summary_v2`) with the outputs and resumes the builder
   from the last one. Anchovy commits a checkpoint's record with its outputs,
   in one perpetual batch. So committed checkpoints are that table, and the
-  reference's two-watermark cases (cp:3017-3022) do not arise.
+  reference's two-watermark cases (cp:3017-3022) do not arise. A checkpoint
+  is usable (by the built waiter, the aggregator, the committer) once built
+  in this run, held in memory until it commits, or committed. The epoch
+  store's `built` keeps every checkpoint built, only to check one built
+  again: one built before a crash may hold transactions the crash lost,
+  which must execute again before it is certified or committed.
 - **Generations**, above.
+- **The accumulator root's round links** are the commit handler's, as every
+  stream's: settlement no longer links them in memory, which a resume
+  mid-epoch would lose.
+- **Missing roots are folded again.** The state hasher folds independently
+  of commits, so a committed checkpoint may lack its root after a crash. The
+  root before the first rebuilt checkpoint is folded again from the
+  committed checkpoints' effects, as the reference's executor accumulates a
+  committed checkpoint's root.
+
+## Status
+
+Implemented, with the tests of step 5 but one: a crash between the two
+batches of a checkpoint commit cannot be placed from a test. It leaves the
+record behind the committed checkpoint, which a crash with commits waiting
+for a checkpoint also does, and which the pipeline tests cover.
 
 ## Order of work
 

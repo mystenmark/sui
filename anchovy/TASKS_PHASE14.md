@@ -13,7 +13,7 @@ in memory.
   - checkpoint builder state;
   - everything else.
 
-## Status: discard-and-replay done (steps 1-4); quarantine next
+## Status: implemented
 
 ## Steps
 
@@ -40,8 +40,14 @@ in memory.
    runtime replaced past 1024 packages. Done. The rule: bounded state in
    memory, unbounded epoch state in the epoch store, never epoch state in
    the perpetual store.
-5. Quarantine and resume (`docs/quarantine_design.md`). Design written,
-   with the user.
+5. Quarantine and resume (`docs/quarantine_design.md`), following the
+   reference. Done: the quarantine and commit record; generations written
+   with their checkpoint; the object store's commit, then the epoch
+   store's; resume from the record with a prior-commit window; built
+   checkpoints usable once built in this run or committed; state hashes
+   above the committed checkpoint deleted at startup, missing roots folded
+   again; the root's round links in the commit handler. Tests of the
+   quarantine, and of crashes mid-epoch and with commits waiting.
 
 Notes:
 - The test suite takes about 60s, from about 40s: each test opens epoch
