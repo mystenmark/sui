@@ -152,26 +152,6 @@ impl EpochStore {
         })
     }
 
-    /// Records the chunk settled at `height`, encoded.
-    ///
-    /// # Panics
-    /// If the database cannot be written.
-    pub fn put_chunk(&self, height: u64, chunk: Vec<u8>) {
-        let mut batch = self.db.batch(&[Space::Chunks]);
-        batch.put(Space::Chunks, height.to_be_bytes().to_vec(), chunk);
-        batch.commit().expect("the epoch's database writes");
-    }
-
-    /// The chunk settled at `height`, as `put_chunk` wrote it.
-    ///
-    /// # Panics
-    /// If the database cannot be read.
-    pub fn chunk(&self, height: u64) -> Option<Vec<u8>> {
-        self.db
-            .get(Space::Chunks, &height.to_be_bytes())
-            .expect("the epoch's database reads")
-    }
-
     /// Checkpoint `seq`, built here, as the builder wrote it.
     ///
     /// # Panics

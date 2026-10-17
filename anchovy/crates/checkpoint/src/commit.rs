@@ -13,7 +13,7 @@ use messages::fast::Bump;
 use messages::reader::Reader;
 use tokio::sync::watch;
 use validator::pipeline::items::CertifiedCheckpoint;
-use validator::pipeline::tables::CheckpointStore;
+use validator::pipeline::tables::{CheckpointStore, ChunkTable};
 use workqueue::Processor;
 
 /// Commits each certified checkpoint's transactions from the writeback
@@ -24,11 +24,12 @@ use workqueue::Processor;
 /// Inward: `CheckpointAggregator`: `Vec<CertifiedCheckpoint>`, in sequence
 /// order.
 ///
-/// Reads: the checkpoint store. Writes: the object store, as its only
-/// committer.
+/// Reads: the checkpoint store. Prunes: the chunk table. Writes: the object
+/// store, as its only committer.
 pub struct CheckpointCommitter {
     store: Arc<store::Store>,
     checkpoints: Arc<CheckpointStore>,
+    chunks: Arc<ChunkTable>,
     /// The epoch's last checkpoint, once committed.
     ended: watch::Sender<Option<u64>>,
     bump: Bump,
@@ -38,11 +39,13 @@ impl CheckpointCommitter {
     pub fn new(
         store: Arc<store::Store>,
         checkpoints: Arc<CheckpointStore>,
+        chunks: Arc<ChunkTable>,
         ended: watch::Sender<Option<u64>>,
     ) -> CheckpointCommitter {
         CheckpointCommitter {
             store,
             checkpoints,
+            chunks,
             ended,
             bump: Bump::with_capacity(super::ARENA),
         }
@@ -64,6 +67,7 @@ impl CheckpointCommitter {
             built.encode(),
             certified.summary.to_vec(),
         );
+        self.chunks.prune_through(built.last_height);
         if built.root_state.is_some() {
             self.ended.send_replace(Some(seq));
         }

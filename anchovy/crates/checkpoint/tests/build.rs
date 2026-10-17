@@ -100,12 +100,12 @@ impl Mainnet {
 
     /// The checkpoint's effects in chunks at `heights`, split at `split`.
     fn chunks(&self, heights: [u64; 2], split: usize) -> Arc<ChunkTable> {
-        let chunks = Arc::new(ChunkTable::new(self.epoch_store.clone()));
+        let chunks = Arc::new(ChunkTable::new());
         let mut effects = self.effects();
         let rest = effects.split_off(split);
         let [first, second] = heights;
         for (height, effects) in [(first, effects), (second, rest)] {
-            chunks.insert(&SettledChunk {
+            chunks.insert(SettledChunk {
                 height,
                 checkpoint_seq: self.summary().sequence_number,
                 effects,
@@ -391,7 +391,7 @@ fn out_of_order_checkpoints_summarize_in_order() {
     let s = m.summary();
     let epoch = params(ProtocolVersion::MAX.as_u64(), s.epoch);
     // Checkpoints 11, 12 and 13 of one or two chunks each.
-    let chunks = Arc::new(ChunkTable::new(m.epoch_store.clone()));
+    let chunks = Arc::new(ChunkTable::new());
     let effects = m.effects();
     let groups = [
         &effects[0..5],
@@ -400,7 +400,7 @@ fn out_of_order_checkpoints_summarize_in_order() {
         &effects[12..14],
     ];
     for (height, group) in groups.iter().enumerate() {
-        chunks.insert(&SettledChunk {
+        chunks.insert(SettledChunk {
             height: height as u64,
             checkpoint_seq: 0,
             effects: group.to_vec(),

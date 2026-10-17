@@ -7,8 +7,8 @@
 //!
 //! Each epoch has a directory of two Tidehunter databases:
 //! - `replayed`: what replaying the epoch's commits from its start writes
-//!   again (consensus output, checkpoint builder state, settled chunks,
-//!   generations), so a restart drops it;
+//!   again (consensus output, checkpoint builder state, generations), so a
+//!   restart drops it;
 //! - `kept`: what a replay could not rebuild, as the stores it was derived
 //!   from have moved on (start versions).
 
@@ -35,20 +35,18 @@ pub enum Space {
     CheckpointHashes,
     Roots,
     // Everything else.
-    Chunks,
     Generations,
     StartVersions,
 }
 
 impl Space {
-    const REPLAYED: [Space; 8] = [
+    const REPLAYED: [Space; 7] = [
         Space::Processed,
         Space::Locks,
         Space::Streams,
         Space::Built,
         Space::CheckpointHashes,
         Space::Roots,
-        Space::Chunks,
         Space::Generations,
     ];
     const KEPT: [Space; 1] = [Space::StartVersions];
@@ -60,7 +58,6 @@ impl Space {
             Space::Streams => "streams",
             Space::Built => "built",
             Space::CheckpointHashes => "checkpoint_hashes",
-            Space::Chunks => "chunks",
             Space::Roots => "roots",
             Space::Generations => "generations",
             Space::StartVersions => "start_versions",
@@ -75,7 +72,7 @@ impl Space {
             Space::Locks => 32 + 8 + 32,
             Space::Streams | Space::StartVersions => 32 + 8,
             Space::Generations => 32 + 8 + 4 + 4,
-            Space::Built | Space::CheckpointHashes | Space::Roots | Space::Chunks => 8,
+            Space::Built | Space::CheckpointHashes | Space::Roots => 8,
         }
     }
 

@@ -458,7 +458,7 @@ impl SettlementScheduler {
             .map(to_executed)
             .collect();
         let count = all.len() as u64;
-        self.chunks.insert(&SettledChunk {
+        self.chunks.insert(SettledChunk {
             height: chunk.height,
             checkpoint_seq: chunk.checkpoint_seq,
             effects: all,

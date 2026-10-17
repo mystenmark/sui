@@ -1,19 +1,20 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The tables availability checks read, over the epoch store. Each is
-//! shared by its writer and its readers across threads; a writer records an
-//! entry before notifying its key, so a reader that finds no entry may wait
-//! for the key.
+//! The tables availability checks read. Each is shared by its writer and
+//! its readers across threads; a writer records an entry before notifying
+//! its key, so a reader that finds no entry may wait for the key.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::epoch_store::{BuilderOutput, EpochStore};
-use crate::pipeline::items::{ExecutedEffects, SettledChunk};
+use crate::pipeline::items::SettledChunk;
 use crate::pipeline::keys::StreamId;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    // The lock guards no data, only makes a read and a write one step.
+    // Every critical section here is a single operation, which leaves the
+    // data consistent even if it panicked.
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -75,45 +76,32 @@ impl GenerationTable {
     }
 }
 
-/// Settled chunks by height, in the epoch store. Written by
-/// `SettlementScheduler` (owner: the settlement work), read by the
-/// checkpoint waiter's availability check and by `ContentsBuilder`.
+/// Settled chunks by height, in memory: only checkpoints not yet committed
+/// read them, so they are pruned as checkpoints commit, and a replay
+/// settles them again. Written by `SettlementScheduler` (owner: the
+/// settlement work), read by the checkpoint waiter's availability check and
+/// by `ContentsBuilder`, pruned by `CheckpointCommitter`.
+#[derive(Default)]
 pub struct ChunkTable {
-    store: EpochStore,
+    chunks: Mutex<HashMap<u64, Arc<SettledChunk>, foldhash::fast::RandomState>>,
 }
 
 impl ChunkTable {
-    pub fn new(store: EpochStore) -> ChunkTable {
-        ChunkTable { store }
+    pub fn new() -> ChunkTable {
+        ChunkTable::default()
     }
 
-    pub fn insert(&self, chunk: &SettledChunk) {
-        let effects: Vec<_> = chunk
-            .effects
-            .iter()
-            .map(|e| (e.digest, e.effects_digest, &e.effects[..]))
-            .collect();
-        let encoded =
-            bcs::to_bytes(&(chunk.height, chunk.checkpoint_seq, effects)).expect("a chunk encodes");
-        self.store.put_chunk(chunk.height, encoded);
+    pub fn insert(&self, chunk: SettledChunk) {
+        lock(&self.chunks).insert(chunk.height, Arc::new(chunk));
     }
 
     pub fn get(&self, height: u64) -> Option<Arc<SettledChunk>> {
-        let bytes = self.store.chunk(height)?;
-        let (height, checkpoint_seq, effects): (u64, u64, Vec<([u8; 32], [u8; 32], Vec<u8>)>) =
-            bcs::from_bytes(&bytes).expect("a stored chunk decodes");
-        Some(Arc::new(SettledChunk {
-            height,
-            checkpoint_seq,
-            effects: effects
-                .into_iter()
-                .map(|(digest, effects_digest, effects)| ExecutedEffects {
-                    digest,
-                    effects_digest,
-                    effects: effects.into(),
-                })
-                .collect(),
-        }))
+        lock(&self.chunks).get(&height).cloned()
+    }
+
+    /// Drops the chunks at or below `height`.
+    pub fn prune_through(&self, height: u64) {
+        lock(&self.chunks).retain(|&h, _| h > height);
     }
 }
 
