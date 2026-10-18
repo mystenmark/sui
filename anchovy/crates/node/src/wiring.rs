@@ -24,6 +24,7 @@ use validator::consensus::decode::{CommitDecoder, CommitRequest, DecodedCommit};
 use validator::consensus::status::ConsensusTxStatusCache;
 use validator::consensus::vote::{BlockVoter, VoteRequest};
 use validator::epoch::EpochState;
+use validator::epoch_store::{CommittedCheckpoints, ConsensusOutput as OutputWriter, EpochStore};
 use validator::pipeline::items::{
     BuiltCommand, BuiltWaits, CertifiedCheckpoint, CheckpointContentsBuilt, CheckpointEffects,
     CheckpointSignature, Chunk, EffectsWaitItem, EpochCloserInput, Executable, FundsCommand,
@@ -47,10 +48,12 @@ pub(crate) fn spawn(
     parts: Arc<Parts>,
     q: &Queues,
     i: Inboxes,
+    output: OutputWriter,
     state_sync: Queue<CertifiedCheckpoint>,
     ended: watch::Sender<Option<u64>>,
 ) -> Vec<WorkerHandle> {
     let w = Spawner { parts, queues: q.clone() };
+    let committed = output.committed_checkpoints();
     vec![
         // Submission.
         w.thread("submission")
@@ -61,7 +64,7 @@ pub(crate) fn spawn(
         // Consensus.
         w.one("voting",            i.votes,            |p, q| p.voter(q.built_waits),                                  drop),
         w.one("commit-decode",     i.commits,          |p, q| p.decoder(q.built_waits),                                into(&q.handler, "handler")),
-        w.one("commit-handler",    i.handler,          |p, q| p.commit_stage(q.resolver, q.settlement, q.checkpoint_waits), drop),
+        w.one("commit-handler",    i.handler,          move |p, q| p.commit_stage(output, q.resolver, q.settlement, q.checkpoint_waits), drop),
         // Execution.
         w.one("resolver",          i.resolver,         |p, q| p.resolver(q.input_waits, q.funds),                     drop),
         w.one("input-waiter",      i.input_waits,      |p, _| WaiterProcessor::new(p.input_availability()),           into(&q.executor, "executor")),
@@ -78,7 +81,7 @@ pub(crate) fn spawn(
         w.one("epoch-closer",      i.closer,           |p, q| p.epoch_closer(q.resolver, q.effects_waits, q.hasher, q.summary), drop),
         w.one("summary",           i.summary,          |p, q| p.summary(q.built_waits),                               drop),
         w.one("aggregator",        i.aggregator,       move |p, q| p.aggregator(state_sync, q.built_waits),           into(&q.committer, "committer")),
-        w.one("committer",         i.committer,        move |p, _| p.committer(ended),                                drop),
+        w.one("committer",         i.committer,        move |p, _| p.committer(committed, ended),                     drop),
     ]
 }
 
@@ -136,6 +139,7 @@ queues! {
 pub(crate) struct Parts {
     pub store: Arc<store::Store>,
     pub epoch: Arc<EpochState>,
+    pub epoch_store: EpochStore,
     pub key: Arc<ProtocolKey>,
     pub committee: Arc<Committee>,
     pub consensus: TransactionClient,
@@ -166,6 +170,7 @@ impl Parts {
 
     fn commit_stage(
         &self,
+        output: OutputWriter,
         resolver: Queue<Chunk>,
         settlement: Queue<SettlementInput>,
         checkpoint_waits: Queue<Command<ChunkSettled, PendingCheckpoint>>,
@@ -173,6 +178,7 @@ impl Parts {
         CommitStage::new(
             self.epoch.params.clone(),
             self.start,
+            output,
             resolver,
             settlement,
             checkpoint_waits,
@@ -200,6 +206,7 @@ impl Parts {
         Executor::new(
             self.store.clone(),
             self.epoch.clone(),
+            self.epoch_store.clone(),
             self.generations.clone(),
             inputs,
             effects,
@@ -260,7 +267,6 @@ impl Parts {
     fn built_availability(&self) -> BuiltAvailability {
         BuiltAvailability {
             checkpoints: self.checkpoints.clone(),
-            store: self.store.clone(),
         }
     }
 
@@ -306,11 +312,17 @@ impl Parts {
         .with_fork_checks(built)
     }
 
-    fn committer(&self, ended: watch::Sender<Option<u64>>) -> CheckpointCommitter {
+    fn committer(
+        &self,
+        committed: CommittedCheckpoints,
+        ended: watch::Sender<Option<u64>>,
+    ) -> CheckpointCommitter {
         CheckpointCommitter::new(
             self.store.clone(),
             self.checkpoints.clone(),
             self.chunks.clone(),
+            self.generations.clone(),
+            committed,
             ended,
         )
     }

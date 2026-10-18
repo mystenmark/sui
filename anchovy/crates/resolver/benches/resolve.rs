@@ -97,6 +97,14 @@ impl Rng {
     }
 }
 
+/// An empty generation table, over an epoch store in a directory kept alive
+/// with it.
+fn generation_table() -> (Arc<GenerationTable>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _, _) = validator::epoch_store::EpochStore::open(dir.path(), 0);
+    (Arc::new(GenerationTable::new(store)), dir)
+}
+
 fn object_id(n: u64) -> ObjectId {
     let mut id = [0u8; 32];
     id[..8].copy_from_slice(&n.to_le_bytes());
@@ -172,6 +180,7 @@ fn chunk(round: u32, transactions: &[Planned]) -> Chunk {
                             round,
                             writes_before,
                         },
+                        base: None,
                     }
                 })
                 .collect();
@@ -261,7 +270,7 @@ fn availability(rng: &mut Rng) {
             ..store::Commit::default()
         })
         .unwrap();
-    let generations = Arc::new(GenerationTable::new());
+    let (generations, _generations_dir) = generation_table();
     let stream = |n: u64| StreamId {
         id: object_id(n),
         initial_shared_version: 1,
@@ -275,6 +284,8 @@ fn availability(rng: &mut Rng) {
                 version: 2,
                 digest: [0; 32],
             },
+            [0; 32],
+            true,
         );
     }
     let mut check = InputAvailability {

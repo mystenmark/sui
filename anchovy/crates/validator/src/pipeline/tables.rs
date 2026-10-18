@@ -6,16 +6,16 @@
 //! its key, so a reader that finds no entry may wait for the key.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use crate::epoch_store::{BuilderOutput, EpochStore};
 use crate::pipeline::items::SettledChunk;
-use crate::pipeline::keys::StreamId;
-
-type FastMap<K, V> = HashMap<K, V, foldhash::fast::RandomState>;
+use crate::pipeline::keys::{StreamId, TxDigest};
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    // Every critical section here is a single map operation, which leaves
-    // the map consistent even if it panicked.
+    // Every critical section here is a single operation, which leaves the
+    // data consistent even if it panicked.
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -33,23 +33,68 @@ pub enum Generation {
 /// Stream generations by `(stream, round, generation)`. Written by
 /// `Executor` (owner: the exec-pool work), read by the input waiter's
 /// availability check and by `Executor` to resolve exact versions.
-#[derive(Default)]
+///
+/// A generation names an object a transaction wrote, so it is in memory
+/// until that transaction's checkpoint commits, as the object is in the
+/// object store's cache; then it is written to the epoch store
+/// (`commit`). So after a crash the epoch store names only objects the
+/// object store has.
 pub struct GenerationTable {
-    generations: Mutex<FastMap<(StreamId, u32, u32), Generation>>,
+    store: EpochStore,
+    /// Makes `get_or_record`'s read and write one step.
+    recording: Mutex<()>,
+    uncommitted: Mutex<Uncommitted>,
+}
+
+type GenerationKey = (StreamId, u32, u32);
+
+#[derive(Default)]
+struct Uncommitted {
+    generations: HashMap<GenerationKey, Generation, foldhash::fast::RandomState>,
+    /// The generations each transaction produced.
+    by_producer: HashMap<TxDigest, Vec<GenerationKey>, foldhash::fast::RandomState>,
 }
 
 impl GenerationTable {
-    pub fn new() -> GenerationTable {
-        GenerationTable::default()
+    pub fn new(store: EpochStore) -> GenerationTable {
+        GenerationTable {
+            store,
+            recording: Mutex::new(()),
+            uncommitted: Mutex::default(),
+        }
     }
 
-    /// Records generation `generation` of `stream` in `round`.
-    pub fn record(&self, stream: StreamId, round: u32, generation: u32, value: Generation) {
-        lock(&self.generations).insert((stream, round, generation), value);
+    /// Records generation `generation` of `stream` in `round`, produced by
+    /// transaction `producer`; written once `producer` commits, or at once
+    /// if it has.
+    pub fn record(
+        &self,
+        stream: StreamId,
+        round: u32,
+        generation: u32,
+        value: Generation,
+        producer: TxDigest,
+        committed: bool,
+    ) {
+        if committed {
+            self.store
+                .put_generations(&[(stream, round, generation, value)]);
+            return;
+        }
+        let mut uncommitted = lock(&self.uncommitted);
+        let key = (stream, round, generation);
+        uncommitted.generations.insert(key, value);
+        uncommitted
+            .by_producer
+            .entry(producer)
+            .or_default()
+            .push(key);
     }
 
     /// Generation `generation` of `stream` in `round`: the one recorded, or
     /// else `value()`, recorded now. Atomic, so concurrent callers agree.
+    /// For generations no transaction produced (a stream's start), which
+    /// are written at once.
     pub fn get_or_record(
         &self,
         stream: StreamId,
@@ -57,25 +102,55 @@ impl GenerationTable {
         generation: u32,
         value: impl FnOnce() -> Generation,
     ) -> Generation {
-        *lock(&self.generations)
-            .entry((stream, round, generation))
-            .or_insert_with(value)
+        let _recording = lock(&self.recording);
+        if let Some(recorded) = self.get(stream, round, generation) {
+            return recorded;
+        }
+        let value = value();
+        self.store
+            .put_generations(&[(stream, round, generation, value)]);
+        value
     }
 
     /// Generation `generation` of `stream` in `round`, if recorded.
     pub fn get(&self, stream: StreamId, round: u32, generation: u32) -> Option<Generation> {
-        lock(&self.generations)
+        if let Some(found) = lock(&self.uncommitted)
+            .generations
             .get(&(stream, round, generation))
-            .copied()
+        {
+            return Some(*found);
+        }
+        self.store.generation(&stream, round, generation)
+    }
+
+    /// Writes the generations `transactions`, which have committed,
+    /// produced.
+    pub fn commit(&self, transactions: &[TxDigest]) {
+        let mut uncommitted = lock(&self.uncommitted);
+        let mut written = Vec::new();
+        for digest in transactions {
+            for key in uncommitted.by_producer.remove(digest).unwrap_or_default() {
+                let value = uncommitted.generations[&key];
+                written.push((key.0, key.1, key.2, value));
+            }
+        }
+        // Written before they leave memory, under the lock: a reader never
+        // finds them in neither.
+        self.store.put_generations(&written);
+        for (stream, round, generation, _) in written {
+            uncommitted.generations.remove(&(stream, round, generation));
+        }
     }
 }
 
-/// Settled chunks by height. Written by `SettlementScheduler` (owner: the
+/// Settled chunks by height, in memory: only checkpoints not yet committed
+/// read them, so they are pruned as checkpoints commit, and a replay
+/// settles them again. Written by `SettlementScheduler` (owner: the
 /// settlement work), read by the checkpoint waiter's availability check and
 /// by `ContentsBuilder`, pruned by `CheckpointCommitter`.
 #[derive(Default)]
 pub struct ChunkTable {
-    chunks: Mutex<FastMap<u64, Arc<SettledChunk>>>,
+    chunks: Mutex<HashMap<u64, Arc<SettledChunk>, foldhash::fast::RandomState>>,
 }
 
 impl ChunkTable {
@@ -165,47 +240,83 @@ impl BuiltCheckpoint {
 }
 
 /// Checkpoints built, by sequence number. Written by `SummaryBuilder`
-/// (owner: the checkpoint work) and pruned by `CheckpointCommitter`; read by
-/// the built waiter's availability check.
-#[derive(Default)]
+/// (owner: the checkpoint work); read by the built waiter's availability
+/// check, the aggregator and the committer; pruned by the committer.
+///
+/// As the reference's builder summaries, a checkpoint is built only once
+/// built in this run, held in memory until it commits, or committed, then
+/// read from the object store. Every checkpoint built is also kept in the
+/// epoch store's builder state, as the reference's
+/// `locally_computed_checkpoints`, but only to check one built again after
+/// a restart: one built before a crash may hold transactions the crash
+/// lost, which must execute again before it can be certified or committed.
 pub struct CheckpointStore {
-    built: Mutex<Built>,
-}
-
-#[derive(Default)]
-struct Built {
-    checkpoints: BTreeMap<u64, Arc<BuiltCheckpoint>>,
-    /// Every checkpoint below was built, and pruned.
-    pruned_below: u64,
+    objects: Arc<store::Store>,
+    store: EpochStore,
+    output: BuilderOutput,
+    /// Built in this run, not yet committed.
+    built: Mutex<BTreeMap<u64, Arc<BuiltCheckpoint>>>,
+    /// The last checkpoint committed.
+    committed: AtomicU64,
 }
 
 impl CheckpointStore {
-    pub fn new() -> CheckpointStore {
-        CheckpointStore::default()
+    /// Checkpoints committed through `committed`, in `objects`.
+    pub fn new(
+        objects: Arc<store::Store>,
+        committed: u64,
+        store: EpochStore,
+        output: BuilderOutput,
+    ) -> CheckpointStore {
+        CheckpointStore {
+            objects,
+            store,
+            output,
+            built: Mutex::default(),
+            committed: AtomicU64::new(committed),
+        }
     }
 
+    /// Records `checkpoint`, built here.
+    ///
+    /// # Panics
+    /// If a checkpoint of the same sequence number was built with another
+    /// digest, in this run or before a restart: a fork, as this validator
+    /// may have signed the first.
     pub fn insert_built(&self, checkpoint: BuiltCheckpoint) -> Arc<BuiltCheckpoint> {
+        if let Some(bytes) = self.store.built(checkpoint.seq) {
+            assert!(
+                BuiltCheckpoint::decode(&bytes).digest == checkpoint.digest,
+                "fork: checkpoint {} built again differently",
+                checkpoint.seq
+            );
+        }
+        self.output.put_built(checkpoint.seq, checkpoint.encode());
         let checkpoint = Arc::new(checkpoint);
-        lock(&self.built)
-            .checkpoints
-            .insert(checkpoint.seq, checkpoint.clone());
+        lock(&self.built).insert(checkpoint.seq, checkpoint.clone());
         checkpoint
     }
 
+    /// Checkpoint `seq`, if built in this run or committed.
+    ///
+    /// # Panics
+    /// If the object store cannot be read.
     pub fn built(&self, seq: u64) -> Option<Arc<BuiltCheckpoint>> {
-        lock(&self.built).checkpoints.get(&seq).cloned()
+        if let Some(built) = lock(&self.built).get(&seq) {
+            return Some(built.clone());
+        }
+        if seq > self.committed.load(Ordering::Acquire) {
+            return None;
+        }
+        let bytes = self.objects.checkpoint(seq).expect("the store reads")?;
+        Some(Arc::new(BuiltCheckpoint::decode(&bytes)))
     }
 
-    /// Whether checkpoint `seq` was built, though perhaps pruned since.
-    pub fn is_built(&self, seq: u64) -> bool {
-        let built = lock(&self.built);
-        seq < built.pruned_below || built.checkpoints.contains_key(&seq)
-    }
-
-    /// Drops the checkpoints below `seq`.
-    pub fn prune_below(&self, seq: u64) {
+    /// Checkpoint `seq` has committed: those before it are read from the
+    /// object store from now on.
+    pub fn committed(&self, seq: u64) {
+        self.committed.fetch_max(seq, Ordering::AcqRel);
         let mut built = lock(&self.built);
-        built.checkpoints = built.checkpoints.split_off(&seq);
-        built.pruned_below = built.pruned_below.max(seq);
+        *built = built.split_off(&seq);
     }
 }

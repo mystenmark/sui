@@ -9,10 +9,12 @@ publish = false
 bcs.workspace = true
 fastcrypto.workspace = true
 messages.workspace = true
+store.workspace = true
 validator.workspace = true
 workqueue.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 sui-types.workspace = true
 
 [[bench]]

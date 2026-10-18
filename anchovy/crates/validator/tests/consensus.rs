@@ -20,10 +20,19 @@ use validator::consensus::commit::{CommitHandler, DropReason, HandledCommit};
 use validator::consensus::decode::CommitDecoder;
 use validator::consensus::vote::BlockVoter;
 use validator::epoch::EpochState;
+use validator::epoch_store::{ConsensusOutput, EpochStore};
 
 const RGP: u64 = 1000;
 const BUDGET: u64 = 50_000_000;
 const SUI: u64 = 1_000_000_000;
+
+/// The one writer of a fresh epoch store's consensus output, and the
+/// directory the store is in.
+fn consensus_output() -> (ConsensusOutput, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, output, _) = EpochStore::open(dir.path(), 0);
+    (output, dir)
+}
 
 struct Node {
     _dir: tempfile::TempDir,
@@ -369,6 +378,7 @@ fn commit(
 struct Committer {
     decoder: CommitDecoder,
     handler: CommitHandler,
+    _dir: tempfile::TempDir,
 }
 
 impl Committer {
@@ -379,9 +389,11 @@ impl Committer {
 }
 
 fn committer(node: &Node) -> Committer {
+    let (output, dir) = consensus_output();
     Committer {
         decoder: CommitDecoder::new(node.epoch.params.clone(), node.cache.clone()),
-        handler: CommitHandler::new(),
+        handler: CommitHandler::new(output, 0),
+        _dir: dir,
     }
 }
 
@@ -595,7 +607,8 @@ fn handlers_decide_alike_whatever_has_executed() {
     ];
     let decide = || {
         let mut decoder = CommitDecoder::new(node.epoch.params.clone(), node.cache.clone());
-        let mut handler = CommitHandler::new();
+        let (output, _dir) = consensus_output();
+        let mut handler = CommitHandler::new(output, 0);
         commits
             .iter()
             .map(|c| {
