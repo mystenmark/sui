@@ -210,7 +210,7 @@ impl EpochCloser {
             .commit_root_state_digest()
             .then(|| state_hasher::decode(&root_state).digest().digest);
         built.last = Some(LastOfEpoch::Closed(EndOfEpoch {
-            next_committee: next.committee,
+            next_committee: next.stakes(),
             next_protocol_version: next.protocol_version,
             root_state,
             root_state_digest,

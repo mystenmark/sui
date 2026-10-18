@@ -38,6 +38,7 @@ blake2 = "=0.10.6"
 tidehunter = { git = "https://github.com/mystenlabs/tidehunter.git", rev = "f8bc93cf6a973d31fbbe6fa7c2b643ddd8e83ddf" }
 tempfile = "3.20.0"
 # Sui's executor, its types and its framework, linked only by `execution`.
+consensus-config = { path = "../consensus/config" }
 sui-execution = { path = "../sui-execution" }
 sui-framework = { path = "../crates/sui-framework" }
 sui-protocol-config = { path = "../crates/sui-protocol-config" }
