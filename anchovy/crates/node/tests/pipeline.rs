@@ -10,7 +10,6 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
-use checkpoint::ProtocolKey;
 use consensus::{
     Block, BlockRef, BlockStatus, CommittedSubDag, TransactionClient, TransactionsGuard,
 };
@@ -160,12 +159,15 @@ impl Network {
             &genesis.checkpoint,
             genesis.objects.iter().map(|o| o.digest().into_inner()),
         );
-        let protocol_key = Arc::new(ProtocolKey::new(genesis::protocol_key_pair()));
+        let keys = genesis::validator_keys();
         let chain_identifier = messages::base::Digest::new(genesis.chain_identifier);
 
         let sui_committee = sui_types::committee::Committee::new(
             0,
-            BTreeMap::from([(AuthorityPublicKeyBytes::new(*protocol_key.public()), 10_000)]),
+            BTreeMap::from([(
+                AuthorityPublicKeyBytes::new(*keys.protocol.public()),
+                10_000,
+            )]),
         );
         let state_sync = workqueue::queue(1024);
         let (client, normal, priority) = TransactionClient::new(64);
@@ -177,7 +179,7 @@ impl Network {
             state_sync: state_sync.0.clone(),
             chain: CHAIN,
             chain_identifier,
-            protocol_key,
+            keys,
         };
         let mut node = Node::new(perpetual);
         node.start_epoch(|_, _| client.clone());
@@ -268,7 +270,7 @@ impl Network {
             store,
             epochs,
             current,
-            protocol_key,
+            keys,
             chain_identifier,
             ..
         } = self.node.take().unwrap().into_perpetual();
@@ -290,7 +292,7 @@ impl Network {
             state_sync: self.state_sync.0.clone(),
             chain: CHAIN,
             chain_identifier,
-            protocol_key,
+            keys,
         }));
     }
 
