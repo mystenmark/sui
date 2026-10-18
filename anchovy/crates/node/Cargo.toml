@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+bcs.workspace = true
 messages.workspace = true
 consensus.workspace = true
 store.workspace = true

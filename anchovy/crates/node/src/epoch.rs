@@ -12,6 +12,7 @@ use std::sync::Arc;
 use aggregator::Committee;
 use checkpoint::ProtocolKey;
 use consensus::TransactionClient;
+use execution::system_state::Member;
 use messages::base::Digest;
 use protocol_config::Chain;
 use validator::current::CurrentEpoch;
@@ -33,8 +34,9 @@ pub struct EpochRecord {
     pub reference_gas_price: u64,
     pub epoch_start_timestamp_ms: u64,
     pub epoch_duration_ms: u64,
-    /// Each member's protocol key and stake.
-    pub committee: Vec<([u8; 96], u64)>,
+    /// Each member, by protocol key: the checkpoint committee's name and
+    /// stake, and consensus's keys and address.
+    pub committee: Vec<Member>,
     /// The checkpoint the epoch's first checkpoint follows: the previous
     /// epoch's last, or genesis.
     pub previous_checkpoint: u64,
@@ -63,64 +65,84 @@ impl EpochRecord {
         }
     }
 
-    const FIXED: usize = 6 * 8;
-    const MEMBER: usize = 96 + 8;
-
     pub fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(
-            Self::FIXED + 16 + self.committee.len() * Self::MEMBER + self.root_state.len(),
-        );
-        for word in [
+        let committee: Vec<_> = self
+            .committee
+            .iter()
+            .map(|m| {
+                (
+                    m.name.to_vec(),
+                    m.stake,
+                    m.consensus_key,
+                    m.network_key,
+                    &m.address,
+                    &m.hostname,
+                )
+            })
+            .collect();
+        bcs::to_bytes(&(
             self.epoch,
             self.protocol_version,
             self.reference_gas_price,
             self.epoch_start_timestamp_ms,
             self.epoch_duration_ms,
             self.previous_checkpoint,
-            self.committee.len() as u64,
-        ] {
-            bytes.extend_from_slice(&word.to_le_bytes());
-        }
-        for (key, stake) in &self.committee {
-            bytes.extend_from_slice(key);
-            bytes.extend_from_slice(&stake.to_le_bytes());
-        }
-        bytes.extend_from_slice(&(self.root_state.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&self.root_state);
-        bytes
+            committee,
+            &self.root_state,
+        ))
+        .expect("a record encodes")
     }
 
     /// # Panics
     /// If `bytes` is not what `encode` wrote.
     pub fn decode(bytes: &[u8]) -> EpochRecord {
-        let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().expect("a word"));
-        let members = usize::try_from(word(Self::FIXED)).expect("a committee fits in memory");
-        let committee_end = Self::FIXED + 8 + members * Self::MEMBER;
-        let committee = (0..members)
-            .map(|i| {
-                let at = Self::FIXED + 8 + i * Self::MEMBER;
-                (
-                    bytes[at..at + 96].try_into().expect("a protocol key"),
-                    word(at + 96),
-                )
-            })
-            .collect();
-        let root_len = usize::try_from(word(committee_end)).expect("a root fits in memory");
-        assert_eq!(
-            bytes.len(),
-            committee_end + 8 + root_len,
-            "an epoch start record"
+        type Encoded = (
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            Vec<(Vec<u8>, u64, [u8; 32], [u8; 32], String, String)>,
+            Vec<u8>,
         );
-        EpochRecord {
-            epoch: word(0),
-            protocol_version: word(8),
-            reference_gas_price: word(16),
-            epoch_start_timestamp_ms: word(24),
-            epoch_duration_ms: word(32),
-            previous_checkpoint: word(40),
+        let (
+            epoch,
+            protocol_version,
+            reference_gas_price,
+            epoch_start_timestamp_ms,
+            epoch_duration_ms,
+            previous_checkpoint,
             committee,
-            root_state: bytes[committee_end + 8..].to_vec(),
+            root_state,
+        ): Encoded = bcs::from_bytes(bytes).expect("an epoch start record decodes");
+        EpochRecord {
+            epoch,
+            protocol_version,
+            reference_gas_price,
+            epoch_start_timestamp_ms,
+            epoch_duration_ms,
+            previous_checkpoint,
+            committee: committee
+                .into_iter()
+                .map(
+                    |(name, stake, consensus_key, network_key, address, hostname)| Member {
+                        name: name.try_into().expect("a 96-byte protocol key"),
+                        stake,
+                        consensus_key,
+                        network_key,
+                        address,
+                        hostname,
+                    },
+                )
+                .collect(),
+            root_state,
         }
+    }
+
+    /// Each member's protocol key and stake: the checkpoint committee.
+    pub fn stakes(&self) -> impl Iterator<Item = ([u8; 96], u64)> + '_ {
+        self.committee.iter().map(|m| (m.name, m.stake))
     }
 
     /// The current epoch's record.
@@ -208,8 +230,7 @@ impl Epoch {
             [],
         ));
         let committee = Arc::new(
-            Committee::new(record.epoch, record.committee.iter().copied())
-                .expect("the epoch's committee is valid"),
+            Committee::new(record.epoch, record.stakes()).expect("the epoch's committee is valid"),
         );
         let (epoch_store, consensus_output, builder_output) =
             EpochStore::open(&perpetual.epochs, record.epoch);

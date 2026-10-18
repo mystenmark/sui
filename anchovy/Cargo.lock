@@ -2581,6 +2581,7 @@ name = "execution"
 version = "0.1.0"
 dependencies = [
  "bcs",
+ "consensus-config",
  "containers",
  "exec-types",
  "executor",
