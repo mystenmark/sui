@@ -191,6 +191,7 @@ fn commit(index: u32, transactions: &[Claimed<'_>]) -> DecodedCommit {
         rejected: Vec::new(),
         cache_hits: 0,
         cache_misses: transactions.len(),
+        handled: None,
     }
 }
 

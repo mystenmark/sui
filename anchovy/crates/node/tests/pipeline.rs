@@ -18,8 +18,8 @@ use move_core_types::ident_str;
 mod genesis;
 
 use fastcrypto::hash::MultisetHash;
-use node::Pipeline;
 use node::epoch::{Epoch, EpochRecord, Node, Perpetual};
+use node::{ConsensusOutput, Pipeline};
 use protocol_config::Chain;
 use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
 use sui_types::crypto::{AccountKeyPair, AuthorityPublicKeyBytes, get_key_pair};
@@ -182,7 +182,7 @@ impl Network {
             keys,
         };
         let mut node = Node::new(perpetual);
-        node.start_epoch(|_, _| client.clone());
+        node.start_epoch(&mut |_: &Arc<EpochState>, _: ConsensusOutput| client.clone());
         Network {
             node: Some(node),
             state_sync,
@@ -245,7 +245,11 @@ impl Network {
     fn start_epoch(&mut self) {
         let client = self.client.clone();
         let node = self.node.as_mut().expect("the node is running");
-        let epoch = node.start_epoch(|_, _| client).state.params.epoch;
+        let epoch = node
+            .start_epoch(&mut |_: &Arc<EpochState>, _: ConsensusOutput| client.clone())
+            .state
+            .params
+            .epoch;
         let record = EpochRecord::load(&node.perpetual.store);
         assert_eq!(record.epoch, epoch);
         self.checkpoint_offset = record.previous_checkpoint;
@@ -318,6 +322,7 @@ impl Network {
                     .commits
                     .try_push(CommitRequest {
                         commit: commit.clone(),
+                        handled: None,
                     })
                     .is_ok()
             );
@@ -546,6 +551,7 @@ impl Network {
                 .commits
                 .try_push(CommitRequest {
                     commit: commit.clone(),
+                    handled: None,
                 })
                 .is_ok()
         );

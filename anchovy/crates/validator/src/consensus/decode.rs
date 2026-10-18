@@ -11,10 +11,12 @@ use ::consensus::{BlockRef, CommittedSubDag, TransactionIndex};
 use messages::Message;
 use messages::base::{ObjectId, ObjectRef};
 use messages::consensus::{ConsensusTransaction, ConsensusTransactionKind, TransactionClaim};
+use tokio::sync::oneshot;
 use validation::inputs::{InputKind, input_objects};
 use workqueue::{Processor, Refusal, Refuse};
 
 use crate::checks::{self, VerifiedTransaction};
+
 use crate::consensus::cache::{CachedTransaction, ConsensusTxCache};
 use crate::epoch::EpochParams;
 use crate::pipeline::items::{BuiltWaitItem, BuiltWaits, CheckpointSignature};
@@ -23,9 +25,13 @@ use crate::pipeline::keys::CheckpointBuilt;
 /// A commit to decode, from the epoch's consensus.
 pub struct CommitRequest {
     pub commit: CommittedSubDag,
+    /// Answered once the commit is handled and the pipeline can take the
+    /// next. Dropped, the commit was not handled: the pipeline stopped.
+    pub handled: Option<oneshot::Sender<()>>,
 }
 
-/// A full queue drops the commit; consensus replays commits not handled.
+/// A full queue drops the commit, and its answer; consensus replays commits
+/// not handled.
 impl Refuse for CommitRequest {
     fn refuse(self, _: Refusal) {}
 }
@@ -44,6 +50,8 @@ pub struct DecodedCommit {
     /// Transactions taken from the cache, and decoded again.
     pub cache_hits: usize,
     pub cache_misses: usize,
+    /// The commit's answer to consensus, once handled.
+    pub handled: Option<oneshot::Sender<()>>,
 }
 
 /// A user transaction a commit carries, and where it was in the commit.
@@ -173,6 +181,7 @@ impl CommitDecoder {
                 .collect(),
             cache_hits: 0,
             cache_misses: 0,
+            handled: None,
         };
         let mut signatures = waiter::WaitBatch::new();
         for block in blocks {
@@ -301,6 +310,8 @@ impl Processor for CommitDecoder {
     type Output = DecodedCommit;
 
     fn process(&mut self, request: CommitRequest) -> Option<DecodedCommit> {
-        Some(self.decode(request.commit))
+        let mut decoded = self.decode(request.commit);
+        decoded.handled = request.handled;
+        Some(decoded)
     }
 }

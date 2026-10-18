@@ -4,7 +4,8 @@
 //! An epoch's database, discarded once the epoch is over: after the
 //! reference's `AuthorityEpochTables`. Raw bytes by keyspace; the pipeline's
 //! epoch store gives them types and decides who writes which. A directory
-//! per epoch, holding one Tidehunter database.
+//! per epoch, holding the epoch store's Tidehunter database (`store`) and
+//! consensus's (`consensus`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -91,7 +92,7 @@ impl EpochDb {
     /// Epoch `epoch`'s database under `root`: made at the epoch's start,
     /// reopened as it was on restart.
     pub fn open(root: &Path, epoch: u64) -> Result<EpochDb> {
-        let path = epoch_dir(root, epoch);
+        let path = epoch_dir(root, epoch).join("store");
         std::fs::create_dir_all(&path).map_err(DbError::Io)?;
         let mut shape = KeyShapeBuilder::new();
         for space in Space::ALL {
@@ -175,6 +176,12 @@ impl EpochBatch<'_> {
     pub fn commit(self) -> Result<()> {
         Ok(self.batch.commit()?)
     }
+}
+
+/// Where epoch `epoch`'s consensus keeps its data under `root`: in the
+/// epoch's directory, so it goes with the epoch's store.
+pub fn consensus_dir(root: &Path, epoch: u64) -> PathBuf {
+    epoch_dir(root, epoch).join("consensus")
 }
 
 fn epoch_dir(root: &Path, epoch: u64) -> PathBuf {

@@ -166,6 +166,7 @@ fn commit(index: u32, transactions: &[Vec<u8>]) -> DecodedCommit {
         rejected: Vec::new(),
         cache_hits: 0,
         cache_misses: 0,
+        handled: None,
     }
 }
 
