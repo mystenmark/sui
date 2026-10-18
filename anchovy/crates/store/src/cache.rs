@@ -315,8 +315,6 @@ pub struct Store {
     committed_effects: PointCache<Message<TransactionEffects<'static>>>,
     /// The last checkpoint committed by this cache.
     last_committed: Mutex<Option<u64>>,
-    /// Makes `start_version`'s read and initialization one step.
-    start_versions: Mutex<()>,
 }
 
 impl Store {
@@ -337,7 +335,6 @@ impl Store {
             committed: PointCache::new(capacity.transactions),
             committed_effects: PointCache::new(capacity.transactions),
             last_committed: Mutex::new(last_committed),
-            start_versions: Mutex::new(()),
         })
     }
 
@@ -484,7 +481,7 @@ impl Store {
         self.db
             .put_committed_checkpoint(&mut batch, seq, checkpoint, certified);
         if let Some(epoch_start) = epoch_start {
-            self.db.put_epoch_start(&mut batch, epoch_start);
+            self.db.put_epoch_start(&mut batch, 0, epoch_start);
         }
         batch.commit().expect("the database writes");
 
@@ -590,6 +587,11 @@ impl Store {
     }
 
     /// How many transactions are written and not committed.
+    /// Whether the transaction with `digest` executed and has not committed.
+    pub fn is_uncommitted(&self, digest: &Digest) -> bool {
+        self.uncommitted(digest).is_some()
+    }
+
     pub fn uncommitted_transactions(&self) -> usize {
         self.uncommitted.iter().map(|s| lock(s).len()).sum()
     }
@@ -808,48 +810,26 @@ impl Store {
         self.db.last_checkpoint()
     }
 
-    /// The current epoch's start record: the one durable point at which the
-    /// node is in that epoch.
-    pub fn epoch_start(&self) -> Result<Option<Vec<u8>>> {
+    /// The current epoch, the highest with a start record, and that record:
+    /// writing it is the one durable point at which the node is in the
+    /// epoch.
+    pub fn epoch_start(&self) -> Result<Option<(u64, Vec<u8>)>> {
         self.db.epoch_start()
     }
 
-    /// Replaces the current epoch's start record, moving the node into the
-    /// epoch it describes.
+    /// Epoch `epoch`'s start record, kept for good.
+    pub fn epoch_record(&self, epoch: u64) -> Result<Option<Vec<u8>>> {
+        self.db.epoch_record(epoch)
+    }
+
+    /// Writes epoch `epoch`'s start record, moving the node into it.
     ///
     /// # Panics
     /// If the database write fails.
-    pub fn commit_epoch_start(&self, record: Vec<u8>) {
+    pub fn commit_epoch_start(&self, epoch: u64, record: Vec<u8>) {
         let mut batch = self.db.write_batch();
-        self.db.put_epoch_start(&mut batch, record);
+        self.db.put_epoch_start(&mut batch, epoch, record);
         batch.commit().expect("the database writes");
-    }
-
-    /// The version and digest version assignment starts shared object `id`
-    /// (shared at `initial_shared_version`) at in `epoch`: as recorded the
-    /// first time a version was assigned to it in the epoch, else its live
-    /// version, recorded now. None if it has neither.
-    ///
-    /// The live version is right only before anything assigned in the
-    /// epoch has written the object, which the first assignment is. It is
-    /// recorded durably at once, so before any such write can commit: a
-    /// replay of the epoch finds it, though the store has moved on.
-    pub fn start_version(
-        &self,
-        epoch: u64,
-        id: &ObjectId,
-        initial_shared_version: u64,
-    ) -> Result<Option<Live>> {
-        let _initializing = lock(&self.start_versions);
-        if let Some(start) = self.db.start_version(epoch, id, initial_shared_version)? {
-            return Ok(Some(start));
-        }
-        let Some(live) = self.live(id)? else {
-            return Ok(None);
-        };
-        self.db
-            .put_start_version(epoch, id, initial_shared_version, live)?;
-        Ok(Some(live))
     }
 
     /// The highest checkpoint whose outputs are all in the database.

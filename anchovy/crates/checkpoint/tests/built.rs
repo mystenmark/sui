@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use checkpoint::{BuiltAvailability, BuiltRouter};
+use validator::epoch_store::EpochStore;
 use validator::pipeline::items::{
     BuiltWaitItem, CertifiedCheckpoint, CheckpointContentsBuilt, CheckpointSignature,
     EpochCloserInput, PendingCheckpoint,
@@ -98,21 +99,20 @@ struct Setup {
     closer: Inbox<EpochCloserInput>,
     aggregator: Inbox<Vec<CheckpointSignature>>,
     checkpoints: Arc<CheckpointStore>,
-    store: Arc<store::Store>,
     _dir: tempfile::TempDir,
 }
 
 impl Setup {
     fn new() -> Setup {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(store::Store::open(dir.path()).unwrap());
-        let checkpoints = Arc::new(CheckpointStore::new());
+        let (epoch_store, _, builder) = EpochStore::open(dir.path(), 0);
+        let objects = Arc::new(store::Store::open(&dir.path().join("perpetual")).unwrap());
+        let checkpoints = Arc::new(CheckpointStore::new(objects, 0, epoch_store, builder));
         let (epoch_closer, closer) = workqueue::queue(16);
         let (aggregator_queue, aggregator) = workqueue::queue(16);
         Setup {
             waiter: WaiterProcessor::new(BuiltAvailability {
                 checkpoints: checkpoints.clone(),
-                store: store.clone(),
             }),
             router: BuiltRouter {
                 epoch_closer,
@@ -121,7 +121,6 @@ impl Setup {
             closer,
             aggregator,
             checkpoints,
-            store,
             _dir: dir,
         }
     }
@@ -179,18 +178,6 @@ fn items_wait_for_their_checkpoint_then_go_where_their_kind_goes() {
     // Once built, an item is ready at once.
     s.wait(signature(3), 3);
     assert_eq!(s.routed(), (vec![], vec![3]));
-}
-
-#[test]
-fn a_pruned_checkpoint_is_read_as_committed() {
-    let mut s = Setup::new();
-    s.store
-        .commit_genesis_checkpoint(built(0, &summary(0, 0)).encode(), vec![]);
-    s.checkpoints.prune_below(1);
-    // A late signature is released, not parked forever.
-    s.wait(signature(0), 0);
-    s.wait(certified(0, &summary(0, 0)), 0);
-    assert_eq!(s.routed(), (vec![], vec![0]));
 }
 
 #[test]

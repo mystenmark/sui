@@ -112,6 +112,7 @@ fn the_prologue_writes_the_clock_first() {
                 round: 7,
                 writes_before: 0
             },
+            base: None,
         }]
     );
     // A reader of the clock reads what the prologue wrote.

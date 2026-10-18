@@ -71,7 +71,7 @@ impl Started {
 fn the_node_runs_epoch_after_epoch() {
     let (sender, _): (_, AccountKeyPair) = get_key_pair();
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(store::Store::open(dir.path()).unwrap());
+    let store = Arc::new(store::Store::open(&dir.path().join("perpetual")).unwrap());
     let genesis = genesis::build(sender, 1, 1_000_000_000, 25_000);
     execution::genesis::commit(&store, &genesis.objects).unwrap();
     node::epoch::genesis(
@@ -82,6 +82,7 @@ fn the_node_runs_epoch_after_epoch() {
     let (state_sync, _certified) = workqueue::queue(1024);
     let perpetual = Perpetual {
         store: store.clone(),
+        epochs: dir.path().join("epochs"),
         current: CurrentEpoch::new(),
         state_sync,
         chain: Chain::Unknown,

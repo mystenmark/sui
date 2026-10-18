@@ -13,5 +13,9 @@ tidehunter.workspace = true
 rand.workspace = true
 tempfile.workspace = true
 
+[[bench]]
+name = "reads"
+harness = false
+
 [lints]
 workspace = true

@@ -152,7 +152,7 @@ impl Network {
         record_panics();
         let (sender, key) = get_key_pair::<AccountKeyPair>();
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(store::Store::open(dir.path()).unwrap());
+        let store = Arc::new(store::Store::open(&dir.path().join("perpetual")).unwrap());
         let genesis = genesis::build(sender, coins, 10 * SUI, epoch_duration_ms);
         execution::genesis::commit(&store, &genesis.objects).unwrap();
         node::epoch::genesis(
@@ -172,6 +172,7 @@ impl Network {
         let lanes = (normal, priority);
         let perpetual = Perpetual {
             store,
+            epochs: dir.path().join("epochs"),
             current: CurrentEpoch::new(),
             state_sync: state_sync.0.clone(),
             chain: CHAIN,
@@ -265,6 +266,7 @@ impl Network {
         // The epoch's workers hold the store: stopped first, it closes.
         let Perpetual {
             store,
+            epochs,
             current,
             protocol_key,
             chain_identifier,
@@ -277,12 +279,13 @@ impl Network {
             "only the node holds the store"
         );
         drop(store);
-        let store = Arc::new(store::Store::open(self.dir.path()).unwrap());
+        let store = Arc::new(store::Store::open(&self.dir.path().join("perpetual")).unwrap());
         // Checkpoints certified and not committed are certified again.
         let committed = store.committed_checkpoint().unwrap().unwrap();
         self.certified.retain(|seq, _| *seq <= committed);
         self.node = Some(Node::new(Perpetual {
             store,
+            epochs,
             current: CurrentEpoch::new(),
             state_sync: self.state_sync.0.clone(),
             chain: CHAIN,
@@ -305,7 +308,8 @@ impl Network {
         }
         self.start_epoch();
         let running = self.running();
-        for commit in &self.delivered {
+        let from = running.pipeline.replay_from;
+        for commit in self.delivered.iter().filter(|c| c.commit_index >= from) {
             assert!(
                 running
                     .pipeline
@@ -591,7 +595,7 @@ impl Network {
                         .filter(|h| self.pipeline().chunks.get(*h).is_some())
                         .collect::<Vec<_>>(),
                     (0..=seq + 2)
-                        .filter(|s| self.pipeline().checkpoints.is_built(*s))
+                        .filter(|s| self.pipeline().checkpoints.built(*s).is_some())
                         .collect::<Vec<_>>(),
                 );
                 std::thread::sleep(Duration::from_millis(2));
@@ -1309,7 +1313,12 @@ fn checkpoints_of_several_commits() {
     // Commits until checkpoint 2 is cut and built.
     wait_for("checkpoint 2 to be built", || {
         network.commit(vec![]);
-        network.pipeline().checkpoints.is_built(2).then_some(())
+        network
+            .pipeline()
+            .checkpoints
+            .built(2)
+            .is_some()
+            .then_some(())
     });
     network.certify(2);
     let mut listed = HashSet::new();
@@ -1383,5 +1392,81 @@ fn a_withdrawal_exceeding_the_settled_balance_fails() {
         ExecutionErrorKind::InsufficientFundsForWithdraw
     );
     assert!(network.contents(seq).contains(overdraw.digest()));
+    assert_no_panics();
+}
+
+/// Crashes with more commits checkpointed than consensus replays before the
+/// last one written: the epoch resumes after it, not from its start, and
+/// what had not committed executes again, identically, and carries on.
+#[test]
+fn a_crash_resumes_after_the_last_commit_written() {
+    let mut network = Network::new(14);
+    let mut last = 0;
+    for i in 0..12 {
+        let transfer = network.transfer(network.coin(i));
+        last = network.commit(vec![consensus_transaction(&transfer)]);
+        network.wait_executed(&transfer);
+    }
+    network.certify(last);
+    let pending = network.transfer(network.coin(12));
+    let pending_seq = network.commit(vec![consensus_transaction(&pending)]);
+    let executed = network.wait_executed(&pending);
+
+    network.crash();
+    assert!(network.executed(&pending).is_none());
+    network.recover();
+    assert!(
+        network.running().pipeline.replay_from > 1,
+        "replay starts after the last commit written"
+    );
+    assert_eq!(network.wait_executed(&pending), executed);
+    let next = network.transfer(network.coin(13));
+    let next_seq = network.commit(vec![consensus_transaction(&next)]);
+    network.certify(next_seq);
+    network.assert_checkpointed(pending_seq, &[&pending]);
+    network.assert_checkpointed(next_seq, &[&next]);
+    assert_no_panics();
+}
+
+/// Crashes with commits waiting for a checkpoint not yet cut: the epoch
+/// resumes after the last commit written, before them, and replays them
+/// into one checkpoint, cut at a later commit.
+#[test]
+fn a_crash_with_commits_waiting_for_a_checkpoint_replays_them_into_it() {
+    let mut network = Network::new(3);
+    let first = network.transfer(network.coin(0));
+    let seq_1 = network.commit(vec![consensus_transaction(&first)]);
+    network.certify(seq_1);
+    // The checkpoint built listing `transfer`, if any.
+    let holding = |network: &Network, transfer: &Transaction| {
+        (seq_1..)
+            .map_while(|s| network.pipeline().checkpoints.built(s).map(|b| (s, b)))
+            .find(|(_, built)| {
+                let contents: CheckpointContents = bcs::from_bytes(&built.contents).unwrap();
+                contents.iter().any(|d| d.transaction == *transfer.digest())
+            })
+            .map(|(s, _)| s)
+    };
+    // Commits closer than the checkpoint interval: theirs waits.
+    network.commit_interval_ms = 50;
+    let waiting: Vec<_> = (1..3).map(|i| network.transfer(network.coin(i))).collect();
+    for transfer in &waiting {
+        network.commit(vec![consensus_transaction(transfer)]);
+        network.wait_executed(transfer);
+    }
+    assert_eq!(holding(&network, &waiting[0]), None);
+
+    network.crash();
+    network.recover();
+    for transfer in &waiting {
+        network.wait_executed(transfer);
+    }
+    let seq = wait_for("the waiting commits' checkpoint to be built", || {
+        network.commit(vec![]);
+        holding(&network, &waiting[1])
+    });
+    assert_eq!(holding(&network, &waiting[0]), Some(seq));
+    network.certify(seq);
+    network.assert_checkpointed(seq, &[&waiting[0], &waiting[1]]);
     assert_no_panics();
 }

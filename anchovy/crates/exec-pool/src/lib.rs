@@ -15,6 +15,7 @@ use messages::object::{Object, Owner};
 use messages::transaction::SharedObjectMutability;
 use validator::consensus::sequence::SharedAccess;
 use validator::epoch::EpochState;
+use validator::epoch_store::EpochStore;
 use validator::pipeline::items::{
     EffectsWaitItem, EpochCloserInput, Executable, ExecutableTransaction, FundsCommand,
     InputCommand, InputValue, ReservationStatus, Settle, SettlementInput, SystemKind,
@@ -82,6 +83,7 @@ use workqueue::{Processor, PushError, Queue, Sink};
 pub struct Executor {
     store: Arc<store::Store>,
     epoch: Arc<EpochState>,
+    epoch_store: EpochStore,
     generations: Arc<GenerationTable>,
     inputs: Queue<InputCommand>,
     effects: Queue<Command<EffectsKey, EffectsWaitItem>>,
@@ -104,6 +106,7 @@ impl Executor {
     pub fn new(
         store: Arc<store::Store>,
         epoch: Arc<EpochState>,
+        epoch_store: EpochStore,
         generations: Arc<GenerationTable>,
         inputs: Queue<InputCommand>,
         effects: Queue<Command<EffectsKey, EffectsWaitItem>>,
@@ -112,6 +115,7 @@ impl Executor {
         Executor {
             store,
             epoch,
+            epoch_store,
             generations,
             inputs,
             effects,
@@ -143,6 +147,12 @@ impl Executor {
         };
 
         let stored = self.stored_effects(digest);
+        // Executed and committed before a restart: its checkpoint will not
+        // commit again, so what it produced is written at once.
+        let committed = stored.is_some()
+            && !self
+                .store
+                .is_uncommitted(&messages::base::Digest::new(digest));
 
         // 1. Its inputs, from the values its keys resolved to: the shared
         //    accesses' first, in access order (as the resolver keys them),
@@ -246,7 +256,8 @@ impl Executor {
             let produced = produced(effects_v2, stream, self.resolved[i], digest);
             let round = access.ordinal.round;
             let generation = access.ordinal.writes_before + 1;
-            self.generations.record(stream, round, generation, produced);
+            self.generations
+                .record(stream, round, generation, produced, digest, committed);
             let object = match produced {
                 Generation::Version { version, .. } => Some(object_at(&access.id, version)),
                 Generation::Ended { .. } => None,
@@ -358,13 +369,8 @@ impl Executor {
         }
         let generation = self.generations.get_or_record(stream, round, 0, || {
             let start = self
-                .store
-                .start_version(
-                    self.epoch.params.epoch,
-                    &stream.id,
-                    stream.initial_shared_version,
-                )
-                .expect("the store reads and writes")
+                .epoch_store
+                .start_version(&self.store, &stream.id, stream.initial_shared_version)
                 .unwrap_or_else(|| panic!("{stream:?}, which voting found live, is live"));
             Generation::Version {
                 version: start.version,

@@ -21,32 +21,18 @@ use workqueue::{Queue, Sink};
 use crate::push;
 
 /// The built waiter's availability check: the checkpoint this validator
-/// built, from the checkpoint store (including the previous epoch's last),
-/// or, once pruned, as committed.
+/// built, from the checkpoint store (including the previous epoch's last).
 pub struct BuiltAvailability {
     pub checkpoints: Arc<CheckpointStore>,
-    pub store: Arc<store::Store>,
 }
 
 impl Availability<CheckpointBuilt, Arc<BuiltCheckpoint>> for BuiltAvailability {
     fn check(&mut self, keys: &[CheckpointBuilt], found: &mut Vec<Option<Arc<BuiltCheckpoint>>>) {
         found.clear();
-        found.extend(keys.iter().map(|&CheckpointBuilt(seq)| {
-            if let Some(built) = self.checkpoints.built(seq) {
-                return Some(built);
-            }
-            // Only a pruned checkpoint is read back, so that keys not yet
-            // built cost no read.
-            if !self.checkpoints.is_built(seq) {
-                return None;
-            }
-            let committed = self
-                .store
-                .checkpoint(seq)
-                .expect("the store reads")
-                .expect("a checkpoint is pruned once committed");
-            Some(Arc::new(BuiltCheckpoint::decode(&committed)))
-        }));
+        found.extend(
+            keys.iter()
+                .map(|&CheckpointBuilt(seq)| self.checkpoints.built(seq)),
+        );
     }
 }
 

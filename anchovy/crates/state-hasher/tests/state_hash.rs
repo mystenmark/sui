@@ -17,6 +17,14 @@ use support::effects::{KINDS, Rng, checkpoint, transaction};
 use validator::pipeline::items::{CheckpointEffects, ExecutedEffects};
 use workqueue::Processor;
 
+/// Empty state hashes, over an epoch store in a directory kept alive with
+/// them.
+fn state_hashes() -> (Arc<StateHashes>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _, builder) = validator::epoch_store::EpochStore::open(dir.path(), 0);
+    (Arc::new(StateHashes::new(store, builder)), dir)
+}
+
 /// The reference's `accumulate_effects_v3`.
 fn reference(effects: &[ExecutedEffects]) -> GlobalStateHash {
     let effects: Vec<TransactionEffects> = effects
@@ -102,7 +110,7 @@ fn roots_fold_in_order() {
     let mut rng = Rng(0xdead_beef_cafe_f00d);
     let checkpoints = checkpoints(&mut rng, 10);
     let expected = reference_roots(&GlobalStateHash::default(), &checkpoints);
-    let hashes = Arc::new(StateHashes::new());
+    let (hashes, _dir) = state_hashes();
     let mut processor = StateHasher::new(hashes.clone(), 0, StateHash::default());
     for (seq, effects) in checkpoints.iter().enumerate() {
         let seq = seq as u64;
@@ -141,7 +149,7 @@ fn roots_fold_in_order_whatever_the_arrival_order() {
         order.swap(0, 1);
     }
 
-    let hashes = Arc::new(StateHashes::new());
+    let (hashes, _dir) = state_hashes();
     let mut processor = StateHasher::new(hashes.clone(), first, prior);
     let mut arrived = vec![false; checkpoints.len()];
     for i in order {
@@ -173,7 +181,8 @@ fn roots_fold_in_order_whatever_the_arrival_order() {
 #[test]
 #[should_panic(expected = "hashed twice")]
 fn a_checkpoint_hashed_twice_panics() {
-    let mut processor = StateHasher::new(Arc::new(StateHashes::new()), 0, StateHash::default());
+    let (hashes, _dir) = state_hashes();
+    let mut processor = StateHasher::new(hashes, 0, StateHash::default());
     for _ in 0..2 {
         processor.process(CheckpointEffects {
             last_of_epoch: false,

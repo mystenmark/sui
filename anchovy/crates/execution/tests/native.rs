@@ -33,6 +33,11 @@ struct Node {
 
 impl Node {
     fn new() -> Node {
+        Node::with_native(|native| native)
+    }
+
+    /// A node whose anchovy executor is `configure`d.
+    fn with_native(configure: impl FnOnce(NativeExecution) -> NativeExecution) -> Node {
         let (sender, key) = get_key_pair::<AccountKeyPair>();
         let reference =
             Reference::new(ProtocolVersion::MAX.as_u64(), Chain::Unknown, 0, 0, RGP).unwrap();
@@ -44,6 +49,7 @@ impl Node {
             RGP,
         )
         .unwrap();
+        let native = configure(native);
         let dir = tempfile::tempdir().unwrap();
         let store = store::Store::open(dir.path()).unwrap();
         let objects = genesis::objects(&reference, &[(sender, 10 * SUI)]).unwrap();
@@ -270,7 +276,17 @@ impl Node {
 
 #[test]
 fn object_basics_match() {
-    let node = Node::new();
+    object_basics(&Node::new());
+}
+
+/// A runtime replaced after every transaction, which resolves at least one
+/// package each, loads them again: nothing kept from the last runtime is used.
+#[test]
+fn a_replaced_runtime_matches() {
+    object_basics(&Node::with_native(|native| native.with_max_packages(0)));
+}
+
+fn object_basics(node: &Node) {
     let package = node.publish("object_basics");
     macro_rules! pure {
         ($v:expr) => {
