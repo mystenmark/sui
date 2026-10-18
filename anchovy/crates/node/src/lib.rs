@@ -32,6 +32,7 @@ use validator::consensus::vote::VoteRequest;
 use validator::current::EpochHandle;
 use validator::epoch::EpochState;
 use validator::epoch_store::{BuilderOutput, ConsensusOutput as OutputWriter, EpochStore};
+use validator::pipeline::backpressure::{Backpressure, Limits};
 use validator::pipeline::items::{CertifiedCheckpoint, EffectsWaitItem};
 use validator::pipeline::keys::EffectsKey;
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable, GenerationTable};
@@ -43,6 +44,15 @@ use workqueue::{Activity, Queue, WorkerHandle};
 
 /// Each queue's capacity.
 pub const QUEUE: usize = 4096;
+
+/// How far consensus may run ahead of committed checkpoints. The queues
+/// ahead of the executor hold about one item per chunk in flight, so the
+/// chunk limit keeps them under `QUEUE`; the transaction limit is the
+/// reference's default `backpressure_threshold`.
+pub const BACKPRESSURE: Limits = Limits {
+    chunks: QUEUE / 4,
+    transactions: 100_000,
+};
 
 /// The running pipeline: where the black boxes hand it work, where it hands
 /// them work, and the tables its processors share.
@@ -229,6 +239,7 @@ impl Pipeline {
             checkpoints,
             statuses: Arc::new(ConsensusTxStatusCache::new()),
             state_hashes,
+            backpressure: Arc::new(Backpressure::new(BACKPRESSURE, committed_seq)),
             start,
             next_to_certify,
             first_hashed,

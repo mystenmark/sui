@@ -13,6 +13,7 @@ use messages::fast::Bump;
 use messages::reader::Reader;
 use tokio::sync::watch;
 use validator::epoch_store::CommittedCheckpoints;
+use validator::pipeline::backpressure::Backpressure;
 use validator::pipeline::items::CertifiedCheckpoint;
 use validator::pipeline::tables::{CheckpointStore, ChunkTable, GenerationTable};
 use workqueue::Processor;
@@ -32,13 +33,15 @@ use workqueue::Processor;
 ///
 /// Reads: the checkpoint store. Prunes: the chunk table. Writes: the object
 /// store, as its only committer; the generation table's and the consensus
-/// output's committed state.
+/// output's committed state; backpressure's committed watermark, which
+/// releases the commit answers it withheld.
 pub struct CheckpointCommitter {
     store: Arc<store::Store>,
     checkpoints: Arc<CheckpointStore>,
     chunks: Arc<ChunkTable>,
     generations: Arc<GenerationTable>,
     consensus_output: CommittedCheckpoints,
+    backpressure: Arc<Backpressure>,
     /// The epoch's last checkpoint, once committed.
     ended: watch::Sender<Option<u64>>,
     bump: Bump,
@@ -51,6 +54,7 @@ impl CheckpointCommitter {
         chunks: Arc<ChunkTable>,
         generations: Arc<GenerationTable>,
         consensus_output: CommittedCheckpoints,
+        backpressure: Arc<Backpressure>,
         ended: watch::Sender<Option<u64>>,
     ) -> CheckpointCommitter {
         CheckpointCommitter {
@@ -59,6 +63,7 @@ impl CheckpointCommitter {
             chunks,
             generations,
             consensus_output,
+            backpressure,
             ended,
             bump: Bump::with_capacity(super::ARENA),
         }
@@ -85,6 +90,7 @@ impl CheckpointCommitter {
         self.consensus_output.committed_through(built.last_height);
         self.chunks.prune_through(built.last_height);
         self.checkpoints.committed(seq);
+        self.backpressure.committed(seq, built.last_height);
         if built.root_state.is_some() {
             self.ended.send_replace(Some(seq));
         }
