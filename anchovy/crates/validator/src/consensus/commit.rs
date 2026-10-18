@@ -28,6 +28,7 @@ use crate::consensus::sequence::{
 use crate::consensus::status::{ConsensusTxStatus, ConsensusTxStatusCache};
 use crate::epoch::EpochParams;
 use crate::epoch_store::ConsensusOutput;
+use crate::pipeline::backpressure::Backpressure;
 use crate::pipeline::items::{
     Chunk, ChunkSettlement, EpochClose, ExecutableTransaction, PendingCheckpoint, ScheduledEntry,
     SettlementInput, SystemKind, SystemTransaction,
@@ -383,6 +384,7 @@ pub struct CommitStage {
     settlements_out: workqueue::Queue<SettlementInput>,
     checkpoints_out: workqueue::Queue<waiter::Command<ChunkSettled, PendingCheckpoint>>,
     statuses: Arc<ConsensusTxStatusCache>,
+    backpressure: Option<Arc<Backpressure>>,
 }
 
 impl CommitStage {
@@ -420,7 +422,15 @@ impl CommitStage {
             settlements_out: settlements,
             checkpoints_out: checkpoints,
             statuses,
+            backpressure: None,
         }
+    }
+
+    /// Answers each commit through `backpressure`, which may withhold it.
+    #[must_use]
+    pub fn with_backpressure(mut self, backpressure: Arc<Backpressure>) -> CommitStage {
+        self.backpressure = Some(backpressure);
+        self
     }
 
     /// Decides `commit` and lays it out in chunks and checkpoints, or
@@ -645,6 +655,9 @@ impl CommitStage {
             dropped: _,
         } = decided;
         for chunk in chunks {
+            if let Some(backpressure) = &self.backpressure {
+                backpressure.scheduled(chunk.height, chunk.entries.len());
+            }
             push(&self.chunks_out, chunk, "resolver");
         }
         for settlement in settlements {
@@ -692,8 +705,13 @@ impl Processor for CommitStage {
         let handled = commit.handled.take();
         let decided = self.handle(commit);
         if let Some(handled) = handled {
-            // Consensus may have stopped waiting; nothing to do then.
-            let _ = handled.send(());
+            match &self.backpressure {
+                Some(backpressure) => backpressure.answer(handled),
+                // Consensus may have stopped waiting; nothing to do then.
+                None => {
+                    let _ = handled.send(());
+                }
+            }
         }
         decided
     }

@@ -15,6 +15,7 @@ use fastcrypto::traits::{AggregateAuthenticator, ToFromBytes, VerifyingKey};
 use messages::base::Digest;
 use roaring::RoaringBitmap;
 use tracing::{error, warn};
+use validator::pipeline::backpressure::Backpressure;
 use validator::pipeline::items::{
     BuiltWaitItem, BuiltWaits, CertifiedCheckpoint, CheckpointSignature,
 };
@@ -436,13 +437,15 @@ impl Pending {
 ///   `CheckpointBuilt(seq)`, for the fork check;
 /// - `CheckpointCommitter`: `Vec<CertifiedCheckpoint>`, in sequence order.
 ///
-/// Reads: the checkpoint store.
+/// Reads: the checkpoint store. Writes: backpressure's certified watermark.
 pub struct CheckpointAggregator {
     committee: Arc<Committee>,
     checkpoints: Arc<CheckpointStore>,
     state_sync: Queue<CertifiedCheckpoint>,
     /// Where certified checkpoints wait to be checked for a fork, once wired.
     fork_checks: Option<BuiltWaits>,
+    /// Told of each checkpoint certified, once wired.
+    backpressure: Option<Arc<Backpressure>>,
     /// The checkpoint to certify next; every earlier one is certified.
     next: u64,
     pending: BTreeMap<u64, Pending>,
@@ -461,6 +464,7 @@ impl CheckpointAggregator {
             checkpoints,
             state_sync,
             fork_checks: None,
+            backpressure: None,
             next,
             pending: BTreeMap::new(),
             scratch: Vec::new(),
@@ -471,6 +475,13 @@ impl CheckpointAggregator {
     #[must_use]
     pub fn with_fork_checks(mut self, built: BuiltWaits) -> CheckpointAggregator {
         self.fork_checks = Some(built);
+        self
+    }
+
+    /// Tells `backpressure` of each checkpoint certified.
+    #[must_use]
+    pub fn with_backpressure(mut self, backpressure: Arc<Backpressure>) -> CheckpointAggregator {
+        self.backpressure = Some(backpressure);
         self
     }
 
@@ -529,6 +540,10 @@ impl CheckpointAggregator {
                 seq,
                 summary: summary.into(),
             };
+            // Before the committer can commit it.
+            if let Some(backpressure) = &self.backpressure {
+                backpressure.certified(seq);
+            }
             if self.state_sync.try_push(checkpoint.clone()).is_err() {
                 warn!(seq, "state sync refused a certified checkpoint");
             }

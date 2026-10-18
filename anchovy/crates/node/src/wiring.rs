@@ -25,6 +25,7 @@ use validator::consensus::status::ConsensusTxStatusCache;
 use validator::consensus::vote::{BlockVoter, VoteRequest};
 use validator::epoch::EpochState;
 use validator::epoch_store::{CommittedCheckpoints, ConsensusOutput as OutputWriter, EpochStore};
+use validator::pipeline::backpressure::Backpressure;
 use validator::pipeline::items::{
     BuiltCommand, BuiltWaits, CertifiedCheckpoint, CheckpointContentsBuilt, CheckpointEffects,
     CheckpointSignature, Chunk, EffectsWaitItem, EpochCloserInput, Executable, FundsCommand,
@@ -149,6 +150,7 @@ pub(crate) struct Parts {
     pub checkpoints: Arc<CheckpointStore>,
     pub statuses: Arc<ConsensusTxStatusCache>,
     pub state_hashes: Arc<StateHashes>,
+    pub backpressure: Arc<Backpressure>,
     pub start: EpochStart,
     /// The first checkpoint the aggregator certifies.
     pub next_to_certify: u64,
@@ -184,6 +186,7 @@ impl Parts {
             checkpoint_waits,
             self.statuses.clone(),
         )
+        .with_backpressure(self.backpressure.clone())
     }
 
     fn resolver(&self, inputs: Queue<InputCommand>, funds: Queue<FundsCommand>) -> VersionResolver {
@@ -310,6 +313,7 @@ impl Parts {
             state_sync,
         )
         .with_fork_checks(built)
+        .with_backpressure(self.backpressure.clone())
     }
 
     fn committer(
@@ -323,6 +327,7 @@ impl Parts {
             self.chunks.clone(),
             self.generations.clone(),
             committed,
+            self.backpressure.clone(),
             ended,
         )
     }
