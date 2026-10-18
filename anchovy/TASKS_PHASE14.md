@@ -57,3 +57,16 @@ Notes:
   Tidehunter's background threads outliving the test by its 100ms leak
   timeout.
 
+## Batched reads (decided: no)
+
+`cargo bench -p store --bench reads`: object reads (as the input waiter's)
+and processed-digest lookups (as the commit handler's), one at a time,
+sorted, or spread over threads, in batches of 1 to 1024, warm and cold.
+Tidehunter has no multi-get (nor upstream main; sui's typed-store loops
+`get`), so a batch is only faster with its reads in flight together:
+sorting gains nothing; threads gain up to 6x on cold object reads from 64
+keys up, nothing on epoch-store lookups, whose index is in memory.
+
+Decision: reads stay one at a time. If the input waiter needs more read
+throughput, several threads can serve its queue.
+
