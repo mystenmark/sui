@@ -20,6 +20,7 @@ use validator::epoch::EpochState;
 use validator::epoch_store::EpochStore;
 use validator::pipeline::items::CertifiedCheckpoint;
 use validator::pipeline::tables::BuiltCheckpoint;
+use validator::tls::NetworkKey;
 use workqueue::Queue;
 
 use crate::{ConsensusOutput, Pipeline};
@@ -195,7 +196,18 @@ pub struct Perpetual {
     pub chain: Chain,
     /// The genesis checkpoint's digest.
     pub chain_identifier: Digest,
-    pub protocol_key: Arc<ProtocolKey>,
+    pub keys: ValidatorKeys,
+}
+
+/// The validator's keys, as sui's `NodeConfig` holds them. The protocol key
+/// (BLS) names it in every committee and signs its checkpoints; consensus
+/// signs its blocks with the worker key and secures its network with the
+/// network key, both Ed25519.
+pub struct ValidatorKeys {
+    pub protocol: Arc<ProtocolKey>,
+    /// The worker key's Ed25519 secret.
+    pub worker: [u8; 32],
+    pub network: NetworkKey,
 }
 
 /// One epoch: its state, its committee and its pipeline, built from the
@@ -240,7 +252,7 @@ impl Epoch {
             &epoch_store,
             consensus_output,
             builder_output,
-            &perpetual.protocol_key,
+            &perpetual.keys.protocol,
             &committee,
             |output| consensus(&state, output),
             perpetual.state_sync.clone(),

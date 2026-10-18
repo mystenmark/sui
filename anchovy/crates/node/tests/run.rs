@@ -87,7 +87,7 @@ fn the_node_runs_epoch_after_epoch() {
         state_sync,
         chain: Chain::Unknown,
         chain_identifier: Digest::new(genesis.chain_identifier),
-        protocol_key: Arc::new(checkpoint::ProtocolKey::new(genesis::protocol_key_pair())),
+        keys: genesis::validator_keys(),
     };
 
     let (started, epochs) = std::sync::mpsc::channel();

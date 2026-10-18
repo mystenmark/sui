@@ -39,6 +39,29 @@ pub fn protocol_key_pair() -> AuthorityKeyPair {
     get_key_pair_from_rng(&mut StdRng::from_seed([7; 32])).1
 }
 
+/// The validator's worker key pair, consensus's key for its blocks.
+pub fn worker_key_pair() -> NetworkKeyPair {
+    get_key_pair_from_rng(&mut StdRng::from_seed([9; 32])).1
+}
+
+/// The validator's network key pair.
+pub fn network_key_pair() -> NetworkKeyPair {
+    get_key_pair_from_rng(&mut StdRng::from_seed([10; 32])).1
+}
+
+/// The validator's keys, as the node holds them.
+#[allow(dead_code, reason = "not every test crate runs a node")]
+pub fn validator_keys() -> node::epoch::ValidatorKeys {
+    use fastcrypto::traits::ToFromBytes;
+    let secret =
+        |pair: NetworkKeyPair| -> [u8; 32] { pair.private().as_bytes().try_into().unwrap() };
+    node::epoch::ValidatorKeys {
+        protocol: std::sync::Arc::new(checkpoint::ProtocolKey::new(protocol_key_pair())),
+        worker: secret(worker_key_pair()),
+        network: validator::tls::NetworkKey::from_bytes(secret(network_key_pair())),
+    }
+}
+
 /// A genesis whose one validator signs with `protocol_key_pair`, whose first
 /// epoch lasts `epoch_duration_ms`, and giving `account` `coins` gas coins of
 /// `amount` MIST.
@@ -46,8 +69,7 @@ pub fn build(account: SuiAddress, coins: usize, amount: u64, epoch_duration_ms: 
     let mut rng = StdRng::from_seed([8; 32]);
     let protocol = protocol_key_pair();
     let validator_account: AccountKeyPair = get_key_pair_from_rng(&mut rng).1;
-    let network: NetworkKeyPair = get_key_pair_from_rng(&mut rng).1;
-    let worker: NetworkKeyPair = get_key_pair_from_rng(&mut rng).1;
+    let (network, worker) = (network_key_pair(), worker_key_pair());
     let validator_address = SuiAddress::from(validator_account.public());
     let tcp = |port: u16| format!("/ip4/127.0.0.1/tcp/{port}/http").parse().unwrap();
     let udp = |port: u16| format!("/ip4/127.0.0.1/udp/{port}").parse().unwrap();
