@@ -42,7 +42,6 @@ tempfile = "3.20.0"
 consensus-core = { path = "../consensus/core" }
 consensus-types = { path = "../consensus/types" }
 mysten-metrics = { path = "../crates/mysten-metrics" }
-mysten-network = { path = "../crates/mysten-network" }
 consensus-config = { path = "../consensus/config" }
 sui-execution = { path = "../sui-execution" }
 sui-framework = { path = "../crates/sui-framework" }

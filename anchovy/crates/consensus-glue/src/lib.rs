@@ -14,4 +14,5 @@ mod runner;
 mod submit;
 mod verifier;
 
+pub use consensus_config::Parameters;
 pub use runner::Runner;
