@@ -81,10 +81,17 @@ exposes.
 
 consensus-core is async, the node's epoch start is not, and it may run
 inside the node's own runtime. The runner owns a tokio runtime for
-consensus, and starts and stops the authority on it from a short-lived
+consensus. `start` returns the pipeline's client at once and starts the
+authority on that runtime: the pipeline starts its workers after consensus
+(they need its client), and a starting authority may re-vote its own blocks
+inline, waiting on the voter. Submissions flow once the authority is up.
+`stop` waits for the start, then stops the authority, from a short-lived
 thread, so it never blocks one runtime inside another. The boot counter
 starts at 0 and goes up once an authority has handled a commit, as
 `cm:368-387`.
+
+The runner takes consensus-core's `Parameters`, as sui's node config holds
+them; each epoch's authority gets them with the epoch's database.
 
 ### Where consensus keeps its data
 
@@ -92,19 +99,29 @@ Consensus's database is epoch state: each epoch's directory holds the epoch
 store (`store/`) and consensus's database (`consensus/`), and both go when
 the directory is deleted.
 
-## Backpressure (a decision)
+## Backpressure
 
 With a real consensus, commits can outrun execution. As sui's handler
-awaits its backpressure manager before each commit: the commit stage
-withholds a commit's answer while the object store holds more than a
-threshold of uncommitted transactions, unless every certified checkpoint
-has committed (else checkpoint building could deadlock). The withheld
-answer is sent when the condition clears, by the checkpoint committer as
-it commits. So the glue, awaiting the answer, sends no further commit;
+awaits its backpressure manager before each commit, the commit stage
+withholds a commit's answer while too much it scheduled is in flight (not
+yet in a committed checkpoint), unless every certified checkpoint has
+committed (else checkpoint building could deadlock: certifying needs
+commits). The checkpoint committer sends the withheld answer when the
+condition clears. So the glue, awaiting the answer, sends no further commit;
 consensus-core's channel absorbs the wait, and only its commit sync slows,
-as in sui. The pipeline's internal queues stay bounded, a full one a
-sizing bug: the threshold must keep in-flight work under their
-capacities.
+as in sui.
+
+In flight is counted from the commit stage, not from the object store as in
+sui: the store sees only executed transactions, and work scheduled but not
+executed fills the pipeline's bounded queues. Two limits:
+- chunks: the queues ahead of the executor hold about one item per chunk in
+  flight, so a quarter of a queue's capacity keeps them from filling (a full
+  one is a sizing bug);
+- transactions: sui's default threshold, 100,000.
+
+The aggregator records each certified checkpoint before the committer can
+commit it; the committer records each commit, with its last chunk's height,
+and releases what was withheld.
 
 ## Tests
 
@@ -120,6 +137,13 @@ capacities.
 
 The pipeline tests that play consensus by hand stay: deterministic, and
 fast.
+
+Four validators across epochs pass only while the validators keep pace. A
+validator still short of an epoch's last certified checkpoint when a quorum
+has moved on, its consensus for that epoch stopped, cannot finish the
+epoch: the commits carrying the last signatures are no longer served. sui
+catches such a validator up through state sync; the pipeline takes no
+certified checkpoints from state sync yet, so that test waits for it.
 
 ## Order of work
 
