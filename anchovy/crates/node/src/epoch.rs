@@ -185,6 +185,35 @@ pub fn genesis(
     );
 }
 
+/// What starting an epoch's consensus takes.
+pub struct ConsensusStart {
+    pub epoch: Arc<EpochState>,
+    pub record: EpochRecord,
+    /// Where it delivers, and from which commit.
+    pub output: ConsensusOutput,
+    /// Where it keeps its data.
+    pub dir: PathBuf,
+}
+
+/// The node's consensus: started for each epoch, stopped before the node
+/// reconfigures.
+pub trait Consensus {
+    /// Starts the epoch's consensus; its transaction client.
+    fn start(&mut self, start: ConsensusStart) -> TransactionClient;
+
+    /// Stops the running epoch's consensus.
+    fn stop(&mut self);
+}
+
+/// A consensus that is started, and never needs stopping: the tests'.
+impl<F: FnMut(&Arc<EpochState>, ConsensusOutput) -> TransactionClient> Consensus for F {
+    fn start(&mut self, start: ConsensusStart) -> TransactionClient {
+        self(&start.epoch, start.output)
+    }
+
+    fn stop(&mut self) {}
+}
+
 /// What the node keeps across epochs.
 pub struct Perpetual {
     pub store: Arc<store::Store>,
@@ -226,10 +255,7 @@ impl Epoch {
     ///
     /// # Panics
     /// If the store cannot be read, or the record's committee is invalid.
-    pub fn start(
-        perpetual: &Perpetual,
-        consensus: impl FnOnce(&Arc<EpochState>, ConsensusOutput) -> TransactionClient,
-    ) -> Epoch {
+    pub fn start(perpetual: &Perpetual, consensus: &mut impl Consensus) -> Epoch {
         let record = EpochRecord::load(&perpetual.store);
         let state = Arc::new(EpochState::starting_at(
             perpetual.chain,
@@ -254,7 +280,14 @@ impl Epoch {
             builder_output,
             &perpetual.keys.protocol,
             &committee,
-            |output| consensus(&state, output),
+            |output| {
+                consensus.start(ConsensusStart {
+                    epoch: state.clone(),
+                    record: record.clone(),
+                    output,
+                    dir: store::epoch::consensus_dir(&perpetual.epochs, record.epoch),
+                })
+            },
             perpetual.state_sync.clone(),
             &record,
         );
@@ -378,10 +411,7 @@ impl Node {
     ///
     /// # Panics
     /// If an epoch is running.
-    pub fn start_epoch(
-        &mut self,
-        consensus: impl FnOnce(&Arc<EpochState>, ConsensusOutput) -> TransactionClient,
-    ) -> &Epoch {
+    pub fn start_epoch(&mut self, consensus: &mut impl Consensus) -> &Epoch {
         assert!(self.running.is_none(), "one epoch at a time");
         if epoch_ended(&self.perpetual.store) {
             reconfigure(&self.perpetual.store);
@@ -411,17 +441,15 @@ impl Node {
     }
 
     /// Runs epoch after epoch, for good, starting each one's consensus with
-    /// `consensus`.
-    pub async fn run(
-        mut self,
-        mut consensus: impl FnMut(&Arc<EpochState>, ConsensusOutput) -> TransactionClient,
-    ) {
+    /// `consensus`, and stopping it before reconfiguring.
+    pub async fn run(mut self, mut consensus: impl Consensus) {
         loop {
             let mut ended = self.start_epoch(&mut consensus).pipeline.ended.clone();
             ended
                 .wait_for(Option::is_some)
                 .await
                 .expect("the committer lives as long as the epoch");
+            consensus.stop();
             // Joining the epoch's workers blocks.
             self = tokio::task::spawn_blocking(move || {
                 self.finish_epoch();

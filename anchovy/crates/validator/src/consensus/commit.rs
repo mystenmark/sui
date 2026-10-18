@@ -687,7 +687,20 @@ impl Processor for CommitStage {
     type Input = DecodedCommit;
     type Output = ();
 
+    /// Handles `commit`, then answers it: consensus may send the next.
     fn process(&mut self, mut commit: DecodedCommit) -> Option<()> {
+        let handled = commit.handled.take();
+        let decided = self.handle(commit);
+        if let Some(handled) = handled {
+            // Consensus may have stopped waiting; nothing to do then.
+            let _ = handled.send(());
+        }
+        decided
+    }
+}
+
+impl CommitStage {
+    fn handle(&mut self, mut commit: DecodedCommit) -> Option<()> {
         let leader_round = commit.leader.round;
         let rejected = std::mem::take(&mut commit.rejected);
         let positions: Vec<(BlockRef, TransactionIndex)> = commit

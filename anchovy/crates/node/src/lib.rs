@@ -86,6 +86,9 @@ pub struct ConsensusOutput {
     pub commits: Queue<CommitRequest>,
     /// The first commit to deliver: consensus-core's replay point.
     pub replay_from: u32,
+    /// The last commit the pipeline handled before it started: the commit
+    /// record's, or 0 at the epoch's start.
+    pub last_processed: u32,
 }
 
 /// What the commit handler starts the epoch from.
@@ -211,6 +214,7 @@ impl Pipeline {
             votes: queues.votes.clone(),
             commits: queues.commits.clone(),
             replay_from,
+            last_processed: resumed.map_or(0, |r| r.commit_index),
         });
         let parts = Arc::new(Parts {
             store: store.clone(),
