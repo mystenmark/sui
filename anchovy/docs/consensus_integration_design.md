@@ -7,6 +7,14 @@ already have consensus-core's shape: the voter answers blocks
 submissions go through `consensus::TransactionClient`, and a restart says
 where consensus replays from (`ConsensusOutput::replay_from`).
 
+## The boundary
+
+Async code reaches the pipeline one way: it pushes an entry onto one of
+the pipeline's queues, the entry carrying a oneshot, and awaits the
+oneshot. Nothing else crosses: no watches, flags or callbacks for async
+code to read. Acknowledgements, progress and flow control travel in the
+replies.
+
 ## A crate of glue: `consensus-glue`
 
 Only the translation between consensus-core and the pipeline, and
@@ -28,10 +36,12 @@ consensus-core. `consensus-glue` depends on consensus-core, consensus-config,
 ### Verifier
 
 `verify_and_vote_batch(block, transactions)` makes a `consensus::Block`,
-pushes a `VoteRequest` to the voter, and waits for its verdict: rejected
-indices, or an invalid block (`ValidationError::InvalidTransaction`).
-consensus-core calls it from blocking threads and, for its own blocks, inline
-in async code, where tokio's `blocking_recv` panics; so it waits with
+pushes a `VoteRequest` with its oneshot to the voter, and waits for the
+verdict: rejected indices, or an invalid block
+(`ValidationError::InvalidTransaction`). consensus-core's verifier is
+synchronous, so this one blocks on the oneshot rather than awaiting it. It
+is called from blocking threads and, for its own blocks, inline in async
+code, where tokio's `blocking_recv` panics; so it blocks with
 `futures::executor::block_on`, which only parks the thread. A closed queue
 (the epoch stopping) answers that the block is invalid; consensus is
 stopping too. `verify_batch` is the same, its rejections dropped: voting is
@@ -42,9 +52,11 @@ always on, as in sui.
 A task on consensus's runtime takes each `CommittedSubDag` from
 consensus-core's unbounded channel and pushes its copy (commit index and
 digest, leader, timestamp, blocks with their transactions, rejections) to
-the pipeline's commit queue, waiting while it is full. The commit stage
-publishes the last commit it handled (a `watch`, prior commits included);
-the glue sets the commit consumer monitor from it, as sui's handler does.
+the pipeline's commit queue, with a oneshot. The commit stage answers it
+once the commit is handled (prior commits included) and the pipeline can
+take the next. The task awaits the answer, then sets the commit consumer
+monitor to the commit and takes the next: one commit in flight, as sui's
+handler handles commits one at a time.
 
 ### Submission
 
@@ -64,6 +76,8 @@ before the node reconfigures, as sui shuts consensus down first.
 `ConsensusOutput` gains the last commit the pipeline handled (the commit
 record's index, 0 at the epoch's start): `CommitConsumerArgs::new(replay_from
 - 1, last_processed)`. The window before it is already in `replay_from`.
+These are values the pipeline hands consensus when it starts, not state it
+exposes.
 
 consensus-core is async, the node's epoch start is not, and it may run
 inside the node's own runtime. The runner owns a tokio runtime for
@@ -80,14 +94,17 @@ the directory is deleted.
 
 ## Backpressure (a decision)
 
-With a real consensus, commits can outrun execution. As sui: before
-pushing each commit, the glue waits while the object store holds more than
-a threshold of uncommitted transactions, unless every certified checkpoint
-has committed (else checkpoint building could deadlock). The pipeline
-exposes that signal; consensus-core's channel absorbs the wait, and only
-its commit sync slows, as in sui. The pipeline's internal queues stay
-bounded, a full one a sizing bug: the threshold must keep in-flight work
-under their capacities.
+With a real consensus, commits can outrun execution. As sui's handler
+awaits its backpressure manager before each commit: the commit stage
+withholds a commit's answer while the object store holds more than a
+threshold of uncommitted transactions, unless every certified checkpoint
+has committed (else checkpoint building could deadlock). The withheld
+answer is sent when the condition clears, by the checkpoint committer as
+it commits. So the glue, awaiting the answer, sends no further commit;
+consensus-core's channel absorbs the wait, and only its commit sync slows,
+as in sui. The pipeline's internal queues stay bounded, a full one a
+sizing bug: the threshold must keep in-flight work under their
+capacities.
 
 ## Tests
 
@@ -107,10 +124,10 @@ fast.
 ## Order of work
 
 1. The node's consensus trait (`start`, `stop`); `ConsensusOutput`'s last
-   handled commit; the commit stage's handled-commit watch; the epoch
-   directory's `store/` and `consensus/`.
+   handled commit; a oneshot on each `CommitRequest`, answered once
+   handled; the epoch directory's `store/` and `consensus/`.
 2. `consensus-glue`: committee and keys, configs, verifier, commits,
    submission, runner.
 3. One validator on real consensus.
 4. A genesis of several validators; four validators.
-5. Backpressure.
+5. Backpressure: commit answers withheld, and released by the committer.
