@@ -1696,6 +1696,8 @@ dependencies = [
 name = "consensus-glue"
 version = "0.1.0"
 dependencies = [
+ "bcs",
+ "checkpoint",
  "consensus",
  "consensus-config",
  "consensus-core",
@@ -1703,12 +1705,20 @@ dependencies = [
  "execution",
  "fastcrypto",
  "futures",
+ "messages",
  "mysten-metrics",
- "mysten-network",
  "node",
  "prometheus",
+ "protocol-config",
+ "rand 0.8.8",
+ "store",
+ "sui-config",
+ "sui-genesis-builder",
  "sui-protocol-config",
+ "sui-types",
+ "tempfile",
  "tokio",
+ "tonic 0.14.6",
  "validator",
  "workqueue",
 ]
