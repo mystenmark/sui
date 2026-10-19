@@ -1,18 +1,19 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! One anchovy validator and one sui validator, of equal stake: a quorum
-//! needs both, so a checkpoint certifies only if both built it the same.
-//! When they stop certifying, the test reports the first checkpoint they
-//! built differently, and the effects they disagree on.
+//! Sui validators with over two thirds of the stake, and one anchovy
+//! validator. Sui certifies checkpoints on its own, so anchovy's votes and
+//! signatures can hide no discrepancy; anchovy certifies only the
+//! checkpoints it built, and on a certificate of one it did not build (a
+//! fork) it panics, aborting the test. So a test needs only wait for
+//! anchovy to certify what it submitted.
 
 #[path = "../../node/tests/genesis/mod.rs"]
 mod genesis;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use consensus_glue::{Parameters, Runner};
@@ -22,30 +23,34 @@ use messages::base::ObjectId;
 use move_core_types::ident_str;
 use node::epoch::{Node, Perpetual, ValidatorKeys};
 use protocol_config::Chain;
+use rand::rngs::OsRng;
 use sui_config::NodeConfig;
 use sui_core::authority::AuthorityState;
 use sui_core::authority_client::{AuthorityAPI as _, NetworkAuthorityClient};
+use sui_swarm_config::genesis_config::ValidatorGenesisConfigBuilder;
 use sui_swarm_config::network_config_builder::ConfigBuilder;
 use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
+use sui_types::committee::CommitteeTrait as _;
 use sui_types::crypto::{AccountKeyPair, NetworkKeyPair};
 use sui_types::digests::TransactionDigest;
 use sui_types::effects::TransactionEffects;
 use sui_types::effects::TransactionEffectsAPI as _;
 use sui_types::gas_coin::{GAS, GasCoin};
 use sui_types::message_envelope::Message as _;
-use sui_types::messages_checkpoint::{
-    CertifiedCheckpointSummary, CheckpointContents, CheckpointSummary,
-};
+use sui_types::messages_checkpoint::{CheckpointContents, CheckpointSummary};
 use sui_types::messages_grpc::SubmitTxRequest;
 use sui_types::object::{Object, Owner};
 use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
-use sui_types::transaction::{Argument, CallArg, Command, ObjectArg, SharedObjectMutability};
+use sui_types::transaction::{
+    Argument, CallArg, Command, FundsWithdrawalArg, ObjectArg, SharedObjectMutability,
+};
 use sui_types::transaction::{SenderSignedData, Transaction, TransactionData};
 use sui_types::{SUI_CLOCK_OBJECT_ID, SUI_FRAMEWORK_PACKAGE_ID, TypeTag};
 use tokio::runtime::Runtime;
 use validator::Validator;
 use validator::current::CurrentEpoch;
 use validator::pipeline::items::CertifiedCheckpoint;
+use validator::pipeline::tables::CheckpointStore;
 use validator::proto::{
     RawSubmitTxRequest, RawValidatorSubmitStatus, RawWaitForEffectsRequest, SubmitTxType,
 };
@@ -56,20 +61,23 @@ const TIMEOUT: Duration = Duration::from_mins(2);
 const RGP: u64 = 1000;
 const BUDGET: u64 = 50_000_000;
 const SUI: u64 = 1_000_000_000;
+/// A validator's stake in sui's test networks.
+const STAKE: u64 = 20_000_000_000_000_000;
 
 /// Anchovy's node, which the test drives itself to see what it builds.
 struct Anchovy {
     node: Node,
     runner: Runner,
     certified_inbox: Inbox<CertifiedCheckpoint>,
-    certified: BTreeMap<u64, CertifiedCheckpointSummary>,
+    certified: BTreeSet<u64>,
     // Dropped after the node.
     _dir: tempfile::TempDir,
 }
 
 struct Network {
     runtime: Runtime,
-    sui: sui_swarm::memory::Node,
+    /// Validators with a quorum between them.
+    sui: Vec<sui_swarm::memory::Node>,
     sui_client: NetworkAuthorityClient,
     anchovy: Anchovy,
     /// An account genesis gave gas coins, by id.
@@ -94,18 +102,150 @@ fn keys(config: &NodeConfig) -> ValidatorKeys {
     }
 }
 
+/// What explains a fork, once anchovy has detected one: the first
+/// checkpoint the two sides built differently, from their stores.
+struct ForkReport {
+    sui: Arc<AuthorityState>,
+    store: Arc<store::Store>,
+    checkpoints: Arc<CheckpointStore>,
+}
+
+static FORK_REPORT: Mutex<Option<ForkReport>> = Mutex::new(None);
+
+/// On anchovy's fork panic, before it aborts the process, prints the report.
+fn report_forks() {
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if info
+                .payload_as_str()
+                .is_some_and(|m| m.starts_with("fork:"))
+                && let Some(report) = &*FORK_REPORT.lock().unwrap()
+            {
+                eprintln!("{}", report.report());
+            }
+            default(info);
+        }));
+    });
+}
+
+impl ForkReport {
+    /// Both summaries of the first checkpoint built differently, the
+    /// transactions only one side lists, and the effects of those both list
+    /// with different effects.
+    fn report(&self) -> String {
+        let checkpoints = self.sui.get_checkpoint_store();
+        for seq in 1.. {
+            let (Some(theirs), Some(ours)) = (
+                checkpoints.get_locally_computed_checkpoint(seq).unwrap(),
+                self.checkpoints.built(seq),
+            ) else {
+                return format!("no checkpoint through {seq} built differently");
+            };
+            let summary: CheckpointSummary = bcs::from_bytes(&ours.summary).unwrap();
+            if theirs.digest() == summary.digest() {
+                continue;
+            }
+            let their_contents = checkpoints
+                .get_checkpoint_contents(&theirs.content_digest)
+                .unwrap()
+                .expect("sui keeps the contents of what it built");
+            let our_contents: CheckpointContents = bcs::from_bytes(&ours.contents).unwrap();
+            let mut report =
+                format!("checkpoint {seq} forked\nsui: {theirs:#?}\nanchovy: {summary:#?}\n");
+            report += &self.contents_diff(&their_contents, &our_contents);
+            return report;
+        }
+        unreachable!()
+    }
+
+    fn contents_diff(&self, theirs: &CheckpointContents, ours: &CheckpointContents) -> String {
+        let listed = |contents: &CheckpointContents| -> BTreeMap<TransactionDigest, _> {
+            contents
+                .iter()
+                .map(|d| (d.transaction, d.effects))
+                .collect()
+        };
+        let (their_listed, our_listed) = (listed(theirs), listed(ours));
+        let cache = self.sui.get_transaction_cache_reader();
+        let mut diff = String::new();
+        for (digest, their_effects) in &their_listed {
+            match our_listed.get(digest) {
+                None => {
+                    let transaction = cache
+                        .get_transaction_block(digest)
+                        .map(|t| t.data().transaction_data().clone());
+                    writeln!(diff, "only sui lists {digest}: {transaction:#?}").unwrap();
+                }
+                Some(our_effects) if our_effects != their_effects => {
+                    let theirs = cache.get_executed_effects(digest);
+                    let ours = execution::executed(&self.store, &digest.into_inner())
+                        .unwrap()
+                        .map(|e| bcs::from_bytes::<TransactionEffects>(&e.effects).unwrap());
+                    writeln!(
+                        diff,
+                        "{digest}: effects differ\nsui: {theirs:#?}\nanchovy: {ours:#?}"
+                    )
+                    .unwrap();
+                }
+                Some(_) => {}
+            }
+        }
+        for digest in our_listed.keys().filter(|d| !their_listed.contains_key(d)) {
+            let transaction = self
+                .store
+                .transaction(&Digest::new(digest.into_inner()))
+                .unwrap()
+                .map(|t| {
+                    bcs::from_bytes::<SenderSignedData>(t.wire_bytes())
+                        .unwrap()
+                        .transaction_data()
+                        .clone()
+                });
+            writeln!(diff, "only anchovy lists {digest}: {transaction:#?}").unwrap();
+        }
+        diff
+    }
+}
+
 impl Network {
-    /// A genesis of two validators, as sui's test networks make it: the
-    /// first run by sui, the second by anchovy.
+    /// A genesis of three validators, as sui's test networks make it: two
+    /// run by sui, the last by anchovy. Voting power is capped at a third
+    /// of it each (`voting_power::set_voting_power`), so the two with more
+    /// stake have 3,334 votes each, a quorum together, and anchovy 3,332,
+    /// too few to reject a transaction.
     fn new() -> Network {
         telemetry_subscribers::init_for_testing();
+        let validators = [3 * STAKE, 3 * STAKE, STAKE]
+            .into_iter()
+            .map(|stake| {
+                ValidatorGenesisConfigBuilder::new()
+                    .with_stake(stake)
+                    .build(&mut OsRng)
+            })
+            .collect();
         let config = ConfigBuilder::new_with_temp_dir()
-            .committee_size(NonZeroUsize::new(2).unwrap())
+            .with_validators(validators)
             .build();
+        let (sui_configs, [anchovy_config]) = config.validator_configs.split_at(2) else {
+            unreachable!("three validators");
+        };
+        let committee = config.genesis.committee();
+        let votes = |c: &NodeConfig| committee.weight(&c.protocol_public_key());
+        assert!(sui_configs.iter().map(votes).sum::<u64>() >= committee.quorum_threshold());
+        assert!(votes(anchovy_config) < committee.validity_threshold());
+
         let runtime = Runtime::new().unwrap();
-        let sui_config = &config.validator_configs[0];
-        let sui = sui_swarm::memory::Node::new(sui_config.clone());
-        runtime.block_on(sui.start()).unwrap();
+        let sui: Vec<_> = sui_configs
+            .iter()
+            .map(|c| {
+                let node = sui_swarm::memory::Node::new(c.clone());
+                runtime.block_on(node.start()).unwrap();
+                node
+            })
+            .collect();
+        let sui_config = &sui_configs[0];
         let sui_client = runtime
             .block_on(NetworkAuthorityClient::connect(
                 &sui_config.network_address,
@@ -114,8 +254,13 @@ impl Network {
             .unwrap();
         let key = config.account_keys[0].copy();
         let sender = SuiAddress::from(key.public());
-        let (anchovy, coins) =
-            Anchovy::start(&config.validator_configs[1], &config.genesis, sender);
+        report_forks();
+        let (anchovy, coins) = Anchovy::start(anchovy_config, &config.genesis, sender);
+        *FORK_REPORT.lock().unwrap() = Some(ForkReport {
+            sui: sui[0].get_node_handle().unwrap().state(),
+            store: anchovy.node.perpetual.store.clone(),
+            checkpoints: anchovy.node.running().unwrap().pipeline.checkpoints.clone(),
+        });
         Network {
             runtime,
             sui,
@@ -212,6 +357,45 @@ impl Network {
                 ],
             )
             .unwrap();
+        })
+    }
+
+    /// Sends `amount` split off coin `i` to the sender's address balance.
+    fn send_funds(&self, i: usize, amount: u64) -> Transaction {
+        let sender = self.sender;
+        self.ptb(i, |b| {
+            let amount = b.pure(amount).unwrap();
+            let coin = b.command(Command::SplitCoins(Argument::GasCoin, vec![amount]));
+            let recipient = b.pure(sender).unwrap();
+            b.programmable_move_call(
+                SUI_FRAMEWORK_PACKAGE_ID,
+                ident_str!("coin").to_owned(),
+                ident_str!("send_funds").to_owned(),
+                vec![GAS::type_tag()],
+                vec![coin, recipient],
+            );
+        })
+    }
+
+    /// Withdraws `amount` from the sender's address balance into a coin,
+    /// paid with coin `i`.
+    fn withdraw(&self, i: usize, amount: u64) -> Transaction {
+        let sender = self.sender;
+        self.ptb(i, |b| {
+            let withdrawal = b
+                .funds_withdrawal(FundsWithdrawalArg::balance_from_sender(
+                    amount,
+                    GAS::type_tag(),
+                ))
+                .unwrap();
+            let coin = b.programmable_move_call(
+                SUI_FRAMEWORK_PACKAGE_ID,
+                ident_str!("coin").to_owned(),
+                ident_str!("redeem_funds").to_owned(),
+                vec![GAS::type_tag()],
+                vec![withdrawal],
+            );
+            b.transfer_arg(sender, coin);
         })
     }
 
@@ -325,14 +509,14 @@ impl Network {
         })
     }
 
-    /// Submits `transactions` through sui's validator service, then waits as
+    /// Submits `transactions` through a sui validator's service, then waits as
     /// `execute_together`.
     fn execute_through_sui(&mut self, transactions: &[&Transaction]) -> Vec<TransactionEffects> {
         self.submit_through_sui(transactions);
         self.agree_on(transactions)
     }
 
-    /// Submits `transactions` through sui's validator service, one request
+    /// Submits `transactions` through a sui validator's service, one request
     /// each, without waiting for their effects.
     fn submit_through_sui(&mut self, transactions: &[&Transaction]) {
         let client = &self.sui_client;
@@ -347,8 +531,8 @@ impl Network {
         });
     }
 
-    /// Waits until both validators have executed `transactions`, with the
-    /// same effects, and certified their checkpoints; their effects.
+    /// Waits until anchovy has certified the checkpoints of `transactions`,
+    /// each of which succeeded; their effects.
     fn agree_on(&mut self, transactions: &[&Transaction]) -> Vec<TransactionEffects> {
         transactions
             .iter()
@@ -357,18 +541,12 @@ impl Network {
                     network.anchovy.checkpoint_of(transaction.digest())
                 });
                 self.wait_for_certified(seq);
-                let ours = self
+                let effects = self
                     .anchovy
                     .effects(transaction.digest())
                     .expect("executed");
-                let theirs = self
-                    .sui()
-                    .get_transaction_cache_reader()
-                    .get_executed_effects(transaction.digest())
-                    .expect("executed");
-                assert_eq!(ours, theirs);
-                assert!(ours.status().is_ok(), "{:?}", ours.status());
-                ours
+                assert!(effects.status().is_ok(), "{:?}", effects.status());
+                effects
             })
             .collect()
     }
@@ -383,125 +561,31 @@ impl Network {
             }
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for {what}\n{}",
-                self.report()
+                "timed out waiting for {what}: sui certified through {:?}, anchovy {:?}",
+                self.sui()
+                    .get_checkpoint_store()
+                    .get_highest_verified_checkpoint()
+                    .unwrap()
+                    .map(|c| *c.sequence_number()),
+                self.anchovy.certified.last(),
             );
             std::thread::sleep(Duration::from_millis(50));
         }
     }
 
+    /// The first sui validator's state.
     fn sui(&self) -> Arc<AuthorityState> {
-        self.sui
+        self.sui[0]
             .get_node_handle()
             .expect("the sui node is running")
             .state()
     }
 
-    /// Waits until both validators have certified checkpoint `seq`;
-    /// reports where they disagree if they do not.
+    /// Waits until anchovy has certified checkpoint `seq`, as sui did.
     fn wait_for_certified(&mut self, seq: u64) {
         self.wait_for(&format!("checkpoint {seq} to certify"), |network| {
-            let sui = network
-                .sui()
-                .get_checkpoint_store()
-                .get_checkpoint_by_sequence_number(seq)
-                .unwrap();
-            (sui.is_some() && network.anchovy.certified.contains_key(&seq)).then_some(())
+            network.anchovy.certified.contains(&seq).then_some(())
         });
-    }
-
-    /// How far each validator got, and the first checkpoint they built
-    /// differently.
-    fn report(&self) -> String {
-        let sui = self.sui();
-        let checkpoints = sui.get_checkpoint_store();
-        let sui_certified = checkpoints
-            .get_highest_verified_checkpoint()
-            .unwrap()
-            .map(|c| *c.sequence_number());
-        let mut report = format!(
-            "sui: certified through {sui_certified:?}\nanchovy: certified through {:?}\n",
-            self.anchovy.certified.keys().last()
-        );
-        for seq in 1.. {
-            let built = (
-                checkpoints.get_locally_computed_checkpoint(seq).unwrap(),
-                self.anchovy.built(seq),
-            );
-            let (Some(sui_built), Some((anchovy_built, anchovy_contents))) = built else {
-                writeln!(
-                    report,
-                    "checkpoint {seq}: built by sui: {}, by anchovy: {}",
-                    built.0.is_some(),
-                    built.1.is_some()
-                )
-                .unwrap();
-                break;
-            };
-            if sui_built.digest() == anchovy_built.digest() {
-                continue;
-            }
-            let sui_contents = checkpoints
-                .get_checkpoint_contents(&sui_built.content_digest)
-                .unwrap()
-                .expect("sui keeps the contents of what it built");
-            writeln!(
-                report,
-                "checkpoint {seq} forked\nsui: {sui_built:#?}\nanchovy: {anchovy_built:#?}"
-            )
-            .unwrap();
-            report += &self.contents_diff(&sui, &sui_contents, &anchovy_contents);
-            break;
-        }
-        report
-    }
-
-    /// The transactions only one side's contents list, and the effects of
-    /// those both list with different effects.
-    fn contents_diff(
-        &self,
-        sui: &AuthorityState,
-        sui_contents: &CheckpointContents,
-        anchovy_contents: &CheckpointContents,
-    ) -> String {
-        let effects = |contents: &CheckpointContents| -> BTreeMap<TransactionDigest, _> {
-            contents
-                .iter()
-                .map(|d| (d.transaction, d.effects))
-                .collect()
-        };
-        let (sui_listed, anchovy_listed) = (effects(sui_contents), effects(anchovy_contents));
-        let mut diff = String::new();
-        for (digest, sui_effects) in &sui_listed {
-            match anchovy_listed.get(digest) {
-                None => {
-                    let transaction = sui
-                        .get_transaction_cache_reader()
-                        .get_transaction_block(digest)
-                        .map(|t| t.data().transaction_data().clone());
-                    writeln!(diff, "only sui lists {digest}: {transaction:#?}").unwrap();
-                }
-                Some(anchovy_effects) if anchovy_effects != sui_effects => {
-                    let theirs = sui
-                        .get_transaction_cache_reader()
-                        .get_executed_effects(digest);
-                    let ours = self.anchovy.effects(digest);
-                    writeln!(
-                        diff,
-                        "{digest}: effects differ\nsui: {theirs:#?}\nanchovy: {ours:#?}"
-                    )
-                    .unwrap();
-                }
-                Some(_) => {}
-            }
-        }
-        for digest in anchovy_listed.keys() {
-            if !sui_listed.contains_key(digest) {
-                let transaction = self.anchovy.transaction(digest);
-                writeln!(diff, "only anchovy lists {digest}: {transaction:#?}").unwrap();
-            }
-        }
-        diff
     }
 }
 
@@ -544,7 +628,7 @@ impl Anchovy {
             node,
             runner,
             certified_inbox,
-            certified: BTreeMap::new(),
+            certified: BTreeSet::new(),
             _dir: dir,
         };
         (anchovy, genesis.coins)
@@ -552,37 +636,21 @@ impl Anchovy {
 
     fn poll(&mut self) {
         while let Some(certified) = self.certified_inbox.try_pop() {
-            let summary = bcs::from_bytes(&certified.summary).unwrap();
-            self.certified.insert(certified.seq, summary);
+            self.certified.insert(certified.seq);
         }
-    }
-
-    /// Checkpoint `seq` as anchovy built it, with its contents.
-    fn built(&self, seq: u64) -> Option<(CheckpointSummary, CheckpointContents)> {
-        let built = self.node.running()?.pipeline.checkpoints.built(seq)?;
-        Some((
-            bcs::from_bytes(&built.summary).unwrap(),
-            bcs::from_bytes(&built.contents).unwrap(),
-        ))
     }
 
     /// The checkpoint anchovy built listing `transaction`.
     fn checkpoint_of(&self, transaction: &TransactionDigest) -> Option<u64> {
+        let checkpoints = &self.node.running()?.pipeline.checkpoints;
         (1..)
-            .map_while(|seq| Some((seq, self.built(seq)?.1)))
+            .map_while(|seq| {
+                let contents: CheckpointContents =
+                    bcs::from_bytes(&checkpoints.built(seq)?.contents).unwrap();
+                Some((seq, contents))
+            })
             .find(|(_, contents)| contents.iter().any(|d| d.transaction == *transaction))
             .map(|(seq, _)| seq)
-    }
-
-    fn transaction(&self, digest: &TransactionDigest) -> Option<TransactionData> {
-        let transaction = self
-            .node
-            .perpetual
-            .store
-            .transaction(&Digest::new(digest.into_inner()))
-            .unwrap()?;
-        let data: SenderSignedData = bcs::from_bytes(transaction.wire_bytes()).unwrap();
-        Some(data.transaction_data().clone())
     }
 
     fn effects(&self, digest: &TransactionDigest) -> Option<TransactionEffects> {
@@ -674,6 +742,20 @@ fn a_double_spend_in_one_block_executes_alike() {
     network.agree_on(&[&winner]);
     let later = network.transfer(1);
     network.execute(&later);
+    drop(network.runtime);
+}
+
+#[test]
+fn address_balances_settle_alike() {
+    let mut network = Network::new();
+    let send = network.send_funds(0, 3 * SUI);
+    network.execute(&send);
+    let withdraw = network.withdraw(1, SUI);
+    network.execute(&withdraw);
+    let through_sui = network.withdraw(2, SUI);
+    network.execute_through_sui(&[&through_sui]);
+    let again = network.send_funds(0, SUI);
+    network.execute(&again);
     drop(network.runtime);
 }
 
