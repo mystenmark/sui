@@ -263,6 +263,11 @@ impl Pending {
 
     /// Records a signature over a summary other than the local one: a fork,
     /// here or there. It never counts toward the local summary's quorum.
+    ///
+    /// # Panics
+    /// Once a quorum has signed the other summary: the network certified a
+    /// checkpoint this validator did not build, which sui finds when state
+    /// sync brings it the certificate, and halts on.
     fn add_other(
         &mut self,
         committee: &Committee,
@@ -293,6 +298,13 @@ impl Pending {
         let (signers, stake) = self.others.entry(digest).or_default();
         signers.push(position);
         *stake += member.stake;
+        assert!(
+            *stake < committee.quorum_threshold(),
+            "fork: a quorum certified checkpoint {} {:?}, not the {:?} this validator built",
+            self.local.seq,
+            Digest::new(digest),
+            Digest::new(self.local.digest),
+        );
         self.vote(position, member.stake);
         warn!(
             seq = self.local.seq,
@@ -306,6 +318,9 @@ impl Pending {
 
     /// sui's `check_for_split_brain`: no quorum is reachable on any summary
     /// whatever the members yet to sign do.
+    ///
+    /// # Panics
+    /// On a split brain, in a debug build, as sui's `debug_fatal!`.
     fn check_split_brain(&mut self, committee: &Committee) {
         let plurality = self
             .others
@@ -328,6 +343,13 @@ impl Pending {
                 local_stake = self.stake,
                 ?factions,
                 "checkpoint split brain: no summary can reach a quorum"
+            );
+            debug_assert!(
+                false,
+                "checkpoint split brain at checkpoint {}: ours {:?} with stake {}, others {factions:?}",
+                self.local.seq,
+                Digest::new(self.local.digest),
+                self.stake,
             );
         }
     }

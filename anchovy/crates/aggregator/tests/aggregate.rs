@@ -364,19 +364,39 @@ fn outsiders_and_other_epochs_are_dropped() {
 }
 
 #[test]
-fn signatures_over_another_summary_never_count() {
+#[should_panic(expected = "fork: a quorum certified checkpoint 3")]
+fn a_quorum_over_another_summary_is_a_fork() {
     let mut s = setup(4, 3);
     let local = summary(3, 0);
     let fork = summary(3, 1);
     build(&s.checkpoints, &local);
     s.feed(vec![
+        s.signature(&local, 3),
         s.signature(&fork, 0),
         s.signature(&fork, 1),
         s.signature(&fork, 2),
-        s.signature(&local, 3),
     ]);
-    assert!(s.take_certified().is_empty());
+}
 
+#[test]
+#[should_panic(expected = "checkpoint split brain at checkpoint 3")]
+fn a_split_brain_panics_in_a_debug_build() {
+    let mut s = setup(4, 3);
+    let local = summary(3, 0);
+    let fork = summary(3, 1);
+    build(&s.checkpoints, &local);
+    s.feed(vec![
+        s.signature(&local, 0),
+        s.signature(&local, 1),
+        s.signature(&fork, 2),
+        s.signature(&fork, 3),
+    ]);
+}
+
+#[test]
+fn signatures_over_another_summary_never_count() {
+    let local = summary(3, 0);
+    let fork = summary(3, 1);
     // One forked signer does not stop the rest certifying.
     let mut s = setup(4, 3);
     build(&s.checkpoints, &local);
