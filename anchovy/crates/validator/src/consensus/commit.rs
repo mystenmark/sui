@@ -14,20 +14,19 @@
 //! `CommitStage` lays the schedule out in chunks and checkpoints for the
 //! pipeline. Congestion control is not here yet.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use ::consensus::{BlockRef, TransactionIndex};
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest as _};
 use messages::base::ObjectRef;
-use messages::transaction::TransactionKind;
 use workqueue::{Processor, Refusal, Refuse};
 
-use crate::checks::VerifiedTransaction;
-use crate::consensus::decode::{CommittedTransaction, DecodedCommit, OwnedInputs};
+use crate::consensus::decode::{CommittedTransaction, DecodedCommit};
+use crate::consensus::deferral::{DeferralKey, Deferred, decode_deferred, encode_deferred};
 use crate::consensus::execution_time::{
-    ExecutionTimeEstimator, SharedObservations, decode_estimates, encode_estimates,
+    ExecutionTimeEstimator, decode_estimates, encode_estimates,
 };
 use crate::consensus::sequence::{
     Prologue, Schedule, Scheduled, Sequencer, SharedAccess, SharedOrdinal,
@@ -62,9 +61,15 @@ pub struct HandledCommit {
     pub origins: HashMap<[u8; 32], (BlockRef, TransactionIndex)>,
     /// Transactions processed in earlier commits, or earlier in this one.
     pub duplicates: Vec<(BlockRef, TransactionIndex, [u8; 32])>,
+    /// Transactions deferred to a later round, in schedule order.
+    pub deferred: Vec<(BlockRef, TransactionIndex, [u8; 32])>,
     /// Transactions dropped before scheduling, in consensus order. Like the
     /// reference's, they are processed: a later inclusion is a duplicate.
     pub dropped: Vec<(BlockRef, TransactionIndex, [u8; 32], DropReason)>,
+    /// Each scheduled user transaction's execution time estimate, in
+    /// microseconds, in schedule order: what the reference's
+    /// `IndirectStateObserver` sees.
+    pub estimates_us: Vec<u64>,
     pub cache_hits: usize,
     pub cache_misses: usize,
 }
@@ -79,10 +84,12 @@ impl Refuse for HandledCommit {
 /// - the user transactions processed this epoch;
 /// - the owned references locked this epoch, and the transaction holding
 ///   each: the reference's `owned_object_locked_transactions`;
-/// - each shared-object stream's last scheduled generation.
+/// - each shared-object stream's last scheduled generation;
+/// - the transactions deferred to later rounds, by `DeferralKey`;
+/// - the execution time observations taken.
 ///
-/// Each is only looked up, never iterated, so no order of theirs can reach
-/// an output.
+/// Each is only looked up, or iterated in key order, so no order of a hash
+/// table's can reach an output.
 ///
 /// Run inside `CommitStage`, which feeds it decoded commits and lays out
 /// what it decides.
@@ -91,29 +98,30 @@ pub struct CommitHandler {
     last_commit: u32,
     output: ConsensusOutput,
     sequencer: Sequencer,
+    execution_times: ExecutionTimeEstimator,
 }
 
 impl CommitHandler {
-    /// A handler that has handled the commits through `last_commit`.
-    pub fn new(output: ConsensusOutput, last_commit: u32) -> CommitHandler {
+    /// A handler that has handled the commits through `last_commit`, with
+    /// the execution time observations of those written restored.
+    pub fn new(
+        output: ConsensusOutput,
+        last_commit: u32,
+        mut execution_times: ExecutionTimeEstimator,
+    ) -> CommitHandler {
+        for (generation, author, estimates) in output.execution_time_observations() {
+            execution_times.restore(author, generation, &decode_estimates(&estimates));
+        }
         CommitHandler {
             last_commit,
             output,
             sequencer: Sequencer::new(),
+            execution_times,
         }
     }
 
     /// Ends the commit just handled, with what `CommitStage` decided of it:
     /// see `ConsensusOutput::finish_commit`.
-    /// Execution time observations the commit being decided took.
-    pub fn put_execution_time_observations(&mut self, shared: &SharedObservations) {
-        self.output.put_execution_time_observations(
-            shared.author,
-            shared.generation,
-            encode_estimates(&shared.estimates),
-        );
-    }
-
     pub fn finish(&mut self, record: &CommitRecord, height: u64, drained: bool) {
         self.output.finish_commit(record.encode(), height, drained);
     }
@@ -134,17 +142,17 @@ impl CommitHandler {
             commit_digest: commit.digest,
         };
 
-        // 2. Deduplicate against the transactions processed before: this
-        //    handler's own record, never the store. Then lock owned inputs in
-        //    consensus order, as the reference's `filter_consensus_txns`.
-        //
-        //    The reference locks before deduplicating, and a lock held by the
-        //    same digest is no conflict. Deduplicating first decides the
-        //    same: a repeat either won all its locks or was dropped, and is
-        //    dropped again either way.
-        let mut accepted = Vec::with_capacity(commit.transactions.len());
-        let mut origins = HashMap::with_capacity(commit.transactions.len());
-        let mut duplicates = Vec::new();
+        let round = u64::from(commit.leader.round);
+        let config = &epoch.config;
+
+        // 2. Lock owned inputs in consensus order, as the reference's
+        //    `filter_consensus_txns`: a transaction an input of which another
+        //    holds is dropped, and if that one took it earlier in this
+        //    commit, the holder is contested. Dropped transactions are
+        //    processed: a later inclusion is a duplicate.
+        let mut taken: HashMap<ObjectRef, TxDigest> = HashMap::new();
+        let mut contested = HashSet::new();
+        let mut locked = Vec::with_capacity(commit.transactions.len());
         let mut dropped = Vec::new();
         for CommittedTransaction {
             block,
@@ -154,48 +162,127 @@ impl CommitHandler {
         } in commit.transactions
         {
             let digest = transaction.get().0.digest().bytes;
+            let owned = match owned {
+                Ok(owned) => owned,
+                Err(e) => {
+                    self.output.set_processed(digest);
+                    dropped.push((block, index, digest, DropReason::Inputs(e)));
+                    continue;
+                }
+            };
+            if let Err(conflict) = self.lock(digest, &owned) {
+                contested.extend(owned.iter().filter_map(|r| taken.get(r).copied()));
+                self.output.set_processed(digest);
+                dropped.push((block, index, digest, conflict));
+                continue;
+            }
+            taken.extend(owned.iter().map(|r| (*r, digest)));
+            locked.push((block, index, transaction));
+        }
+
+        // 3. Deduplicate against the transactions processed before, this
+        //    handler's own record: `deduplicate_consensus_txns`.
+        let mut accepted = Vec::with_capacity(locked.len());
+        let mut origins = HashMap::with_capacity(locked.len());
+        let mut duplicates = Vec::new();
+        for (block, index, transaction) in locked {
+            let digest = transaction.get().0.digest().bytes;
             if self.output.is_processed(&digest) {
                 duplicates.push((block, index, digest));
                 continue;
             }
             self.output.set_processed(digest);
-            if let Err(drop) = self.lock(digest, owned) {
-                dropped.push((block, index, digest, drop));
-                continue;
-            }
             origins.insert(digest, (block, index));
             accepted.push(transaction);
         }
 
-        // 3. The schedule: the prologue, the transactions in protocol order,
-        //    shared accesses with their ordinals, linked to earlier rounds.
-        let mut schedule = self.sequencer.schedule(&epoch.config, prologue, accepted);
+        // 4. The commit's execution time observations, before its
+        //    transactions are estimated.
+        for shared in &commit.observations {
+            if self.execution_times.observe(shared) {
+                self.output.put_execution_time_observations(
+                    shared.author,
+                    shared.generation,
+                    encode_estimates(&shared.estimates),
+                );
+            }
+        }
+
+        // 5. The transactions deferred to this round, then the commit's, in
+        //    protocol order: `merge_and_reorder_transactions`.
+        let mut previously_deferred = HashMap::new();
+        let mut transactions = Vec::with_capacity(accepted.len());
+        for (key, deferred) in self.output.take_deferred(DeferralKey::due_by(round)) {
+            for deferred in decode_deferred(&deferred) {
+                previously_deferred.insert(deferred.digest(), key);
+                origins.insert(deferred.digest(), deferred.origin);
+                transactions.push(deferred.transaction);
+            }
+        }
+        transactions.extend(accepted);
+        let ordered = self.sequencer.order(config, transactions);
+
+        // 6. Each, in order, deferred or estimated and scheduled:
+        //    `handle_deferral_and_cancellation`. A contested holder is
+        //    deferred a round, as a penalty for the double spend.
+        let mut deferred: BTreeMap<DeferralKey, Vec<Deferred>> = BTreeMap::new();
+        let mut deferred_here = Vec::new();
+        let mut admitted = Vec::with_capacity(ordered.len());
+        let mut estimates_us = Vec::with_capacity(ordered.len());
+        for transaction in ordered {
+            let digest = transaction.get().0.digest().bytes;
+            if contested.contains(&digest) && config.defer_owned_object_double_spend() {
+                let from = previously_deferred
+                    .get(&digest)
+                    .map_or(round, DeferralKey::deferred_from_round);
+                let key = DeferralKey::next_round(round, from);
+                if key.within_limit(config.max_deferral_rounds_for_congestion_control()) {
+                    let origin = origins.remove(&digest).expect("each transaction's origin");
+                    deferred_here.push((origin.0, origin.1, digest));
+                    deferred.entry(key).or_default().push(Deferred {
+                        origin,
+                        transaction,
+                    });
+                    continue;
+                }
+            }
+            estimates_us.push(self.execution_times.estimate_us(&transaction));
+            admitted.push(transaction);
+        }
+        for (key, transactions) in deferred {
+            self.output.defer(key, encode_deferred(&transactions));
+        }
+
+        // 7. The schedule: the prologue, then the transactions, with shared
+        //    accesses and their ordinals, linked to earlier rounds.
+        let mut schedule = self.sequencer.schedule(prologue, admitted);
         self.link(schedule.all_accesses_mut());
         Some(HandledCommit {
             commit_index: commit.commit_index,
             schedule,
             origins,
             duplicates,
+            deferred: deferred_here,
             dropped,
+            estimates_us,
             cache_hits: commit.cache_hits,
             cache_misses: commit.cache_misses,
         })
     }
 
-    /// Locks `owned` for `digest`, unless one of them is locked already:
-    /// `try_acquire_owned_object_locks_post_consensus`. Every reference is
-    /// checked before any is locked, so a transaction listing one twice
-    /// does not conflict with itself.
-    fn lock(&mut self, digest: TxDigest, owned: OwnedInputs) -> Result<(), DropReason> {
-        let owned = owned.map_err(DropReason::Inputs)?;
-        if let Some((object, holder)) = owned
-            .iter()
-            .find_map(|r| self.output.lock_holder(r).map(|holder| (*r, holder)))
-        {
+    /// Locks `owned` for `digest`, unless another transaction holds one of
+    /// them: `try_acquire_owned_object_locks_post_consensus`. Every
+    /// reference is checked before any is locked, so a transaction listing
+    /// one twice does not conflict with itself.
+    fn lock(&mut self, digest: TxDigest, owned: &[ObjectRef]) -> Result<(), DropReason> {
+        if let Some((object, holder)) = owned.iter().find_map(|r| {
+            let holder = self.output.lock_holder(r)?;
+            (holder != digest).then_some((*r, holder))
+        }) {
             return Err(DropReason::LockConflict { object, holder });
         }
         for object in owned {
-            self.output.set_lock(object, digest);
+            self.output.set_lock(*object, digest);
         }
         Ok(())
     }
@@ -380,7 +467,6 @@ pub struct CommitStage {
     start: EpochStart,
     queue: CheckpointQueue,
     commit_times: CommitIntervalObserver,
-    execution_times: ExecutionTimeEstimator,
     /// Commits through this one were decided before a restart: replayed,
     /// they only rebuild the commit interval observer, which is in memory,
     /// as the reference's prior commits do.
@@ -410,13 +496,10 @@ impl CommitStage {
         settlements: workqueue::Queue<SettlementInput>,
         checkpoints: workqueue::Queue<waiter::Command<ChunkSettled, PendingCheckpoint>>,
         statuses: Arc<ConsensusTxStatusCache>,
-        mut execution_times: ExecutionTimeEstimator,
+        execution_times: ExecutionTimeEstimator,
     ) -> CommitStage {
         // From the last commit written, if any; else the epoch's start.
         let record = output.record().map(|bytes| CommitRecord::decode(&bytes));
-        for (generation, author, estimates) in output.execution_time_observations() {
-            execution_times.restore(author, generation, &decode_estimates(&estimates));
-        }
         let queue = match record {
             Some(r) => CheckpointQueue::resumed(r.height, r.next_seq, r.last_built_timestamp),
             None => CheckpointQueue::new(start.previous_checkpoint, start.previous_height),
@@ -424,11 +507,10 @@ impl CommitStage {
         let prior_through = record.map_or(0, |r| r.commit_index);
         CommitStage {
             epoch,
-            handler: CommitHandler::new(output, prior_through),
+            handler: CommitHandler::new(output, prior_through, execution_times),
             start,
             queue,
             commit_times: CommitIntervalObserver::default(),
-            execution_times,
             prior_through,
             last_commit: record.map(|r| r.commit_index),
             closed: record.is_some_and(|r| r.closed),
@@ -450,7 +532,7 @@ impl CommitStage {
 
     /// Decides `commit` and lays it out in chunks and checkpoints, or
     /// nothing if it was handled before or follows the epoch's last.
-    pub fn decide(&mut self, mut commit: DecodedCommit) -> Option<Decided> {
+    pub fn decide(&mut self, commit: DecodedCommit) -> Option<Decided> {
         let epoch = &self.epoch.clone();
         if commit.commit_index <= self.prior_through {
             self.commit_times.observe(
@@ -464,19 +546,13 @@ impl CommitStage {
         if self.closed {
             return None;
         }
-        let observations = std::mem::take(&mut commit.observations);
         let HandledCommit {
             mut schedule,
             origins,
             dropped,
+            estimates_us,
             ..
         } = self.handler.handle(epoch, commit)?;
-        // Before the commit's transactions are estimated, as the reference.
-        for shared in observations {
-            if self.execution_times.observe(&shared) {
-                self.handler.put_execution_time_observations(&shared);
-            }
-        }
         let config = &epoch.config;
         let Some(&Scheduled::Prologue(prologue)) = schedule.transactions.first() else {
             unreachable!("a schedule starts with its prologue");
@@ -496,11 +572,9 @@ impl CommitStage {
             config.get_consensus_commit_rate_estimation_window_size(),
             prologue.timestamp_ms,
         );
-        let estimates = schedule.transactions.iter().filter_map(|t| match t {
-            Scheduled::User(transaction) => Some(self.estimate_us(transaction)),
-            Scheduled::Prologue(_) => None,
-        });
-        let digest = self.commit_times.digest(&indirect_state_digest(estimates));
+        let digest = self
+            .commit_times
+            .digest(&indirect_state_digest(estimates_us));
         let mut prologue_transaction = Some(prologue_transaction(&prologue, &digest));
 
         // 2. Each transaction with its shared accesses, in schedule order.
@@ -569,17 +643,6 @@ impl CommitStage {
         let mut decided = self.chunk(epoch, &prologue, entries, digests, close);
         decided.dropped = dropped;
         Some(decided)
-    }
-
-    /// `transaction`'s estimated execution time, in whole microseconds, as
-    /// the reference's `get_tx_cost`.
-    fn estimate_us(&self, transaction: &VerifiedTransaction) -> u64 {
-        let TransactionKind::ProgrammableTransaction(ptb) = transaction.get().0.data().kind()
-        else {
-            unreachable!("validation admits only programmable user transactions");
-        };
-        let estimate = self.execution_times.estimate(ptb.commands);
-        u64::try_from(estimate.as_micros()).unwrap_or(u64::MAX)
     }
 
     /// Chunks of at most `max_transactions_per_checkpoint`, each with the

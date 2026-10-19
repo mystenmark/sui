@@ -212,6 +212,15 @@ fn scheduled(handled: &HandledCommit) -> Vec<[u8; 32]> {
         .collect()
 }
 
+/// The digests of the user transactions deferred to a later round.
+fn deferred(handled: &HandledCommit) -> Vec<[u8; 32]> {
+    handled
+        .deferred
+        .iter()
+        .map(|(.., digest)| *digest)
+        .collect()
+}
+
 /// Each dropped transaction's digest, and the reference and holder of the
 /// lock it lost.
 fn conflicts(handled: &HandledCommit) -> Vec<([u8; 32], messages::base::ObjectRef, [u8; 32])> {
@@ -233,6 +242,22 @@ fn wire(r: &ObjectRef) -> messages::base::ObjectRef {
     }
 }
 
+/// A handler of a committee of one, that has handled no commit.
+fn new_handler(output: validator::epoch_store::ConsensusOutput) -> CommitHandler {
+    let config = protocol_config::ProtocolConfig::get_for_version(
+        protocol_config::ProtocolVersion::MAX,
+        protocol_config::Chain::Unknown,
+    );
+    CommitHandler::new(
+        output,
+        0,
+        validator::consensus::execution_time::ExecutionTimeEstimator::new(
+            vec![([0; 96], 10_000)],
+            &config,
+        ),
+    )
+}
+
 #[test]
 fn the_later_of_two_transactions_spending_one_object_in_a_commit_is_dropped() {
     let epoch = epoch();
@@ -241,21 +266,70 @@ fn the_later_of_two_transactions_spending_one_object_in_a_commit_is_dropped() {
     let first = sender.transaction(random_object_ref(), &[object]);
     let second = sender.transaction(random_object_ref(), &[object]);
     let (output, _dir) = consensus_output();
-    let mut handler = CommitHandler::new(output, 0);
+    let mut handler = new_handler(output);
     let decided = handler
         .handle(&epoch, commit(1, &[(&first, &[]), (&second, &[])]))
+        .unwrap();
+    // The holder of the contested lock waits a round, as a penalty.
+    assert!(scheduled(&decided).is_empty());
+    assert_eq!(deferred(&decided), vec![digest(&first)]);
+    assert_eq!(
+        conflicts(&decided),
+        vec![(digest(&second), wire(&object), digest(&first))]
+    );
+    // Included again, the dropped one loses the lock again, as locks are
+    // taken before deduplication; the deferred one is scheduled.
+    let decided = handler
+        .handle(&epoch, commit(2, &[(&second, &[])]))
         .unwrap();
     assert_eq!(scheduled(&decided), vec![digest(&first)]);
     assert_eq!(
         conflicts(&decided),
         vec![(digest(&second), wire(&object), digest(&first))]
     );
-    // Dropped, it is processed: included again, it is a duplicate.
+    assert!(decided.duplicates.is_empty());
+}
+
+#[test]
+fn a_deferred_transaction_outlives_a_restart() {
+    let epoch = epoch();
+    let sender = Sender::new();
+    let object = random_object_ref();
+    let first = sender.transaction(random_object_ref(), &[object]);
+    let second = sender.transaction(random_object_ref(), &[object]);
+    let dir = tempfile::tempdir().unwrap();
+    let (_, output, _) = EpochStore::open(dir.path(), 0);
+    let committed = output.committed_checkpoints();
+    let mut handler = new_handler(output);
     let decided = handler
-        .handle(&epoch, commit(2, &[(&second, &[])]))
+        .handle(&epoch, commit(1, &[(&first, &[]), (&second, &[])]))
         .unwrap();
-    assert!(scheduled(&decided).is_empty() && decided.dropped.is_empty());
-    assert_eq!(decided.duplicates.len(), 1);
+    assert_eq!(deferred(&decided), vec![digest(&first)]);
+    // The commit's output is written once its checkpoint commits.
+    let record = validator::consensus::commit::CommitRecord {
+        commit_index: 1,
+        leader_round: 1,
+        height: 1,
+        next_seq: 2,
+        last_built_timestamp: 0,
+        root_version: 1,
+        closed: false,
+    };
+    handler.finish(&record, 1, true);
+    committed.committed_through(1);
+    drop((handler, committed));
+
+    let (_, output, _) = EpochStore::open(dir.path(), 0);
+    let mut handler = CommitHandler::new(
+        output,
+        1,
+        validator::consensus::execution_time::ExecutionTimeEstimator::new(
+            vec![([0; 96], 10_000)],
+            &epoch.config,
+        ),
+    );
+    let decided = handler.handle(&epoch, commit(2, &[])).unwrap();
+    assert_eq!(scheduled(&decided), vec![digest(&first)]);
 }
 
 #[test]
@@ -266,10 +340,10 @@ fn a_shared_gas_coin_conflicts_like_any_owned_input() {
     let first = sender.transaction(gas, &[]);
     let second = sender.transaction(gas, &[random_object_ref()]);
     let (output, _dir) = consensus_output();
-    let decided = CommitHandler::new(output, 0)
+    let decided = new_handler(output)
         .handle(&epoch, commit(1, &[(&first, &[]), (&second, &[])]))
         .unwrap();
-    assert_eq!(scheduled(&decided), vec![digest(&first)]);
+    assert_eq!(deferred(&decided), vec![digest(&first)]);
     assert_eq!(
         conflicts(&decided),
         vec![(digest(&second), wire(&gas), digest(&first))]
@@ -287,7 +361,7 @@ fn a_lock_holds_across_commits_for_its_version_only() {
     let again = sender.transaction(random_object_ref(), &[object]);
     let later = sender.transaction(random_object_ref(), &[next]);
     let (output, _dir) = consensus_output();
-    let mut handler = CommitHandler::new(output, 0);
+    let mut handler = new_handler(output);
     let decided = handler.handle(&epoch, commit(1, &[(&first, &[])])).unwrap();
     assert_eq!(scheduled(&decided), vec![digest(&first)]);
     let decided = handler
@@ -313,7 +387,7 @@ fn inputs_claimed_immutable_are_not_locked() {
         .collect();
     let claim = [frozen];
     let (output, _dir) = consensus_output();
-    let decided = CommitHandler::new(output, 0)
+    let decided = new_handler(output)
         .handle(
             &epoch,
             commit(
@@ -331,12 +405,9 @@ fn inputs_claimed_immutable_are_not_locked() {
     // object is locked like an owned one.
     assert_eq!(
         scheduled(&decided),
-        vec![
-            digest(&claiming[0]),
-            digest(&claiming[1]),
-            digest(&unclaimed[0])
-        ]
+        vec![digest(&claiming[0]), digest(&claiming[1])]
     );
+    assert_eq!(deferred(&decided), vec![digest(&unclaimed[0])]);
     assert_eq!(
         conflicts(&decided),
         vec![(digest(&unclaimed[1]), wire(&frozen), digest(&unclaimed[0]))]
@@ -351,7 +422,7 @@ fn a_transaction_with_invalid_inputs_is_dropped_and_locks_nothing() {
     let twice = sender.transaction(random_object_ref(), &[object, object]);
     let valid = sender.transaction(random_object_ref(), &[object]);
     let (output, _dir) = consensus_output();
-    let decided = CommitHandler::new(output, 0)
+    let decided = new_handler(output)
         .handle(&epoch, commit(1, &[(&twice, &[]), (&valid, &[])]))
         .unwrap();
     assert_eq!(scheduled(&decided), vec![digest(&valid)]);
@@ -368,10 +439,11 @@ fn decisions(handled: &HandledCommit) -> String {
         .map(|i| handled.schedule.accesses(i).to_vec())
         .collect();
     format!(
-        "{:?} {accesses:?} {:?} {:?}",
+        "{:?} {accesses:?} {:?} {:?} {:?}",
         scheduled(handled),
         handled.dropped,
-        handled.duplicates
+        handled.duplicates,
+        handled.deferred
     )
 }
 
@@ -400,21 +472,21 @@ fn handlers_fed_the_same_commits_decide_alike_and_a_replay_changes_nothing() {
             .collect()
     };
     let (output, _dir) = consensus_output();
-    let mut handler = CommitHandler::new(output, 0);
+    let mut handler = new_handler(output);
     let first = decide(&mut handler);
     let (other, _other_dir) = consensus_output();
-    assert_eq!(first, decide(&mut CommitHandler::new(other, 0)));
+    assert_eq!(first, decide(&mut new_handler(other)));
     // Consensus replays commits after a restart; those handled are skipped.
     for c in commits() {
         assert!(handler.handle(&epoch, c).is_none());
     }
     // The first commit's first transaction took two objects; its second,
-    // sharing one, lost it.
+    // sharing one, lost it, and the first waits a round.
     let (output, _dir) = consensus_output();
-    let decided = CommitHandler::new(output, 0)
+    let decided = new_handler(output)
         .handle(&epoch, commits().remove(0))
         .unwrap();
-    assert_eq!(scheduled(&decided)[0], digest(&transactions[0]));
+    assert_eq!(deferred(&decided)[0], digest(&transactions[0]));
     assert_eq!(decided.dropped[0].2, digest(&transactions[1]));
 }
 
@@ -496,19 +568,24 @@ fn the_stage_leaves_dropped_transactions_out_of_its_chunks() {
             &epoch.config,
         ),
     );
+    let users = |decided: &validator::consensus::commit::Decided| -> Vec<[u8; 32]> {
+        decided
+            .chunks
+            .iter()
+            .flat_map(|c| &c.entries)
+            .filter_map(|e| match &e.transaction {
+                ExecutableTransaction::User(t) => Some(digest_of(t)),
+                ExecutableTransaction::System(_) => None,
+            })
+            .collect()
+    };
     let decided = stage
         .decide(commit(1, &[(&first, &[]), (&second, &[])]))
         .unwrap();
-    let users: Vec<_> = decided
-        .chunks
-        .iter()
-        .flat_map(|c| &c.entries)
-        .filter_map(|e| match &e.transaction {
-            ExecutableTransaction::User(t) => Some(digest_of(t)),
-            ExecutableTransaction::System(_) => None,
-        })
-        .collect();
-    assert_eq!(users, vec![digest(&first)]);
+    // The first, its lock contested, is in the next round's chunks.
+    assert!(users(&decided).is_empty());
+    let next = stage.decide(commit(2, &[])).unwrap();
+    assert_eq!(users(&next), vec![digest(&first)]);
     assert!(
         decided
             .settlements

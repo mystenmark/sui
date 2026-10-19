@@ -69,7 +69,16 @@ fn config() -> ProtocolConfig {
 }
 
 fn schedule(round: u32, transactions: Vec<VerifiedTransaction>) -> Schedule {
-    Sequencer::new().schedule(&config(), prologue(round), transactions)
+    order_and_schedule(&mut Sequencer::new(), round, transactions)
+}
+
+fn order_and_schedule(
+    sequencer: &mut Sequencer,
+    round: u32,
+    transactions: Vec<VerifiedTransaction>,
+) -> Schedule {
+    let ordered = sequencer.order(&config(), transactions);
+    sequencer.schedule(prologue(round), ordered)
 }
 
 /// The generation each access reads, by transaction, prologue first.
@@ -202,20 +211,16 @@ fn transactions_using_randomness_go_last() {
 #[test]
 fn each_commit_starts_over() {
     let mut sequencer = Sequencer::new();
-    let first = sequencer.schedule(
-        &config(),
-        prologue(3),
+    let first = order_and_schedule(
+        &mut sequencer,
+        3,
         vec![
             transaction(1000, &[(9, 2, W)]),
             transaction(1000, &[(9, 2, W)]),
         ],
     );
     assert_eq!(generations(&first), [vec![0], vec![0], vec![1]]);
-    let second = sequencer.schedule(
-        &config(),
-        prologue(5),
-        vec![transaction(1000, &[(9, 2, W)])],
-    );
+    let second = order_and_schedule(&mut sequencer, 5, vec![transaction(1000, &[(9, 2, W)])]);
     assert_eq!(
         second.accesses(1)[0].ordinal,
         SharedOrdinal {
@@ -270,7 +275,7 @@ fn ordinals_name_the_versions_the_reference_assigns() {
                     transaction(1000 * (1 + rng.below(3)), &inputs)
                 })
                 .collect();
-            let s = sequencer.schedule(&config(), prologue(round), transactions);
+            let s = order_and_schedule(&mut sequencer, round, transactions);
             // Each stream's versions by generation in this commit.
             let mut generations: HashMap<(ObjectId, u64), Vec<u64>> = HashMap::new();
             for i in 0..s.len() {

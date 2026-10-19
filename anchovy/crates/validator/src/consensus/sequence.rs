@@ -119,22 +119,63 @@ impl Sequencer {
         Sequencer::default()
     }
 
-    /// The commit's schedule: the prologue, then `transactions` (accepted and
-    /// deduplicated, in commit order) ordered as the protocol says, those
-    /// using randomness last; each transaction's shared inputs with their
-    /// ordinals. `collect_transactions_to_schedule`, without deferral or
-    /// cancellation, and `assign_versions_from_consensus`, with ordinals for
-    /// versions.
-    pub fn schedule(
+    /// `transactions` (accepted, deduplicated, those deferred first, then
+    /// the commit's in commit order) as the protocol orders them: those
+    /// using randomness last, each sorted by gas price if the protocol says
+    /// so, ties keeping their order. The reference's
+    /// `merge_and_reorder_transactions`.
+    pub fn order(
         &mut self,
         config: &ProtocolConfig,
+        transactions: Vec<VerifiedTransaction>,
+    ) -> Vec<VerifiedTransaction> {
+        let by_gas_price =
+            config.consensus_transaction_ordering() == ConsensusTransactionOrdering::ByGasPrice;
+        self.order.clear();
+        self.order
+            .extend(transactions.iter().enumerate().map(|(i, transaction)| {
+                let price = if by_gas_price {
+                    transaction.get().0.data().gas_data().price
+                } else {
+                    0
+                };
+                (
+                    uses_randomness(transaction),
+                    std::cmp::Reverse(price),
+                    i as u32,
+                )
+            }));
+        self.order
+            .sort_by_key(|(randomness, price, _)| (*randomness, *price));
+        let mut transactions: Vec<Option<VerifiedTransaction>> =
+            transactions.into_iter().map(Some).collect();
+        self.order
+            .iter()
+            .map(|(_, _, i)| {
+                transactions[*i as usize]
+                    .take()
+                    .expect("each transaction once")
+            })
+            .collect()
+    }
+
+    /// The commit's schedule: the prologue, then `transactions`, in order,
+    /// each with its shared inputs' ordinals: the reference's
+    /// `assign_versions_from_consensus`, with ordinals for versions.
+    pub fn schedule(
+        &mut self,
         prologue: Prologue,
         transactions: Vec<VerifiedTransaction>,
     ) -> Schedule {
         let round = prologue.round;
         let mut schedule = Schedule {
             transactions: Vec::with_capacity(transactions.len() + 1),
-            accesses: Vec::with_capacity(1),
+            accesses: Vec::with_capacity(
+                1 + transactions
+                    .iter()
+                    .map(|t| shared_inputs(t).count())
+                    .sum::<usize>(),
+            ),
             ends: Vec::with_capacity(transactions.len() + 1),
         };
 
@@ -154,39 +195,9 @@ impl Sequencer {
         schedule.accesses.push(clock);
         schedule.ends.push(1);
 
-        // 2. The user transactions, then those using randomness, each sorted
-        //    by gas price if the protocol says so; ties keep commit order.
-        let by_gas_price =
-            config.consensus_transaction_ordering() == ConsensusTransactionOrdering::ByGasPrice;
-        self.order.clear();
-        let mut access_count = 0;
-        self.order
-            .extend(transactions.iter().enumerate().map(|(i, transaction)| {
-                let data = transaction.get().0.data();
-                let mut uses_randomness = false;
-                for shared in shared_inputs(transaction) {
-                    uses_randomness |= shared.id == RANDOMNESS_STATE;
-                    access_count += 1;
-                }
-                let price = if by_gas_price {
-                    data.gas_data().price
-                } else {
-                    0
-                };
-                (uses_randomness, std::cmp::Reverse(price), i as u32)
-            }));
-        self.order
-            .sort_by_key(|(randomness, price, _)| (*randomness, *price));
-        schedule.accesses.reserve_exact(access_count);
-        let mut transactions: Vec<Option<VerifiedTransaction>> =
-            transactions.into_iter().map(Some).collect();
-
-        // 3. Each transaction's shared inputs, in that order: every access
-        //    reads the generation before the transaction's own writes.
-        for (position, (_, _, i)) in self.order.iter().enumerate() {
-            let transaction = transactions[*i as usize]
-                .take()
-                .expect("each transaction once");
+        // 2. Each transaction's shared inputs: every access reads the
+        //    generation before the transaction's own writes.
+        for (position, transaction) in transactions.into_iter().enumerate() {
             let start = schedule.accesses.len();
             for shared in shared_inputs(&transaction) {
                 let stream = (shared.id, shared.initial_shared_version.get());
@@ -237,6 +248,11 @@ impl Sequencer {
             }
         }
     }
+}
+
+/// Whether `transaction` reads the randomness state.
+pub fn uses_randomness(transaction: &VerifiedTransaction) -> bool {
+    shared_inputs(transaction).any(|shared| shared.id == RANDOMNESS_STATE)
 }
 
 /// A user transaction's shared inputs, in input order: the reference's

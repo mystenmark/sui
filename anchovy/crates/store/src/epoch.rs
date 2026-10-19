@@ -27,6 +27,7 @@ pub enum Space {
     Streams,
     Commit,
     ExecutionTimeObservations,
+    Deferred,
     // Checkpoint builder state.
     Built,
     CheckpointHashes,
@@ -37,12 +38,13 @@ pub enum Space {
 }
 
 impl Space {
-    const ALL: [Space; 10] = [
+    const ALL: [Space; 11] = [
         Space::Processed,
         Space::Locks,
         Space::Streams,
         Space::Commit,
         Space::ExecutionTimeObservations,
+        Space::Deferred,
         Space::Built,
         Space::CheckpointHashes,
         Space::Roots,
@@ -57,6 +59,7 @@ impl Space {
             Space::Streams => "streams",
             Space::Commit => "commit",
             Space::ExecutionTimeObservations => "execution_time_observations",
+            Space::Deferred => "deferred",
             Space::Built => "built",
             Space::CheckpointHashes => "checkpoint_hashes",
             Space::Roots => "roots",
@@ -77,6 +80,8 @@ impl Space {
             Space::Commit => 1,
             // A generation and an authority's index.
             Space::ExecutionTimeObservations => 8 + 4,
+            // A deferral key: its variant, then two big-endian rounds.
+            Space::Deferred => 1 + 8 + 8,
         }
     }
 }

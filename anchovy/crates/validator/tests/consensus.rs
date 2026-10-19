@@ -154,6 +154,22 @@ fn block(round: u32, transactions: Vec<Vec<u8>>) -> Block {
     }
 }
 
+/// A handler of a committee of one, that has handled no commit.
+fn new_handler(output: validator::epoch_store::ConsensusOutput) -> CommitHandler {
+    let config = protocol_config::ProtocolConfig::get_for_version(
+        protocol_config::ProtocolVersion::MAX,
+        protocol_config::Chain::Unknown,
+    );
+    CommitHandler::new(
+        output,
+        0,
+        validator::consensus::execution_time::ExecutionTimeEstimator::new(
+            vec![([0; 96], 10_000)],
+            &config,
+        ),
+    )
+}
+
 #[test]
 fn the_handwritten_encoding_is_sui_s() {
     let node = Node::new();
@@ -392,7 +408,7 @@ fn committer(node: &Node) -> Committer {
     let (output, dir) = consensus_output();
     Committer {
         decoder: CommitDecoder::new(node.epoch.params.clone(), node.cache.clone()),
-        handler: CommitHandler::new(output, 0),
+        handler: new_handler(output),
         _dir: dir,
     }
 }
@@ -410,6 +426,15 @@ fn scheduled(handled: &HandledCommit) -> Vec<TransactionIndex> {
             }
             validator::consensus::sequence::Scheduled::Prologue(_) => None,
         })
+        .collect()
+}
+
+/// The positions of the transactions `handled` deferred to a later round.
+fn deferred(handled: &HandledCommit) -> Vec<TransactionIndex> {
+    handled
+        .deferred
+        .iter()
+        .map(|(_, index, _)| *index)
         .collect()
 }
 
@@ -523,7 +548,9 @@ fn the_first_of_two_transactions_spending_one_coin_wins() {
     let handled = committer(&node)
         .handle(&node.epoch, commit(1, 1, vec![block], vec![]))
         .unwrap();
-    assert_eq!(scheduled(&handled), [0]);
+    // The winner, its lock contested, waits a round.
+    assert!(scheduled(&handled).is_empty());
+    assert_eq!(deferred(&handled), [0]);
     assert_eq!(conflicted(&handled), [1]);
 }
 
@@ -566,8 +593,9 @@ fn owned_inputs_are_locked_in_consensus_order_before_gas_price_order() {
         .unwrap();
     // Owned inputs are locked in consensus order, before the schedule's
     // gas price order: the cheaper transaction, first in the block, takes
-    // the coin, and the dearer one is dropped unscheduled.
-    assert_eq!(scheduled(&handled), [0]);
+    // the coin (and waits a round, the coin contested), and the dearer one
+    // is dropped unscheduled.
+    assert_eq!(deferred(&handled), [0]);
     assert_eq!(conflicted(&handled), [1]);
 }
 
@@ -608,7 +636,7 @@ fn handlers_decide_alike_whatever_has_executed() {
     let decide = || {
         let mut decoder = CommitDecoder::new(node.epoch.params.clone(), node.cache.clone());
         let (output, _dir) = consensus_output();
-        let mut handler = CommitHandler::new(output, 0);
+        let mut handler = new_handler(output);
         commits
             .iter()
             .map(|c| {

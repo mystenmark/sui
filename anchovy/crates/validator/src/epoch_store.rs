@@ -6,7 +6,7 @@
 //! (`store::epoch`), in three sections: consensus output, written only by
 //! the commit handler; checkpoint builder state; and everything else.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -14,6 +14,7 @@ use messages::base::{Digest, ObjectId, ObjectRef};
 use store::Live;
 use store::epoch::{EpochDb, Space};
 
+use crate::consensus::deferral::DeferralKey;
 use crate::pipeline::keys::{StreamId, TxDigest};
 use crate::pipeline::tables::Generation;
 
@@ -36,9 +37,19 @@ impl EpochStore {
     /// If the database cannot be opened.
     pub fn open(root: &Path, epoch: u64) -> (EpochStore, ConsensusOutput, BuilderOutput) {
         let db = Arc::new(EpochDb::open(root, epoch).expect("the epoch's database opens"));
+        let deferred = db
+            .entries(Space::Deferred)
+            .expect("the epoch's database reads")
+            .into_iter()
+            .map(|(key, value)| {
+                let key = key.try_into().expect("a deferral key's length");
+                (DeferralKey::decode(&key), value)
+            })
+            .collect();
         let consensus = ConsensusOutput {
             quarantine: Arc::new(Mutex::new(Quarantine {
                 db: db.clone(),
+                deferred,
                 open: Output::default(),
                 queued: std::collections::VecDeque::new(),
                 processed: HashMap::new(),
@@ -288,6 +299,9 @@ pub struct CommittedCheckpoints {
 
 struct Quarantine {
     db: Arc<EpochDb>,
+    /// Every transaction deferred and not yet taken, as written and queued:
+    /// few, so all in memory, as the reference's `ConsensusOutputCache`.
+    deferred: BTreeMap<DeferralKey, Vec<u8>>,
     /// The commit being decided.
     open: Output,
     /// Decided commits not yet written, in commit order.
@@ -311,6 +325,8 @@ struct Output {
     /// The execution time observations taken: (generation, authority
     /// index) and the encoded estimates.
     observations: Vec<((u64, u32), Vec<u8>)>,
+    /// Transactions deferred, encoded, and the keys taken, in order.
+    deferred: Vec<(DeferralKey, Option<Vec<u8>>)>,
     /// The commit stage's state after the commit, encoded.
     record: Vec<u8>,
     /// The last chunk height the commit assigned.
@@ -413,6 +429,31 @@ impl ConsensusOutput {
             .open
             .observations
             .push(((generation, author), estimates));
+    }
+
+    /// Defers transactions, `transactions` encoded, by `key`: one key per
+    /// commit, as the reference's.
+    pub fn defer(&mut self, key: DeferralKey, transactions: Vec<u8>) {
+        let mut q = lock_quarantine(&self.quarantine);
+        let previous = q.deferred.insert(key, transactions.clone());
+        assert!(previous.is_none(), "{key:?} deferred to twice");
+        q.open.deferred.push((key, Some(transactions)));
+    }
+
+    /// Takes the transactions deferred by keys in `keys`, in key order.
+    pub fn take_deferred(
+        &mut self,
+        keys: std::ops::Range<DeferralKey>,
+    ) -> Vec<(DeferralKey, Vec<u8>)> {
+        let mut q = lock_quarantine(&self.quarantine);
+        let taken: Vec<DeferralKey> = q.deferred.range(keys).map(|(key, _)| *key).collect();
+        taken
+            .into_iter()
+            .map(|key| {
+                q.open.deferred.push((key, None));
+                (key, q.deferred.remove(&key).expect("a key in range"))
+            })
+            .collect()
     }
 
     /// The execution time observations of the commits written, by
@@ -536,6 +577,13 @@ impl Quarantine {
                     value,
                 );
                 release(&mut self.streams, &stream, |last| &mut last.1);
+            }
+            for (key, transactions) in output.deferred {
+                let key = key.encode().to_vec();
+                match transactions {
+                    Some(transactions) => batch.put(Space::Deferred, key, transactions),
+                    None => batch.delete(Space::Deferred, key),
+                }
             }
             for ((generation, author), estimates) in output.observations {
                 let mut key = generation.to_be_bytes().to_vec();

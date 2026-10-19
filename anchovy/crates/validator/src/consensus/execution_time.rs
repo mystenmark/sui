@@ -12,11 +12,13 @@ use std::time::Duration;
 
 use messages::build::type_tag::TypeInput;
 use messages::system_transaction::ExecutionTimeObservationKey;
-use messages::transaction::Command;
+use messages::transaction::{Command, TransactionKind};
 use protocol_config::{
     ExecutionTimeEstimateParams, PerObjectCongestionControlMode, ProtocolConfig,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::checks::VerifiedTransaction;
 
 /// The reference's `ExecutionTimeObservationKey`, owned.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -202,6 +204,16 @@ impl ExecutionTimeEstimator {
         *latest = generation;
         *observed = Some(duration);
         observations.update_median(&self.committee, &self.params);
+    }
+
+    /// `transaction`'s estimated execution time, in whole microseconds, as
+    /// the reference's `get_tx_cost`.
+    pub fn estimate_us(&self, transaction: &VerifiedTransaction) -> u64 {
+        let TransactionKind::ProgrammableTransaction(ptb) = transaction.get().0.data().kind()
+        else {
+            unreachable!("validation admits only programmable user transactions");
+        };
+        u64::try_from(self.estimate(ptb.commands).as_micros()).unwrap_or(u64::MAX)
     }
 
     /// `commands`' estimated execution time.

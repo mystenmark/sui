@@ -1150,12 +1150,15 @@ async fn a_transaction_dropped_after_consensus_is_answered_rejected() {
         wait(&service, &second, Some(at_second)).await,
         RawValidatorTransactionStatus::Rejected(_)
     ));
+    // The first, its lock contested, waits a round.
+    assert!(seq > 0);
+    let next = network.commit(vec![]);
     assert!(matches!(
         wait(&service, &first, Some(at_first)).await,
         RawValidatorTransactionStatus::Executed(_)
     ));
-    network.certify(seq);
-    network.assert_checkpointed(seq, &[&first]);
+    network.certify(next);
+    network.assert_checkpointed(next, &[&first]);
     assert_no_panics();
 }
 
@@ -1349,7 +1352,7 @@ fn checkpoints_of_several_commits() {
 /// Two transactions paying with the same coin version, in one commit: the
 /// later one in consensus order is dropped.
 #[test]
-fn an_owned_conflict_in_one_commit_drops_the_later_transaction() {
+fn an_owned_conflict_in_one_commit_drops_the_later_and_defers_the_earlier() {
     let mut network = Network::new(1);
     let coin = network.coin(0);
     let first = network.transfer(coin);
@@ -1358,9 +1361,14 @@ fn an_owned_conflict_in_one_commit_drops_the_later_transaction() {
         consensus_transaction(&first),
         consensus_transaction(&second),
     ]);
-    network.certify(seq);
-    network.assert_checkpointed(seq, &[&first]);
-    assert!(!network.contents(seq).contains(second.digest()));
+    // The holder of the contested lock waits a round, as a penalty.
+    let next = network.commit(vec![]);
+    network.certify(next);
+    network.assert_checkpointed(next, &[&first]);
+    for seq in seq..=next {
+        assert!(!network.contents(seq).contains(second.digest()));
+    }
+    assert!(!network.contents(seq).contains(first.digest()));
     assert!(
         execution::executed(network.store(), &second.digest().into_inner())
             .unwrap()
