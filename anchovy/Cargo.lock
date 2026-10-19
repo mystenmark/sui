@@ -1726,6 +1726,7 @@ dependencies = [
  "telemetry-subscribers",
  "tempfile",
  "tokio",
+ "tonic 0.14.6",
  "validator",
  "workqueue",
 ]
