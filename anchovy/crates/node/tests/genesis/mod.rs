@@ -151,8 +151,11 @@ pub fn build_with(
     for (_, _, protocol) in &validators {
         builder = builder.add_validator_signature(protocol);
     }
-    let genesis = builder.build();
+    from_sui(&builder.build(), account)
+}
 
+/// Anchovy's genesis from sui's, `account`'s gas coins by id.
+pub fn from_sui(genesis: &sui_config::genesis::Genesis, account: SuiAddress) -> Genesis {
     let summary = genesis.checkpoint();
     let gas = &summary.epoch_rolling_gas_cost_summary;
     let checkpoint = BuiltCheckpoint {
