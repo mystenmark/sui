@@ -26,7 +26,9 @@ use workqueue::{Processor, Refusal, Refuse};
 
 use crate::checks::VerifiedTransaction;
 use crate::consensus::decode::{CommittedTransaction, DecodedCommit, OwnedInputs};
-use crate::consensus::execution_time::ExecutionTimeEstimator;
+use crate::consensus::execution_time::{
+    ExecutionTimeEstimator, SharedObservations, decode_estimates, encode_estimates,
+};
 use crate::consensus::sequence::{
     Prologue, Schedule, Scheduled, Sequencer, SharedAccess, SharedOrdinal,
 };
@@ -103,6 +105,15 @@ impl CommitHandler {
 
     /// Ends the commit just handled, with what `CommitStage` decided of it:
     /// see `ConsensusOutput::finish_commit`.
+    /// Execution time observations the commit being decided took.
+    pub fn put_execution_time_observations(&mut self, shared: &SharedObservations) {
+        self.output.put_execution_time_observations(
+            shared.author,
+            shared.generation,
+            encode_estimates(&shared.estimates),
+        );
+    }
+
     pub fn finish(&mut self, record: &CommitRecord, height: u64, drained: bool) {
         self.output.finish_commit(record.encode(), height, drained);
     }
@@ -399,10 +410,13 @@ impl CommitStage {
         settlements: workqueue::Queue<SettlementInput>,
         checkpoints: workqueue::Queue<waiter::Command<ChunkSettled, PendingCheckpoint>>,
         statuses: Arc<ConsensusTxStatusCache>,
-        execution_times: ExecutionTimeEstimator,
+        mut execution_times: ExecutionTimeEstimator,
     ) -> CommitStage {
         // From the last commit written, if any; else the epoch's start.
         let record = output.record().map(|bytes| CommitRecord::decode(&bytes));
+        for (generation, author, estimates) in output.execution_time_observations() {
+            execution_times.restore(author, generation, &decode_estimates(&estimates));
+        }
         let queue = match record {
             Some(r) => CheckpointQueue::resumed(r.height, r.next_seq, r.last_built_timestamp),
             None => CheckpointQueue::new(start.previous_checkpoint, start.previous_height),
@@ -459,7 +473,9 @@ impl CommitStage {
         } = self.handler.handle(epoch, commit)?;
         // Before the commit's transactions are estimated, as the reference.
         for shared in observations {
-            self.execution_times.observe(shared);
+            if self.execution_times.observe(&shared) {
+                self.handler.put_execution_time_observations(&shared);
+            }
         }
         let config = &epoch.config;
         let Some(&Scheduled::Prologue(prologue)) = schedule.transactions.first() else {

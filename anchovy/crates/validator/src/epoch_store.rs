@@ -308,6 +308,9 @@ struct Output {
     processed: std::collections::HashSet<TxDigest>,
     locks: HashMap<ObjectRef, TxDigest>,
     streams: HashMap<StreamId, (u32, u32)>,
+    /// The execution time observations taken: (generation, authority
+    /// index) and the encoded estimates.
+    observations: Vec<((u64, u32), Vec<u8>)>,
     /// The commit stage's state after the commit, encoded.
     record: Vec<u8>,
     /// The last chunk height the commit assigned.
@@ -396,6 +399,40 @@ impl ConsensusOutput {
             .open
             .streams
             .insert(stream, last);
+    }
+
+    /// Authority `author`'s execution time observations of `generation`,
+    /// `estimates` encoded, taken by the commit being decided.
+    pub fn put_execution_time_observations(
+        &mut self,
+        author: u32,
+        generation: u64,
+        estimates: Vec<u8>,
+    ) {
+        lock_quarantine(&self.quarantine)
+            .open
+            .observations
+            .push(((generation, author), estimates));
+    }
+
+    /// The execution time observations of the commits written, by
+    /// (generation, authority index): for the commit stage's start, which
+    /// replays later commits.
+    ///
+    /// # Panics
+    /// If the database cannot be read.
+    pub fn execution_time_observations(&self) -> Vec<(u64, u32, Vec<u8>)> {
+        lock_quarantine(&self.quarantine)
+            .db
+            .entries(Space::ExecutionTimeObservations)
+            .expect("the epoch's database reads")
+            .into_iter()
+            .map(|(key, estimates)| {
+                let generation = u64::from_be_bytes(key[..8].try_into().expect("8 bytes"));
+                let author = u32::from_be_bytes(key[8..].try_into().expect("4 bytes"));
+                (generation, author, estimates)
+            })
+            .collect()
     }
 
     /// Ends the commit being decided: `record` is the commit stage's state
@@ -499,6 +536,11 @@ impl Quarantine {
                     value,
                 );
                 release(&mut self.streams, &stream, |last| &mut last.1);
+            }
+            for ((generation, author), estimates) in output.observations {
+                let mut key = generation.to_be_bytes().to_vec();
+                key.extend_from_slice(&author.to_be_bytes());
+                batch.put(Space::ExecutionTimeObservations, key, estimates);
             }
             record = output.record;
         }

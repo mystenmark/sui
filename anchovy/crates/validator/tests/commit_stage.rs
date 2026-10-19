@@ -7,6 +7,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest as _};
@@ -18,12 +19,13 @@ use sui_types::crypto::{AccountKeyPair, get_key_pair};
 use sui_types::digests::{AdditionalConsensusStateDigest, ConsensusCommitDigest};
 use sui_types::messages_consensus::ConsensusDeterminedVersionAssignments;
 use sui_types::transaction::{
-    CallArg, ObjectArg, ProgrammableTransaction, SharedObjectMutability, Transaction,
-    TransactionData, TransactionKind, VerifiedTransaction,
+    Argument, CallArg, Command, ObjectArg, ProgrammableTransaction, SharedObjectMutability,
+    Transaction, TransactionData, TransactionKind, VerifiedTransaction,
 };
 use validator::checks;
 use validator::consensus::commit::{CommitStage, Decided, EpochStart};
 use validator::consensus::decode::{CommittedTransaction, DecodedCommit};
+use validator::consensus::execution_time::{ExecutionTimeEstimator, Key, SharedObservations};
 use validator::epoch::EpochParams;
 use validator::epoch_store::{ConsensusOutput, EpochStore};
 use validator::pipeline::items::{
@@ -60,11 +62,19 @@ struct Outputs {
     chunks: Inbox<Chunk>,
     settlements: Inbox<SettlementInput>,
     checkpoints: Inbox<waiter::Command<ChunkSettled, PendingCheckpoint>>,
-    /// The epoch store the stage writes.
-    _dir: tempfile::TempDir,
+    /// The epoch store the stage writes, unless the test keeps it.
+    dir: Option<tempfile::TempDir>,
 }
 
 fn stage(epoch: &Arc<EpochParams>) -> (CommitStage, Outputs) {
+    let (output, dir) = consensus_output();
+    let (stage, mut outputs) = stage_over(epoch, output);
+    outputs.dir = Some(dir);
+    (stage, outputs)
+}
+
+/// A stage of a committee of one, over `output`.
+fn stage_over(epoch: &Arc<EpochParams>, output: ConsensusOutput) -> (CommitStage, Outputs) {
     let (chunks, chunk_inbox) = workqueue::queue(1024);
     let (settlements, settlement_inbox) = workqueue::queue(1024);
     let (checkpoints, checkpoint_inbox) = workqueue::queue(1024);
@@ -76,7 +86,6 @@ fn stage(epoch: &Arc<EpochParams>) -> (CommitStage, Outputs) {
         epoch_start_timestamp_ms: 0,
         epoch_duration_ms: u64::MAX,
     };
-    let (output, dir) = consensus_output();
     (
         CommitStage::new(
             epoch.clone(),
@@ -86,16 +95,13 @@ fn stage(epoch: &Arc<EpochParams>) -> (CommitStage, Outputs) {
             settlements,
             checkpoints,
             Arc::new(validator::consensus::status::ConsensusTxStatusCache::new()),
-            validator::consensus::execution_time::ExecutionTimeEstimator::new(
-                vec![([0; 96], 1)],
-                &epoch.config,
-            ),
+            ExecutionTimeEstimator::new(vec![([0; 96], 10_000)], &epoch.config),
         ),
         Outputs {
             chunks: chunk_inbox,
             settlements: settlement_inbox,
             checkpoints: checkpoint_inbox,
-            _dir: dir,
+            dir: None,
         },
     )
 }
@@ -134,6 +140,26 @@ fn transactions(count: usize, seed: u64) -> Vec<Vec<u8>> {
             bcs::to_bytes(&Transaction::from_data_and_signer(data, vec![&key])).unwrap()
         })
         .collect()
+}
+
+/// A signed transaction splitting its gas coin, as `Transaction` BCS.
+fn split_transaction() -> Vec<u8> {
+    let (sender, key): (SuiAddress, AccountKeyPair) = get_key_pair();
+    let pt = ProgrammableTransaction {
+        inputs: vec![CallArg::Pure(bcs::to_bytes(&1u64).unwrap())],
+        commands: vec![Command::SplitCoins(
+            Argument::GasCoin,
+            vec![Argument::Input(0)],
+        )],
+    };
+    let data = TransactionData::new(
+        TransactionKind::ProgrammableTransaction(pt),
+        sender,
+        random_object_ref(),
+        1_000_000,
+        1000,
+    );
+    bcs::to_bytes(&Transaction::from_data_and_signer(data, vec![&key])).unwrap()
 }
 
 fn commit(index: u32, round: u32, timestamp_ms: u64, transactions: &[Vec<u8>]) -> DecodedCommit {
@@ -222,6 +248,47 @@ fn reference_state_digest(timestamps: &VecDeque<u64>) -> AdditionalConsensusStat
     fold.update(bcs::to_bytes(&d1).unwrap());
     fold.update(bcs::to_bytes(&d2).unwrap());
     AdditionalConsensusStateDigest::new(fold.finalize().into())
+}
+
+/// The prologue digest of a commit splitting a coin, after a commit carrying
+/// an observation of splits if `observed`, with the stage restarted between
+/// them if `restart`, as consensus replays the window of earlier commits.
+fn prologue_after(observed: bool, restart: bool, split: &[u8]) -> [u8; 32] {
+    let epoch = epoch(10_000, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (_, output, _) = EpochStore::open(dir.path(), 0);
+    let committed = output.committed_checkpoints();
+    let (mut stage, _outputs) = stage_over(&epoch, output);
+    let mut first = commit(1, 2, 1_000, &[]);
+    if observed {
+        first.observations = vec![SharedObservations {
+            author: 0,
+            authority: [0; 96],
+            generation: 1,
+            estimates: vec![(Key::SplitCoins, Duration::from_millis(50))],
+        }];
+    }
+    stage.process(first);
+    // The first commit's checkpoint commits: its output is written.
+    committed.committed_through(u64::MAX);
+    if restart {
+        drop((stage, committed));
+        let (_, output, _) = EpochStore::open(dir.path(), 0);
+        stage = stage_over(&epoch, output).0;
+        assert!(stage.decide(commit(1, 2, 1_000, &[])).is_none(), "replayed");
+    }
+    let decided = stage
+        .decide(commit(2, 4, 2_000, &[split.to_vec()]))
+        .unwrap();
+    digest_of(&decided.chunks[0].entries[0].transaction)
+}
+
+#[test]
+fn execution_time_observations_outlive_a_restart() {
+    let split = split_transaction();
+    let observed = prologue_after(true, false, &split);
+    assert_ne!(observed, prologue_after(false, false, &split));
+    assert_eq!(observed, prologue_after(true, true, &split));
 }
 
 #[test]

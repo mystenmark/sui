@@ -26,6 +26,7 @@ pub enum Space {
     Locks,
     Streams,
     Commit,
+    ExecutionTimeObservations,
     // Checkpoint builder state.
     Built,
     CheckpointHashes,
@@ -36,11 +37,12 @@ pub enum Space {
 }
 
 impl Space {
-    const ALL: [Space; 9] = [
+    const ALL: [Space; 10] = [
         Space::Processed,
         Space::Locks,
         Space::Streams,
         Space::Commit,
+        Space::ExecutionTimeObservations,
         Space::Built,
         Space::CheckpointHashes,
         Space::Roots,
@@ -54,6 +56,7 @@ impl Space {
             Space::Locks => "locks",
             Space::Streams => "streams",
             Space::Commit => "commit",
+            Space::ExecutionTimeObservations => "execution_time_observations",
             Space::Built => "built",
             Space::CheckpointHashes => "checkpoint_hashes",
             Space::Roots => "roots",
@@ -72,6 +75,8 @@ impl Space {
             Space::Generations => 32 + 8 + 4 + 4,
             Space::Built | Space::CheckpointHashes | Space::Roots => 8,
             Space::Commit => 1,
+            // A generation and an authority's index.
+            Space::ExecutionTimeObservations => 8 + 4,
         }
     }
 }
@@ -147,6 +152,18 @@ impl EpochDb {
             above.push(key);
         }
         Ok(above)
+    }
+
+    /// Every entry of `space`, in key order: for reading state back at
+    /// start-up.
+    pub fn entries(&self, space: Space) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.db
+            .iterator(self.spaces[space as usize])
+            .map(|entry| {
+                let (key, value) = entry?;
+                Ok((key.to_vec(), value.to_vec()))
+            })
+            .collect()
     }
 
     /// Writes, committed atomically.

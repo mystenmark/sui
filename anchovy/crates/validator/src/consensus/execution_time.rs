@@ -16,9 +16,10 @@ use messages::transaction::Command;
 use protocol_config::{
     ExecutionTimeEstimateParams, PerObjectCongestionControlMode, ProtocolConfig,
 };
+use serde::{Deserialize, Serialize};
 
 /// The reference's `ExecutionTimeObservationKey`, owned.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Key {
     MoveEntryPoint {
         package: [u8; 32],
@@ -104,6 +105,16 @@ pub fn duration(d: messages::consensus::Duration) -> Option<Duration> {
         .map(|_| Duration::new(d.secs, d.nanos))
 }
 
+pub fn encode_estimates(estimates: &[(Key, Duration)]) -> Vec<u8> {
+    bcs::to_bytes(estimates).expect("estimates serialize")
+}
+
+/// # Panics
+/// Unless `bytes` are as `encode_estimates` made them.
+pub fn decode_estimates(bytes: &[u8]) -> Vec<(Key, Duration)> {
+    bcs::from_bytes(bytes).expect("estimates as encoded")
+}
+
 /// What one authority shared through consensus: its estimates by key, the
 /// latest of its generations replacing earlier ones.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -151,29 +162,35 @@ impl ExecutionTimeEstimator {
 
     /// Takes the observations a commit carries, if their author is the
     /// authority they claim to come from, as the reference's
-    /// `verify_consensus_transaction`.
-    pub fn observe(&mut self, shared: SharedObservations) {
+    /// `verify_consensus_transaction`; whether it took them.
+    pub fn observe(&mut self, shared: &SharedObservations) -> bool {
         let Some((name, _)) = self.committee.get(shared.author as usize) else {
-            return;
+            return false;
         };
         if *name != shared.authority {
-            return;
+            return false;
         }
-        for (key, duration) in shared.estimates {
-            self.observe_one(shared.author, shared.generation, key, duration);
+        self.restore(shared.author, shared.generation, &shared.estimates);
+        true
+    }
+
+    /// Takes observations `observe` took before a restart.
+    pub fn restore(&mut self, author: u32, generation: u64, estimates: &[(Key, Duration)]) {
+        for (key, duration) in estimates {
+            self.observe_one(author, generation, key, *duration);
         }
     }
 
-    fn observe_one(&mut self, source: u32, generation: u64, key: Key, duration: Duration) {
+    fn observe_one(&mut self, source: u32, generation: u64, key: &Key, duration: Duration) {
         // The reference uses only the default for publishing.
-        if key == Key::Publish {
+        if *key == Key::Publish {
             return;
         }
         let members = self.committee.len();
         let default_none = self.params.default_none_duration_for_new_keys;
         let observations = self
             .observations
-            .entry(key)
+            .entry(key.clone())
             .or_insert_with(|| Observations {
                 by_authority: vec![(0, None); members],
                 stake_weighted_median: (!default_none).then_some(Duration::ZERO),
@@ -273,17 +290,17 @@ mod tests {
     #[test]
     fn the_estimate_is_the_stake_weighted_median_of_the_latest_observations() {
         let mut estimator = estimator(&[3_000, 3_000, 4_000]);
-        estimator.observe(shared(0, 1, 10));
+        estimator.observe(&shared(0, 1, 10));
         // Too little stake has observed it.
         assert_eq!(estimator.estimate(&[SPLIT]), Duration::from_millis(2));
-        estimator.observe(shared(1, 1, 20));
-        estimator.observe(shared(2, 1, 30));
+        estimator.observe(&shared(1, 1, 20));
+        estimator.observe(&shared(2, 1, 30));
         // 3,000 + 3,000 of 10,000 is past half at 20.
         assert_eq!(estimator.estimate(&[SPLIT]), Duration::from_millis(40));
         // An older generation is ignored; a newer one replaces.
-        estimator.observe(shared(1, 1, 100));
+        estimator.observe(&shared(1, 1, 100));
         assert_eq!(estimator.estimate(&[SPLIT]), Duration::from_millis(40));
-        estimator.observe(shared(1, 2, 100));
+        estimator.observe(&shared(1, 2, 100));
         assert_eq!(estimator.estimate(&[SPLIT]), Duration::from_millis(60));
     }
 
@@ -292,7 +309,7 @@ mod tests {
         let mut estimator = estimator(&[5_000, 5_000]);
         let mut forged = shared(0, 1, 50);
         forged.author = 1;
-        estimator.observe(forged);
+        assert!(!estimator.observe(&forged));
         assert_eq!(estimator.estimate(&[SPLIT]), Duration::from_millis(2));
     }
 }
