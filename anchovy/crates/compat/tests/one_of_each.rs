@@ -19,22 +19,29 @@ use consensus_glue::{Parameters, Runner};
 use fastcrypto::traits::{KeyPair as _, ToFromBytes as _};
 use messages::base::Digest;
 use messages::base::ObjectId;
+use move_core_types::ident_str;
 use node::epoch::{Node, Perpetual, ValidatorKeys};
 use protocol_config::Chain;
 use sui_config::NodeConfig;
 use sui_core::authority::AuthorityState;
+use sui_core::authority_client::{AuthorityAPI as _, NetworkAuthorityClient};
 use sui_swarm_config::network_config_builder::ConfigBuilder;
 use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
 use sui_types::crypto::{AccountKeyPair, NetworkKeyPair};
 use sui_types::digests::TransactionDigest;
 use sui_types::effects::TransactionEffects;
 use sui_types::effects::TransactionEffectsAPI as _;
+use sui_types::gas_coin::{GAS, GasCoin};
 use sui_types::message_envelope::Message as _;
 use sui_types::messages_checkpoint::{
     CertifiedCheckpointSummary, CheckpointContents, CheckpointSummary,
 };
-use sui_types::object::Object;
+use sui_types::messages_grpc::SubmitTxRequest;
+use sui_types::object::{Object, Owner};
+use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
+use sui_types::transaction::{Argument, CallArg, Command, ObjectArg, SharedObjectMutability};
 use sui_types::transaction::{SenderSignedData, Transaction, TransactionData};
+use sui_types::{SUI_CLOCK_OBJECT_ID, SUI_FRAMEWORK_PACKAGE_ID, TypeTag};
 use tokio::runtime::Runtime;
 use validator::Validator;
 use validator::current::CurrentEpoch;
@@ -63,6 +70,7 @@ struct Anchovy {
 struct Network {
     runtime: Runtime,
     sui: sui_swarm::memory::Node,
+    sui_client: NetworkAuthorityClient,
     anchovy: Anchovy,
     /// An account genesis gave gas coins, by id.
     sender: SuiAddress,
@@ -95,8 +103,15 @@ impl Network {
             .committee_size(NonZeroUsize::new(2).unwrap())
             .build();
         let runtime = Runtime::new().unwrap();
-        let sui = sui_swarm::memory::Node::new(config.validator_configs[0].clone());
+        let sui_config = &config.validator_configs[0];
+        let sui = sui_swarm::memory::Node::new(sui_config.clone());
         runtime.block_on(sui.start()).unwrap();
+        let sui_client = runtime
+            .block_on(NetworkAuthorityClient::connect(
+                &sui_config.network_address,
+                sui_config.network_key_pair().public().clone(),
+            ))
+            .unwrap();
         let key = config.account_keys[0].copy();
         let sender = SuiAddress::from(key.public());
         let (anchovy, coins) =
@@ -104,6 +119,7 @@ impl Network {
         Network {
             runtime,
             sui,
+            sui_client,
             anchovy,
             sender,
             key,
@@ -111,22 +127,107 @@ impl Network {
         }
     }
 
-    /// Gas coin `i`, as anchovy has it.
-    fn coin(&self, i: usize) -> ObjectRef {
+    /// Object `id`, as anchovy has it.
+    fn live(&self, id: ObjectID) -> Object {
         let object = self
             .anchovy
             .node
             .perpetual
             .store
-            .live_object(&ObjectId(self.coins[i].into_bytes()))
+            .live_object(&ObjectId(id.into_bytes()))
             .unwrap()
             .unwrap();
-        let object: Object = bcs::from_bytes(object.wire_bytes()).unwrap();
-        object.compute_object_reference()
+        bcs::from_bytes(object.wire_bytes()).unwrap()
+    }
+
+    /// Gas coin `i`, as anchovy has it.
+    fn coin(&self, i: usize) -> ObjectRef {
+        self.live(self.coins[i]).compute_object_reference()
+    }
+
+    /// Shared object `id`, as an input.
+    fn shared(&self, id: ObjectID, mutable: bool) -> ObjectArg {
+        let Owner::Shared {
+            initial_shared_version,
+        } = self.live(id).owner
+        else {
+            panic!("{id} is shared");
+        };
+        ObjectArg::SharedObject {
+            id,
+            initial_shared_version,
+            mutability: if mutable {
+                SharedObjectMutability::Mutable
+            } else {
+                SharedObjectMutability::Immutable
+            },
+        }
     }
 
     fn sign(&self, data: TransactionData) -> Transaction {
         Transaction::from_data_and_signer(data, vec![&self.key])
+    }
+
+    /// A transaction paid with coin `i`, of the commands `f` builds.
+    fn ptb(&self, i: usize, f: impl FnOnce(&mut ProgrammableTransactionBuilder)) -> Transaction {
+        let mut builder = ProgrammableTransactionBuilder::new();
+        f(&mut builder);
+        self.sign(TransactionData::new_programmable(
+            self.sender,
+            vec![self.coin(i)],
+            builder.finish(),
+            BUDGET,
+            RGP,
+        ))
+    }
+
+    /// Splits 1 SUI off coin `i` and shares the new coin.
+    fn share(&self, i: usize) -> Transaction {
+        self.ptb(i, |b| {
+            let amount = b.pure(SUI).unwrap();
+            let coin = b.command(Command::SplitCoins(Argument::GasCoin, vec![amount]));
+            b.programmable_move_call(
+                SUI_FRAMEWORK_PACKAGE_ID,
+                ident_str!("transfer").to_owned(),
+                ident_str!("public_share_object").to_owned(),
+                vec![TypeTag::Struct(Box::new(GasCoin::type_()))],
+                vec![coin],
+            );
+        })
+    }
+
+    /// Splits a MIST off the shared coin `shared` to the sender, paid with
+    /// coin `i`.
+    fn split_shared(&self, i: usize, shared: ObjectID) -> Transaction {
+        let shared = self.shared(shared, true);
+        self.ptb(i, |b| {
+            b.move_call(
+                SUI_FRAMEWORK_PACKAGE_ID,
+                ident_str!("pay").to_owned(),
+                ident_str!("split").to_owned(),
+                vec![GAS::type_tag()],
+                vec![
+                    CallArg::Object(shared),
+                    CallArg::Pure(bcs::to_bytes(&1u64).unwrap()),
+                ],
+            )
+            .unwrap();
+        })
+    }
+
+    /// Reads the clock, paid with coin `i`.
+    fn read_clock(&self, i: usize) -> Transaction {
+        let clock = self.shared(SUI_CLOCK_OBJECT_ID, false);
+        self.ptb(i, |b| {
+            b.move_call(
+                SUI_FRAMEWORK_PACKAGE_ID,
+                ident_str!("clock").to_owned(),
+                ident_str!("timestamp_ms").to_owned(),
+                vec![],
+                vec![CallArg::Object(clock)],
+            )
+            .unwrap();
+        })
     }
 
     /// 1 SUI to a fresh address, paid with coin `i`.
@@ -144,11 +245,20 @@ impl Network {
     /// Submits `transaction` through anchovy's RPC service, and waits until
     /// both validators have executed it, with the same effects, and
     /// certified its checkpoint.
-    fn execute(&mut self, transaction: &Transaction) {
+    fn execute(&mut self, transaction: &Transaction) -> TransactionEffects {
+        self.execute_together(&[transaction]).remove(0)
+    }
+
+    /// `execute` for `transactions` submitted in one request, so in one
+    /// block.
+    fn execute_together(&mut self, transactions: &[&Transaction]) -> Vec<TransactionEffects> {
         let service = Validator::over(self.anchovy.node.perpetual.current.clone());
         self.runtime.block_on(async {
             let request = RawSubmitTxRequest {
-                transactions: vec![bcs::to_bytes(transaction).unwrap().into()],
+                transactions: transactions
+                    .iter()
+                    .map(|t| bcs::to_bytes(t).unwrap().into())
+                    .collect(),
                 submit_type: SubmitTxType::Default as i32,
             };
             let submitted = tokio::time::timeout(
@@ -158,42 +268,78 @@ impl Network {
             .await
             .expect("submitted in time")
             .unwrap();
-            let position = match submitted.into_inner().results.remove(0).inner.unwrap() {
-                RawValidatorSubmitStatus::Submitted(position) => Some(position),
-                RawValidatorSubmitStatus::Executed(_) => None,
-                status @ RawValidatorSubmitStatus::Rejected(_) => {
-                    panic!("not submitted: {status:?}")
-                }
-            };
-            let request = RawWaitForEffectsRequest {
-                transaction_digest: Some(transaction.digest().into_inner().to_vec().into()),
-                consensus_position: position,
-                include_details: false,
-                ping_type: None,
-            };
-            tokio::time::timeout(
-                TIMEOUT,
-                service.wait_for_effects(tonic::Request::new(request)),
-            )
-            .await
-            .expect("answered in time")
-            .unwrap();
+            for (transaction, result) in transactions.iter().zip(submitted.into_inner().results) {
+                let position = match result.inner.unwrap() {
+                    RawValidatorSubmitStatus::Submitted(position) => Some(position),
+                    RawValidatorSubmitStatus::Executed(_) => None,
+                    status @ RawValidatorSubmitStatus::Rejected(_) => {
+                        panic!("not submitted: {status:?}")
+                    }
+                };
+                let request = RawWaitForEffectsRequest {
+                    transaction_digest: Some(transaction.digest().into_inner().to_vec().into()),
+                    consensus_position: position,
+                    include_details: false,
+                    ping_type: None,
+                };
+                tokio::time::timeout(
+                    TIMEOUT,
+                    service.wait_for_effects(tonic::Request::new(request)),
+                )
+                .await
+                .expect("answered in time")
+                .unwrap();
+            }
         });
-        let seq = self.wait_for("the transaction's checkpoint", |network| {
-            network.anchovy.checkpoint_of(transaction.digest())
+        self.agree_on(transactions)
+    }
+
+    /// Submits `transactions` through sui's validator service, then waits as
+    /// `execute_together`.
+    fn execute_through_sui(&mut self, transactions: &[&Transaction]) -> Vec<TransactionEffects> {
+        self.submit_through_sui(transactions);
+        self.agree_on(transactions)
+    }
+
+    /// Submits `transactions` through sui's validator service, one request
+    /// each, without waiting for their effects.
+    fn submit_through_sui(&mut self, transactions: &[&Transaction]) {
+        let client = &self.sui_client;
+        self.runtime.block_on(async {
+            for transaction in transactions {
+                let request = SubmitTxRequest::new_transaction((*transaction).clone());
+                tokio::time::timeout(TIMEOUT, client.submit_transaction(request, None))
+                    .await
+                    .expect("submitted in time")
+                    .unwrap();
+            }
         });
-        self.wait_for_certified(seq);
-        let ours = self
-            .anchovy
-            .effects(transaction.digest())
-            .expect("executed");
-        let theirs = self
-            .sui()
-            .get_transaction_cache_reader()
-            .get_executed_effects(transaction.digest())
-            .expect("executed");
-        assert_eq!(ours, theirs);
-        assert!(ours.status().is_ok(), "{:?}", ours.status());
+    }
+
+    /// Waits until both validators have executed `transactions`, with the
+    /// same effects, and certified their checkpoints; their effects.
+    fn agree_on(&mut self, transactions: &[&Transaction]) -> Vec<TransactionEffects> {
+        transactions
+            .iter()
+            .map(|transaction| {
+                let seq = self.wait_for("the transaction's checkpoint", |network| {
+                    network.anchovy.checkpoint_of(transaction.digest())
+                });
+                self.wait_for_certified(seq);
+                let ours = self
+                    .anchovy
+                    .effects(transaction.digest())
+                    .expect("executed");
+                let theirs = self
+                    .sui()
+                    .get_transaction_cache_reader()
+                    .get_executed_effects(transaction.digest())
+                    .expect("executed");
+                assert_eq!(ours, theirs);
+                assert!(ours.status().is_ok(), "{:?}", ours.status());
+                ours
+            })
+            .collect()
     }
 
     /// Waits until `f` gives something.
@@ -430,6 +576,48 @@ fn transfers_execute_alike() {
     let other = network.transfer(1);
     network.execute(&again);
     network.execute(&other);
+    drop(network.runtime);
+}
+
+#[test]
+fn shared_objects_execute_alike() {
+    let mut network = Network::new();
+    let share = network.share(0);
+    let created = network.execute(&share).created();
+    let (shared, _) = created
+        .iter()
+        .find(|(_, owner)| matches!(owner, Owner::Shared { .. }))
+        .expect("a shared coin");
+    let shared = shared.0;
+    let write = network.split_shared(1, shared);
+    network.execute(&write);
+    let clock = network.read_clock(2);
+    network.execute(&clock);
+    // Both write the shared coin in one commit, if submitted together.
+    let again = network.split_shared(0, shared);
+    let other = network.split_shared(1, shared);
+    network.execute_together(&[&again, &other]);
+    drop(network.runtime);
+}
+
+#[test]
+fn transactions_through_sui_execute_alike() {
+    let mut network = Network::new();
+    let first = network.transfer(0);
+    network.execute_through_sui(&[&first]);
+    let share = network.share(1);
+    let created = network.execute_through_sui(&[&share]).remove(0).created();
+    let (shared, _) = created
+        .iter()
+        .find(|(_, owner)| matches!(owner, Owner::Shared { .. }))
+        .expect("a shared coin");
+    let shared = shared.0;
+    // A write through each validator at once.
+    let ours = network.split_shared(0, shared);
+    let theirs = network.split_shared(1, shared);
+    network.submit_through_sui(&[&theirs]);
+    network.execute(&ours);
+    network.agree_on(&[&theirs]);
     drop(network.runtime);
 }
 

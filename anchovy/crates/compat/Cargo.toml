@@ -16,6 +16,7 @@ consensus-glue.workspace = true
 execution.workspace = true
 fastcrypto.workspace = true
 messages.workspace = true
+move-core-types.workspace = true
 node.workspace = true
 protocol-config.workspace = true
 rand.workspace = true

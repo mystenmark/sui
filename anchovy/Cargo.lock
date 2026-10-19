@@ -1712,6 +1712,7 @@ dependencies = [
  "execution",
  "fastcrypto",
  "messages",
+ "move-core-types",
  "node",
  "protocol-config",
  "rand 0.8.8",
