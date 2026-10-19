@@ -86,6 +86,10 @@ fn stage(epoch: &Arc<EpochParams>) -> (CommitStage, Outputs) {
             settlements,
             checkpoints,
             Arc::new(validator::consensus::status::ConsensusTxStatusCache::new()),
+            validator::consensus::execution_time::ExecutionTimeEstimator::new(
+                vec![([0; 96], 1)],
+                &epoch.config,
+            ),
         ),
         Outputs {
             chunks: chunk_inbox,
@@ -157,6 +161,7 @@ fn commit(index: u32, round: u32, timestamp_ms: u64, transactions: &[Vec<u8>]) -
                 )
             })
             .collect(),
+        observations: Vec::new(),
         rejected: Vec::new(),
         cache_hits: 0,
         cache_misses: transactions.len(),

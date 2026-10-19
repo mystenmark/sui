@@ -231,6 +231,7 @@ impl Pipeline {
             epoch_store: epoch_store.clone(),
             key: protocol_key.clone(),
             committee: committee.clone(),
+            stakes: record.stakes().collect(),
             consensus: consensus.clone(),
             cache: Arc::new(ConsensusTxCache::new()),
             generations: Arc::new(GenerationTable::new(epoch_store.clone())),

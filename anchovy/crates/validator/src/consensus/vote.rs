@@ -28,6 +28,7 @@ use workqueue::{Processor, Refusal, Refuse};
 use crate::checks::{self, SignatureChecks, VerifiedTransaction};
 use crate::consensus::cache::{BlockEntries, CachedTransaction, ConsensusTxCache};
 use crate::consensus::decode::{checkpoint_signature, claimed_immutable};
+use crate::consensus::execution_time::duration;
 use crate::epoch::EpochState;
 use crate::pipeline::items::{BuiltWaitItem, BuiltWaits};
 use crate::pipeline::keys::CheckpointBuilt;
@@ -443,6 +444,14 @@ fn validate_transactions(
             ConsensusTransactionKind::ExecutionTimeObservation(observation) => {
                 if observation.estimate_count() > config.max_programmable_tx_commands() as usize {
                     return invalid("ExecutionTimeObservation contains too many estimates");
+                }
+                // The reference cannot deserialize such a duration.
+                if observation
+                    .estimates
+                    .iter()
+                    .any(|(_, d)| duration(*d).is_none())
+                {
+                    return invalid("ExecutionTimeObservation duration overflows");
                 }
             }
             ConsensusTransactionKind::UpdateTransactionDenyConfig(update) => {

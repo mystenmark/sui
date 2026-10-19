@@ -18,6 +18,7 @@ use workqueue::{Processor, Refusal, Refuse};
 use crate::checks::{self, VerifiedTransaction};
 
 use crate::consensus::cache::{CachedTransaction, ConsensusTxCache};
+use crate::consensus::execution_time::{Key, SharedObservations, duration};
 use crate::epoch::EpochParams;
 use crate::pipeline::items::{BuiltWaitItem, BuiltWaits, CheckpointSignature};
 use crate::pipeline::keys::CheckpointBuilt;
@@ -45,6 +46,8 @@ pub struct DecodedCommit {
     pub timestamp_ms: u64,
     pub digest: [u8; 32],
     pub transactions: Vec<CommittedTransaction>,
+    /// The execution time observations it carries, in commit order.
+    pub observations: Vec<SharedObservations>,
     /// Where the transactions a quorum voted to reject were.
     pub rejected: Vec<(BlockRef, TransactionIndex)>,
     /// Transactions taken from the cache, and decoded again.
@@ -175,6 +178,7 @@ impl CommitDecoder {
             timestamp_ms,
             digest,
             transactions: Vec::new(),
+            observations: Vec::new(),
             rejected: rejected
                 .iter()
                 .flat_map(|(block, indices)| indices.iter().map(|i| (*block, *i)))
@@ -218,6 +222,11 @@ impl CommitDecoder {
                             }
                             continue;
                         }
+                        Decoded::Observations(mut observations) => {
+                            observations.author = block.reference.author;
+                            decoded.observations.push(observations);
+                            continue;
+                        }
                         Decoded::Other => continue,
                     }
                 };
@@ -256,6 +265,8 @@ impl CommitDecoder {
 enum Decoded {
     User(CachedTransaction),
     CheckpointSignature(CheckpointSignature),
+    /// Their author not yet set.
+    Observations(SharedObservations),
     Other,
 }
 
@@ -294,6 +305,21 @@ fn decode_transaction(bytes: Vec<u8>) -> Decoded {
     let immutable = match transaction.get().kind() {
         ConsensusTransactionKind::UserTransactionV2(user) => {
             claimed_immutable(user.claims()).to_vec()
+        }
+        ConsensusTransactionKind::ExecutionTimeObservation(observation) => {
+            return Decoded::Observations(SharedObservations {
+                author: 0,
+                authority: observation.authority.bytes,
+                generation: observation.generation,
+                estimates: observation
+                    .estimates
+                    .iter()
+                    .map(|(key, d)| {
+                        let d = duration(*d).expect("voting rejects unrepresentable durations");
+                        (Key::of_observation(key), d)
+                    })
+                    .collect(),
+            });
         }
         _ => return Decoded::Other,
     };

@@ -133,6 +133,10 @@ async fn the_stage_records_each_committed_transaction_s_status() {
         settlements,
         checkpoints,
         statuses.clone(),
+        validator::consensus::execution_time::ExecutionTimeEstimator::new(
+            vec![([0; 96], 1)],
+            &epoch.config,
+        ),
     );
     let mut decoded = commit(1, &[(&first, &[]), (&second, &[])]);
     let block = decoded.leader;
@@ -187,6 +191,7 @@ fn commit(index: u32, transactions: &[Claimed<'_>]) -> DecodedCommit {
                 CommittedTransaction::new(block, i as u16, parse(t.bytes.clone()), &immutable)
             })
             .collect(),
+        observations: Vec::new(),
         rejected: Vec::new(),
         cache_hits: 0,
         cache_misses: transactions.len(),
@@ -486,6 +491,10 @@ fn the_stage_leaves_dropped_transactions_out_of_its_chunks() {
         settlements,
         checkpoints,
         Arc::new(validator::consensus::status::ConsensusTxStatusCache::new()),
+        validator::consensus::execution_time::ExecutionTimeEstimator::new(
+            vec![([0; 96], 1)],
+            &epoch.config,
+        ),
     );
     let decided = stage
         .decide(commit(1, &[(&first, &[]), (&second, &[])]))

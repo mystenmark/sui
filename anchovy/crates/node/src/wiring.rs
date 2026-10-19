@@ -21,6 +21,7 @@ use validator::checks::{Valid, Verified};
 use validator::consensus::cache::ConsensusTxCache;
 use validator::consensus::commit::{CommitStage, EpochStart};
 use validator::consensus::decode::{CommitDecoder, CommitRequest, DecodedCommit};
+use validator::consensus::execution_time::ExecutionTimeEstimator;
 use validator::consensus::status::ConsensusTxStatusCache;
 use validator::consensus::vote::{BlockVoter, VoteRequest};
 use validator::epoch::EpochState;
@@ -143,6 +144,8 @@ pub(crate) struct Parts {
     pub epoch_store: EpochStore,
     pub key: Arc<ProtocolKey>,
     pub committee: Arc<Committee>,
+    /// Each member's name and stake, by committee index.
+    pub stakes: Vec<([u8; 96], u64)>,
     pub consensus: TransactionClient,
     pub cache: Arc<ConsensusTxCache>,
     pub generations: Arc<GenerationTable>,
@@ -185,6 +188,7 @@ impl Parts {
             settlement,
             checkpoint_waits,
             self.statuses.clone(),
+            ExecutionTimeEstimator::new(self.stakes.clone(), &self.epoch.params.config),
         )
         .with_backpressure(self.backpressure.clone())
     }

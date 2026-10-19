@@ -18,10 +18,15 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use ::consensus::{BlockRef, TransactionIndex};
+use blake2::digest::consts::U32;
+use blake2::{Blake2b, Digest as _};
 use messages::base::ObjectRef;
+use messages::transaction::TransactionKind;
 use workqueue::{Processor, Refusal, Refuse};
 
+use crate::checks::VerifiedTransaction;
 use crate::consensus::decode::{CommittedTransaction, DecodedCommit, OwnedInputs};
+use crate::consensus::execution_time::ExecutionTimeEstimator;
 use crate::consensus::sequence::{
     Prologue, Schedule, Scheduled, Sequencer, SharedAccess, SharedOrdinal,
 };
@@ -336,9 +341,8 @@ pub struct Decided {
 ///
 /// Not here yet, as the design leaves them for later:
 /// - deferral and cancellation: the prologue lists no cancelled
-///   transactions, and its additional state digest folds in no execution
-///   time estimates, so it matches the reference's only for a commit with
-///   no user transactions (the reference estimates each one's cost);
+///   transactions, and execution time estimates budget nothing (they only
+///   go into the prologue's additional state digest);
 /// - randomness: transactions using it are scheduled last in the commit's
 ///   chunks, not in chunks of their own;
 /// - the end of the epoch, beyond a stand-in: the first commit at or past the
@@ -365,6 +369,7 @@ pub struct CommitStage {
     start: EpochStart,
     queue: CheckpointQueue,
     commit_times: CommitIntervalObserver,
+    execution_times: ExecutionTimeEstimator,
     /// Commits through this one were decided before a restart: replayed,
     /// they only rebuild the commit interval observer, which is in memory,
     /// as the reference's prior commits do.
@@ -394,6 +399,7 @@ impl CommitStage {
         settlements: workqueue::Queue<SettlementInput>,
         checkpoints: workqueue::Queue<waiter::Command<ChunkSettled, PendingCheckpoint>>,
         statuses: Arc<ConsensusTxStatusCache>,
+        execution_times: ExecutionTimeEstimator,
     ) -> CommitStage {
         // From the last commit written, if any; else the epoch's start.
         let record = output.record().map(|bytes| CommitRecord::decode(&bytes));
@@ -408,6 +414,7 @@ impl CommitStage {
             start,
             queue,
             commit_times: CommitIntervalObserver::default(),
+            execution_times,
             prior_through,
             last_commit: record.map(|r| r.commit_index),
             closed: record.is_some_and(|r| r.closed),
@@ -429,7 +436,7 @@ impl CommitStage {
 
     /// Decides `commit` and lays it out in chunks and checkpoints, or
     /// nothing if it was handled before or follows the epoch's last.
-    pub fn decide(&mut self, commit: DecodedCommit) -> Option<Decided> {
+    pub fn decide(&mut self, mut commit: DecodedCommit) -> Option<Decided> {
         let epoch = &self.epoch.clone();
         if commit.commit_index <= self.prior_through {
             self.commit_times.observe(
@@ -443,12 +450,17 @@ impl CommitStage {
         if self.closed {
             return None;
         }
+        let observations = std::mem::take(&mut commit.observations);
         let HandledCommit {
             mut schedule,
             origins,
             dropped,
             ..
         } = self.handler.handle(epoch, commit)?;
+        // Before the commit's transactions are estimated, as the reference.
+        for shared in observations {
+            self.execution_times.observe(shared);
+        }
         let config = &epoch.config;
         let Some(&Scheduled::Prologue(prologue)) = schedule.transactions.first() else {
             unreachable!("a schedule starts with its prologue");
@@ -463,13 +475,17 @@ impl CommitStage {
         self.last_commit = Some(prologue.commit_index);
 
         // 1. The prologue, with the state digest of the commits through
-        //    this one.
+        //    this one and the estimates of the transactions it schedules.
         self.commit_times.observe(
             config.get_consensus_commit_rate_estimation_window_size(),
             prologue.timestamp_ms,
         );
-        let mut prologue_transaction =
-            Some(prologue_transaction(&prologue, &self.commit_times.digest()));
+        let estimates = schedule.transactions.iter().filter_map(|t| match t {
+            Scheduled::User(transaction) => Some(self.estimate_us(transaction)),
+            Scheduled::Prologue(_) => None,
+        });
+        let digest = self.commit_times.digest(&indirect_state_digest(estimates));
+        let mut prologue_transaction = Some(prologue_transaction(&prologue, &digest));
 
         // 2. Each transaction with its shared accesses, in schedule order.
         let transactions = std::mem::take(&mut schedule.transactions);
@@ -537,6 +553,17 @@ impl CommitStage {
         let mut decided = self.chunk(epoch, &prologue, entries, digests, close);
         decided.dropped = dropped;
         Some(decided)
+    }
+
+    /// `transaction`'s estimated execution time, in whole microseconds, as
+    /// the reference's `get_tx_cost`.
+    fn estimate_us(&self, transaction: &VerifiedTransaction) -> u64 {
+        let TransactionKind::ProgrammableTransaction(ptb) = transaction.get().0.data().kind()
+        else {
+            unreachable!("validation admits only programmable user transactions");
+        };
+        let estimate = self.execution_times.estimate(ptb.commands);
+        u64::try_from(estimate.as_micros()).unwrap_or(u64::MAX)
     }
 
     /// Chunks of at most `max_transactions_per_checkpoint`, each with the
@@ -874,20 +901,12 @@ impl CommitIntervalObserver {
         self.timestamps.push_back(timestamp_ms);
     }
 
-    /// The reference's `AdditionalConsensusState::digest` folded, by its
-    /// `IndirectStateObserver::fold_with`, with an observer that saw
-    /// nothing.
-    ///
-    /// TODO: the reference's observer also sees each user transaction's
-    /// execution-time estimate (congestion control), so this matches it
-    /// only for commits without user transactions.
-    fn digest(&self) -> [u8; 32] {
-        use blake2::digest::consts::U32;
-        use blake2::{Blake2b, Digest as _};
+    /// The reference's `AdditionalConsensusState::digest`, folded with the
+    /// commit's `indirect` state digest by `IndirectStateObserver::fold_with`.
+    fn digest(&self, indirect: &[u8; 32]) -> [u8; 32] {
         let state = Blake2b::<U32>::digest(
             bcs::to_bytes(&self.timestamps).expect("a sequence of u64 serializes"),
         );
-        let indirect = Blake2b::<U32>::digest([]);
         let mut fold = Blake2b::<U32>::new();
         // Each digest as BCS: its length, then its bytes.
         fold.update([32]);
@@ -896,6 +915,18 @@ impl CommitIntervalObserver {
         fold.update(indirect);
         fold.finalize().into()
     }
+}
+
+/// The reference's `IndirectStateObserver` digest: what it observed of a
+/// commit, each scheduled user transaction's execution time estimate, as
+/// BCS of `Some(estimate_us)`.
+fn indirect_state_digest(estimates_us: impl IntoIterator<Item = u64>) -> [u8; 32] {
+    let mut hash = Blake2b::<U32>::new();
+    for estimate in estimates_us {
+        hash.update([1]);
+        hash.update(estimate.to_le_bytes());
+    }
+    hash.finalize().into()
 }
 
 /// `prologue`'s `ConsensusCommitPrologueV4`, as the reference's
@@ -1097,8 +1128,9 @@ mod tests {
         for t in [2000, 3000, 4000] {
             short.observe(3, t);
         }
-        assert_eq!(long.digest(), short.digest());
+        let none = indirect_state_digest([]);
+        assert_eq!(long.digest(&none), short.digest(&none));
         short.observe(3, 5000);
-        assert_ne!(long.digest(), short.digest());
+        assert_ne!(long.digest(&none), short.digest(&none));
     }
 }

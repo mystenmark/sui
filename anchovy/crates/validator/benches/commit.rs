@@ -163,6 +163,7 @@ fn commit(index: u32, transactions: &[Vec<u8>]) -> DecodedCommit {
                 )
             })
             .collect(),
+        observations: Vec::new(),
         rejected: Vec::new(),
         cache_hits: 0,
         cache_misses: 0,
@@ -204,6 +205,10 @@ fn main() {
                 settlements,
                 checkpoints,
                 Arc::new(validator::consensus::status::ConsensusTxStatusCache::new()),
+                validator::consensus::execution_time::ExecutionTimeEstimator::new(
+                    vec![([0; 96], 1)],
+                    &epoch.config,
+                ),
             );
             let mut elapsed = Duration::ZERO;
             let mut allocations = 0;
