@@ -9,8 +9,9 @@
 //! [`Objects`] source, the node's store.
 //!
 //! Not checked, and refused as unsupported instead where they matter:
-//! address balances (fund withdrawals, coin reservations, gasless
-//! transactions). Not checked: the operator's deny config and the coin
+//! address balances beyond withdrawals from the sender's or sponsor's
+//! (withdrawals from allowances, coin reservations, gas from a balance,
+//! gasless transactions). Not checked: the operator's deny config and the coin
 //! deny list, the bytecode verification of packages to be published
 //! (execution verifies them), and previously received objects (the
 //! reference's markers).
@@ -22,8 +23,9 @@ use messages::base::{ObjectDigest, ObjectId, ObjectRef, SuiAddress};
 use messages::object::{Data, MoveObjectType, Object, Owner};
 use messages::system_transaction::EndOfEpochTransactionKind;
 use messages::transaction::{
-    CallArg, Command, ObjectArg, SenderSignedData, SharedObjectArg, SharedObjectMutability,
-    TransactionData, TransactionKind, TxState,
+    CallArg, Command, ObjectArg, Reservation, SenderSignedData, SharedObjectArg,
+    SharedObjectMutability, TransactionData, TransactionKind, TxState, WithdrawFrom,
+    WithdrawalTypeArg,
 };
 use messages::type_tag::TypeTag;
 
@@ -305,7 +307,44 @@ pub fn check(
     check_objects(data, &inputs)?;
     check_replay_protection(data, &inputs)?;
     check_receiving_objects(&inputs, &receiving, &received)?;
-    check_owned_objects_live(&inputs)
+    check_owned_objects_live(&inputs)?;
+    check_funds_withdrawals(data)
+}
+
+/// The reference's `process_funds_withdrawals_for_signing`, for the
+/// withdrawals `refuse_address_balances` lets through: each reserves a
+/// non-zero amount, and the amounts drawn on one balance do not overflow.
+fn check_funds_withdrawals(data: &TransactionData<'_, impl TxState>) -> Result<(), Error> {
+    let TransactionKind::ProgrammableTransaction(pt) = data.kind() else {
+        return Ok(());
+    };
+    let invalid = |message: &str| Err(error(ErrorKind::InvalidWithdrawReservation, message));
+    let mut reserved: Vec<((&SuiAddress, TypeTag<'_>), u64)> = Vec::new();
+    for arg in pt.inputs {
+        let CallArg::FundsWithdrawal(w) = arg else {
+            continue;
+        };
+        let w = w.get();
+        let Reservation::MaxAmountU64(amount) = w.reservation;
+        if amount == 0 {
+            return invalid("Balance withdraw reservation amount must be non-zero");
+        }
+        let owner = match w.withdraw_from {
+            WithdrawFrom::Sender => data.sender(),
+            WithdrawFrom::Sponsor => data.gas_data().owner,
+            WithdrawFrom::SenderAllowance { funder, .. } => funder,
+        };
+        let WithdrawalTypeArg::Balance(ty) = w.type_arg;
+        let balance = (owner, ty);
+        match reserved.iter_mut().find(|(b, _)| *b == balance) {
+            Some((_, total)) => match total.checked_add(amount) {
+                Some(sum) => *total = sum,
+                None => return invalid("Balance withdraw reservation overflow"),
+            },
+            None => reserved.push((balance, amount)),
+        }
+    }
+    Ok(())
 }
 
 /// Address balances are not kept yet, so nothing that draws on them can be
@@ -335,7 +374,11 @@ fn refuse_address_balances(
     if let TransactionKind::ProgrammableTransaction(pt) = data.kind() {
         for arg in pt.inputs {
             match arg {
-                CallArg::FundsWithdrawal(_) => return unsupported("a funds withdrawal"),
+                CallArg::FundsWithdrawal(w)
+                    if matches!(w.get().withdraw_from, WithdrawFrom::SenderAllowance { .. }) =>
+                {
+                    return unsupported("a withdrawal from an allowance");
+                }
                 CallArg::Object(ObjectArg::ImmOrOwnedObject(r)) if r.is_coin_reservation() => {
                     return unsupported("a coin reservation");
                 }

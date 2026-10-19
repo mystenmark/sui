@@ -1285,10 +1285,8 @@ fn funds_sent_to_an_address_balance_settle_and_can_be_withdrawn() {
     // The prologue, the transfer, a settlement and the barrier.
     assert_eq!(network.contents(seq_1).len(), 4);
 
-    // This validator's input checks reject funds withdrawals (address
-    // balances are not supported there yet); the committee commits it.
     let withdraw = network.withdraw(network.coin(1), SUI);
-    let seq_2 = network.commit_outvoted(vec![consensus_transaction(&withdraw)], &[0]);
+    let seq_2 = network.commit(vec![consensus_transaction(&withdraw)]);
     network.certify(seq_2);
     network.assert_checkpointed(seq_2, &[&withdraw]);
     let created = network.effects(withdraw.digest()).created();
@@ -1385,17 +1383,13 @@ fn a_withdrawal_exceeding_the_settled_balance_fails() {
     let send = network.send_funds(network.coin(0), SUI);
     let seq = network.commit(vec![consensus_transaction(&send)]);
     network.certify(seq);
-    // This validator's input checks reject funds withdrawals; the committee
-    // commits it.
+    // Voting does not check balances: the overdraft is committed.
     let deposit = network.send_funds(network.coin(1), 5 * SUI);
     let overdraw = network.withdraw(network.coin(2), 2 * SUI);
-    let seq = network.commit_outvoted(
-        vec![
-            consensus_transaction(&deposit),
-            consensus_transaction(&overdraw),
-        ],
-        &[1],
-    );
+    let seq = network.commit(vec![
+        consensus_transaction(&deposit),
+        consensus_transaction(&overdraw),
+    ]);
     network.certify(seq);
     network.assert_checkpointed(seq, &[&deposit]);
     let effects = network.effects(overdraw.digest());
