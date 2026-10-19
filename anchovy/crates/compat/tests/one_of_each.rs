@@ -294,6 +294,37 @@ impl Network {
         self.agree_on(transactions)
     }
 
+    /// Submits `transactions` through anchovy's RPC service in one request,
+    /// without waiting for their effects; what it answered of each.
+    fn submit_through_anchovy(
+        &mut self,
+        transactions: &[&Transaction],
+    ) -> Vec<RawValidatorSubmitStatus> {
+        let service = Validator::over(self.anchovy.node.perpetual.current.clone());
+        self.runtime.block_on(async {
+            let request = RawSubmitTxRequest {
+                transactions: transactions
+                    .iter()
+                    .map(|t| bcs::to_bytes(t).unwrap().into())
+                    .collect(),
+                submit_type: SubmitTxType::Default as i32,
+            };
+            let submitted = tokio::time::timeout(
+                TIMEOUT,
+                service.submit_transaction(tonic::Request::new(request)),
+            )
+            .await
+            .expect("submitted in time")
+            .unwrap();
+            submitted
+                .into_inner()
+                .results
+                .into_iter()
+                .map(|r| r.inner.unwrap())
+                .collect()
+        })
+    }
+
     /// Submits `transactions` through sui's validator service, then waits as
     /// `execute_together`.
     fn execute_through_sui(&mut self, transactions: &[&Transaction]) -> Vec<TransactionEffects> {
@@ -618,6 +649,31 @@ fn transactions_through_sui_execute_alike() {
     network.submit_through_sui(&[&theirs]);
     network.execute(&ours);
     network.agree_on(&[&theirs]);
+    drop(network.runtime);
+}
+
+#[test]
+fn a_double_spend_in_one_block_executes_alike() {
+    let mut network = Network::new();
+    // Both pay with the same version of coin 0.
+    let first = network.transfer(0);
+    let second = network.transfer(0);
+    let statuses = network.submit_through_anchovy(&[&first, &second]);
+    assert!(
+        statuses
+            .iter()
+            .all(|s| matches!(s, RawValidatorSubmitStatus::Submitted(_))),
+        "{statuses:?}"
+    );
+    let winner = network.wait_for("one of them to execute", |network| {
+        [&first, &second]
+            .into_iter()
+            .find(|t| network.anchovy.checkpoint_of(t.digest()).is_some())
+            .cloned()
+    });
+    network.agree_on(&[&winner]);
+    let later = network.transfer(1);
+    network.execute(&later);
     drop(network.runtime);
 }
 
