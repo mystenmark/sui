@@ -298,12 +298,10 @@ impl CommitRecord {
 pub struct EpochStart {
     /// The checkpoint before the epoch's first (the previous epoch's last, or
     /// the genesis checkpoint, 0): the epoch's first checkpoint follows it,
-    /// its first chunk follows `previous_height`, and its checkpoint
-    /// intervals count from `previous_timestamp_ms`. A restart replays the
+    /// and its first chunk follows `previous_height`. A restart replays the
     /// epoch's commits from its first, rebuilding the handler's other state.
     pub previous_checkpoint: u64,
     pub previous_height: u64,
-    pub previous_timestamp_ms: u64,
     /// The accumulator root's stream starts at this version.
     pub accumulator_root_initial_shared_version: u64,
     /// The root's version the epoch's first chunk reads: where version
@@ -401,11 +399,7 @@ impl CommitStage {
         let record = output.record().map(|bytes| CommitRecord::decode(&bytes));
         let queue = match record {
             Some(r) => CheckpointQueue::resumed(r.height, r.next_seq, r.last_built_timestamp),
-            None => CheckpointQueue::new(
-                start.previous_checkpoint,
-                start.previous_height,
-                start.previous_timestamp_ms,
-            ),
+            None => CheckpointQueue::new(start.previous_checkpoint, start.previous_height),
         };
         let prior_through = record.map_or(0, |r| r.commit_index);
         CommitStage {
@@ -785,13 +779,11 @@ struct CheckpointQueue {
 }
 
 impl CheckpointQueue {
-    fn new(
-        previous_checkpoint: u64,
-        previous_height: u64,
-        previous_timestamp_ms: u64,
-    ) -> CheckpointQueue {
+    /// No checkpoint cut yet this epoch: as the reference's, its first
+    /// commit cuts one, whatever the interval.
+    fn new(previous_checkpoint: u64, previous_height: u64) -> CheckpointQueue {
         CheckpointQueue {
-            last_built_timestamp: previous_timestamp_ms,
+            last_built_timestamp: 0,
             pending: Vec::new(),
             pending_timestamp: 0,
             pending_transactions: 0,
@@ -1046,7 +1038,7 @@ mod tests {
 
     #[test]
     fn a_chunk_that_does_not_fit_cuts_the_checkpoint_before_it() {
-        let mut queue = CheckpointQueue::new(0, 0, 0);
+        let mut queue = CheckpointQueue::new(0, 0);
         let mut flushed = Vec::new();
         for (transactions, timestamp) in [(3, 10), (2, 10), (2, 20)] {
             let height = queue.next_height();
@@ -1067,7 +1059,7 @@ mod tests {
 
     #[test]
     fn a_chunk_larger_than_the_limit_is_a_checkpoint_of_its_own() {
-        let mut queue = CheckpointQueue::new(7, 0, 0);
+        let mut queue = CheckpointQueue::new(7, 0);
         let mut flushed = Vec::new();
         let height = queue.next_height();
         assert_eq!(queue.push_chunk(height, 9, 0, 5, &mut flushed), 8);
@@ -1079,7 +1071,7 @@ mod tests {
 
     #[test]
     fn checkpoints_are_cut_once_the_interval_has_passed_by_commit_time() {
-        let mut queue = CheckpointQueue::new(0, 0, 0);
+        let mut queue = CheckpointQueue::new(0, 0);
         let mut flushed = Vec::new();
         let mut cut = Vec::new();
         for timestamp in [100, 150, 250, 300, 449, 450] {

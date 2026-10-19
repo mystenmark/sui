@@ -190,7 +190,6 @@ fn main() {
             let start = EpochStart {
                 previous_checkpoint: 0,
                 previous_height: 0,
-                previous_timestamp_ms: 0,
                 accumulator_root_initial_shared_version: 1,
                 accumulator_root_version: 1,
                 epoch_start_timestamp_ms: 0,

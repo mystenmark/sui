@@ -123,7 +123,6 @@ async fn the_stage_records_each_committed_transaction_s_status() {
         EpochStart {
             previous_checkpoint: 0,
             previous_height: 0,
-            previous_timestamp_ms: 0,
             accumulator_root_initial_shared_version: 1,
             accumulator_root_version: 1,
             epoch_start_timestamp_ms: 0,
@@ -477,7 +476,6 @@ fn the_stage_leaves_dropped_transactions_out_of_its_chunks() {
         EpochStart {
             previous_checkpoint: 0,
             previous_height: 0,
-            previous_timestamp_ms: 0,
             accumulator_root_initial_shared_version: 1,
             accumulator_root_version: 1,
             epoch_start_timestamp_ms: 0,

@@ -71,7 +71,6 @@ fn stage(epoch: &Arc<EpochParams>) -> (CommitStage, Outputs) {
     let start = EpochStart {
         previous_checkpoint: 10,
         previous_height: 0,
-        previous_timestamp_ms: 0,
         accumulator_root_initial_shared_version: ROOT_VERSION,
         accumulator_root_version: ROOT_VERSION,
         epoch_start_timestamp_ms: 0,

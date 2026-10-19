@@ -135,7 +135,6 @@ fn epoch_start(store: &store::Store, epoch_store: &EpochStore, record: &EpochRec
     EpochStart {
         previous_checkpoint: checkpoint.seq,
         previous_height: checkpoint.last_height,
-        previous_timestamp_ms: checkpoint.timestamp_ms,
         accumulator_root_version,
         accumulator_root_initial_shared_version: initial_shared_version,
         epoch_start_timestamp_ms: record.epoch_start_timestamp_ms,
