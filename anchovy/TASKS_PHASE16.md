@@ -24,7 +24,9 @@ the effects both list differently.
 Tests: an idle network; transfers; shared objects, a shared object written
 twice in one commit and through both validators at once; transactions
 submitted through sui; a double spend in one block; address balance
-deposits and withdrawals; epochs following one another.
+deposits and withdrawals; epochs following one another; anchovy crashing and
+resuming, mid-epoch and across an epoch's end; a published package created,
+shared and written.
 
 ## Forks found and fixed
 
@@ -89,5 +91,11 @@ Known divergences, not yet reached by a test:
 Seen once and not reproduced: `execution_time_observations_outlive_a_restart`
 failed under the full suite's load (took 13s); 36 parallel reruns passed.
 
-Next tests: a crash and restart of each side, package publishing,
-randomness, protocol upgrades.
+Not a fork, found on the way: the consensus-glue test's client waited
+forever for a transaction committed after its epoch's last commit (dropped,
+as in the reference); it now submits again.
+
+Next: randomness (anchovy takes no part in DKG or in generating
+randomness, which reaches sui validators over their own network), protocol
+upgrades (capabilities, which anchovy neither submits nor counts),
+congestion control (deferral by the estimates), a sui validator's crash.
