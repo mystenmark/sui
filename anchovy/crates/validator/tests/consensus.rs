@@ -160,14 +160,7 @@ fn new_handler(output: validator::epoch_store::ConsensusOutput) -> CommitHandler
         protocol_config::ProtocolVersion::MAX,
         protocol_config::Chain::Unknown,
     );
-    CommitHandler::new(
-        output,
-        0,
-        validator::consensus::execution_time::ExecutionTimeEstimator::new(
-            vec![([0; 96], 10_000)],
-            &config,
-        ),
-    )
+    CommitHandler::new(output, 0, vec![([0; 96], 10_000)], &config, None)
 }
 
 #[test]
@@ -424,7 +417,8 @@ fn scheduled(handled: &HandledCommit) -> Vec<TransactionIndex> {
             validator::consensus::sequence::Scheduled::User(t) => {
                 Some(handled.origins[&t.get().0.digest().bytes].1)
             }
-            validator::consensus::sequence::Scheduled::Prologue(_) => None,
+            validator::consensus::sequence::Scheduled::Prologue(_)
+            | validator::consensus::sequence::Scheduled::AuthenticatorStateUpdate(_) => None,
         })
         .collect()
 }
@@ -643,17 +637,21 @@ fn handlers_decide_alike_whatever_has_executed() {
                 let decided = handler
                     .handle(&node.epoch.params, decoder.decode(c.clone()))
                     .unwrap();
-                let order: Vec<_> = decided
-                    .schedule
-                    .transactions
-                    .iter()
-                    .map(|t| match t {
-                        validator::consensus::sequence::Scheduled::User(t) => {
-                            Some(t.get().0.digest().bytes)
-                        }
-                        validator::consensus::sequence::Scheduled::Prologue(_) => None,
-                    })
-                    .collect();
+                let order: Vec<_> =
+                    decided
+                        .schedule
+                        .transactions
+                        .iter()
+                        .map(|t| match t {
+                            validator::consensus::sequence::Scheduled::User(t) => {
+                                Some(t.get().0.digest().bytes)
+                            }
+                            validator::consensus::sequence::Scheduled::Prologue(_)
+                            | validator::consensus::sequence::Scheduled::AuthenticatorStateUpdate(
+                                _,
+                            ) => None,
+                        })
+                        .collect();
                 let accesses: Vec<_> = (0..decided.schedule.len())
                     .map(|i| decided.schedule.accesses(i).to_vec())
                     .collect();

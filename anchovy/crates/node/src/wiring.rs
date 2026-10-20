@@ -21,7 +21,6 @@ use validator::checks::{Valid, Verified};
 use validator::consensus::cache::ConsensusTxCache;
 use validator::consensus::commit::{CommitStage, EpochStart};
 use validator::consensus::decode::{CommitDecoder, CommitRequest, DecodedCommit};
-use validator::consensus::execution_time::ExecutionTimeEstimator;
 use validator::consensus::status::ConsensusTxStatusCache;
 use validator::consensus::vote::{BlockVoter, VoteRequest};
 use validator::epoch::EpochState;
@@ -188,7 +187,7 @@ impl Parts {
             settlement,
             checkpoint_waits,
             self.statuses.clone(),
-            ExecutionTimeEstimator::new(self.stakes.clone(), &self.epoch.params.config),
+            self.stakes.clone(),
         )
         .with_backpressure(self.backpressure.clone())
     }

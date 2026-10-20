@@ -8,6 +8,7 @@
 
 use hashbrown::HashMap;
 use messages::base::ObjectId;
+use messages::build::system_transaction::{Jwk, JwkId};
 use messages::transaction::{
     CallArg, ObjectArg, SharedObjectArg, SharedObjectMutability, TransactionKind,
 };
@@ -19,6 +20,9 @@ use crate::checks::VerifiedTransaction;
 const CLOCK: ObjectId = ObjectId::from_u16(0x6);
 /// `SUI_CLOCK_OBJECT_SHARED_VERSION`.
 const CLOCK_INITIAL_SHARED_VERSION: u64 = 1;
+/// The authenticator state (`SUI_AUTHENTICATOR_STATE_OBJECT_ID`), which
+/// `AuthenticatorStateUpdate` writes.
+const AUTHENTICATOR_STATE: ObjectId = ObjectId::from_u16(0x7);
 /// The randomness state (`SUI_RANDOMNESS_STATE_OBJECT_ID`).
 const RANDOMNESS_STATE: ObjectId = ObjectId::from_u16(0x8);
 
@@ -64,7 +68,16 @@ pub struct Prologue {
 #[derive(Debug)]
 pub enum Scheduled {
     Prologue(Prologue),
+    /// The JSON web keys that became active in the last commit.
+    AuthenticatorStateUpdate(Vec<(JwkId, Jwk)>),
     User(VerifiedTransaction),
+}
+
+/// An `AuthenticatorStateUpdate` to schedule: the authenticator state's
+/// initial shared version, and the keys it adds.
+pub struct AuthenticatorUpdate {
+    pub initial_shared_version: u64,
+    pub keys: Vec<(JwkId, Jwk)>,
 }
 
 /// A commit's transactions in execution order, each with its shared
@@ -159,24 +172,26 @@ impl Sequencer {
             .collect()
     }
 
-    /// The commit's schedule: the prologue, then `transactions`, in order,
-    /// each with its shared inputs' ordinals: the reference's
-    /// `assign_versions_from_consensus`, with ordinals for versions.
+    /// The commit's schedule: the prologue, the authenticator state's
+    /// update if any, then `transactions`, in order, each with its shared
+    /// inputs' ordinals: the reference's `assign_versions_from_consensus`,
+    /// with ordinals for versions.
     pub fn schedule(
         &mut self,
         prologue: Prologue,
+        update: Option<AuthenticatorUpdate>,
         transactions: Vec<VerifiedTransaction>,
     ) -> Schedule {
         let round = prologue.round;
         let mut schedule = Schedule {
-            transactions: Vec::with_capacity(transactions.len() + 1),
+            transactions: Vec::with_capacity(transactions.len() + 2),
             accesses: Vec::with_capacity(
                 1 + transactions
                     .iter()
                     .map(|t| shared_inputs(t).count())
                     .sum::<usize>(),
             ),
-            ends: Vec::with_capacity(transactions.len() + 1),
+            ends: Vec::with_capacity(transactions.len() + 2),
         };
 
         // 1. The prologue writes the clock, first.
@@ -195,9 +210,30 @@ impl Sequencer {
         schedule.accesses.push(clock);
         schedule.ends.push(1);
 
-        // 2. Each transaction's shared inputs: every access reads the
+        // 2. The authenticator state's update writes it, next.
+        if let Some(update) = update {
+            let authenticator = SharedAccess {
+                id: AUTHENTICATOR_STATE,
+                initial_shared_version: update.initial_shared_version,
+                mutability: SharedObjectMutability::Mutable,
+                ordinal: SharedOrdinal {
+                    round,
+                    writes_before: 0,
+                },
+                base: None,
+            };
+            Self::count(&mut self.writes, 1, std::iter::once(&authenticator));
+            schedule.accesses.push(authenticator);
+            schedule.ends.push(2);
+            schedule
+                .transactions
+                .push(Scheduled::AuthenticatorStateUpdate(update.keys));
+        }
+
+        // 3. Each transaction's shared inputs: every access reads the
         //    generation before the transaction's own writes.
-        for (position, transaction) in transactions.into_iter().enumerate() {
+        let first = schedule.transactions.len();
+        for (offset, transaction) in transactions.into_iter().enumerate() {
             let start = schedule.accesses.len();
             for shared in shared_inputs(&transaction) {
                 let stream = (shared.id, shared.initial_shared_version.get());
@@ -212,7 +248,7 @@ impl Sequencer {
                     base: None,
                 });
             }
-            let index = u32::try_from(position + 1).expect("fewer than 2^32 transactions");
+            let index = u32::try_from(first + offset).expect("fewer than 2^32 transactions");
             let accesses = &schedule.accesses[start..];
             Self::count(&mut self.writes, index, accesses.iter());
             schedule

@@ -124,6 +124,7 @@ async fn the_stage_records_each_committed_transaction_s_status() {
             previous_checkpoint: 0,
             previous_height: 0,
             accumulator_root_initial_shared_version: 1,
+            authenticator_initial_shared_version: None,
             accumulator_root_version: 1,
             epoch_start_timestamp_ms: 0,
             epoch_duration_ms: u64::MAX,
@@ -133,10 +134,7 @@ async fn the_stage_records_each_committed_transaction_s_status() {
         settlements,
         checkpoints,
         statuses.clone(),
-        validator::consensus::execution_time::ExecutionTimeEstimator::new(
-            vec![([0; 96], 1)],
-            &epoch.config,
-        ),
+        vec![([0; 96], 1)],
     );
     let mut decoded = commit(1, &[(&first, &[]), (&second, &[])]);
     let block = decoded.leader;
@@ -192,6 +190,7 @@ fn commit(index: u32, transactions: &[Claimed<'_>]) -> DecodedCommit {
             })
             .collect(),
         observations: Vec::new(),
+        jwks: Vec::new(),
         rejected: Vec::new(),
         cache_hits: 0,
         cache_misses: transactions.len(),
@@ -207,7 +206,7 @@ fn scheduled(handled: &HandledCommit) -> Vec<[u8; 32]> {
         .iter()
         .filter_map(|t| match t {
             Scheduled::User(t) => Some(digest_of(t)),
-            Scheduled::Prologue(_) => None,
+            Scheduled::Prologue(_) | Scheduled::AuthenticatorStateUpdate(_) => None,
         })
         .collect()
 }
@@ -248,14 +247,7 @@ fn new_handler(output: validator::epoch_store::ConsensusOutput) -> CommitHandler
         protocol_config::ProtocolVersion::MAX,
         protocol_config::Chain::Unknown,
     );
-    CommitHandler::new(
-        output,
-        0,
-        validator::consensus::execution_time::ExecutionTimeEstimator::new(
-            vec![([0; 96], 10_000)],
-            &config,
-        ),
-    )
+    CommitHandler::new(output, 0, vec![([0; 96], 10_000)], &config, None)
 }
 
 #[test]
@@ -320,16 +312,94 @@ fn a_deferred_transaction_outlives_a_restart() {
     drop((handler, committed));
 
     let (_, output, _) = EpochStore::open(dir.path(), 0);
-    let mut handler = CommitHandler::new(
-        output,
-        1,
-        validator::consensus::execution_time::ExecutionTimeEstimator::new(
-            vec![([0; 96], 10_000)],
-            &epoch.config,
-        ),
-    );
+    let mut handler = CommitHandler::new(output, 1, vec![([0; 96], 10_000)], &epoch.config, None);
     let decided = handler.handle(&epoch, commit(2, &[])).unwrap();
     assert_eq!(scheduled(&decided), vec![digest(&first)]);
+}
+
+/// The keys a commit's authenticator state update adds.
+fn updated_keys(handled: &HandledCommit) -> Vec<String> {
+    handled
+        .schedule
+        .transactions
+        .iter()
+        .filter_map(|t| match t {
+            Scheduled::AuthenticatorStateUpdate(keys) => Some(keys),
+            _ => None,
+        })
+        .flatten()
+        .map(|(id, _)| id.kid.clone())
+        .collect()
+}
+
+#[test]
+fn a_key_a_quorum_voted_for_is_added_by_the_next_commit_across_a_restart() {
+    use messages::build::system_transaction::{Jwk, JwkId};
+    use validator::consensus::jwk::JwkVote;
+    let epoch = epoch();
+    // Two of three: 6,667 of 10,000, a quorum.
+    let members: Vec<_> = [3_334, 3_333, 3_333]
+        .into_iter()
+        .zip(0u8..)
+        .map(|(stake, i)| ([i; 96], stake))
+        .collect();
+    let vote = |author: u8, kid: &str| JwkVote {
+        author: u32::from(author),
+        authority: [author; 96],
+        id: JwkId {
+            iss: "https://issuer".to_owned(),
+            kid: kid.to_owned(),
+        },
+        jwk: Jwk {
+            kty: "RSA".to_owned(),
+            e: "AQAB".to_owned(),
+            n: "n".to_owned(),
+            alg: "RS256".to_owned(),
+        },
+    };
+    let handler = |output| CommitHandler::new(output, 0, members.clone(), &epoch.config, Some(1));
+    let with_votes = |index: u32, votes: Vec<JwkVote>| {
+        let mut commit = commit(index, &[]);
+        commit.jwks = votes;
+        commit
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (_, output, _) = EpochStore::open(dir.path(), 0);
+    let committed = output.committed_checkpoints();
+    let mut first = handler(output);
+    // "a" becomes active in commit 1; "b" has one vote of two.
+    let decided = first
+        .handle(
+            &epoch,
+            with_votes(1, vec![vote(0, "a"), vote(1, "a"), vote(0, "b")]),
+        )
+        .unwrap();
+    assert!(updated_keys(&decided).is_empty());
+    let record = validator::consensus::commit::CommitRecord {
+        commit_index: 1,
+        leader_round: 1,
+        height: 1,
+        next_seq: 2,
+        last_built_timestamp: 0,
+        root_version: 1,
+        closed: false,
+    };
+    first.finish(&record, 1, true);
+    committed.committed_through(1);
+    drop((first, committed));
+
+    // Restarted: commit 2 adds "a", and a second vote makes "b" active,
+    // which commit 3 adds.
+    let (_, output, _) = EpochStore::open(dir.path(), 0);
+    let mut second = CommitHandler::new(output, 1, members.clone(), &epoch.config, Some(1));
+    let decided = second
+        .handle(&epoch, with_votes(2, vec![vote(2, "b")]))
+        .unwrap();
+    assert_eq!(updated_keys(&decided), ["a"]);
+    let decided = second.handle(&epoch, commit(3, &[])).unwrap();
+    assert_eq!(updated_keys(&decided), ["b"]);
+    let decided = second.handle(&epoch, commit(4, &[])).unwrap();
+    assert!(updated_keys(&decided).is_empty());
 }
 
 #[test]
@@ -554,6 +624,7 @@ fn the_stage_leaves_dropped_transactions_out_of_its_chunks() {
             previous_checkpoint: 0,
             previous_height: 0,
             accumulator_root_initial_shared_version: 1,
+            authenticator_initial_shared_version: None,
             accumulator_root_version: 1,
             epoch_start_timestamp_ms: 0,
             epoch_duration_ms: u64::MAX,
@@ -563,10 +634,7 @@ fn the_stage_leaves_dropped_transactions_out_of_its_chunks() {
         settlements,
         checkpoints,
         Arc::new(validator::consensus::status::ConsensusTxStatusCache::new()),
-        validator::consensus::execution_time::ExecutionTimeEstimator::new(
-            vec![([0; 96], 1)],
-            &epoch.config,
-        ),
+        vec![([0; 96], 1)],
     );
     let users = |decided: &validator::consensus::commit::Decided| -> Vec<[u8; 32]> {
         decided

@@ -132,11 +132,22 @@ fn epoch_start(store: &store::Store, epoch_store: &EpochStore, record: &EpochRec
         .start_version(store, &root, initial_shared_version)
         .expect("the accumulator root exists")
         .version;
+    // Created only by an epoch's last transaction, so as the epoch started.
+    let authenticator_initial_shared_version = store
+        .live_object(&messages::base::ObjectId::from_u16(0x7))
+        .expect("the store reads")
+        .map(|authenticator| match authenticator.get().owner {
+            messages::object::Owner::Shared {
+                initial_shared_version,
+            } => initial_shared_version,
+            _ => panic!("the authenticator state is shared"),
+        });
     EpochStart {
         previous_checkpoint: checkpoint.seq,
         previous_height: checkpoint.last_height,
         accumulator_root_version,
         accumulator_root_initial_shared_version: initial_shared_version,
+        authenticator_initial_shared_version,
         epoch_start_timestamp_ms: record.epoch_start_timestamp_ms,
         epoch_duration_ms: record.epoch_duration_ms,
     }

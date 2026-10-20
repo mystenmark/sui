@@ -130,7 +130,7 @@ fn main() {
                 let before = ALLOCATIONS.load(Ordering::Relaxed);
                 let start = Instant::now();
                 let ordered = sequencer.order(&config, transactions);
-                let schedule = sequencer.schedule(prologue, ordered);
+                let schedule = sequencer.schedule(prologue, None, ordered);
                 let took = start.elapsed();
                 let allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
                 assert_eq!(schedule.len(), commit_size + 1);

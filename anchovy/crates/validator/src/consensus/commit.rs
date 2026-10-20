@@ -21,6 +21,8 @@ use ::consensus::{BlockRef, TransactionIndex};
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest as _};
 use messages::base::ObjectRef;
+use messages::build::system_transaction::{Jwk, JwkId};
+use protocol_config::ProtocolConfig;
 use workqueue::{Processor, Refusal, Refuse};
 
 use crate::consensus::decode::{CommittedTransaction, DecodedCommit};
@@ -28,8 +30,9 @@ use crate::consensus::deferral::{DeferralKey, Deferred, decode_deferred, encode_
 use crate::consensus::execution_time::{
     ExecutionTimeEstimator, decode_estimates, encode_estimates,
 };
+use crate::consensus::jwk::{JwkAggregator, JwkVote, decode_vote, encode_vote, jwk_order};
 use crate::consensus::sequence::{
-    Prologue, Schedule, Scheduled, Sequencer, SharedAccess, SharedOrdinal,
+    AuthenticatorUpdate, Prologue, Schedule, Scheduled, Sequencer, SharedAccess, SharedOrdinal,
 };
 use crate::consensus::status::{ConsensusTxStatus, ConsensusTxStatusCache};
 use crate::epoch::EpochParams;
@@ -99,24 +102,49 @@ pub struct CommitHandler {
     output: ConsensusOutput,
     sequencer: Sequencer,
     execution_times: ExecutionTimeEstimator,
+    jwks: JwkAggregator,
+    /// The JSON web keys that became active in the last commit handled,
+    /// which the next adds to the authenticator state.
+    new_jwks: Vec<(JwkId, Jwk)>,
+    /// The authenticator state's initial shared version, if the epoch
+    /// agrees keys: the reference's `authenticator_state_enabled`.
+    authenticator: Option<u64>,
 }
 
 impl CommitHandler {
-    /// A handler that has handled the commits through `last_commit`, with
-    /// the execution time observations of those written restored.
+    /// A handler of `committee`'s commits (each member's name and stake, by
+    /// index), that has handled those through `last_commit`, with what the
+    /// commits written observed and voted for restored. `authenticator` is
+    /// the authenticator state's initial shared version, if it exists.
     pub fn new(
         output: ConsensusOutput,
         last_commit: u32,
-        mut execution_times: ExecutionTimeEstimator,
+        committee: Vec<([u8; 96], u64)>,
+        config: &ProtocolConfig,
+        authenticator: Option<u64>,
     ) -> CommitHandler {
+        let mut execution_times = ExecutionTimeEstimator::new(committee.clone(), config);
         for (generation, author, estimates) in output.execution_time_observations() {
             execution_times.restore(author, generation, &decode_estimates(&estimates));
         }
+        let mut jwks =
+            JwkAggregator::new(committee, config.max_jwk_votes_per_validator_per_epoch());
+        for vote in output.jwk_votes() {
+            let (author, key) = decode_vote(&vote);
+            jwks.restore(author, key);
+        }
+        let new_jwks = output
+            .new_jwks()
+            .map(|keys| bcs::from_bytes(&keys).expect("keys as encoded"))
+            .unwrap_or_default();
         CommitHandler {
             last_commit,
             output,
             sequencer: Sequencer::new(),
             execution_times,
+            jwks,
+            new_jwks,
+            authenticator: authenticator.filter(|_| config.enable_jwk_consensus_updates()),
         }
     }
 
@@ -208,7 +236,12 @@ impl CommitHandler {
             }
         }
 
-        // 5. The transactions deferred to this round, then the commit's, in
+        // 5. The keys voted for (`process_jwks`), and the update adding those
+        //    that became active in the last commit
+        //    (`create_authenticator_state_update`).
+        let update = self.jwk_update(&commit.jwks);
+
+        // 6. The transactions deferred to this round, then the commit's, in
         //    protocol order: `merge_and_reorder_transactions`.
         let mut previously_deferred = HashMap::new();
         let mut transactions = Vec::with_capacity(accepted.len());
@@ -222,7 +255,7 @@ impl CommitHandler {
         transactions.extend(accepted);
         let ordered = self.sequencer.order(config, transactions);
 
-        // 6. Each, in order, deferred or estimated and scheduled:
+        // 7. Each, in order, deferred or estimated and scheduled:
         //    `handle_deferral_and_cancellation`. A contested holder is
         //    deferred a round, as a penalty for the double spend.
         let mut deferred: BTreeMap<DeferralKey, Vec<Deferred>> = BTreeMap::new();
@@ -253,9 +286,10 @@ impl CommitHandler {
             self.output.defer(key, encode_deferred(&transactions));
         }
 
-        // 7. The schedule: the prologue, then the transactions, with shared
-        //    accesses and their ordinals, linked to earlier rounds.
-        let mut schedule = self.sequencer.schedule(prologue, admitted);
+        // 8. The schedule: the prologue, the update, then the transactions,
+        //    with shared accesses and their ordinals, linked to earlier
+        //    rounds.
+        let mut schedule = self.sequencer.schedule(prologue, update, admitted);
         self.link(schedule.all_accesses_mut());
         Some(HandledCommit {
             commit_index: commit.commit_index,
@@ -267,6 +301,31 @@ impl CommitHandler {
             estimates_us,
             cache_hits: commit.cache_hits,
             cache_misses: commit.cache_misses,
+        })
+    }
+
+    /// Counts `votes`, and takes the keys that became active in the last
+    /// commit: the update adding them, if any; none unless the epoch agrees
+    /// keys.
+    fn jwk_update(&mut self, votes: &[JwkVote]) -> Option<AuthenticatorUpdate> {
+        let initial_shared_version = self.authenticator?;
+        let mut active = Vec::new();
+        for vote in votes {
+            let Some(activated) = self.jwks.vote(vote) else {
+                continue;
+            };
+            let key = (vote.id.clone(), vote.jwk.clone());
+            self.output.put_jwk_vote(encode_vote(vote.author, &key));
+            if activated {
+                active.push(key);
+            }
+        }
+        self.output
+            .set_new_jwks(bcs::to_bytes(&active).expect("keys serialize"));
+        let keys = std::mem::replace(&mut self.new_jwks, active);
+        (!keys.is_empty()).then_some(AuthenticatorUpdate {
+            initial_shared_version,
+            keys,
         })
     }
 
@@ -407,6 +466,9 @@ pub struct EpochStart {
     pub previous_height: u64,
     /// The accumulator root's stream starts at this version.
     pub accumulator_root_initial_shared_version: u64,
+    /// The authenticator state's, if it exists: absent before the end of
+    /// the epoch that creates it.
+    pub authenticator_initial_shared_version: Option<u64>,
     /// The root's version the epoch's first chunk reads: where version
     /// assignment starts it (`Store::start_version`).
     pub accumulator_root_version: u64,
@@ -496,7 +558,7 @@ impl CommitStage {
         settlements: workqueue::Queue<SettlementInput>,
         checkpoints: workqueue::Queue<waiter::Command<ChunkSettled, PendingCheckpoint>>,
         statuses: Arc<ConsensusTxStatusCache>,
-        execution_times: ExecutionTimeEstimator,
+        committee: Vec<([u8; 96], u64)>,
     ) -> CommitStage {
         // From the last commit written, if any; else the epoch's start.
         let record = output.record().map(|bytes| CommitRecord::decode(&bytes));
@@ -505,9 +567,16 @@ impl CommitStage {
             None => CheckpointQueue::new(start.previous_checkpoint, start.previous_height),
         };
         let prior_through = record.map_or(0, |r| r.commit_index);
+        let handler = CommitHandler::new(
+            output,
+            prior_through,
+            committee,
+            &epoch.config,
+            start.authenticator_initial_shared_version,
+        );
         CommitStage {
             epoch,
-            handler: CommitHandler::new(output, prior_through, execution_times),
+            handler,
             start,
             queue,
             commit_times: CommitIntervalObserver::default(),
@@ -585,6 +654,17 @@ impl CommitStage {
             let (transaction, digest, origin) = match scheduled {
                 Scheduled::Prologue(_) => {
                     let system = prologue_transaction.take().expect("one prologue");
+                    let digest = system.digest;
+                    (ExecutableTransaction::System(system), digest, None)
+                }
+                Scheduled::AuthenticatorStateUpdate(keys) => {
+                    let system = authenticator_state_update_transaction(
+                        &prologue,
+                        self.start
+                            .authenticator_initial_shared_version
+                            .expect("the authenticator state exists"),
+                        keys,
+                    );
                     let digest = system.digest;
                     (ExecutableTransaction::System(system), digest, None)
                 }
@@ -1034,6 +1114,40 @@ pub fn prologue_transaction(
     system_transaction(
         kind,
         SystemKind::Prologue {
+            round: prologue.round,
+        },
+    )
+}
+
+/// The `AuthenticatorStateUpdate` of the commit `prologue` begins, adding
+/// `keys`, as the reference's `authenticator_state_update_transaction`: in
+/// the order of `jwk_lt`, as validated this epoch.
+pub fn authenticator_state_update_transaction(
+    prologue: &Prologue,
+    initial_shared_version: u64,
+    mut keys: Vec<(JwkId, Jwk)>,
+) -> SystemTransaction {
+    use messages::build::base::SequenceNumber;
+    use messages::build::system_transaction::{ActiveJwk, AuthenticatorStateUpdate};
+    use messages::build::transaction::TransactionKind;
+
+    keys.sort_by(jwk_order);
+    let kind = TransactionKind::AuthenticatorStateUpdate(AuthenticatorStateUpdate {
+        epoch: prologue.epoch,
+        round: u64::from(prologue.round),
+        new_active_jwks: keys
+            .into_iter()
+            .map(|(jwk_id, jwk)| ActiveJwk {
+                jwk_id,
+                jwk,
+                epoch: prologue.epoch,
+            })
+            .collect(),
+        authenticator_obj_initial_shared_version: SequenceNumber(initial_shared_version),
+    });
+    system_transaction(
+        kind,
+        SystemKind::AuthenticatorStateUpdate {
             round: prologue.round,
         },
     )

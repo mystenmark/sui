@@ -40,6 +40,8 @@ pub struct SystemTransaction {
 pub enum SystemKind {
     /// The consensus commit prologue of the commit in `round`.
     Prologue { round: u32 },
+    /// The authenticator state's update in the commit in `round`.
+    AuthenticatorStateUpdate { round: u32 },
     /// The `index`th settlement transaction of the chunk at `height`.
     Settlement { height: u64, index: u32 },
     /// The accumulator barrier of the chunk at `height`.

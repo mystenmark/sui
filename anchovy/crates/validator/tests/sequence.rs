@@ -78,7 +78,7 @@ fn order_and_schedule(
     transactions: Vec<VerifiedTransaction>,
 ) -> Schedule {
     let ordered = sequencer.order(&config(), transactions);
-    sequencer.schedule(prologue(round), ordered)
+    sequencer.schedule(prologue(round), None, ordered)
 }
 
 /// The generation each access reads, by transaction, prologue first.
@@ -101,7 +101,7 @@ fn order(schedule: &Schedule) -> Vec<[u8; 32]> {
         .iter()
         .filter_map(|t| match t {
             Scheduled::User(t) => Some(t.get().0.digest().bytes),
-            Scheduled::Prologue(_) => None,
+            Scheduled::Prologue(_) | Scheduled::AuthenticatorStateUpdate(_) => None,
         })
         .collect()
 }

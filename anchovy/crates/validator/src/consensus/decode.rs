@@ -10,6 +10,7 @@ use std::sync::Arc;
 use ::consensus::{BlockRef, CommittedSubDag, TransactionIndex};
 use messages::Message;
 use messages::base::{ObjectId, ObjectRef};
+use messages::build::system_transaction::{Jwk, JwkId};
 use messages::consensus::{ConsensusTransaction, ConsensusTransactionKind, TransactionClaim};
 use tokio::sync::oneshot;
 use validation::inputs::{InputKind, input_objects};
@@ -19,6 +20,7 @@ use crate::checks::{self, VerifiedTransaction};
 
 use crate::consensus::cache::{CachedTransaction, ConsensusTxCache};
 use crate::consensus::execution_time::{Key, SharedObservations, duration};
+use crate::consensus::jwk::JwkVote;
 use crate::epoch::EpochParams;
 use crate::pipeline::items::{BuiltWaitItem, BuiltWaits, CheckpointSignature};
 use crate::pipeline::keys::CheckpointBuilt;
@@ -48,6 +50,8 @@ pub struct DecodedCommit {
     pub transactions: Vec<CommittedTransaction>,
     /// The execution time observations it carries, in commit order.
     pub observations: Vec<SharedObservations>,
+    /// The JSON web keys validators voted for, in commit order.
+    pub jwks: Vec<JwkVote>,
     /// Where the transactions a quorum voted to reject were.
     pub rejected: Vec<(BlockRef, TransactionIndex)>,
     /// Transactions taken from the cache, and decoded again.
@@ -179,6 +183,7 @@ impl CommitDecoder {
             digest,
             transactions: Vec::new(),
             observations: Vec::new(),
+            jwks: Vec::new(),
             rejected: rejected
                 .iter()
                 .flat_map(|(block, indices)| indices.iter().map(|i| (*block, *i)))
@@ -227,6 +232,11 @@ impl CommitDecoder {
                             decoded.observations.push(observations);
                             continue;
                         }
+                        Decoded::Jwk(mut vote) => {
+                            vote.author = block.reference.author;
+                            decoded.jwks.push(vote);
+                            continue;
+                        }
                         Decoded::Other => continue,
                     }
                 };
@@ -267,6 +277,8 @@ enum Decoded {
     CheckpointSignature(CheckpointSignature),
     /// Their author not yet set.
     Observations(SharedObservations),
+    /// Its author not yet set.
+    Jwk(JwkVote),
     Other,
 }
 
@@ -319,6 +331,14 @@ fn decode_transaction(bytes: Vec<u8>) -> Decoded {
                         (Key::of_observation(key), d)
                     })
                     .collect(),
+            });
+        }
+        ConsensusTransactionKind::NewJwkFetched(fetched) => {
+            return Decoded::Jwk(JwkVote {
+                author: 0,
+                authority: fetched.authority.bytes,
+                id: JwkId::from(&fetched.jwk_id),
+                jwk: Jwk::from(&fetched.jwk),
             });
         }
         _ => return Decoded::Other,

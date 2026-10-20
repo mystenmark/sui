@@ -25,7 +25,7 @@ use sui_types::transaction::{
 use validator::checks;
 use validator::consensus::commit::{CommitStage, Decided, EpochStart};
 use validator::consensus::decode::{CommittedTransaction, DecodedCommit};
-use validator::consensus::execution_time::{ExecutionTimeEstimator, Key, SharedObservations};
+use validator::consensus::execution_time::{Key, SharedObservations};
 use validator::epoch::EpochParams;
 use validator::epoch_store::{ConsensusOutput, EpochStore};
 use validator::pipeline::items::{
@@ -82,6 +82,7 @@ fn stage_over(epoch: &Arc<EpochParams>, output: ConsensusOutput) -> (CommitStage
         previous_checkpoint: 10,
         previous_height: 0,
         accumulator_root_initial_shared_version: ROOT_VERSION,
+        authenticator_initial_shared_version: None,
         accumulator_root_version: ROOT_VERSION,
         epoch_start_timestamp_ms: 0,
         epoch_duration_ms: u64::MAX,
@@ -95,7 +96,7 @@ fn stage_over(epoch: &Arc<EpochParams>, output: ConsensusOutput) -> (CommitStage
             settlements,
             checkpoints,
             Arc::new(validator::consensus::status::ConsensusTxStatusCache::new()),
-            ExecutionTimeEstimator::new(vec![([0; 96], 10_000)], &epoch.config),
+            vec![([0; 96], 10_000)],
         ),
         Outputs {
             chunks: chunk_inbox,
@@ -188,6 +189,7 @@ fn commit(index: u32, round: u32, timestamp_ms: u64, transactions: &[Vec<u8>]) -
             })
             .collect(),
         observations: Vec::new(),
+        jwks: Vec::new(),
         rejected: Vec::new(),
         cache_hits: 0,
         cache_misses: transactions.len(),

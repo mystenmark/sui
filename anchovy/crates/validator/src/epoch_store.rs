@@ -7,6 +7,9 @@
 //! the commit handler; checkpoint builder state; and everything else.
 
 use std::collections::{BTreeMap, HashMap};
+
+use blake2::digest::consts::U32;
+use blake2::{Blake2b, Digest as _};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -327,6 +330,11 @@ struct Output {
     observations: Vec<((u64, u32), Vec<u8>)>,
     /// Transactions deferred, encoded, and the keys taken, in order.
     deferred: Vec<(DeferralKey, Option<Vec<u8>>)>,
+    /// The JSON web key votes counted, encoded.
+    jwk_votes: Vec<Vec<u8>>,
+    /// The keys that became active, encoded, if the epoch agrees keys: the
+    /// next commit's update.
+    new_jwks: Option<Vec<u8>>,
     /// The commit stage's state after the commit, encoded.
     record: Vec<u8>,
     /// The last chunk height the commit assigned.
@@ -456,6 +464,44 @@ impl ConsensusOutput {
             .collect()
     }
 
+    /// A JSON web key vote the commit being decided counted, encoded.
+    pub fn put_jwk_vote(&mut self, vote: Vec<u8>) {
+        lock_quarantine(&self.quarantine).open.jwk_votes.push(vote);
+    }
+
+    /// The JSON web keys that became active in the commit being decided,
+    /// encoded.
+    pub fn set_new_jwks(&mut self, keys: Vec<u8>) {
+        lock_quarantine(&self.quarantine).open.new_jwks = Some(keys);
+    }
+
+    /// The JSON web key votes of the commits written, in no order: for the
+    /// commit handler's start.
+    ///
+    /// # Panics
+    /// If the database cannot be read.
+    pub fn jwk_votes(&self) -> Vec<Vec<u8>> {
+        lock_quarantine(&self.quarantine)
+            .db
+            .entries(Space::JwkVotes)
+            .expect("the epoch's database reads")
+            .into_iter()
+            .map(|(_, vote)| vote)
+            .collect()
+    }
+
+    /// The JSON web keys that became active in the last commit written, as
+    /// `set_new_jwks` took them.
+    ///
+    /// # Panics
+    /// If the database cannot be read.
+    pub fn new_jwks(&self) -> Option<Vec<u8>> {
+        lock_quarantine(&self.quarantine)
+            .db
+            .get(Space::Commit, &[1])
+            .expect("the epoch's database reads")
+    }
+
     /// The execution time observations of the commits written, by
     /// (generation, authority index): for the commit stage's start, which
     /// replays later commits.
@@ -559,6 +605,7 @@ impl Quarantine {
         };
         let mut batch = self.db.batch();
         let mut record = Vec::new();
+        let mut new_jwks = None;
         for output in self.queued.drain(..=last) {
             for digest in output.processed {
                 batch.put(Space::Processed, digest.to_vec(), Vec::new());
@@ -585,14 +632,22 @@ impl Quarantine {
                     None => batch.delete(Space::Deferred, key),
                 }
             }
+            for vote in output.jwk_votes {
+                let key = Blake2b::<U32>::digest(&vote).to_vec();
+                batch.put(Space::JwkVotes, key, vote);
+            }
             for ((generation, author), estimates) in output.observations {
                 let mut key = generation.to_be_bytes().to_vec();
                 key.extend_from_slice(&author.to_be_bytes());
                 batch.put(Space::ExecutionTimeObservations, key, estimates);
             }
             record = output.record;
+            new_jwks = output.new_jwks;
         }
         batch.put(Space::Commit, vec![0], record);
+        if let Some(new_jwks) = new_jwks {
+            batch.put(Space::Commit, vec![1], new_jwks);
+        }
         batch.commit().expect("the epoch's database writes");
     }
 }
