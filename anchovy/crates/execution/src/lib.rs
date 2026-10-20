@@ -7,6 +7,7 @@
 //! go out, as the reference's BCS, which the rest of anchovy reads with its
 //! own views.
 
+pub mod epoch_start;
 pub mod genesis;
 pub mod native;
 pub mod reads;

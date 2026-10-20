@@ -191,7 +191,6 @@ fn main() {
             let (checkpoints, checkpoint_inbox) = workqueue::queue(1024);
             let start = EpochStart {
                 previous_checkpoint: 0,
-                previous_height: 0,
                 accumulator_root_initial_shared_version: 1,
                 authenticator_initial_shared_version: None,
                 accumulator_root_version: 1,

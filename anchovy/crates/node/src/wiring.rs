@@ -12,6 +12,7 @@ use checkpoint::{
 };
 use consensus::TransactionClient;
 use exec_pool::{EffectsAvailability, EffectsRouter, Executor};
+use execution::epoch_start::SystemObjects;
 use messages::transaction::DigestPending;
 use resolver::{InputAvailability, VersionResolver};
 use settlement::{FundsReserver, SettlementScheduler};
@@ -145,6 +146,8 @@ pub(crate) struct Parts {
     pub committee: Arc<Committee>,
     /// Each member's name and stake, by committee index.
     pub stakes: Vec<([u8; 96], u64)>,
+    /// The system objects as the epoch started.
+    pub system_objects: SystemObjects,
     pub consensus: TransactionClient,
     pub cache: Arc<ConsensusTxCache>,
     pub generations: Arc<GenerationTable>,
@@ -285,6 +288,7 @@ impl Parts {
     ) -> EpochCloser {
         EpochCloser::new(
             self.epoch.params.clone(),
+            self.system_objects,
             self.store.clone(),
             self.checkpoints.clone(),
             resolver,

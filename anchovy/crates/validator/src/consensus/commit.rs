@@ -16,6 +16,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
 use ::consensus::{BlockRef, TransactionIndex};
 use blake2::digest::consts::U32;
@@ -28,7 +29,7 @@ use workqueue::{Processor, Refusal, Refuse};
 use crate::consensus::decode::{CommittedTransaction, DecodedCommit};
 use crate::consensus::deferral::{DeferralKey, Deferred, decode_deferred, encode_deferred};
 use crate::consensus::execution_time::{
-    ExecutionTimeEstimator, decode_estimates, encode_estimates,
+    ExecutionTimeEstimator, Key, decode_estimates, encode_estimates,
 };
 use crate::consensus::jwk::{JwkAggregator, JwkVote, decode_vote, encode_vote, jwk_order};
 use crate::consensus::sequence::{
@@ -304,6 +305,12 @@ impl CommitHandler {
         })
     }
 
+    /// The execution time observations so far, as the epoch's last commit
+    /// stores them for the next epoch.
+    pub fn execution_time_observations(&self) -> Vec<(Key, Vec<([u8; 96], Duration)>)> {
+        self.execution_times.observations()
+    }
+
     /// Counts `votes`, and takes the keys that became active in the last
     /// commit: the update adding them, if any; none unless the epoch agrees
     /// keys.
@@ -459,11 +466,10 @@ impl CommitRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EpochStart {
     /// The checkpoint before the epoch's first (the previous epoch's last, or
-    /// the genesis checkpoint, 0): the epoch's first checkpoint follows it,
-    /// and its first chunk follows `previous_height`. A restart replays the
-    /// epoch's commits from its first, rebuilding the handler's other state.
+    /// the genesis checkpoint, 0): the epoch's first checkpoint follows it.
+    /// Chunk heights count from 1 each epoch, as the reference's, whose
+    /// settlement transactions carry them.
     pub previous_checkpoint: u64,
-    pub previous_height: u64,
     /// The accumulator root's stream starts at this version.
     pub accumulator_root_initial_shared_version: u64,
     /// The authenticator state's, if it exists: absent before the end of
@@ -564,7 +570,7 @@ impl CommitStage {
         let record = output.record().map(|bytes| CommitRecord::decode(&bytes));
         let queue = match record {
             Some(r) => CheckpointQueue::resumed(r.height, r.next_seq, r.last_built_timestamp),
-            None => CheckpointQueue::new(start.previous_checkpoint, start.previous_height),
+            None => CheckpointQueue::new(start.previous_checkpoint),
         };
         let prior_through = record.map_or(0, |r| r.commit_index);
         let handler = CommitHandler::new(
@@ -821,6 +827,8 @@ impl CommitStage {
                 round: prologue.round,
                 root_version: self.root_version,
                 shared,
+                first_checkpoint: self.start.previous_checkpoint + 1,
+                observations: self.handler.execution_time_observations(),
             });
         }
         decided
@@ -967,13 +975,13 @@ struct CheckpointQueue {
 impl CheckpointQueue {
     /// No checkpoint cut yet this epoch: as the reference's, its first
     /// commit cuts one, whatever the interval.
-    fn new(previous_checkpoint: u64, previous_height: u64) -> CheckpointQueue {
+    fn new(previous_checkpoint: u64) -> CheckpointQueue {
         CheckpointQueue {
             last_built_timestamp: 0,
             pending: Vec::new(),
             pending_timestamp: 0,
             pending_transactions: 0,
-            height: previous_height,
+            height: 0,
             next_seq: previous_checkpoint + 1,
         }
     }
@@ -1153,16 +1161,16 @@ pub fn authenticator_state_update_transaction(
     )
 }
 
-/// The change-epoch transaction ending `epoch`: an `EndOfEpochTransaction`
-/// of `ChangeEpoch` alone, starting epoch `epoch + 1` at
+/// The transaction ending `epoch`: an `EndOfEpochTransaction` of `kinds`,
+/// then `ChangeEpoch`, starting epoch `epoch + 1` at
 /// `epoch_start_timestamp_ms` with `protocol_version` and no new system
 /// packages, and charging the epoch's gas totals `gas` (computation,
-/// storage, rebate, non-refundable).
-///
-/// Not yet: the other end-of-epoch kinds the reference includes when its
-/// protocol flags hold (R2.8 of `docs/reconfiguration_reference.md`).
-pub fn change_epoch_transaction(
+/// storage, rebate, non-refundable). The reference's
+/// `create_and_execute_advance_epoch_tx`; `kinds` are what it puts before
+/// `ChangeEpoch`.
+pub fn end_of_epoch_transaction(
     epoch: u64,
+    mut kinds: Vec<messages::build::system_transaction::EndOfEpochTransactionKind>,
     protocol_version: u64,
     gas: [u64; 4],
     epoch_start_timestamp_ms: u64,
@@ -1172,20 +1180,20 @@ pub fn change_epoch_transaction(
     use messages::build::transaction::TransactionKind;
 
     let [computation, storage, rebate, non_refundable] = gas;
-    let kind =
-        TransactionKind::EndOfEpochTransaction(vec![EndOfEpochTransactionKind::ChangeEpoch(
-            ChangeEpoch {
-                epoch: epoch + 1,
-                protocol_version: ProtocolVersion(protocol_version),
-                storage_charge: storage,
-                computation_charge: computation,
-                storage_rebate: rebate,
-                non_refundable_storage_fee: non_refundable,
-                epoch_start_timestamp_ms,
-                system_packages: Vec::new(),
-            },
-        )]);
-    system_transaction(kind, SystemKind::ChangeEpoch { epoch })
+    kinds.push(EndOfEpochTransactionKind::ChangeEpoch(ChangeEpoch {
+        epoch: epoch + 1,
+        protocol_version: ProtocolVersion(protocol_version),
+        storage_charge: storage,
+        computation_charge: computation,
+        storage_rebate: rebate,
+        non_refundable_storage_fee: non_refundable,
+        epoch_start_timestamp_ms,
+        system_packages: Vec::new(),
+    }));
+    system_transaction(
+        TransactionKind::EndOfEpochTransaction(kinds),
+        SystemKind::ChangeEpoch { epoch },
+    )
 }
 
 /// A system transaction of `kind`: sent by the zero address, with no gas
@@ -1262,7 +1270,7 @@ mod tests {
 
     #[test]
     fn a_chunk_that_does_not_fit_cuts_the_checkpoint_before_it() {
-        let mut queue = CheckpointQueue::new(0, 0);
+        let mut queue = CheckpointQueue::new(0);
         let mut flushed = Vec::new();
         for (transactions, timestamp) in [(3, 10), (2, 10), (2, 20)] {
             let height = queue.next_height();
@@ -1283,7 +1291,7 @@ mod tests {
 
     #[test]
     fn a_chunk_larger_than_the_limit_is_a_checkpoint_of_its_own() {
-        let mut queue = CheckpointQueue::new(7, 0);
+        let mut queue = CheckpointQueue::new(7);
         let mut flushed = Vec::new();
         let height = queue.next_height();
         assert_eq!(queue.push_chunk(height, 9, 0, 5, &mut flushed), 8);
@@ -1295,7 +1303,7 @@ mod tests {
 
     #[test]
     fn checkpoints_are_cut_once_the_interval_has_passed_by_commit_time() {
-        let mut queue = CheckpointQueue::new(0, 0);
+        let mut queue = CheckpointQueue::new(0);
         let mut flushed = Vec::new();
         let mut cut = Vec::new();
         for timestamp in [100, 150, 250, 300, 449, 450] {

@@ -4,15 +4,25 @@
 //! Closing the epoch: its last checkpoint, built whole
 //! (`docs/reconfiguration_design.md`, The final checkpoint).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use execution::epoch_start::SystemObjects;
 use fastcrypto::hash::MultisetHash;
 use messages::base::Digest;
+use messages::build::base::{AuthorityPublicKeyBytes, ChainIdentifier, SequenceNumber};
+use messages::build::system_transaction::{
+    AuthenticatorStateExpire, Duration, EndOfEpochTransactionKind, StoredExecutionTimeObservations,
+    WriteAccumulatorStorageCost,
+};
 use messages::fast::Bump;
-use validator::consensus::commit::change_epoch_transaction;
+use messages::transaction::TransactionKind;
+use protocol_config::{ExecutionTimeEstimateParams, PerObjectCongestionControlMode};
+use validator::consensus::commit::end_of_epoch_transaction;
+use validator::consensus::execution_time::Key;
 use validator::epoch::EpochParams;
 use validator::pipeline::items::{
-    CheckpointContentsBuilt, CheckpointEffects, Chunk, EffectsWaitItem, EndOfEpoch,
+    CheckpointContentsBuilt, CheckpointEffects, Chunk, EffectsWaitItem, EndOfEpoch, EpochClose,
     EpochCloserInput, ExecutableTransaction, ExecutedEffects, LastOfEpoch, ScheduledEntry,
 };
 use validator::pipeline::keys::EffectsKey;
@@ -24,9 +34,11 @@ use crate::{contents_of, push, summary};
 
 /// Passes each checkpoint on to `SummaryBuilder` once the previous one is
 /// built, but the epoch's last, which it closes:
-/// 1. Builds the change-epoch transaction: the epoch's gas totals through
-///    this checkpoint (the previous one's are built), and this checkpoint's
-///    timestamp as the next epoch's start.
+/// 1. Builds the end-of-epoch transaction: the kinds the reference puts
+///    before `ChangeEpoch` as the protocol and the system objects at the
+///    epoch's start call for them, then `ChangeEpoch`, with the epoch's gas
+///    totals through this checkpoint (the previous one's are built), and
+///    this checkpoint's timestamp as the next epoch's start.
 /// 2. Hands it to the resolver with the shared accesses the commit handler
 ///    reserved, so it executes after everything else in the epoch, into the
 ///    writeback cache: built, not committed. It commits with the certified
@@ -37,8 +49,7 @@ use crate::{contents_of, push, summary};
 ///    next committee and protocol version from the system state the
 ///    transaction wrote, and the epoch's root.
 ///
-/// Not yet: the end-of-epoch kinds beside `ChangeEpoch`, and protocol
-/// upgrades (the next epoch keeps the protocol version).
+/// Not yet: protocol upgrades (the next epoch keeps the protocol version).
 ///
 /// Inward:
 /// - built waiter, ready: `EpochCloserInput::Built`;
@@ -55,6 +66,8 @@ use crate::{contents_of, push, summary};
 /// Reads: the checkpoint store, the object store.
 pub struct EpochCloser {
     epoch: Arc<EpochParams>,
+    /// The system objects as the epoch started.
+    objects: SystemObjects,
     store: Arc<store::Store>,
     checkpoints: Arc<CheckpointStore>,
     resolver: Queue<Chunk>,
@@ -74,6 +87,7 @@ struct Closing {
 impl EpochCloser {
     pub fn new(
         epoch: Arc<EpochParams>,
+        objects: SystemObjects,
         store: Arc<store::Store>,
         checkpoints: Arc<CheckpointStore>,
         resolver: Queue<Chunk>,
@@ -83,6 +97,7 @@ impl EpochCloser {
     ) -> EpochCloser {
         EpochCloser {
             epoch,
+            objects,
             store,
             checkpoints,
             resolver,
@@ -106,9 +121,11 @@ impl EpochCloser {
             .checkpoints
             .built(seq - 1)
             .expect("a checkpoint is released once the previous one is built");
+        let kinds = self.end_of_epoch_kinds(&built, &close);
         let epoch = &self.epoch;
-        let transaction = change_epoch_transaction(
+        let transaction = end_of_epoch_transaction(
             epoch.epoch,
+            kinds,
             epoch.config.version.as_u64(),
             summary::rolling_gas(&built, Some(&previous), epoch.epoch),
             built.pending.timestamp_ms,
@@ -141,6 +158,171 @@ impl EpochCloser {
             built,
             change_epoch: digest,
         });
+    }
+
+    /// What the reference's `create_and_execute_advance_epoch_tx` puts
+    /// before `ChangeEpoch`, in its order: each kind as its protocol flag
+    /// and the system objects as the epoch started call for it.
+    fn end_of_epoch_kinds(
+        &mut self,
+        built: &CheckpointContentsBuilt,
+        close: &EpochClose,
+    ) -> Vec<EndOfEpochTransactionKind> {
+        let config = &self.epoch.config;
+        let objects = self.objects;
+        let mut kinds = Vec::new();
+        if config.enable_jwk_consensus_updates() {
+            kinds.push(match objects.authenticator_state {
+                Some(version) => {
+                    EndOfEpochTransactionKind::AuthenticatorStateExpire(AuthenticatorStateExpire {
+                        min_epoch: (self.epoch.epoch + 1)
+                            .saturating_sub(config.max_age_of_jwk_in_epochs()),
+                        authenticator_obj_initial_shared_version: SequenceNumber(version),
+                    })
+                }
+                None => EndOfEpochTransactionKind::AuthenticatorStateCreate,
+            });
+        }
+        if config.random_beacon() && objects.randomness_state.is_none() {
+            kinds.push(EndOfEpochTransactionKind::RandomnessStateCreate);
+        }
+        if config.bridge() {
+            match objects.bridge {
+                None => kinds.push(EndOfEpochTransactionKind::BridgeStateCreate(
+                    ChainIdentifier::from(&self.epoch.chain_identifier),
+                )),
+                Some(version)
+                    if config.should_try_to_finalize_bridge_committee()
+                        && !objects.bridge_committee_initiated =>
+                {
+                    kinds.push(EndOfEpochTransactionKind::BridgeCommitteeInit(
+                        SequenceNumber(version),
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+        if config.enable_coin_deny_list() && objects.deny_list.is_none() {
+            kinds.push(EndOfEpochTransactionKind::DenyListStateCreate);
+        }
+        if let PerObjectCongestionControlMode::ExecutionTimeEstimate(params) =
+            config.per_object_congestion_control_mode()
+        {
+            let observations = self.stored_observations(built, close, &params);
+            kinds.push(EndOfEpochTransactionKind::StoreExecutionTimeObservations(
+                observations,
+            ));
+        }
+        let config = &self.epoch.config;
+        for (enabled, exists, kind) in [
+            (
+                config.create_root_accumulator_object(),
+                objects.accumulator_root,
+                EndOfEpochTransactionKind::AccumulatorRootCreate,
+            ),
+            (
+                config.enable_coin_registry(),
+                objects.coin_registry,
+                EndOfEpochTransactionKind::CoinRegistryCreate,
+            ),
+            (
+                config.enable_display_registry(),
+                objects.display_registry,
+                EndOfEpochTransactionKind::DisplayRegistryCreate,
+            ),
+            (
+                config.address_aliases(),
+                objects.address_alias_state,
+                EndOfEpochTransactionKind::AddressAliasStateCreate,
+            ),
+            (
+                config.create_forwarding_address_registry(),
+                objects.forwarding_address_registry,
+                EndOfEpochTransactionKind::ForwardingAddressRegistryCreate,
+            ),
+        ] {
+            if enabled && exists.is_none() {
+                kinds.push(kind);
+            }
+        }
+        // As the store holds them now, after the epoch's other transactions.
+        if objects.accumulator_root.is_some()
+            && config.enable_accumulators()
+            && let Some(count) = execution::epoch_start::accumulator_object_count(&self.store)
+                .expect("the store reads")
+        {
+            kinds.push(EndOfEpochTransactionKind::WriteAccumulatorStorageCost(
+                WriteAccumulatorStorageCost {
+                    storage_cost: count.saturating_mul(config.accumulator_object_storage_cost()),
+                },
+            ));
+        }
+        kinds
+    }
+
+    /// The reference's `create_execution_time_observations_tx`: the
+    /// observations as of the epoch's last commit, of the keys the commands
+    /// of the last `stored_observations_num_included_checkpoints`
+    /// checkpoints before this one, and of this one, use; at most
+    /// `stored_observations_limit`, by key.
+    fn stored_observations(
+        &mut self,
+        built: &CheckpointContentsBuilt,
+        close: &EpochClose,
+        params: &ExecutionTimeEstimateParams,
+    ) -> StoredExecutionTimeObservations {
+        let last_before = built.pending.seq - 1;
+        let first = last_before
+            .saturating_sub(params.stored_observations_num_included_checkpoints - 1)
+            .max(close.first_checkpoint);
+        let mut keys = HashSet::new();
+        for seq in first..=last_before {
+            let contents = self
+                .checkpoints
+                .built(seq)
+                .expect("the epoch's checkpoints are built")
+                .contents
+                .clone();
+            self.command_keys(&contents, &mut keys);
+        }
+        self.command_keys(&built.contents, &mut keys);
+        let limit = usize::try_from(params.stored_observations_limit).unwrap_or(usize::MAX);
+        StoredExecutionTimeObservations::V1(
+            close
+                .observations
+                .iter()
+                .filter(|(key, _)| keys.contains(key))
+                .take(limit)
+                .map(|(key, by_authority)| {
+                    let by_authority = by_authority
+                        .iter()
+                        .map(|(name, duration)| {
+                            let duration = Duration {
+                                secs: duration.as_secs(),
+                                nanos: duration.subsec_nanos(),
+                            };
+                            (AuthorityPublicKeyBytes(*name), duration)
+                        })
+                        .collect();
+                    (key.to_stored(), by_authority)
+                })
+                .collect(),
+        )
+    }
+
+    /// Adds the keys of the commands of the transactions `contents`
+    /// (`CheckpointContents` BCS) lists.
+    fn command_keys(&mut self, contents: &[u8], keys: &mut HashSet<Key>) {
+        for digest in crate::transactions(contents, &mut self.bump) {
+            let transaction = self
+                .store
+                .transaction(&digest)
+                .expect("the store reads")
+                .expect("a checkpoint's transactions executed");
+            if let TransactionKind::ProgrammableTransaction(ptb) = transaction.get().data().kind() {
+                keys.extend(ptb.commands.iter().map(Key::of_command));
+            }
+        }
     }
 
     /// Step 3.

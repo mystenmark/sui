@@ -122,7 +122,6 @@ async fn the_stage_records_each_committed_transaction_s_status() {
         epoch.clone(),
         EpochStart {
             previous_checkpoint: 0,
-            previous_height: 0,
             accumulator_root_initial_shared_version: 1,
             authenticator_initial_shared_version: None,
             accumulator_root_version: 1,
@@ -622,7 +621,6 @@ fn the_stage_leaves_dropped_transactions_out_of_its_chunks() {
         epoch.clone(),
         EpochStart {
             previous_checkpoint: 0,
-            previous_height: 0,
             accumulator_root_initial_shared_version: 1,
             authenticator_initial_shared_version: None,
             accumulator_root_version: 1,

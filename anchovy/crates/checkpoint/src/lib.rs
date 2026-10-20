@@ -16,8 +16,11 @@ use std::sync::Arc;
 
 use consensus::{Priority, TransactionClient};
 use messages::Message;
+use messages::arena::BumpAlloc;
 use messages::base::Digest;
+use messages::checkpoint::{CheckpointContents, VersionedCheckpointContents};
 use messages::fast::Bump;
+use messages::reader::Reader;
 use messages::transaction::SenderSignedData;
 use validator::epoch::EpochParams;
 use validator::pipeline::items::{
@@ -290,5 +293,22 @@ impl Availability<ChunkSettled> for ChunkAvailability {
     fn check(&mut self, keys: &[ChunkSettled], found: &mut Vec<Option<()>>) {
         found.clear();
         found.extend(keys.iter().map(|k| self.chunks.get(k.0).map(|_| ())));
+    }
+}
+
+/// The transactions of `contents` (`CheckpointContents` BCS), in order.
+pub(crate) fn transactions(contents: &[u8], bump: &mut Bump) -> Vec<Digest> {
+    bump.reset();
+    let mut r = Reader::new(contents);
+    let parsed = CheckpointContents::parse(&mut r, &mut BumpAlloc(bump))
+        .and_then(|c| r.finish().map(|()| c))
+        .expect("built contents parse");
+    match parsed.version {
+        VersionedCheckpointContents::V1 { transactions, .. } => {
+            transactions.iter().map(|t| t.transaction).collect()
+        }
+        VersionedCheckpointContents::V2(transactions) => {
+            transactions.iter().map(|t| t.digest.transaction).collect()
+        }
     }
 }

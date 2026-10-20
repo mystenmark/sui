@@ -20,8 +20,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::checks::VerifiedTransaction;
 
-/// The reference's `ExecutionTimeObservationKey`, owned.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// The reference's `ExecutionTimeObservationKey`, owned, and ordered as it
+/// orders them.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Key {
     MoveEntryPoint {
         package: [u8; 32],
@@ -76,6 +77,31 @@ impl Key {
             ExecutionTimeObservationKey::Publish => Key::Publish,
             ExecutionTimeObservationKey::MakeMoveVec => Key::MakeMoveVec,
             ExecutionTimeObservationKey::Upgrade => Key::Upgrade,
+        }
+    }
+
+    /// As the end-of-epoch transaction stores it.
+    pub fn to_stored(&self) -> messages::build::system_transaction::ExecutionTimeObservationKey {
+        use messages::build::base::{AccountAddress, ObjectId};
+        use messages::build::system_transaction::ExecutionTimeObservationKey as Stored;
+        match self {
+            Key::MoveEntryPoint {
+                package,
+                module,
+                function,
+                type_arguments,
+            } => Stored::MoveEntryPoint {
+                package: ObjectId(AccountAddress(*package)),
+                module: module.to_string(),
+                function: function.to_string(),
+                type_arguments: type_arguments.clone(),
+            },
+            Key::TransferObjects => Stored::TransferObjects,
+            Key::SplitCoins => Stored::SplitCoins,
+            Key::MergeCoins => Stored::MergeCoins,
+            Key::Publish => Stored::Publish,
+            Key::MakeMoveVec => Stored::MakeMoveVec,
+            Key::Upgrade => Stored::Upgrade,
         }
     }
 
@@ -204,6 +230,27 @@ impl ExecutionTimeEstimator {
         *latest = generation;
         *observed = Some(duration);
         observations.update_median(&self.committee, &self.params);
+    }
+
+    /// Every key's observations, by authority name, sorted by key: what the
+    /// reference takes at the epoch's last commit (`take_observations`) to
+    /// store for the next epoch.
+    pub fn observations(&self) -> Vec<(Key, Vec<([u8; 96], Duration)>)> {
+        let mut observations: Vec<_> = self
+            .observations
+            .iter()
+            .map(|(key, observations)| {
+                let by_authority = observations
+                    .by_authority
+                    .iter()
+                    .zip(&self.committee)
+                    .filter_map(|((_, duration), (name, _))| Some((*name, (*duration)?)))
+                    .collect();
+                (key.clone(), by_authority)
+            })
+            .collect();
+        observations.sort_by(|(a, _), (b, _)| a.cmp(b));
+        observations
     }
 
     /// `transaction`'s estimated execution time, in whole microseconds, as

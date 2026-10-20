@@ -162,7 +162,8 @@ fn generation(stream: StreamId, round: u32, generation: u32) -> InputKey {
 fn handler() -> (CommitHandler, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let (_, output, _) = EpochStore::open(dir.path(), 0);
-    (CommitHandler::new(output, 0), dir)
+    let handler = CommitHandler::new(output, 0, vec![([0; 96], 10_000)], &epoch().config, None);
+    (handler, dir)
 }
 
 /// `entry`'s keys and resolved bases, its accesses linked by `handler`.

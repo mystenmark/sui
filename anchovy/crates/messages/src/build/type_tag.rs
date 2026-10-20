@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use super::base::AccountAddress;
 use crate::type_tag as view;
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TypeTag {
     Bool,
     U8,
@@ -22,7 +22,7 @@ pub enum TypeTag {
     U256,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StructTag {
     pub address: AccountAddress,
     pub module: String,
@@ -32,7 +32,7 @@ pub struct StructTag {
 }
 
 /// The same wire type as [`TypeTag`] under another name.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TypeInput {
     #[serde(rename = "bool")]
     Bool,
@@ -48,7 +48,7 @@ pub enum TypeInput {
     U256,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StructInput {
     pub address: AccountAddress,
     pub module: String,

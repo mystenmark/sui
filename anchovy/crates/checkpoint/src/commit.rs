@@ -6,11 +6,7 @@
 
 use std::sync::Arc;
 
-use messages::arena::BumpAlloc;
-use messages::base::Digest;
-use messages::checkpoint::{CheckpointContents, VersionedCheckpointContents};
 use messages::fast::Bump;
-use messages::reader::Reader;
 use tokio::sync::watch;
 use validator::epoch_store::CommittedCheckpoints;
 use validator::pipeline::backpressure::Backpressure;
@@ -78,7 +74,7 @@ impl CheckpointCommitter {
             .checkpoints
             .built(seq)
             .expect("a checkpoint is certified only once built here");
-        let transactions = transactions(&built.contents, &mut self.bump);
+        let transactions = crate::transactions(&built.contents, &mut self.bump);
         self.store.commit_checkpoint(
             seq,
             &transactions,
@@ -93,23 +89,6 @@ impl CheckpointCommitter {
         self.backpressure.committed(seq, built.last_height);
         if built.root_state.is_some() {
             self.ended.send_replace(Some(seq));
-        }
-    }
-}
-
-/// The transactions of `contents` (`CheckpointContents` BCS), in order.
-fn transactions(contents: &[u8], bump: &mut Bump) -> Vec<Digest> {
-    bump.reset();
-    let mut r = Reader::new(contents);
-    let parsed = CheckpointContents::parse(&mut r, &mut BumpAlloc(bump))
-        .and_then(|c| r.finish().map(|()| c))
-        .expect("built contents parse");
-    match parsed.version {
-        VersionedCheckpointContents::V1 { transactions, .. } => {
-            transactions.iter().map(|t| t.transaction).collect()
-        }
-        VersionedCheckpointContents::V2(transactions) => {
-            transactions.iter().map(|t| t.digest.transaction).collect()
         }
     }
 }

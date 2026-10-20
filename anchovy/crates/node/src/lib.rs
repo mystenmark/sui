@@ -21,6 +21,7 @@ use aggregator::Committee;
 use checkpoint::ProtocolKey;
 use consensus::TransactionClient;
 use epoch::EpochRecord;
+use execution::epoch_start::SystemObjects;
 use messages::transaction::DigestPending;
 use state_hasher::StateHashes;
 use tokio::sync::watch;
@@ -106,7 +107,12 @@ pub struct ConsensusOutput {
 /// # Panics
 /// If the store cannot be read or written, lacks `previous`, or has no
 /// shared accumulator root.
-fn epoch_start(store: &store::Store, epoch_store: &EpochStore, record: &EpochRecord) -> EpochStart {
+fn epoch_start(
+    store: &store::Store,
+    epoch_store: &EpochStore,
+    record: &EpochRecord,
+    objects: &SystemObjects,
+) -> EpochStart {
     let checkpoint = BuiltCheckpoint::decode(
         &store
             .checkpoint(record.previous_checkpoint)
@@ -132,22 +138,11 @@ fn epoch_start(store: &store::Store, epoch_store: &EpochStore, record: &EpochRec
         .start_version(store, &root, initial_shared_version)
         .expect("the accumulator root exists")
         .version;
-    // Created only by an epoch's last transaction, so as the epoch started.
-    let authenticator_initial_shared_version = store
-        .live_object(&messages::base::ObjectId::from_u16(0x7))
-        .expect("the store reads")
-        .map(|authenticator| match authenticator.get().owner {
-            messages::object::Owner::Shared {
-                initial_shared_version,
-            } => initial_shared_version,
-            _ => panic!("the authenticator state is shared"),
-        });
     EpochStart {
         previous_checkpoint: checkpoint.seq,
-        previous_height: checkpoint.last_height,
         accumulator_root_version,
         accumulator_root_initial_shared_version: initial_shared_version,
-        authenticator_initial_shared_version,
+        authenticator_initial_shared_version: objects.authenticator_state,
         epoch_start_timestamp_ms: record.epoch_start_timestamp_ms,
         epoch_duration_ms: record.epoch_duration_ms,
     }
@@ -179,7 +174,11 @@ impl Pipeline {
         state_sync: Queue<CertifiedCheckpoint>,
         record: &EpochRecord,
     ) -> Pipeline {
-        let start = epoch_start(store, epoch_store, record);
+        // Created only by an epoch's last transaction, so as the epoch
+        // started, whatever of it a restart finds committed.
+        let system_objects =
+            execution::epoch_start::system_objects(store).expect("the store reads");
+        let start = epoch_start(store, epoch_store, record, &system_objects);
         let committed_seq = store
             .committed_checkpoint()
             .expect("the store reads")
@@ -193,14 +192,19 @@ impl Pipeline {
         let next_to_certify = committed_seq + 1;
 
         // Where the epoch resumes: after the last commit its consensus
-        // output was written through, else from its start.
-        let committed_height = BuiltCheckpoint::decode(
-            &store
-                .checkpoint(committed_seq)
-                .expect("the store reads")
-                .expect("the committed checkpoint is stored"),
-        )
-        .last_height;
+        // output was written through, else from its start, before any of its
+        // chunks: heights count from 1 each epoch.
+        let committed_height = if committed_seq > record.previous_checkpoint {
+            BuiltCheckpoint::decode(
+                &store
+                    .checkpoint(committed_seq)
+                    .expect("the store reads")
+                    .expect("the committed checkpoint is stored"),
+            )
+            .last_height
+        } else {
+            0
+        };
         consensus_output
             .committed_checkpoints()
             .committed_through(committed_height);
@@ -243,6 +247,7 @@ impl Pipeline {
             key: protocol_key.clone(),
             committee: committee.clone(),
             stakes: record.stakes().collect(),
+            system_objects,
             consensus: consensus.clone(),
             cache: Arc::new(ConsensusTxCache::new()),
             generations: Arc::new(GenerationTable::new(epoch_store.clone())),
