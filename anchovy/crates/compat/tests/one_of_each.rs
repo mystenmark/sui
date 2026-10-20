@@ -66,12 +66,22 @@ const STAKE: u64 = 20_000_000_000_000_000;
 
 /// Anchovy's node, which the test drives itself to see what it builds.
 struct Anchovy {
-    node: Node,
+    /// None only while restarting.
+    node: Option<Node>,
     runner: Runner,
     certified_inbox: Inbox<CertifiedCheckpoint>,
     certified: BTreeSet<u64>,
     // Dropped after the node.
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
+}
+
+/// Not waiting at start for peers to return anchovy's last block: its
+/// database survives its crashes.
+fn parameters() -> Parameters {
+    Parameters {
+        sync_last_known_own_block_timeout: Duration::ZERO,
+        ..Parameters::default()
+    }
 }
 
 struct Network {
@@ -274,7 +284,7 @@ impl Network {
         let (anchovy, coins) = Anchovy::start(anchovy_config, &config.genesis, sender);
         *FORK_REPORT.lock().unwrap() = Some(ForkReport {
             sui: sui[0].get_node_handle().unwrap().state(),
-            store: anchovy.node.perpetual.store.clone(),
+            store: anchovy.node().perpetual.store.clone(),
             checkpoints: anchovy.checkpoints(),
         });
         Network {
@@ -292,7 +302,7 @@ impl Network {
     fn live(&self, id: ObjectID) -> Object {
         let object = self
             .anchovy
-            .node
+            .node()
             .perpetual
             .store
             .live_object(&ObjectId(id.into_bytes()))
@@ -452,7 +462,7 @@ impl Network {
     /// `execute` for `transactions` submitted in one request, so in one
     /// block.
     fn execute_together(&mut self, transactions: &[&Transaction]) -> Vec<TransactionEffects> {
-        let service = Validator::over(self.anchovy.node.perpetual.current.clone());
+        let service = Validator::over(self.anchovy.node().perpetual.current.clone());
         self.runtime.block_on(async {
             let request = RawSubmitTxRequest {
                 transactions: transactions
@@ -500,7 +510,7 @@ impl Network {
         &mut self,
         transactions: &[&Transaction],
     ) -> Vec<RawValidatorSubmitStatus> {
-        let service = Validator::over(self.anchovy.node.perpetual.current.clone());
+        let service = Validator::over(self.anchovy.node().perpetual.current.clone());
         self.runtime.block_on(async {
             let request = RawSubmitTxRequest {
                 transactions: transactions
@@ -623,13 +633,7 @@ impl Anchovy {
         );
         let (state_sync, certified_inbox) = workqueue::queue(1024);
         let keys = keys(config);
-        let mut runner = Runner::new(
-            &keys,
-            Parameters {
-                sync_last_known_own_block_timeout: Duration::ZERO,
-                ..Parameters::default()
-            },
-        );
+        let mut runner = Runner::new(&keys, parameters());
         let mut node = Node::new(Perpetual {
             store,
             epochs: dir.path().join("epochs"),
@@ -641,11 +645,11 @@ impl Anchovy {
         });
         node.start_epoch(&mut runner);
         let anchovy = Anchovy {
-            node,
+            node: Some(node),
             runner,
             certified_inbox,
             certified: BTreeSet::new(),
-            _dir: dir,
+            dir,
         };
         (anchovy, genesis.coins)
     }
@@ -657,30 +661,73 @@ impl Anchovy {
             self.certified.insert(certified.seq);
         }
         let ended = self
-            .node
+            .node()
             .running()
             .is_some_and(|epoch| epoch.pipeline.ended.borrow().is_some());
         if ended {
             node::epoch::Consensus::stop(&mut self.runner);
-            self.node.finish_epoch();
-            self.node.start_epoch(&mut self.runner);
+            let node = self.node.as_mut().unwrap();
+            node.finish_epoch();
+            node.start_epoch(&mut self.runner);
             if let Some(report) = &mut *FORK_REPORT.lock().unwrap() {
                 report.checkpoints = self.checkpoints();
             }
         }
     }
 
+    fn node(&self) -> &Node {
+        self.node.as_ref().expect("anchovy is running")
+    }
+
+    /// Stops anchovy wherever it is, as a crash would, and starts it again
+    /// over its store as a new process: its pipeline resumes from what it
+    /// committed, and consensus replays from its database.
+    fn restart(&mut self) {
+        // The report holds the store: let go, so that it closes.
+        let sui = FORK_REPORT.lock().unwrap().take().map(|report| report.sui);
+        node::epoch::Consensus::stop(&mut self.runner);
+        let Perpetual {
+            store,
+            epochs,
+            state_sync,
+            chain,
+            chain_identifier,
+            keys,
+            ..
+        } = self.node.take().unwrap().into_perpetual();
+        assert_eq!(Arc::strong_count(&store), 1, "only the node holds the store");
+        drop(store);
+        let store = Arc::new(store::Store::open(&self.dir.path().join("perpetual")).unwrap());
+        self.runner = Runner::new(&keys, parameters());
+        let mut node = Node::new(Perpetual {
+            store: store.clone(),
+            epochs,
+            current: CurrentEpoch::new(),
+            state_sync,
+            chain,
+            chain_identifier,
+            keys,
+        });
+        node.start_epoch(&mut self.runner);
+        self.node = Some(node);
+        *FORK_REPORT.lock().unwrap() = sui.map(|sui| ForkReport {
+            sui,
+            store,
+            checkpoints: self.checkpoints(),
+        });
+    }
+
     fn checkpoints(&self) -> Arc<CheckpointStore> {
-        self.node.running().unwrap().pipeline.checkpoints.clone()
+        self.node().running().unwrap().pipeline.checkpoints.clone()
     }
 
     fn epoch(&self) -> u64 {
-        self.node.running().unwrap().state.params.epoch
+        self.node().running().unwrap().state.params.epoch
     }
 
     /// The checkpoint anchovy built listing `transaction`.
     fn checkpoint_of(&self, transaction: &TransactionDigest) -> Option<u64> {
-        let checkpoints = &self.node.running()?.pipeline.checkpoints;
+        let checkpoints = &self.node().running()?.pipeline.checkpoints;
         (1..)
             .map_while(|seq| {
                 let contents: CheckpointContents =
@@ -693,7 +740,7 @@ impl Anchovy {
 
     fn effects(&self, digest: &TransactionDigest) -> Option<TransactionEffects> {
         let executed =
-            execution::executed(&self.node.perpetual.store, &digest.into_inner()).unwrap()?;
+            execution::executed(&self.node().perpetual.store, &digest.into_inner()).unwrap()?;
         Some(bcs::from_bytes(&executed.effects).unwrap())
     }
 }
@@ -806,6 +853,25 @@ fn epochs_follow_one_another_alike() {
         (network.anchovy.epoch() >= 2).then_some(())
     });
     let later = network.transfer(0);
+    network.execute(&later);
+    drop(network.runtime);
+}
+
+#[test]
+fn anchovy_resumes_alike_after_a_crash() {
+    let mut network = Network::with_epoch_duration(Some(10_000));
+    let first = network.transfer(0);
+    network.execute(&first);
+    network.anchovy.restart();
+    // Spending the first transfer's output.
+    let again = network.transfer(0);
+    network.execute(&again);
+    // And into the next epoch, restarted again on the way.
+    network.anchovy.restart();
+    network.wait_for("epoch 1", |network| {
+        (network.anchovy.epoch() >= 1).then_some(())
+    });
+    let later = network.transfer(1);
     network.execute(&later);
     drop(network.runtime);
 }
