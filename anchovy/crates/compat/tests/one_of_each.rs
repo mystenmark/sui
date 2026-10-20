@@ -967,6 +967,20 @@ fn a_published_package_runs_alike() {
 }
 
 #[test]
+fn a_sui_validator_resumes_alike_after_a_crash() {
+    let mut network = Network::new();
+    let first = network.transfer(0);
+    network.execute(&first);
+    // Without it there is no quorum: the network waits for it.
+    network.sui[1].stop();
+    std::thread::sleep(Duration::from_secs(2));
+    network.runtime.block_on(network.sui[1].start()).unwrap();
+    let again = network.transfer(0);
+    network.execute(&again);
+    drop(network.runtime);
+}
+
+#[test]
 fn an_idle_network_certifies_checkpoints() {
     let mut network = Network::new();
     network.wait_for_certified(3);
