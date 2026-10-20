@@ -11,15 +11,20 @@ Branched from `mlogan-phase15` (consensus integration, not yet merged).
 ## Harness
 
 `crates/compat/tests/one_of_each.rs`: sui's `ConfigBuilder` makes a genesis
-of two validators and their node configs; sui runs the first in-process
-(`sui_swarm::memory::Node`), anchovy the second, with that validator's keys
-and the same genesis. When checkpoints stop certifying, the test reports
-each side's progress and the first checkpoint they built differently: both
-summaries, the transactions only one lists, and the effects of those both
-list differently.
+of three validators; sui runs two in-process (`sui_swarm::memory::Node`),
+anchovy the third, with that validator's keys and the same genesis. Voting
+power is capped at a third each, so the two sui validators (3,334 votes
+each) hold a quorum and anchovy (3,332) can neither reject a transaction
+nor hold up a certificate: its votes hide no discrepancy. A fork is
+anchovy's own check panicking (a quorum certified a summary other than the
+one it built), which aborts the test; a panic hook first prints the first
+checkpoint the two built differently, the transactions only one lists and
+the effects both list differently.
 
-Tests: an idle network certifies checkpoints; transfers submitted through
-anchovy execute alike on both and certify.
+Tests: an idle network; transfers; shared objects, a shared object written
+twice in one commit and through both validators at once; transactions
+submitted through sui; a double spend in one block; address balance
+deposits and withdrawals.
 
 ## Forks found and fixed
 
@@ -36,6 +41,23 @@ anchovy execute alike on both and certify.
    the consensus output and restored at start-up; voting rejects durations
    the reference cannot deserialize.
 
+3. A double spend in one block: the reference defers a transaction
+   holding a lock another in the same commit tried to take
+   (`defer_owned_object_double_spend`). The handler now locks before
+   deduplicating, as the reference, defers contested holders a round, and
+   keeps deferred transactions with the consensus output; deferred ones
+   are merged first into the commit of the round they wait for.
+4. Not a fork, found on the way: anchovy voted to reject funds
+   withdrawals. Its input checks now take withdrawals from the sender's or
+   sponsor's balance (`process_funds_withdrawals_for_signing`).
+5. With sui holding a quorum, every checkpoint 3: an
+   `AuthenticatorStateUpdate` anchovy lacked. JSON web keys are now agreed
+   through consensus (`consensus::jwk`): votes by stake, capped per
+   validator; the next commit adds keys that became active.
+
+Anchovy's aggregator now panics on a certified fork, and on a split brain
+in debug builds (sui's `debug_fatal!`).
+
 ## Open
 
 Known divergences, not yet reached by a test:
@@ -45,9 +67,14 @@ Known divergences, not yet reached by a test:
   loaded at the epoch's start, nor stored by the change-epoch transaction;
   capabilities (protocol upgrades) are ignored.
 - Deferral and cancellation: congestion control (budgets from the
-  estimates), owned-object double-spend deferral, unpaid amplification
-  deferral, randomness after DKG failure (likely in a mixed network: anchovy
-  takes no part in DKG).
+  estimates), unpaid amplification deferral (disabled in current protocol
+  versions), randomness after DKG failure (likely in a mixed network:
+  anchovy takes no part in DKG).
+- The signature verifier does not take keys that become active (the
+  reference's `update_authenticator_state` on executing the update), so
+  zkLogin transactions using them fail anchovy's checks.
+- Input checks still refuse withdrawals from allowances, coin
+  reservations and gas from an address balance.
 
-Next tests: shared objects, transactions submitted to sui, a crash and
-restart of each side, an epoch change.
+Next tests: an epoch change, a crash and restart of each side, package
+publishing, randomness.
