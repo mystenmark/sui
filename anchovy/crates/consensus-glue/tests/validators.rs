@@ -42,6 +42,9 @@ const RGP: u64 = 1000;
 const BUDGET: u64 = 50_000_000;
 const SUI: u64 = 1_000_000_000;
 const TIMEOUT: Duration = Duration::from_mins(1);
+/// How long a client waits for a transaction's effects before submitting it
+/// again.
+const RESUBMIT_AFTER: Duration = Duration::from_secs(10);
 /// Longer than any test: commits carry the wall clock, and genesis starts
 /// the first epoch at time 0.
 const FOREVER_MS: u64 = 1 << 50;
@@ -318,47 +321,19 @@ impl Network {
     }
 
     /// Submits `transaction` through validator `v`'s RPC service and waits
-    /// for its effects there.
+    /// for its effects there. Submitted again if they do not come: one
+    /// committed after its epoch's last commit is dropped, as the
+    /// reference's, and a client submits it again.
     fn execute(&self, v: usize, transaction: &Transaction) -> TransactionEffects {
         let member = &self.members[v];
         let service = Validator::over(member.running().current.clone());
-        self.runtime.block_on(async {
-            let request = RawSubmitTxRequest {
-                transactions: vec![bcs::to_bytes(transaction).unwrap().into()],
-                submit_type: SubmitTxType::Default as i32,
-            };
-            let submitted = tokio::time::timeout(
-                TIMEOUT,
-                service.submit_transaction(tonic::Request::new(request)),
-            )
-            .await
-            .expect("submitted in time")
-            .unwrap();
-            let position = match submitted.into_inner().results.remove(0).inner.unwrap() {
-                RawValidatorSubmitStatus::Submitted(position) => Some(position),
-                RawValidatorSubmitStatus::Executed(_) => None,
-                status @ RawValidatorSubmitStatus::Rejected(_) => {
-                    panic!("not submitted: {status:?}")
-                }
-            };
-            let request = RawWaitForEffectsRequest {
-                transaction_digest: Some(transaction.digest().into_inner().to_vec().into()),
-                consensus_position: position,
-                include_details: false,
-                ping_type: None,
-            };
-            let status = tokio::time::timeout(
-                TIMEOUT,
-                service.wait_for_effects(tonic::Request::new(request)),
-            )
-            .await
-            .expect("answered in time")
-            .unwrap();
-            let RawValidatorTransactionStatus::Executed(_) = status.into_inner().inner.unwrap()
-            else {
-                panic!("executed");
-            };
-        });
+        let deadline = Instant::now() + TIMEOUT;
+        while !self
+            .runtime
+            .block_on(submit_and_wait(&service, transaction))
+        {
+            assert!(Instant::now() < deadline, "executed in time");
+        }
         let executed = execution::executed(member.store(), &transaction.digest().into_inner())
             .unwrap()
             .expect("executed");
@@ -418,6 +393,46 @@ impl Network {
             }
         }
     }
+}
+
+/// Submits `transaction` through `service`, then waits for its effects for
+/// a while: whether they came.
+async fn submit_and_wait(service: &Validator, transaction: &Transaction) -> bool {
+    let request = RawSubmitTxRequest {
+        transactions: vec![bcs::to_bytes(transaction).unwrap().into()],
+        submit_type: SubmitTxType::Default as i32,
+    };
+    let submitted = tokio::time::timeout(
+        TIMEOUT,
+        service.submit_transaction(tonic::Request::new(request)),
+    )
+    .await
+    .expect("submitted in time")
+    .unwrap();
+    let position = match submitted.into_inner().results.remove(0).inner.unwrap() {
+        RawValidatorSubmitStatus::Submitted(position) => Some(position),
+        RawValidatorSubmitStatus::Executed(_) => None,
+        status @ RawValidatorSubmitStatus::Rejected(_) => panic!("not submitted: {status:?}"),
+    };
+    let request = RawWaitForEffectsRequest {
+        transaction_digest: Some(transaction.digest().into_inner().to_vec().into()),
+        consensus_position: position,
+        include_details: false,
+        ping_type: None,
+    };
+    let Ok(status) = tokio::time::timeout(
+        RESUBMIT_AFTER,
+        service.wait_for_effects(tonic::Request::new(request)),
+    )
+    .await
+    else {
+        return false;
+    };
+    let RawValidatorTransactionStatus::Executed(_) = status.unwrap().into_inner().inner.unwrap()
+    else {
+        panic!("executed");
+    };
+    true
 }
 
 impl Drop for Network {
