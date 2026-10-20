@@ -154,7 +154,16 @@ impl ForkReport {
             let our_contents: CheckpointContents = bcs::from_bytes(&ours.contents).unwrap();
             let mut report =
                 format!("checkpoint {seq} forked\nsui: {theirs:#?}\nanchovy: {summary:#?}\n");
-            report += &self.contents_diff(&their_contents, &our_contents);
+            let diff = self.contents_diff(&their_contents, &our_contents);
+            if diff.is_empty() {
+                // The same transactions and effects: an order, or a field.
+                write!(
+                    report,
+                    "sui: {their_contents:#?}\nanchovy: {our_contents:#?}"
+                )
+                .unwrap();
+            }
+            report += &diff;
             return report;
         }
         unreachable!()
@@ -216,6 +225,11 @@ impl Network {
     /// stake have 3,334 votes each, a quorum together, and anchovy 3,332,
     /// too few to reject a transaction.
     fn new() -> Network {
+        Network::with_epoch_duration(None)
+    }
+
+    /// As `new`, its epochs lasting `epoch_duration_ms`, if given.
+    fn with_epoch_duration(epoch_duration_ms: Option<u64>) -> Network {
         telemetry_subscribers::init_for_testing();
         let validators = [3 * STAKE, 3 * STAKE, STAKE]
             .into_iter()
@@ -225,9 +239,11 @@ impl Network {
                     .build(&mut OsRng)
             })
             .collect();
-        let config = ConfigBuilder::new_with_temp_dir()
-            .with_validators(validators)
-            .build();
+        let mut builder = ConfigBuilder::new_with_temp_dir().with_validators(validators);
+        if let Some(duration) = epoch_duration_ms {
+            builder = builder.with_epoch_duration(duration);
+        }
+        let config = builder.build();
         let (sui_configs, [anchovy_config]) = config.validator_configs.split_at(2) else {
             unreachable!("three validators");
         };
@@ -259,7 +275,7 @@ impl Network {
         *FORK_REPORT.lock().unwrap() = Some(ForkReport {
             sui: sui[0].get_node_handle().unwrap().state(),
             store: anchovy.node.perpetual.store.clone(),
-            checkpoints: anchovy.node.running().unwrap().pipeline.checkpoints.clone(),
+            checkpoints: anchovy.checkpoints(),
         });
         Network {
             runtime,
@@ -634,10 +650,32 @@ impl Anchovy {
         (anchovy, genesis.coins)
     }
 
+    /// Takes what anchovy certified, and moves it into the next epoch once
+    /// its epoch has ended, as `Node::run`.
     fn poll(&mut self) {
         while let Some(certified) = self.certified_inbox.try_pop() {
             self.certified.insert(certified.seq);
         }
+        let ended = self
+            .node
+            .running()
+            .is_some_and(|epoch| epoch.pipeline.ended.borrow().is_some());
+        if ended {
+            node::epoch::Consensus::stop(&mut self.runner);
+            self.node.finish_epoch();
+            self.node.start_epoch(&mut self.runner);
+            if let Some(report) = &mut *FORK_REPORT.lock().unwrap() {
+                report.checkpoints = self.checkpoints();
+            }
+        }
+    }
+
+    fn checkpoints(&self) -> Arc<CheckpointStore> {
+        self.node.running().unwrap().pipeline.checkpoints.clone()
+    }
+
+    fn epoch(&self) -> u64 {
+        self.node.running().unwrap().state.params.epoch
     }
 
     /// The checkpoint anchovy built listing `transaction`.
@@ -756,6 +794,19 @@ fn address_balances_settle_alike() {
     network.execute_through_sui(&[&through_sui]);
     let again = network.send_funds(0, SUI);
     network.execute(&again);
+    drop(network.runtime);
+}
+
+#[test]
+fn epochs_follow_one_another_alike() {
+    let mut network = Network::with_epoch_duration(Some(5_000));
+    let first = network.transfer(0);
+    network.execute(&first);
+    network.wait_for("epoch 2", |network| {
+        (network.anchovy.epoch() >= 2).then_some(())
+    });
+    let later = network.transfer(0);
+    network.execute(&later);
     drop(network.runtime);
 }
 
