@@ -24,7 +24,7 @@ the effects both list differently.
 Tests: an idle network; transfers; shared objects, a shared object written
 twice in one commit and through both validators at once; transactions
 submitted through sui; a double spend in one block; address balance
-deposits and withdrawals.
+deposits and withdrawals; epochs following one another.
 
 ## Forks found and fixed
 
@@ -55,17 +55,27 @@ deposits and withdrawals.
    through consensus (`consensus::jwk`): votes by stake, capped per
    validator; the next commit adds keys that became active.
 
+6. The epoch's last transaction: the reference puts more kinds before
+   `ChangeEpoch` (authenticator expiry, bridge committee, stored execution
+   time observations, accumulator storage cost, and creations of missing
+   system objects). The closer now builds them all, from the system objects
+   as the epoch started (`execution::epoch_start`, the reference's
+   `EpochStartConfiguration`).
+7. The epoch's last checkpoint's contents: the reference lists no
+   signatures for its last transaction.
+8. The next epoch's first checkpoint: chunk heights count from 1 each
+   epoch in the reference, and the settlement barrier carries them.
+
 Anchovy's aggregator now panics on a certified fork, and on a split brain
 in debug builds (sui's `debug_fatal!`).
 
 ## Open
 
 Known divergences, not yet reached by a test:
-- Chunk heights restart at 0 each epoch in the reference, and the
-  settlement barrier carries the height; anchovy continues them.
-- Epoch change: observations stored at the previous epoch's end are not
-  loaded at the epoch's start, nor stored by the change-epoch transaction;
-  capabilities (protocol upgrades) are ignored.
+- Observations stored at the previous epoch's end are not loaded into the
+  estimator at the epoch's start (only matters once validators share
+  observations).
+- Capabilities and protocol upgrades: the next epoch keeps the version.
 - Deferral and cancellation: congestion control (budgets from the
   estimates), unpaid amplification deferral (disabled in current protocol
   versions), randomness after DKG failure (likely in a mixed network:
@@ -76,5 +86,8 @@ Known divergences, not yet reached by a test:
 - Input checks still refuse withdrawals from allowances, coin
   reservations and gas from an address balance.
 
-Next tests: an epoch change, a crash and restart of each side, package
-publishing, randomness.
+Seen once and not reproduced: `execution_time_observations_outlive_a_restart`
+failed under the full suite's load (took 13s); 36 parallel reruns passed.
+
+Next tests: a crash and restart of each side, package publishing,
+randomness, protocol upgrades.
