@@ -16,7 +16,7 @@ use messages::effects::{
 use messages::fast::checkpoint::UserSignature;
 use messages::fast::{Bump, Writer};
 use messages::reader::Reader;
-use messages::transaction::{SenderSignedData, TransactionKind};
+use messages::transaction::{GenericSignature, SenderSignedData, TransactionKind};
 use protocol_config::ProtocolConfig;
 use validator::pipeline::items::ExecutedEffects;
 
@@ -104,11 +104,10 @@ pub fn build(
         let mut contents = messages::fast::ContentsBuilder::new_in(bump, effects.len());
         // The lengths are asserted equal above.
         for (executed, transaction) in effects.iter().zip(transactions) {
-            let mut signatures = containers::Vec::<UserSignature<'_>>::with_capacity_in(
-                transaction.tx_signatures().len(),
-                bump,
-            );
-            signatures.extend(transaction.tx_signatures().iter().map(|s| (s.0, None)));
+            let listed = listed_signatures(transaction);
+            let mut signatures =
+                containers::Vec::<UserSignature<'_>>::with_capacity_in(listed.len(), bump);
+            signatures.extend(listed.iter().map(|s| (s.0, None)));
             contents.push(
                 Digest::new(executed.digest),
                 Digest::new(executed.effects_digest),
@@ -149,7 +148,7 @@ fn contents_v1<'a>(
 ) -> messages::fast::Built<'a> {
     let signatures: usize = transactions
         .iter()
-        .flat_map(SenderSignedData::tx_signatures)
+        .flat_map(listed_signatures)
         .map(|s| 3 + s.0.len())
         .sum();
     let mut w = Writer::new_in(bump, 10 + effects.len() * 69 + signatures);
@@ -161,12 +160,23 @@ fn contents_v1<'a>(
     }
     w.len_prefix(transactions.len());
     for transaction in transactions {
-        w.len_prefix(transaction.tx_signatures().len());
-        for signature in transaction.tx_signatures() {
+        let listed = listed_signatures(transaction);
+        w.len_prefix(listed.len());
+        for signature in listed {
             w.bytes(signature.0);
         }
     }
     w.finish("CheckpointContents")
+}
+
+/// The signatures the contents list for `transaction`: none for the epoch's
+/// last, whose signatures the reference's builder leaves out
+/// (`create_and_execute_advance_epoch_tx`), else its own.
+fn listed_signatures<'a, 's>(transaction: &'s SenderSignedData<'a>) -> &'s [GenericSignature<'a>] {
+    match transaction.data().kind() {
+        TransactionKind::EndOfEpochTransaction(_) | TransactionKind::ChangeEpoch(_) => &[],
+        _ => transaction.tx_signatures(),
+    }
 }
 
 type Blake2b256 = Blake2b<U32>;
