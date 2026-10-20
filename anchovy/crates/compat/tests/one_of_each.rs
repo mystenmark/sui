@@ -21,6 +21,7 @@ use fastcrypto::traits::{KeyPair as _, ToFromBytes as _};
 use messages::base::Digest;
 use messages::base::ObjectId;
 use move_core_types::ident_str;
+use move_core_types::identifier::Identifier;
 use node::epoch::{Node, Perpetual, ValidatorKeys};
 use protocol_config::Chain;
 use rand::rngs::OsRng;
@@ -425,6 +426,46 @@ impl Network {
         })
     }
 
+    /// Publishes sui-core's test package `name`, paid with coin `i`.
+    fn publish(&self, i: usize, name: &str) -> Transaction {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../crates/sui-core/src/unit_tests/data")
+            .join(name);
+        let package = sui_move_build::BuildConfig::new_for_testing()
+            .build(&path)
+            .unwrap();
+        self.sign(TransactionData::new_module(
+            self.sender,
+            self.coin(i),
+            package.get_package_bytes(false),
+            package.get_dependency_storage_package_ids(),
+            10 * BUDGET,
+            RGP,
+        ))
+    }
+
+    /// Calls `package::module::function` with `arguments`, paid with coin
+    /// `i`.
+    fn call(
+        &self,
+        i: usize,
+        package: ObjectID,
+        module: &str,
+        function: &str,
+        arguments: Vec<CallArg>,
+    ) -> Transaction {
+        self.ptb(i, |b| {
+            b.move_call(
+                package,
+                Identifier::new(module).unwrap(),
+                Identifier::new(function).unwrap(),
+                vec![],
+                arguments,
+            )
+            .unwrap();
+        })
+    }
+
     /// Reads the clock, paid with coin `i`.
     fn read_clock(&self, i: usize) -> Transaction {
         let clock = self.shared(SUI_CLOCK_OBJECT_ID, false);
@@ -695,7 +736,11 @@ impl Anchovy {
             keys,
             ..
         } = self.node.take().unwrap().into_perpetual();
-        assert_eq!(Arc::strong_count(&store), 1, "only the node holds the store");
+        assert_eq!(
+            Arc::strong_count(&store),
+            1,
+            "only the node holds the store"
+        );
         drop(store);
         let store = Arc::new(store::Store::open(&self.dir.path().join("perpetual")).unwrap());
         self.runner = Runner::new(&keys, parameters());
@@ -873,6 +918,51 @@ fn anchovy_resumes_alike_after_a_crash() {
     });
     let later = network.transfer(1);
     network.execute(&later);
+    drop(network.runtime);
+}
+
+#[test]
+fn a_published_package_runs_alike() {
+    let mut network = Network::new();
+    let publish = network.publish(0, "object_basics");
+    let effects = network.execute(&publish);
+    let package = effects
+        .created()
+        .into_iter()
+        .find(|(_, owner)| *owner == Owner::Immutable)
+        .expect("a package")
+        .0
+        .0;
+    let sender = network.sender;
+    let create = network.call(
+        1,
+        package,
+        "object_basics",
+        "create",
+        vec![
+            CallArg::Pure(bcs::to_bytes(&7u64).unwrap()),
+            CallArg::Pure(bcs::to_bytes(&sender).unwrap()),
+        ],
+    );
+    network.execute(&create);
+    let share = network.call(2, package, "object_basics", "share", vec![]);
+    let created = network.execute(&share).created();
+    let (shared, _) = created
+        .iter()
+        .find(|(_, owner)| matches!(owner, Owner::Shared { .. }))
+        .expect("a shared object");
+    let shared = network.shared(shared.0, true);
+    let set = network.call(
+        0,
+        package,
+        "object_basics",
+        "set_value",
+        vec![
+            CallArg::Object(shared),
+            CallArg::Pure(bcs::to_bytes(&9u64).unwrap()),
+        ],
+    );
+    network.execute(&set);
     drop(network.runtime);
 }
 
