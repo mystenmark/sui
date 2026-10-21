@@ -319,29 +319,35 @@ fn check_funds_withdrawals(data: &TransactionData<'_, impl TxState>) -> Result<(
         return Ok(());
     };
     let invalid = |message: &str| Err(error(ErrorKind::InvalidWithdrawReservation, message));
-    let mut reserved: Vec<((&SuiAddress, TypeTag<'_>), u64)> = Vec::new();
-    for arg in pt.inputs {
-        let CallArg::FundsWithdrawal(w) = arg else {
-            continue;
-        };
-        let w = w.get();
-        let Reservation::MaxAmountU64(amount) = w.reservation;
+    // Each withdrawal's balance (its owner and type) and amount.
+    let withdrawals = || {
+        pt.inputs.iter().filter_map(|arg| {
+            let CallArg::FundsWithdrawal(w) = arg else {
+                return None;
+            };
+            let w = w.get();
+            let owner = match w.withdraw_from {
+                WithdrawFrom::Sender => data.sender(),
+                WithdrawFrom::Sponsor => data.gas_data().owner,
+                WithdrawFrom::SenderAllowance { funder, .. } => funder,
+            };
+            let WithdrawalTypeArg::Balance(ty) = w.type_arg;
+            let Reservation::MaxAmountU64(amount) = w.reservation;
+            Some(((owner, ty), amount))
+        })
+    };
+    // In order, as the reference accumulates them: each balance's running
+    // total, without a table.
+    for (i, (balance, amount)) in withdrawals().enumerate() {
         if amount == 0 {
             return invalid("Balance withdraw reservation amount must be non-zero");
         }
-        let owner = match w.withdraw_from {
-            WithdrawFrom::Sender => data.sender(),
-            WithdrawFrom::Sponsor => data.gas_data().owner,
-            WithdrawFrom::SenderAllowance { funder, .. } => funder,
-        };
-        let WithdrawalTypeArg::Balance(ty) = w.type_arg;
-        let balance = (owner, ty);
-        match reserved.iter_mut().find(|(b, _)| *b == balance) {
-            Some((_, total)) => match total.checked_add(amount) {
-                Some(sum) => *total = sum,
-                None => return invalid("Balance withdraw reservation overflow"),
-            },
-            None => reserved.push((balance, amount)),
+        let total = withdrawals()
+            .take(i + 1)
+            .filter(|(b, _)| *b == balance)
+            .try_fold(0u64, |total, (_, amount)| total.checked_add(amount));
+        if total.is_none() {
+            return invalid("Balance withdraw reservation overflow");
         }
     }
     Ok(())

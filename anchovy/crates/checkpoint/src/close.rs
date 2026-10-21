@@ -4,7 +4,6 @@
 //! Closing the epoch: its last checkpoint, built whole
 //! (`docs/reconfiguration_design.md`, The final checkpoint).
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use execution::epoch_start::SystemObjects;
@@ -19,7 +18,7 @@ use messages::fast::Bump;
 use messages::transaction::TransactionKind;
 use protocol_config::{ExecutionTimeEstimateParams, PerObjectCongestionControlMode};
 use validator::consensus::commit::end_of_epoch_transaction;
-use validator::consensus::execution_time::Key;
+use validator::consensus::execution_time::{Key, KeyRef};
 use validator::epoch::EpochParams;
 use validator::pipeline::items::{
     CheckpointContentsBuilt, CheckpointEffects, Chunk, EffectsWaitItem, EndOfEpoch, EpochClose,
@@ -275,7 +274,10 @@ impl EpochCloser {
         let first = last_before
             .saturating_sub(params.stored_observations_num_included_checkpoints - 1)
             .max(close.first_checkpoint);
-        let mut keys = HashSet::new();
+        let observations = &close.observations;
+        let flags = Bump::with_capacity(observations.len());
+        let mut used = containers::Vec::with_capacity_in(observations.len(), &flags);
+        used.resize(observations.len(), false);
         for seq in first..=last_before {
             let contents = self
                 .checkpoints
@@ -283,17 +285,17 @@ impl EpochCloser {
                 .expect("the epoch's checkpoints are built")
                 .contents
                 .clone();
-            self.command_keys(&contents, &mut keys);
+            self.mark_used(&contents, observations, &mut used);
         }
-        self.command_keys(&built.contents, &mut keys);
+        self.mark_used(&built.contents, observations, &mut used);
         let limit = usize::try_from(params.stored_observations_limit).unwrap_or(usize::MAX);
         StoredExecutionTimeObservations::V1(
-            close
-                .observations
+            observations
                 .iter()
-                .filter(|(key, _)| keys.contains(key))
+                .zip(used.iter())
+                .filter(|(_, used)| **used)
                 .take(limit)
-                .map(|(key, by_authority)| {
+                .map(|((key, by_authority), _)| {
                     let by_authority = by_authority
                         .iter()
                         .map(|(name, duration)| {
@@ -310,17 +312,30 @@ impl EpochCloser {
         )
     }
 
-    /// Adds the keys of the commands of the transactions `contents`
-    /// (`CheckpointContents` BCS) lists.
-    fn command_keys(&mut self, contents: &[u8], keys: &mut HashSet<Key>) {
+    /// Marks in `used` each of `observations` (sorted by key) whose key a
+    /// command of a transaction `contents` (`CheckpointContents` BCS) lists
+    /// uses.
+    fn mark_used(
+        &mut self,
+        contents: &[u8],
+        observations: &[(Key, Vec<([u8; 96], std::time::Duration)>)],
+        used: &mut [bool],
+    ) {
         for digest in crate::transactions(contents, &mut self.bump) {
             let transaction = self
                 .store
                 .transaction(&digest)
                 .expect("the store reads")
                 .expect("a checkpoint's transactions executed");
-            if let TransactionKind::ProgrammableTransaction(ptb) = transaction.get().data().kind() {
-                keys.extend(ptb.commands.iter().map(Key::of_command));
+            let TransactionKind::ProgrammableTransaction(ptb) = transaction.get().data().kind()
+            else {
+                continue;
+            };
+            for command in ptb.commands {
+                let key = KeyRef::of_command(command);
+                if let Ok(i) = observations.binary_search_by(|(k, _)| k.as_ref().cmp(&key)) {
+                    used[i] = true;
+                }
             }
         }
     }

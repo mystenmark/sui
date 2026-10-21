@@ -7,8 +7,11 @@
 //! default. The commit stage folds each scheduled transaction's estimate
 //! into the prologue's additional state digest.
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::hash::{Hash, Hasher};
 use std::time::Duration;
+
+use hashbrown::{Equivalent, HashMap};
 
 use messages::build::type_tag::TypeInput;
 use messages::system_transaction::ExecutionTimeObservationKey;
@@ -21,8 +24,9 @@ use serde::{Deserialize, Serialize};
 use crate::checks::VerifiedTransaction;
 
 /// The reference's `ExecutionTimeObservationKey`, owned, and ordered as it
-/// orders them.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// orders them. Ordered and hashed as its [`KeyRef`], by which commands look
+/// it up without allocating.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Key {
     MoveEntryPoint {
         package: [u8; 32],
@@ -40,21 +44,95 @@ pub enum Key {
     Upgrade,
 }
 
-impl Key {
-    pub fn of_command(command: &Command<'_>) -> Key {
+/// A [`Key`], borrowed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum KeyRef<'a> {
+    MoveEntryPoint {
+        package: &'a [u8; 32],
+        module: &'a str,
+        function: &'a str,
+        type_arguments: &'a [TypeInput],
+    },
+    TransferObjects,
+    SplitCoins,
+    MergeCoins,
+    Publish,
+    MakeMoveVec,
+    Upgrade,
+}
+
+impl<'a> KeyRef<'a> {
+    /// The reference's `ExecutionTimeObservationKey::from_command`: no type
+    /// arguments.
+    pub fn of_command(command: &Command<'a>) -> KeyRef<'a> {
         match command {
-            Command::MoveCall(call) => Key::MoveEntryPoint {
-                package: call.package.0,
-                module: call.module.into(),
-                function: call.function.into(),
-                type_arguments: Vec::new(),
+            Command::MoveCall(call) => KeyRef::MoveEntryPoint {
+                package: &call.package.0,
+                module: call.module,
+                function: call.function,
+                type_arguments: &[],
             },
-            Command::TransferObjects(..) => Key::TransferObjects,
-            Command::SplitCoins(..) => Key::SplitCoins,
-            Command::MergeCoins(..) => Key::MergeCoins,
-            Command::Publish(..) => Key::Publish,
-            Command::MakeMoveVec(..) => Key::MakeMoveVec,
-            Command::Upgrade(..) => Key::Upgrade,
+            Command::TransferObjects(..) => KeyRef::TransferObjects,
+            Command::SplitCoins(..) => KeyRef::SplitCoins,
+            Command::MergeCoins(..) => KeyRef::MergeCoins,
+            Command::Publish(..) => KeyRef::Publish,
+            Command::MakeMoveVec(..) => KeyRef::MakeMoveVec,
+            Command::Upgrade(..) => KeyRef::Upgrade,
+        }
+    }
+
+    fn default_duration(self) -> Duration {
+        match self {
+            KeyRef::Publish | KeyRef::Upgrade => Duration::from_millis(3),
+            _ => Duration::from_millis(1),
+        }
+    }
+}
+
+impl Equivalent<Key> for KeyRef<'_> {
+    fn equivalent(&self, key: &Key) -> bool {
+        *self == key.as_ref()
+    }
+}
+
+impl Hash for Key {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_ref().hash(state);
+    }
+}
+
+impl PartialOrd for Key {
+    fn partial_cmp(&self, other: &Key) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Key {
+    fn cmp(&self, other: &Key) -> Ordering {
+        self.as_ref().cmp(&other.as_ref())
+    }
+}
+
+impl Key {
+    pub fn as_ref(&self) -> KeyRef<'_> {
+        match self {
+            Key::MoveEntryPoint {
+                package,
+                module,
+                function,
+                type_arguments,
+            } => KeyRef::MoveEntryPoint {
+                package,
+                module,
+                function,
+                type_arguments,
+            },
+            Key::TransferObjects => KeyRef::TransferObjects,
+            Key::SplitCoins => KeyRef::SplitCoins,
+            Key::MergeCoins => KeyRef::MergeCoins,
+            Key::Publish => KeyRef::Publish,
+            Key::MakeMoveVec => KeyRef::MakeMoveVec,
+            Key::Upgrade => KeyRef::Upgrade,
         }
     }
 
@@ -102,13 +180,6 @@ impl Key {
             Key::Publish => Stored::Publish,
             Key::MakeMoveVec => Stored::MakeMoveVec,
             Key::Upgrade => Stored::Upgrade,
-        }
-    }
-
-    fn default_duration(&self) -> Duration {
-        match self {
-            Key::Publish | Key::Upgrade => Duration::from_millis(3),
-            _ => Duration::from_millis(1),
         }
     }
 }
@@ -166,7 +237,7 @@ pub struct ExecutionTimeEstimator {
     /// Each member's name and stake, by committee index.
     committee: Vec<([u8; 96], u64)>,
     params: ExecutionTimeEstimateParams,
-    observations: HashMap<Key, Observations>,
+    observations: HashMap<Key, Observations, foldhash::fast::RandomState>,
 }
 
 impl ExecutionTimeEstimator {
@@ -184,7 +255,7 @@ impl ExecutionTimeEstimator {
         ExecutionTimeEstimator {
             committee,
             params,
-            observations: HashMap::new(),
+            observations: HashMap::default(),
         }
     }
 
@@ -268,7 +339,7 @@ impl ExecutionTimeEstimator {
         commands
             .iter()
             .map(|command| {
-                let key = Key::of_command(command);
+                let key = KeyRef::of_command(command);
                 self.observations
                     .get(&key)
                     .and_then(|o| o.stake_weighted_median)

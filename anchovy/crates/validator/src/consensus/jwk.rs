@@ -7,7 +7,8 @@
 //! `AuthenticatorStateUpdate` adds it to the authenticator state.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+
+use containers::HeapHashMap;
 
 use messages::build::system_transaction::{Jwk, JwkId};
 
@@ -41,8 +42,10 @@ pub struct JwkAggregator {
     committee: Vec<([u8; 96], u64)>,
     quorum: u64,
     max_votes: u64,
-    stakes: HashMap<(JwkId, Jwk), (HashSet<u32>, u64)>,
-    votes: HashMap<u32, u64>,
+    /// Each key's voters, by committee index, and their stake.
+    stakes: HeapHashMap<(JwkId, Jwk), (Vec<u32>, u64)>,
+    /// How many keys each member voted for, by committee index.
+    votes: Vec<u64>,
 }
 
 impl JwkAggregator {
@@ -50,11 +53,11 @@ impl JwkAggregator {
     pub fn new(committee: Vec<([u8; 96], u64)>, max_votes: u64) -> JwkAggregator {
         let total: u64 = committee.iter().map(|(_, stake)| stake).sum();
         JwkAggregator {
+            votes: vec![0; committee.len()],
             committee,
             quorum: u64::try_from(u128::from(total) * 2 / 3).expect("below the total") + 1,
             max_votes,
-            stakes: HashMap::new(),
-            votes: HashMap::new(),
+            stakes: HeapHashMap::default(),
         }
     }
 
@@ -66,7 +69,7 @@ impl JwkAggregator {
         if *name != vote.authority || !vote.small_enough() {
             return None;
         }
-        if self.votes.get(&vote.author).copied().unwrap_or(0) >= self.max_votes {
+        if self.votes[vote.author as usize] >= self.max_votes {
             return None;
         }
         let key = (vote.id.clone(), vote.jwk.clone());
@@ -84,9 +87,10 @@ impl JwkAggregator {
 
     fn insert(&mut self, author: u32, stake: u64, key: (JwkId, Jwk)) {
         let (voters, total) = self.stakes.entry(key).or_default();
-        if voters.insert(author) {
+        if !voters.contains(&author) {
+            voters.push(author);
             *total += stake;
-            *self.votes.entry(author).or_default() += 1;
+            self.votes[author as usize] += 1;
         }
     }
 

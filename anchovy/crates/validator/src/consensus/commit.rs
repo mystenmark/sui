@@ -14,14 +14,15 @@
 //! `CommitStage` lays the schedule out in chunks and checkpoints for the
 //! pipeline. Congestion control is not here yet.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
 use ::consensus::{BlockRef, TransactionIndex};
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest as _};
-use messages::base::ObjectRef;
+use containers::Bump;
+use messages::base::{Digest, ObjectRef};
 use messages::build::system_transaction::{Jwk, JwkId};
 use protocol_config::ProtocolConfig;
 use workqueue::{Processor, Refusal, Refuse};
@@ -157,7 +158,13 @@ impl CommitHandler {
 
     /// Decides `commit`, or nothing if it was handled before. It takes only
     /// what consensus agrees on: the epoch's parameters and the commit.
-    pub fn handle(&mut self, epoch: &EpochParams, commit: DecodedCommit) -> Option<HandledCommit> {
+    /// `bump`, reset first, holds the decision's temporaries.
+    pub fn handle(
+        &mut self,
+        epoch: &EpochParams,
+        commit: DecodedCommit,
+        bump: &mut Bump,
+    ) -> Option<HandledCommit> {
         // 1. A commit handled before is skipped.
         if commit.commit_index <= self.last_commit {
             return None;
@@ -173,15 +180,17 @@ impl CommitHandler {
 
         let round = u64::from(commit.leader.round);
         let config = &epoch.config;
+        bump.reset();
+        let bump = &*bump;
 
         // 2. Lock owned inputs in consensus order, as the reference's
         //    `filter_consensus_txns`: a transaction an input of which another
         //    holds is dropped, and if that one took it earlier in this
         //    commit, the holder is contested. Dropped transactions are
         //    processed: a later inclusion is a duplicate.
-        let mut taken: HashMap<ObjectRef, TxDigest> = HashMap::new();
-        let mut contested = HashSet::new();
-        let mut locked = Vec::with_capacity(commit.transactions.len());
+        let mut taken = containers::hash_map(bump, commit.transactions.len());
+        let mut contested = containers::message_set(bump, 0);
+        let mut locked = containers::Vec::with_capacity_in(commit.transactions.len(), bump);
         let mut dropped = Vec::new();
         for CommittedTransaction {
             block,
@@ -200,7 +209,11 @@ impl CommitHandler {
                 }
             };
             if let Err(conflict) = self.lock(digest, &owned) {
-                contested.extend(owned.iter().filter_map(|r| taken.get(r).copied()));
+                contested.extend(
+                    owned
+                        .iter()
+                        .filter_map(|r| taken.get(r).copied().map(Digest::new)),
+                );
                 self.output.set_processed(digest);
                 dropped.push((block, index, digest, conflict));
                 continue;
@@ -244,11 +257,11 @@ impl CommitHandler {
 
         // 6. The transactions deferred to this round, then the commit's, in
         //    protocol order: `merge_and_reorder_transactions`.
-        let mut previously_deferred = HashMap::new();
+        let mut previously_deferred = containers::message_map(bump, 0);
         let mut transactions = Vec::with_capacity(accepted.len());
         for (key, deferred) in self.output.take_deferred(DeferralKey::due_by(round)) {
             for deferred in decode_deferred(&deferred) {
-                previously_deferred.insert(deferred.digest(), key);
+                previously_deferred.insert(Digest::new(deferred.digest()), key);
                 origins.insert(deferred.digest(), deferred.origin);
                 transactions.push(deferred.transaction);
             }
@@ -259,24 +272,29 @@ impl CommitHandler {
         // 7. Each, in order, deferred or estimated and scheduled:
         //    `handle_deferral_and_cancellation`. A contested holder is
         //    deferred a round, as a penalty for the double spend.
-        let mut deferred: BTreeMap<DeferralKey, Vec<Deferred>> = BTreeMap::new();
+        let mut deferred: containers::BTreeMap<DeferralKey, containers::Vec<Deferred>> =
+            containers::BTreeMap::new_in(bump);
         let mut deferred_here = Vec::new();
         let mut admitted = Vec::with_capacity(ordered.len());
         let mut estimates_us = Vec::with_capacity(ordered.len());
         for transaction in ordered {
             let digest = transaction.get().0.digest().bytes;
-            if contested.contains(&digest) && config.defer_owned_object_double_spend() {
+            if contested.contains(&Digest::new(digest)) && config.defer_owned_object_double_spend()
+            {
                 let from = previously_deferred
-                    .get(&digest)
+                    .get(&Digest::new(digest))
                     .map_or(round, DeferralKey::deferred_from_round);
                 let key = DeferralKey::next_round(round, from);
                 if key.within_limit(config.max_deferral_rounds_for_congestion_control()) {
                     let origin = origins.remove(&digest).expect("each transaction's origin");
                     deferred_here.push((origin.0, origin.1, digest));
-                    deferred.entry(key).or_default().push(Deferred {
-                        origin,
-                        transaction,
-                    });
+                    deferred
+                        .entry(key)
+                        .or_insert_with(|| containers::Vec::new_in(bump))
+                        .push(Deferred {
+                            origin,
+                            transaction,
+                        });
                     continue;
                 }
             }
@@ -395,6 +413,10 @@ impl CommitHandler {
         }
     }
 }
+
+/// The commit handler's arena: enough for a commit's temporaries without a
+/// second chunk.
+const ARENA_BYTES: usize = 64 * 1024;
 
 /// The accumulator root (`SUI_ACCUMULATOR_ROOT_OBJECT_ID`), which each
 /// chunk's settlement writes.
@@ -535,6 +557,8 @@ pub struct CommitStage {
     start: EpochStart,
     queue: CheckpointQueue,
     commit_times: CommitIntervalObserver,
+    /// The handler's temporaries, for one commit at a time.
+    bump: Bump,
     /// Commits through this one were decided before a restart: replayed,
     /// they only rebuild the commit interval observer, which is in memory,
     /// as the reference's prior commits do.
@@ -586,6 +610,7 @@ impl CommitStage {
             start,
             queue,
             commit_times: CommitIntervalObserver::default(),
+            bump: Bump::with_capacity(ARENA_BYTES),
             prior_through,
             last_commit: record.map(|r| r.commit_index),
             closed: record.is_some_and(|r| r.closed),
@@ -627,7 +652,7 @@ impl CommitStage {
             dropped,
             estimates_us,
             ..
-        } = self.handler.handle(epoch, commit)?;
+        } = self.handler.handle(epoch, commit, &mut self.bump)?;
         let config = &epoch.config;
         let Some(&Scheduled::Prologue(prologue)) = schedule.transactions.first() else {
             unreachable!("a schedule starts with its prologue");
@@ -929,8 +954,8 @@ impl CommitStage {
             .finish(&record, self.queue.height, self.queue.pending.is_empty());
         // What became of each transaction, for its submitter: dropped, or
         // finalized (scheduled, or a duplicate of one that was).
-        let dropped: HashSet<(BlockRef, TransactionIndex)> =
-            decided.dropped.iter().map(|(b, i, ..)| (*b, *i)).collect();
+        let mut dropped = containers::hash_set(&self.bump, decided.dropped.len());
+        dropped.extend(decided.dropped.iter().map(|(b, i, ..)| (*b, *i)));
         self.statuses.set_statuses(
             rejected
                 .into_iter()
@@ -944,6 +969,7 @@ impl CommitStage {
                     (b, i, status)
                 })),
         );
+        drop(dropped);
         self.emit(decided);
         self.statuses.update_leader_round(leader_round);
         Some(())
