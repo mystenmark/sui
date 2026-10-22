@@ -91,9 +91,41 @@ Known divergences, not yet reached by a test:
 Seen once and not reproduced: `execution_time_observations_outlive_a_restart`
 failed under the full suite's load (took 13s); 36 parallel reruns passed.
 
-Not a fork, found on the way: the consensus-glue test's client waited
-forever for a transaction committed after its epoch's last commit (dropped,
-as in the reference); it now submits again.
+Not a fork, found on the way: a wait for effects at a position whose epoch
+ended waited forever for a transaction consensus dropped. It now answers
+`EpochEnded`, as the reference's, and the glue test's and compat harness's
+clients submit again. The compat harness also only moved anchovy into the
+next epoch between RPCs; it now polls while one runs.
+
+## Containers and arenas (PRD.md)
+
+Done: each worker's processors share one arena, reset after each item and
+never freed (`Processor::process` takes it; `Bump::reset` keeps the largest
+chunk). Every processor's own arena is gone, and the temporaries of the
+commit stage, settlement scheduler, block voter, signature checks, submit
+checker and checkpoint builders are in it.
+
+Remaining std collections and heap temporaries on hot paths:
+- `validation::inputs::check` (`input_objects`, receiving, loaded, coins
+  Vecs and `BTreeSet`s): needs the caller's arena.
+- Commit handler: `HandledCommit` (`origins`, accepted, duplicates,
+  deferred, estimates), `Sequencer::order`/`schedule`, `decide`'s entries,
+  `emit`'s heights, `decode_deferred`, `set_statuses`' woken,
+  `update_median`.
+- Commit decoder: `owned_inputs_to_lock`'s inputs.
+- Execution: `input_objects`/`receiving_objects` copies, `Kept`'s Vec,
+  `StoreReads::parse` copies; exec-pool's `provided` and `written`.
+- Resolver: a fresh arena per withdrawing transaction.
+- Settlement: `WaitBatch` key Vecs, the effects Vec before reordering,
+  reservations cloned, `Merged::Events` and `build`'s chunk, BCS to hash.
+- Checkpoint: `contents_of`'s Vecs are in the arena; still `summary::sign`'s
+  message, `SummaryBuilder`'s resolved list, `GenerationTable::commit`,
+  `Store::commit_checkpoint`'s records.
+- Aggregator: `certify`'s keys, `certified_bytes`' bitmap.
+- Natives: fixed-size values built through Vecs.
+- Long-lived tables with SipHash: store cache shards, epoch store
+  quarantine and output maps, aggregator `Committee.index`, status
+  waiters (digest keys: `MessageMap`; others foldhash).
 
 Next: randomness (anchovy takes no part in DKG or in generating
 randomness, which reaches sui validators over their own network), protocol
