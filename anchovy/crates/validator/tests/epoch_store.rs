@@ -99,7 +99,7 @@ fn generations_are_written_once_their_producer_commits() {
         assert_eq!(table.get(stream(1), 3, 1), Some(version(2)));
         assert_eq!(table.get(stream(2), 7, 1), Some(ended));
         assert_eq!(table.get(stream(1), 3, 2), None);
-        table.commit(&[[1; 32]]);
+        table.commit(&[[1; 32]], &containers::Bump::default());
         assert_eq!(table.get(stream(1), 3, 1), Some(version(2)));
         // A stream's start, recorded once.
         assert_eq!(

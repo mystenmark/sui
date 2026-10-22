@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+containers.workspace = true
 fastcrypto.workspace = true
 messages.workspace = true
 roaring.workspace = true

@@ -417,8 +417,9 @@ impl Store {
         transactions: &[Digest],
         checkpoint: Vec<u8>,
         certified: Vec<u8>,
+        bump: &containers::Bump,
     ) {
-        self.commit(seq, transactions, checkpoint, Some(certified), None);
+        self.commit(seq, transactions, checkpoint, Some(certified), None, bump);
     }
 
     /// Commits the genesis checkpoint, which has no transactions of its own
@@ -428,7 +429,8 @@ impl Store {
     /// # Panics
     /// If a checkpoint is committed already, or the database write fails.
     pub fn commit_genesis_checkpoint(&self, checkpoint: Vec<u8>, epoch_start: Vec<u8>) {
-        self.commit(0, &[], checkpoint, None, Some(epoch_start));
+        let bump = containers::Bump::with_capacity(0);
+        self.commit(0, &[], checkpoint, None, Some(epoch_start), &bump);
     }
 
     fn commit(
@@ -438,6 +440,7 @@ impl Store {
         checkpoint: Vec<u8>,
         certified: Option<Vec<u8>>,
         epoch_start: Option<Vec<u8>>,
+        bump: &containers::Bump,
     ) {
         {
             let last = *lock(&self.last_committed);
@@ -447,10 +450,12 @@ impl Store {
                 "checkpoint {seq} committed after {last:?}"
             );
         }
-        let records: Vec<Arc<TxRecord>> = transactions
-            .iter()
-            .filter_map(|d| lock(&self.uncommitted[shard(&d.bytes)]).get(d).cloned())
-            .collect();
+        let mut records = containers::Vec::with_capacity_in(transactions.len(), bump);
+        records.extend(
+            transactions
+                .iter()
+                .filter_map(|d| lock(&self.uncommitted[shard(&d.bytes)]).get(d).cloned()),
+        );
 
         // 1. Durable before anything leaves memory.
         let mut batch = self.db.write_batch();

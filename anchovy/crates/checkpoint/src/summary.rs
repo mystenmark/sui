@@ -160,8 +160,8 @@ fn version_specific_data_v1<'b>(
 
 /// `key`'s signature over `summary` in `epoch`, as the reference's
 /// `AuthoritySignInfo::new`: the intent message's BCS, then the epoch.
-pub fn sign(key: &ProtocolKey, summary: &[u8], epoch: u64) -> [u8; 48] {
-    let mut message = Vec::with_capacity(3 + summary.len() + 8);
+pub fn sign(key: &ProtocolKey, summary: &[u8], epoch: u64, bump: &Bump) -> [u8; 48] {
+    let mut message = containers::Vec::with_capacity_in(3 + summary.len() + 8, bump);
     message.extend_from_slice(&CHECKPOINT_SUMMARY_INTENT);
     message.extend_from_slice(summary);
     message.extend_from_slice(&epoch.to_le_bytes());
@@ -170,8 +170,13 @@ pub fn sign(key: &ProtocolKey, summary: &[u8], epoch: u64) -> [u8; 48] {
 
 /// The `ConsensusTransaction` BCS submitting `key`'s signature over
 /// `summary`: a `CheckpointSignatureV2` of a `SignedCheckpointSummary`.
-pub fn signature_transaction(key: &ProtocolKey, summary: &[u8], epoch: u64) -> Vec<u8> {
-    let signature = sign(key, summary, epoch);
+pub fn signature_transaction(
+    key: &ProtocolKey,
+    summary: &[u8],
+    epoch: u64,
+    bump: &Bump,
+) -> Vec<u8> {
+    let signature = sign(key, summary, epoch, bump);
     let mut out = Vec::with_capacity(8 + 1 + summary.len() + 8 + 97 + 48);
     // The tracking id is local bookkeeping; the reference hashes the
     // signature into it.

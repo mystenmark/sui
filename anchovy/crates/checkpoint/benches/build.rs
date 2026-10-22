@@ -232,7 +232,7 @@ fn main() {
             let summary_allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
 
             let start = Instant::now();
-            std::hint::black_box(summary::sign(&key, &summary.bytes, 1));
+            std::hint::black_box(summary::sign(&key, &summary.bytes, 1, &bump));
             let sign_took = start.elapsed();
 
             // The first round warms the arenas and the store's caches.

@@ -375,7 +375,7 @@ fn signature_transaction_verifies_in_sui() {
     let m = Mainnet::load();
     let s = m.summary();
     let key = key();
-    let bytes = summary::signature_transaction(&key, s.bytes, s.epoch);
+    let bytes = summary::signature_transaction(&key, s.bytes, s.epoch, &Bump::default());
     let transaction: ConsensusTransaction = bcs::from_bytes(&bytes).unwrap();
     let ConsensusTransactionKind::CheckpointSignatureV2(message) = transaction.kind else {
         panic!("a CheckpointSignatureV2");

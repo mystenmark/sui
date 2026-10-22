@@ -78,10 +78,11 @@ impl CheckpointCommitter {
             &transactions,
             built.encode(),
             certified.summary.to_vec(),
+            bump,
         );
         let mut digests = containers::Vec::with_capacity_in(transactions.len(), bump);
         digests.extend(transactions.iter().map(|d| d.bytes));
-        self.generations.commit(&digests);
+        self.generations.commit(&digests, bump);
         self.consensus_output.committed_through(built.last_height);
         self.chunks.prune_through(built.last_height);
         self.checkpoints.committed(seq);

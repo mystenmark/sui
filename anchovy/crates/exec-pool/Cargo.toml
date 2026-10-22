@@ -6,6 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+containers.workspace = true
 execution.workspace = true
 messages.workspace = true
 store.workspace = true

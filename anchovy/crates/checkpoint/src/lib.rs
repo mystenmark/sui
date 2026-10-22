@@ -248,6 +248,7 @@ impl Processor for SummaryBuilder {
                 &self.key,
                 &summary.bytes,
                 self.epoch.epoch,
+                bump,
             ));
             let checkpoint = BuiltCheckpoint {
                 seq,

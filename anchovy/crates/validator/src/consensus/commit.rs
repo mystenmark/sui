@@ -951,8 +951,8 @@ impl CommitStage {
                     };
                     (b, i, status)
                 })),
+            bump,
         );
-        drop(dropped);
         self.emit(decided, bump);
         self.statuses.update_leader_round(leader_round);
         Some(())
@@ -1238,11 +1238,7 @@ fn system_transaction(
         },
         expiration: TransactionExpiration::None,
     });
-    let digest = messages::base::Digest::of(
-        "TransactionData",
-        &bcs::to_bytes(&data).expect("transaction data serializes"),
-    )
-    .bytes;
+    let size = bcs::serialized_size(&data).expect("transaction data serializes");
     let transaction = Transaction {
         data: SenderSignedData(SenderSignedTransaction {
             intent_message: IntentMessage {
@@ -1259,9 +1255,12 @@ fn system_transaction(
         }),
         auth_signature: EmptySignInfo {},
     };
+    let bytes = bcs::to_bytes(&transaction).expect("a transaction serializes");
+    // The data follows the one-element sequence's length and the intent.
+    let digest = messages::base::Digest::of("TransactionData", &bytes[4..4 + size]).bytes;
     SystemTransaction {
         kind: system,
-        bytes: bcs::to_bytes(&transaction).expect("a transaction serializes"),
+        bytes,
         digest,
     }
 }

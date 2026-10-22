@@ -164,12 +164,7 @@ impl NativeExecution {
             funds,
             assigned_accumulator,
         );
-        if arena.chunks() > 1 {
-            // Grow the first chunk so that later transactions this large fit in it.
-            *arena = Bump::with_capacity(arena.allocated().next_power_of_two().max(ARENA_CAPACITY));
-        } else {
-            arena.reset();
-        }
+        arena.reset();
         if runtime.package_cache.len() > self.max_packages {
             *runtime = Runtime::new(&self.config).expect("a runtime builds as it did at the start");
         }

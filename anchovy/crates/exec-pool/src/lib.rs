@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use containers::Bump;
 use execution::{Funds, Input};
 use messages::Message;
 use messages::effects::{
@@ -93,7 +94,8 @@ pub struct Executor {
 }
 
 /// The objects a transaction wrote: id, version, object.
-type WrittenObjects = Vec<(messages::base::ObjectId, u64, Message<Object<'static>>)>;
+type WrittenObjects<'b> =
+    containers::Vec<'b, (messages::base::ObjectId, u64, Message<Object<'static>>)>;
 
 /// A written object's value: the object as the input waiter resolves it.
 fn object(bytes: Vec<u8>) -> Message<Object<'static>> {
@@ -136,6 +138,7 @@ impl Executor {
         resolved_keys: &mut Vec<(InputKey, InputValue)>,
         effects_keys: &mut Vec<EffectsKey>,
         deposits: &mut Vec<Settle>,
+        bump: &Bump,
     ) {
         let entry = &executable.entry;
         let (digest, bytes): (TxDigest, &[u8]) = match &entry.transaction {
@@ -162,7 +165,7 @@ impl Executor {
             .iter()
             .map(|v| v.as_ref().expect("every key resolved"));
         self.resolved.clear();
-        let mut provided: Vec<(messages::base::ObjectId, Input<'_>)> = Vec::new();
+        let mut provided = containers::Vec::new_in(bump);
         for access in &entry.shared {
             let generation = match values.next().expect("a value per shared access") {
                 InputValue::Generation(generation, object) => {
@@ -216,8 +219,15 @@ impl Executor {
 
         // 2. Its effects: stored, or from executing and committing it.
         let (effects, written) = match stored {
-            Some(effects) => (effects, Vec::new()),
-            None => self.execute_now(digest, bytes, &provided, funds, executable.root_version),
+            Some(effects) => (effects, containers::Vec::new_in(bump)),
+            None => self.execute_now(
+                digest,
+                bytes,
+                &provided,
+                funds,
+                executable.root_version,
+                bump,
+            ),
         };
         drop(provided);
         let VersionedEffects::V2(effects_v2) = &effects.get().version else {
@@ -324,25 +334,28 @@ impl Executor {
     /// # Panics
     /// If execution fails outside the transaction: everything it reads was
     /// waited for, so that is a bug.
-    fn execute_now(
+    fn execute_now<'b>(
         &self,
         digest: TxDigest,
         bytes: &[u8],
         provided: &[(messages::base::ObjectId, Input<'_>)],
         funds: Funds,
         root_version: u64,
-    ) -> (Message<TransactionEffects<'static>>, WrittenObjects) {
+        bump: &'b Bump,
+    ) -> (Message<TransactionEffects<'static>>, WrittenObjects<'b>) {
         let outcome = self
             .epoch
             .execution
             .execute_at(&self.store, bytes, provided, funds, Some(root_version))
             .unwrap_or_else(|e| panic!("transaction {digest:?} failed to execute: {e:?}"));
-        let written = outcome
-            .commit
-            .written
-            .iter()
-            .map(|w| (w.id, w.version, object(w.bytes.clone())))
-            .collect();
+        let mut written = containers::Vec::with_capacity_in(outcome.commit.written.len(), bump);
+        written.extend(
+            outcome
+                .commit
+                .written
+                .iter()
+                .map(|w| (w.id, w.version, object(w.bytes.clone()))),
+        );
         self.store.write(outcome.commit);
         let effects = Message::parse(outcome.effects)
             .map_err(|(e, _)| e)
@@ -502,7 +515,7 @@ impl Processor for Executor {
     type Input = Vec<Executable>;
     type Output = ();
 
-    fn process(&mut self, ready: Vec<Executable>, _bump: &mut workqueue::Bump) -> Option<()> {
+    fn process(&mut self, ready: Vec<Executable>, bump: &mut Bump) -> Option<()> {
         let mut resolved_keys = Vec::new();
         let mut effects_keys = Vec::with_capacity(ready.len());
         let mut deposits = Vec::new();
@@ -512,6 +525,7 @@ impl Processor for Executor {
                 &mut resolved_keys,
                 &mut effects_keys,
                 &mut deposits,
+                bump,
             );
         }
         // Everything is committed and recorded: now the keys are visible.

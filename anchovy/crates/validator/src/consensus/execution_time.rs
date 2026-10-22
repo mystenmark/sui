@@ -238,6 +238,8 @@ pub struct ExecutionTimeEstimator {
     committee: Vec<([u8; 96], u64)>,
     params: ExecutionTimeEstimateParams,
     observations: HashMap<Key, Observations, foldhash::fast::RandomState>,
+    /// Scratch for `update_median`, kept between uses.
+    observed: Vec<(Duration, usize)>,
 }
 
 impl ExecutionTimeEstimator {
@@ -256,6 +258,7 @@ impl ExecutionTimeEstimator {
             committee,
             params,
             observations: HashMap::default(),
+            observed: Vec::new(),
         }
     }
 
@@ -300,7 +303,7 @@ impl ExecutionTimeEstimator {
         }
         *latest = generation;
         *observed = Some(duration);
-        observations.update_median(&self.committee, &self.params);
+        observations.update_median(&self.committee, &self.params, &mut self.observed);
     }
 
     /// Every key's observations, by authority name, sorted by key: what the
@@ -359,13 +362,15 @@ impl Observations {
         &mut self,
         committee: &[([u8; 96], u64)],
         params: &ExecutionTimeEstimateParams,
+        observed: &mut Vec<(Duration, usize)>,
     ) {
-        let mut observed: Vec<(Duration, usize)> = self
-            .by_authority
-            .iter()
-            .enumerate()
-            .filter_map(|(i, (_, duration))| duration.map(|d| (d, i)))
-            .collect();
+        observed.clear();
+        observed.extend(
+            self.by_authority
+                .iter()
+                .enumerate()
+                .filter_map(|(i, (_, duration))| duration.map(|d| (d, i))),
+        );
         observed.sort_unstable();
         let stake = |i: usize| committee[i].1;
         let total: u64 = observed.iter().map(|&(_, i)| stake(i)).sum();
@@ -374,7 +379,7 @@ impl Observations {
             return;
         }
         let mut running = 0;
-        for (duration, i) in observed {
+        for &(duration, i) in observed.iter() {
             running += stake(i);
             if running > total / 2 {
                 self.stake_weighted_median = Some(duration);

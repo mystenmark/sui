@@ -262,7 +262,13 @@ fn committed_checkpoints_and_the_watermark_survive_reopening() {
         store.commit_genesis_checkpoint(b"genesis".to_vec(), b"start".to_vec());
         // Past 255, where little-endian keys would sort wrongly.
         for seq in 1..=300u64 {
-            store.commit_checkpoint(seq, &[], seq.to_le_bytes().to_vec(), vec![seq as u8]);
+            store.commit_checkpoint(
+                seq,
+                &[],
+                seq.to_le_bytes().to_vec(),
+                vec![seq as u8],
+                &containers::Bump::default(),
+            );
         }
     }
     let store = Store::open(dir.path()).unwrap();
@@ -279,7 +285,7 @@ fn committed_checkpoints_and_the_watermark_survive_reopening() {
     assert_eq!(store.certified(0).unwrap(), None);
     assert_eq!(store.certified(2).unwrap(), Some(vec![2]));
     assert_eq!(store.checkpoint(301).unwrap(), None);
-    store.commit_checkpoint(301, &[], vec![], vec![]);
+    store.commit_checkpoint(301, &[], vec![], vec![], &containers::Bump::default());
 }
 
 #[test]
@@ -288,5 +294,5 @@ fn checkpoints_commit_in_order() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
     store.commit_genesis_checkpoint(vec![], vec![]);
-    store.commit_checkpoint(2, &[], vec![], vec![]);
+    store.commit_checkpoint(2, &[], vec![], vec![], &containers::Bump::default());
 }

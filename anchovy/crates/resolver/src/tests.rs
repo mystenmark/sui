@@ -173,7 +173,7 @@ fn resolve(
     mut entry: ScheduledEntry,
 ) -> (Vec<InputKey>, Vec<(StreamId, u32, u32)>) {
     handler.link(&mut entry.shared);
-    let base = resolver.resolve(&entry, &Digest::new(CHAIN));
+    let base = resolver.resolve(&entry, &Digest::new(CHAIN), &containers::Bump::default());
     (resolver.keys.clone(), base)
 }
 

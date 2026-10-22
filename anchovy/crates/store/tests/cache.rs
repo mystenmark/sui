@@ -209,7 +209,13 @@ fn run_model(seed: u64, capacity: Capacity) {
                 {
                     digests.insert(0, *old);
                 }
-                store.commit_checkpoint(next_checkpoint, &digests, vec![step as u8], vec![]);
+                store.commit_checkpoint(
+                    next_checkpoint,
+                    &digests,
+                    vec![step as u8],
+                    vec![],
+                    &containers::Bump::default(),
+                );
                 next_checkpoint += 1;
                 for tx in txs {
                     for &(object, version, state) in &tx.outputs {
@@ -426,7 +432,13 @@ fn racing_readers_never_see_an_older_version() {
         store.write(tx.commit(&pool));
         pending.push(tx.digest);
         if n % 3 == 2 {
-            store.commit_checkpoint(n / 3, &pending, vec![], vec![]);
+            store.commit_checkpoint(
+                n / 3,
+                &pending,
+                vec![],
+                vec![],
+                &containers::Bump::default(),
+            );
             pending.clear();
         }
     }
@@ -486,7 +498,13 @@ fn racing_readers_never_see_an_executed_transaction_unexecuted() {
         written.store(n + 1, Ordering::Release);
         pending.push(tx.digest);
         if n % 2 == 1 {
-            store.commit_checkpoint(n / 2, &pending, vec![], vec![]);
+            store.commit_checkpoint(
+                n / 2,
+                &pending,
+                vec![],
+                vec![],
+                &containers::Bump::default(),
+            );
             pending.clear();
         }
     }
