@@ -14,7 +14,7 @@
 //! `CommitStage` lays the schedule out in chunks and checkpoints for the
 //! pipeline. Congestion control is not here yet.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,7 +25,7 @@ use containers::Bump;
 use messages::base::{Digest, ObjectRef};
 use messages::build::system_transaction::{Jwk, JwkId};
 use protocol_config::ProtocolConfig;
-use workqueue::{Processor, Refusal, Refuse};
+use workqueue::Processor;
 
 use crate::consensus::decode::{CommittedTransaction, DecodedCommit};
 use crate::consensus::deferral::{DeferralKey, Deferred, decode_deferred, encode_deferred};
@@ -59,29 +59,24 @@ pub enum DropReason {
 /// A commit the handler decided: its schedule, where each scheduled
 /// transaction came from, and the transactions it had processed before.
 #[derive(Debug)]
-pub struct HandledCommit {
+pub struct HandledCommit<'b> {
     pub commit_index: u32,
-    pub schedule: Schedule,
+    pub schedule: Schedule<'b>,
     /// Each scheduled user transaction's block and position, by digest.
-    pub origins: HashMap<[u8; 32], (BlockRef, TransactionIndex)>,
+    pub origins: containers::MessageMap<'b, Digest, (BlockRef, TransactionIndex)>,
     /// Transactions processed in earlier commits, or earlier in this one.
-    pub duplicates: Vec<(BlockRef, TransactionIndex, [u8; 32])>,
+    pub duplicates: containers::Vec<'b, (BlockRef, TransactionIndex, [u8; 32])>,
     /// Transactions deferred to a later round, in schedule order.
-    pub deferred: Vec<(BlockRef, TransactionIndex, [u8; 32])>,
+    pub deferred: containers::Vec<'b, (BlockRef, TransactionIndex, [u8; 32])>,
     /// Transactions dropped before scheduling, in consensus order. Like the
     /// reference's, they are processed: a later inclusion is a duplicate.
-    pub dropped: Vec<(BlockRef, TransactionIndex, [u8; 32], DropReason)>,
+    pub dropped: containers::Vec<'b, (BlockRef, TransactionIndex, [u8; 32], DropReason)>,
     /// Each scheduled user transaction's execution time estimate, in
     /// microseconds, in schedule order: what the reference's
     /// `IndirectStateObserver` sees.
-    pub estimates_us: Vec<u64>,
+    pub estimates_us: containers::Vec<'b, u64>,
     pub cache_hits: usize,
     pub cache_misses: usize,
-}
-
-/// A full queue drops the commit; consensus replays commits not handled.
-impl Refuse for HandledCommit {
-    fn refuse(self, _: Refusal) {}
 }
 
 /// The consensus handler. What it decided, beyond the commit in hand, is
@@ -158,13 +153,13 @@ impl CommitHandler {
 
     /// Decides `commit`, or nothing if it was handled before. It takes only
     /// what consensus agrees on: the epoch's parameters and the commit.
-    /// `bump`, reset first, holds the decision's temporaries.
-    pub fn handle(
+    /// `bump` holds the decision's temporaries.
+    pub fn handle<'b>(
         &mut self,
         epoch: &EpochParams,
         commit: DecodedCommit,
-        bump: &mut Bump,
-    ) -> Option<HandledCommit> {
+        bump: &'b Bump,
+    ) -> Option<HandledCommit<'b>> {
         // 1. A commit handled before is skipped.
         if commit.commit_index <= self.last_commit {
             return None;
@@ -180,8 +175,6 @@ impl CommitHandler {
 
         let round = u64::from(commit.leader.round);
         let config = &epoch.config;
-        bump.reset();
-        let bump = &*bump;
 
         // 2. Lock owned inputs in consensus order, as the reference's
         //    `filter_consensus_txns`: a transaction an input of which another
@@ -191,7 +184,7 @@ impl CommitHandler {
         let mut taken = containers::hash_map(bump, commit.transactions.len());
         let mut contested = containers::message_set(bump, 0);
         let mut locked = containers::Vec::with_capacity_in(commit.transactions.len(), bump);
-        let mut dropped = Vec::new();
+        let mut dropped = containers::Vec::new_in(bump);
         for CommittedTransaction {
             block,
             index,
@@ -224,9 +217,9 @@ impl CommitHandler {
 
         // 3. Deduplicate against the transactions processed before, this
         //    handler's own record: `deduplicate_consensus_txns`.
-        let mut accepted = Vec::with_capacity(locked.len());
-        let mut origins = HashMap::with_capacity(locked.len());
-        let mut duplicates = Vec::new();
+        let mut accepted = containers::Vec::with_capacity_in(locked.len(), bump);
+        let mut origins = containers::message_map(bump, locked.len());
+        let mut duplicates = containers::Vec::new_in(bump);
         for (block, index, transaction) in locked {
             let digest = transaction.get().0.digest().bytes;
             if self.output.is_processed(&digest) {
@@ -234,7 +227,7 @@ impl CommitHandler {
                 continue;
             }
             self.output.set_processed(digest);
-            origins.insert(digest, (block, index));
+            origins.insert(Digest::new(digest), (block, index));
             accepted.push(transaction);
         }
 
@@ -258,25 +251,25 @@ impl CommitHandler {
         // 6. The transactions deferred to this round, then the commit's, in
         //    protocol order: `merge_and_reorder_transactions`.
         let mut previously_deferred = containers::message_map(bump, 0);
-        let mut transactions = Vec::with_capacity(accepted.len());
+        let mut transactions = containers::Vec::with_capacity_in(accepted.len(), bump);
         for (key, deferred) in self.output.take_deferred(DeferralKey::due_by(round)) {
             for deferred in decode_deferred(&deferred) {
                 previously_deferred.insert(Digest::new(deferred.digest()), key);
-                origins.insert(deferred.digest(), deferred.origin);
+                origins.insert(Digest::new(deferred.digest()), deferred.origin);
                 transactions.push(deferred.transaction);
             }
         }
         transactions.extend(accepted);
-        let ordered = self.sequencer.order(config, transactions);
+        let ordered = self.sequencer.order(config, transactions, bump);
 
         // 7. Each, in order, deferred or estimated and scheduled:
         //    `handle_deferral_and_cancellation`. A contested holder is
         //    deferred a round, as a penalty for the double spend.
         let mut deferred: containers::BTreeMap<DeferralKey, containers::Vec<Deferred>> =
             containers::BTreeMap::new_in(bump);
-        let mut deferred_here = Vec::new();
-        let mut admitted = Vec::with_capacity(ordered.len());
-        let mut estimates_us = Vec::with_capacity(ordered.len());
+        let mut deferred_here = containers::Vec::new_in(bump);
+        let mut admitted = containers::Vec::with_capacity_in(ordered.len(), bump);
+        let mut estimates_us = containers::Vec::with_capacity_in(ordered.len(), bump);
         for transaction in ordered {
             let digest = transaction.get().0.digest().bytes;
             if contested.contains(&Digest::new(digest)) && config.defer_owned_object_double_spend()
@@ -286,7 +279,9 @@ impl CommitHandler {
                     .map_or(round, DeferralKey::deferred_from_round);
                 let key = DeferralKey::next_round(round, from);
                 if key.within_limit(config.max_deferral_rounds_for_congestion_control()) {
-                    let origin = origins.remove(&digest).expect("each transaction's origin");
+                    let origin = origins
+                        .remove(&Digest::new(digest))
+                        .expect("each transaction's origin");
                     deferred_here.push((origin.0, origin.1, digest));
                     deferred
                         .entry(key)
@@ -308,7 +303,7 @@ impl CommitHandler {
         // 8. The schedule: the prologue, the update, then the transactions,
         //    with shared accesses and their ordinals, linked to earlier
         //    rounds.
-        let mut schedule = self.sequencer.schedule(prologue, update, admitted);
+        let mut schedule = self.sequencer.schedule(prologue, update, admitted, bump);
         self.link(schedule.all_accesses_mut());
         Some(HandledCommit {
             commit_index: commit.commit_index,
@@ -504,17 +499,17 @@ pub struct EpochStart {
 
 /// What `CommitStage` decided about one commit, in emission order.
 #[derive(Debug)]
-pub struct Decided {
+pub struct Decided<'b> {
     /// The commit's chunks, by height.
-    pub chunks: Vec<Chunk>,
+    pub chunks: containers::Vec<'b, Chunk>,
     /// Each chunk's settlement work, by height.
-    pub settlements: Vec<ChunkSettlement>,
+    pub settlements: containers::Vec<'b, ChunkSettlement>,
     /// The checkpoints the commit completed, by sequence number. A commit
     /// may complete none (its chunks wait for a later commit's), or several.
-    pub checkpoints: Vec<PendingCheckpoint>,
+    pub checkpoints: containers::Vec<'b, PendingCheckpoint>,
     /// The transactions dropped before scheduling, in consensus order. They
     /// are in no chunk, so never in a checkpoint.
-    pub dropped: Vec<(BlockRef, TransactionIndex, TxDigest, DropReason)>,
+    pub dropped: containers::Vec<'b, (BlockRef, TransactionIndex, TxDigest, DropReason)>,
 }
 
 /// The consensus handler as the pipeline runs it: decides each commit (see
@@ -625,7 +620,7 @@ impl CommitStage {
 
     /// Decides `commit` and lays it out in chunks and checkpoints, or
     /// nothing if it was handled before or follows the epoch's last.
-    pub fn decide(&mut self, commit: DecodedCommit, bump: &mut Bump) -> Option<Decided> {
+    pub fn decide<'b>(&mut self, commit: DecodedCommit, bump: &'b Bump) -> Option<Decided<'b>> {
         let epoch = &self.epoch.clone();
         if commit.commit_index <= self.prior_through {
             self.commit_times.observe(
@@ -671,9 +666,10 @@ impl CommitStage {
         let mut prologue_transaction = Some(prologue_transaction(&prologue, &digest));
 
         // 2. Each transaction with its shared accesses, in schedule order.
-        let transactions = std::mem::take(&mut schedule.transactions);
-        let mut entries = Vec::with_capacity(transactions.len());
-        let mut digests = Vec::with_capacity(transactions.len());
+        let transactions =
+            std::mem::replace(&mut schedule.transactions, containers::Vec::new_in(bump));
+        let mut entries = containers::Vec::with_capacity_in(transactions.len(), bump);
+        let mut digests = containers::Vec::with_capacity_in(transactions.len(), bump);
         for (i, scheduled) in transactions.into_iter().enumerate() {
             let (transaction, digest, origin) = match scheduled {
                 Scheduled::Prologue(_) => {
@@ -694,7 +690,7 @@ impl CommitStage {
                 }
                 Scheduled::User(transaction) => {
                     let digest = transaction.get().0.digest().bytes;
-                    let origin = origins[&digest];
+                    let origin = origins[&Digest::new(digest)];
                     (
                         ExecutableTransaction::User(transaction),
                         digest,
@@ -744,7 +740,7 @@ impl CommitStage {
         });
 
         // 4. Chunks and checkpoints.
-        let mut decided = self.chunk(epoch, &prologue, entries, digests, close);
+        let mut decided = self.chunk(epoch, &prologue, entries, digests, close, bump);
         decided.dropped = dropped;
         Some(decided)
     }
@@ -752,25 +748,26 @@ impl CommitStage {
     /// Chunks of at most `max_transactions_per_checkpoint`, each with the
     /// next height, queued into checkpoints: the reference's
     /// `create_pending_checkpoints`.
-    fn chunk(
+    fn chunk<'b>(
         &mut self,
         epoch: &Arc<EpochParams>,
         prologue: &Prologue,
-        entries: Vec<ScheduledEntry>,
-        digests: Vec<TxDigest>,
+        entries: containers::Vec<'b, ScheduledEntry>,
+        digests: containers::Vec<'b, TxDigest>,
         close: Option<Vec<SharedAccess>>,
-    ) -> Decided {
+        bump: &'b Bump,
+    ) -> Decided<'b> {
         let config = &epoch.config;
         let max = usize::try_from(config.max_transactions_per_checkpoint())
             .expect("a checkpoint's size fits in usize");
         let chunk_count = entries.len().div_ceil(max);
         let mut decided = Decided {
-            chunks: Vec::with_capacity(chunk_count),
-            settlements: Vec::with_capacity(chunk_count),
-            checkpoints: Vec::new(),
-            dropped: Vec::new(),
+            chunks: containers::Vec::with_capacity_in(chunk_count, bump),
+            settlements: containers::Vec::with_capacity_in(chunk_count, bump),
+            checkpoints: containers::Vec::new_in(bump),
+            dropped: containers::Vec::new_in(bump),
         };
-        let mut flushed = Vec::new();
+        let mut flushed = containers::Vec::new_in(bump);
         let mut entries = entries.into_iter();
         let mut digests = digests.into_iter();
         for position in 0..chunk_count {
@@ -826,15 +823,14 @@ impl CommitStage {
         if close.is_some() {
             flushed.extend(self.queue.flush_forced());
         }
-        decided.checkpoints = flushed
-            .into_iter()
-            .map(|f| PendingCheckpoint {
+        decided
+            .checkpoints
+            .extend(flushed.into_iter().map(|f| PendingCheckpoint {
                 seq: f.seq,
                 heights: f.heights,
                 timestamp_ms: f.timestamp_ms,
                 close: None,
-            })
-            .collect();
+            }));
         if let Some(shared) = close {
             let last = decided
                 .checkpoints
@@ -852,7 +848,7 @@ impl CommitStage {
         decided
     }
 
-    fn emit(&mut self, decided: Decided) {
+    fn emit(&mut self, decided: Decided<'_>, bump: &Bump) {
         // Dropped transactions go nowhere: no processor waits on them yet.
         let Decided {
             chunks,
@@ -877,11 +873,8 @@ impl CommitStage {
             let keys = checkpoints.iter().map(|c| c.heights.len()).sum();
             let mut batch = waiter::WaitBatch::with_capacity(checkpoints.len(), keys);
             for checkpoint in checkpoints {
-                let heights: Vec<_> = checkpoint
-                    .heights
-                    .iter()
-                    .map(|&h| ChunkSettled(h))
-                    .collect();
+                let mut heights = containers::Vec::with_capacity_in(checkpoint.heights.len(), bump);
+                heights.extend(checkpoint.heights.iter().map(|&h| ChunkSettled(h)));
                 batch.push(checkpoint, heights);
             }
             push(
@@ -924,14 +917,11 @@ impl Processor for CommitStage {
 }
 
 impl CommitStage {
-    fn handle(&mut self, mut commit: DecodedCommit, bump: &mut Bump) -> Option<()> {
+    fn handle(&mut self, mut commit: DecodedCommit, bump: &Bump) -> Option<()> {
         let leader_round = commit.leader.round;
         let rejected = std::mem::take(&mut commit.rejected);
-        let positions: Vec<(BlockRef, TransactionIndex)> = commit
-            .transactions
-            .iter()
-            .map(|t| (t.block, t.index))
-            .collect();
+        let mut positions = containers::Vec::with_capacity_in(commit.transactions.len(), bump);
+        positions.extend(commit.transactions.iter().map(|t| (t.block, t.index)));
         let commit_index = commit.commit_index;
         let decided = self.decide(commit, bump)?;
         let record = CommitRecord {
@@ -963,7 +953,7 @@ impl CommitStage {
                 })),
         );
         drop(dropped);
-        self.emit(decided);
+        self.emit(decided, bump);
         self.statuses.update_leader_round(leader_round);
         Some(())
     }
@@ -1031,7 +1021,7 @@ impl CheckpointQueue {
         transactions: usize,
         timestamp_ms: u64,
         max: usize,
-        flushed: &mut Vec<Flushed>,
+        flushed: &mut containers::Vec<'_, Flushed>,
     ) -> u64 {
         if self.pending_transactions > 0 && self.pending_transactions + transactions > max {
             flushed.extend(self.flush_forced());
@@ -1290,7 +1280,8 @@ mod tests {
     #[test]
     fn a_chunk_that_does_not_fit_cuts_the_checkpoint_before_it() {
         let mut queue = CheckpointQueue::new(0);
-        let mut flushed = Vec::new();
+        let bump = Bump::default();
+        let mut flushed = containers::Vec::new_in(&bump);
         for (transactions, timestamp) in [(3, 10), (2, 10), (2, 20)] {
             let height = queue.next_height();
             queue.push_chunk(height, transactions, timestamp, 5, &mut flushed);
@@ -1311,7 +1302,8 @@ mod tests {
     #[test]
     fn a_chunk_larger_than_the_limit_is_a_checkpoint_of_its_own() {
         let mut queue = CheckpointQueue::new(7);
-        let mut flushed = Vec::new();
+        let bump = Bump::default();
+        let mut flushed = containers::Vec::new_in(&bump);
         let height = queue.next_height();
         assert_eq!(queue.push_chunk(height, 9, 0, 5, &mut flushed), 8);
         assert!(flushed.is_empty());
@@ -1323,7 +1315,8 @@ mod tests {
     #[test]
     fn checkpoints_are_cut_once_the_interval_has_passed_by_commit_time() {
         let mut queue = CheckpointQueue::new(0);
-        let mut flushed = Vec::new();
+        let bump = Bump::default();
+        let mut flushed = containers::Vec::new_in(&bump);
         let mut cut = Vec::new();
         for timestamp in [100, 150, 250, 300, 449, 450] {
             let height = queue.next_height();

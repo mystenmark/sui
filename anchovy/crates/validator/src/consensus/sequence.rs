@@ -6,6 +6,7 @@
 //! exact version from per-epoch state, this assigns an ordinal, which
 //! execution maps to a version later: no state outlives a commit.
 
+use containers::Bump;
 use hashbrown::HashMap;
 use messages::base::ObjectId;
 use messages::build::system_transaction::{Jwk, JwkId};
@@ -82,15 +83,15 @@ pub struct AuthenticatorUpdate {
 
 /// A commit's transactions in execution order, each with its shared
 /// accesses, laid out flat.
-#[derive(Debug, Default)]
-pub struct Schedule {
-    pub transactions: Vec<Scheduled>,
-    accesses: Vec<SharedAccess>,
+#[derive(Debug)]
+pub struct Schedule<'b> {
+    pub transactions: containers::Vec<'b, Scheduled>,
+    accesses: containers::Vec<'b, SharedAccess>,
     /// Where each transaction's accesses end in `accesses`.
-    ends: Vec<u32>,
+    ends: containers::Vec<'b, u32>,
 }
 
-impl Schedule {
+impl Schedule<'_> {
     /// The shared accesses of the `i`th transaction, in input order.
     pub fn accesses(&self, i: usize) -> &[SharedAccess] {
         let start = i.checked_sub(1).map_or(0, |j| self.ends[j] as usize);
@@ -137,11 +138,12 @@ impl Sequencer {
     /// using randomness last, each sorted by gas price if the protocol says
     /// so, ties keeping their order. The reference's
     /// `merge_and_reorder_transactions`.
-    pub fn order(
+    pub fn order<'b>(
         &mut self,
         config: &ProtocolConfig,
-        transactions: Vec<VerifiedTransaction>,
-    ) -> Vec<VerifiedTransaction> {
+        transactions: containers::Vec<'b, VerifiedTransaction>,
+        bump: &'b Bump,
+    ) -> containers::Vec<'b, VerifiedTransaction> {
         let by_gas_price =
             config.consensus_transaction_ordering() == ConsensusTransactionOrdering::ByGasPrice;
         self.order.clear();
@@ -160,38 +162,37 @@ impl Sequencer {
             }));
         self.order
             .sort_by_key(|(randomness, price, _)| (*randomness, *price));
-        let mut transactions: Vec<Option<VerifiedTransaction>> =
-            transactions.into_iter().map(Some).collect();
-        self.order
-            .iter()
-            .map(|(_, _, i)| {
-                transactions[*i as usize]
-                    .take()
-                    .expect("each transaction once")
-            })
-            .collect()
+        let mut slots = containers::Vec::with_capacity_in(transactions.len(), bump);
+        slots.extend(transactions.into_iter().map(Some));
+        let mut ordered = containers::Vec::with_capacity_in(slots.len(), bump);
+        ordered.extend(
+            self.order
+                .iter()
+                .map(|(_, _, i)| slots[*i as usize].take().expect("each transaction once")),
+        );
+        ordered
     }
 
     /// The commit's schedule: the prologue, the authenticator state's
     /// update if any, then `transactions`, in order, each with its shared
     /// inputs' ordinals: the reference's `assign_versions_from_consensus`,
     /// with ordinals for versions.
-    pub fn schedule(
+    pub fn schedule<'b>(
         &mut self,
         prologue: Prologue,
         update: Option<AuthenticatorUpdate>,
-        transactions: Vec<VerifiedTransaction>,
-    ) -> Schedule {
+        transactions: containers::Vec<'b, VerifiedTransaction>,
+        bump: &'b Bump,
+    ) -> Schedule<'b> {
         let round = prologue.round;
+        let accesses = 2 + transactions
+            .iter()
+            .map(|t| shared_inputs(t).count())
+            .sum::<usize>();
         let mut schedule = Schedule {
-            transactions: Vec::with_capacity(transactions.len() + 2),
-            accesses: Vec::with_capacity(
-                1 + transactions
-                    .iter()
-                    .map(|t| shared_inputs(t).count())
-                    .sum::<usize>(),
-            ),
-            ends: Vec::with_capacity(transactions.len() + 2),
+            transactions: containers::Vec::with_capacity_in(transactions.len() + 2, bump),
+            accesses: containers::Vec::with_capacity_in(accesses, bump),
+            ends: containers::Vec::with_capacity_in(transactions.len() + 2, bump),
         };
 
         // 1. The prologue writes the clock, first.

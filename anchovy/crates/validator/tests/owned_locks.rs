@@ -108,6 +108,7 @@ async fn the_stage_records_each_committed_transaction_s_status() {
         ConsensusPosition, ConsensusTxStatus, ConsensusTxStatusCache, StatusResult,
     };
     use workqueue::Processor;
+    let mut bump = containers::Bump::default();
     let epoch = epoch();
     let sender = Sender::new();
     let object = random_object_ref();
@@ -138,7 +139,7 @@ async fn the_stage_records_each_committed_transaction_s_status() {
     let mut decoded = commit(1, &[(&first, &[]), (&second, &[])]);
     let block = decoded.leader;
     decoded.rejected = vec![(block, 2)];
-    stage.process(decoded, &mut workqueue::Bump::default());
+    stage.process(decoded, &mut bump);
     let status = |index| {
         statuses.notify_read(ConsensusPosition {
             epoch: epoch.epoch,
@@ -170,6 +171,7 @@ type Claimed<'a> = (&'a Tx, &'a [ObjectRef]);
 
 /// Commit `index`, one block, of `transactions` in consensus order.
 fn commit(index: u32, transactions: &[Claimed<'_>]) -> DecodedCommit {
+    let bump = containers::Bump::default();
     let block = BlockRef {
         round: index,
         author: 1,
@@ -190,7 +192,7 @@ fn commit(index: u32, transactions: &[Claimed<'_>]) -> DecodedCommit {
                     i as u16,
                     parse(t.bytes.clone()),
                     &immutable,
-                    &containers::Bump::default(),
+                    &bump,
                 )
             })
             .collect(),
@@ -257,6 +259,7 @@ fn new_handler(output: validator::epoch_store::ConsensusOutput) -> CommitHandler
 
 #[test]
 fn the_later_of_two_transactions_spending_one_object_in_a_commit_is_dropped() {
+    let bump = containers::Bump::default();
     let epoch = epoch();
     let sender = Sender::new();
     let object = random_object_ref();
@@ -265,11 +268,7 @@ fn the_later_of_two_transactions_spending_one_object_in_a_commit_is_dropped() {
     let (output, _dir) = consensus_output();
     let mut handler = new_handler(output);
     let decided = handler
-        .handle(
-            &epoch,
-            commit(1, &[(&first, &[]), (&second, &[])]),
-            &mut workqueue::Bump::default(),
-        )
+        .handle(&epoch, commit(1, &[(&first, &[]), (&second, &[])]), &bump)
         .unwrap();
     // The holder of the contested lock waits a round, as a penalty.
     assert!(scheduled(&decided).is_empty());
@@ -281,11 +280,7 @@ fn the_later_of_two_transactions_spending_one_object_in_a_commit_is_dropped() {
     // Included again, the dropped one loses the lock again, as locks are
     // taken before deduplication; the deferred one is scheduled.
     let decided = handler
-        .handle(
-            &epoch,
-            commit(2, &[(&second, &[])]),
-            &mut workqueue::Bump::default(),
-        )
+        .handle(&epoch, commit(2, &[(&second, &[])]), &bump)
         .unwrap();
     assert_eq!(scheduled(&decided), vec![digest(&first)]);
     assert_eq!(
@@ -297,6 +292,7 @@ fn the_later_of_two_transactions_spending_one_object_in_a_commit_is_dropped() {
 
 #[test]
 fn a_deferred_transaction_outlives_a_restart() {
+    let bump = containers::Bump::default();
     let epoch = epoch();
     let sender = Sender::new();
     let object = random_object_ref();
@@ -307,11 +303,7 @@ fn a_deferred_transaction_outlives_a_restart() {
     let committed = output.committed_checkpoints();
     let mut handler = new_handler(output);
     let decided = handler
-        .handle(
-            &epoch,
-            commit(1, &[(&first, &[]), (&second, &[])]),
-            &mut workqueue::Bump::default(),
-        )
+        .handle(&epoch, commit(1, &[(&first, &[]), (&second, &[])]), &bump)
         .unwrap();
     assert_eq!(deferred(&decided), vec![digest(&first)]);
     // The commit's output is written once its checkpoint commits.
@@ -330,9 +322,7 @@ fn a_deferred_transaction_outlives_a_restart() {
 
     let (_, output, _) = EpochStore::open(dir.path(), 0);
     let mut handler = CommitHandler::new(output, 1, vec![([0; 96], 10_000)], &epoch.config, None);
-    let decided = handler
-        .handle(&epoch, commit(2, &[]), &mut workqueue::Bump::default())
-        .unwrap();
+    let decided = handler.handle(&epoch, commit(2, &[]), &bump).unwrap();
     assert_eq!(scheduled(&decided), vec![digest(&first)]);
 }
 
@@ -355,6 +345,7 @@ fn updated_keys(handled: &HandledCommit) -> Vec<String> {
 fn a_key_a_quorum_voted_for_is_added_by_the_next_commit_across_a_restart() {
     use messages::build::system_transaction::{Jwk, JwkId};
     use validator::consensus::jwk::JwkVote;
+    let bump = containers::Bump::default();
     let epoch = epoch();
     // Two of three: 6,667 of 10,000, a quorum.
     let members: Vec<_> = [3_334, 3_333, 3_333]
@@ -391,7 +382,7 @@ fn a_key_a_quorum_voted_for_is_added_by_the_next_commit_across_a_restart() {
         .handle(
             &epoch,
             with_votes(1, vec![vote(0, "a"), vote(1, "a"), vote(0, "b")]),
-            &mut workqueue::Bump::default(),
+            &bump,
         )
         .unwrap();
     assert!(updated_keys(&decided).is_empty());
@@ -413,25 +404,18 @@ fn a_key_a_quorum_voted_for_is_added_by_the_next_commit_across_a_restart() {
     let (_, output, _) = EpochStore::open(dir.path(), 0);
     let mut second = CommitHandler::new(output, 1, members.clone(), &epoch.config, Some(1));
     let decided = second
-        .handle(
-            &epoch,
-            with_votes(2, vec![vote(2, "b")]),
-            &mut workqueue::Bump::default(),
-        )
+        .handle(&epoch, with_votes(2, vec![vote(2, "b")]), &bump)
         .unwrap();
     assert_eq!(updated_keys(&decided), ["a"]);
-    let decided = second
-        .handle(&epoch, commit(3, &[]), &mut workqueue::Bump::default())
-        .unwrap();
+    let decided = second.handle(&epoch, commit(3, &[]), &bump).unwrap();
     assert_eq!(updated_keys(&decided), ["b"]);
-    let decided = second
-        .handle(&epoch, commit(4, &[]), &mut workqueue::Bump::default())
-        .unwrap();
+    let decided = second.handle(&epoch, commit(4, &[]), &bump).unwrap();
     assert!(updated_keys(&decided).is_empty());
 }
 
 #[test]
 fn a_shared_gas_coin_conflicts_like_any_owned_input() {
+    let bump = containers::Bump::default();
     let epoch = epoch();
     let sender = Sender::new();
     let gas = random_object_ref();
@@ -439,11 +423,7 @@ fn a_shared_gas_coin_conflicts_like_any_owned_input() {
     let second = sender.transaction(gas, &[random_object_ref()]);
     let (output, _dir) = consensus_output();
     let decided = new_handler(output)
-        .handle(
-            &epoch,
-            commit(1, &[(&first, &[]), (&second, &[])]),
-            &mut workqueue::Bump::default(),
-        )
+        .handle(&epoch, commit(1, &[(&first, &[]), (&second, &[])]), &bump)
         .unwrap();
     assert_eq!(deferred(&decided), vec![digest(&first)]);
     assert_eq!(
@@ -454,6 +434,7 @@ fn a_shared_gas_coin_conflicts_like_any_owned_input() {
 
 #[test]
 fn a_lock_holds_across_commits_for_its_version_only() {
+    let bump = containers::Bump::default();
     let epoch = epoch();
     let sender = Sender::new();
     let object = random_object_ref();
@@ -465,19 +446,11 @@ fn a_lock_holds_across_commits_for_its_version_only() {
     let (output, _dir) = consensus_output();
     let mut handler = new_handler(output);
     let decided = handler
-        .handle(
-            &epoch,
-            commit(1, &[(&first, &[])]),
-            &mut workqueue::Bump::default(),
-        )
+        .handle(&epoch, commit(1, &[(&first, &[])]), &bump)
         .unwrap();
     assert_eq!(scheduled(&decided), vec![digest(&first)]);
     let decided = handler
-        .handle(
-            &epoch,
-            commit(2, &[(&again, &[]), (&later, &[])]),
-            &mut workqueue::Bump::default(),
-        )
+        .handle(&epoch, commit(2, &[(&again, &[]), (&later, &[])]), &bump)
         .unwrap();
     assert_eq!(scheduled(&decided), vec![digest(&later)]);
     assert_eq!(
@@ -488,6 +461,7 @@ fn a_lock_holds_across_commits_for_its_version_only() {
 
 #[test]
 fn inputs_claimed_immutable_are_not_locked() {
+    let bump = containers::Bump::default();
     let epoch = epoch();
     let sender = Sender::new();
     let frozen = random_object_ref();
@@ -511,7 +485,7 @@ fn inputs_claimed_immutable_are_not_locked() {
                     (&unclaimed[1], &[]),
                 ],
             ),
-            &mut workqueue::Bump::default(),
+            &bump,
         )
         .unwrap();
     // The handler goes by the claim, which voting verified: without it, the
@@ -529,6 +503,7 @@ fn inputs_claimed_immutable_are_not_locked() {
 
 #[test]
 fn a_transaction_with_invalid_inputs_is_dropped_and_locks_nothing() {
+    let bump = containers::Bump::default();
     let epoch = epoch();
     let sender = Sender::new();
     let object = random_object_ref();
@@ -536,11 +511,7 @@ fn a_transaction_with_invalid_inputs_is_dropped_and_locks_nothing() {
     let valid = sender.transaction(random_object_ref(), &[object]);
     let (output, _dir) = consensus_output();
     let decided = new_handler(output)
-        .handle(
-            &epoch,
-            commit(1, &[(&twice, &[]), (&valid, &[])]),
-            &mut workqueue::Bump::default(),
-        )
+        .handle(&epoch, commit(1, &[(&twice, &[]), (&valid, &[])]), &bump)
         .unwrap();
     assert_eq!(scheduled(&decided), vec![digest(&valid)]);
     let [(_, _, dropped, DropReason::Inputs(e))] = &decided.dropped[..] else {
@@ -566,6 +537,7 @@ fn decisions(handled: &HandledCommit) -> String {
 
 #[test]
 fn handlers_fed_the_same_commits_decide_alike_and_a_replay_changes_nothing() {
+    let bump = containers::Bump::default();
     let epoch = epoch();
     let sender = Sender::new();
     let objects: Vec<_> = (0..4).map(|_| random_object_ref()).collect();
@@ -585,13 +557,7 @@ fn handlers_fed_the_same_commits_decide_alike_and_a_replay_changes_nothing() {
     let decide = |handler: &mut CommitHandler| -> Vec<String> {
         commits()
             .into_iter()
-            .map(|c| {
-                decisions(
-                    &handler
-                        .handle(&epoch, c, &mut workqueue::Bump::default())
-                        .unwrap(),
-                )
-            })
+            .map(|c| decisions(&handler.handle(&epoch, c, &bump).unwrap()))
             .collect()
     };
     let (output, _dir) = consensus_output();
@@ -601,17 +567,13 @@ fn handlers_fed_the_same_commits_decide_alike_and_a_replay_changes_nothing() {
     assert_eq!(first, decide(&mut new_handler(other)));
     // Consensus replays commits after a restart; those handled are skipped.
     for c in commits() {
-        assert!(
-            handler
-                .handle(&epoch, c, &mut workqueue::Bump::default())
-                .is_none()
-        );
+        assert!(handler.handle(&epoch, c, &bump).is_none());
     }
     // The first commit's first transaction took two objects; its second,
     // sharing one, lost it, and the first waits a round.
     let (output, _dir) = consensus_output();
     let decided = new_handler(output)
-        .handle(&epoch, commits().remove(0), &mut workqueue::Bump::default())
+        .handle(&epoch, commits().remove(0), &bump)
         .unwrap();
     assert_eq!(deferred(&decided)[0], digest(&transactions[0]));
     assert_eq!(decided.dropped[0].2, digest(&transactions[1]));
@@ -636,6 +598,7 @@ fn user_transaction(transaction: &[u8], immutable: &[ObjectRef]) -> Vec<u8> {
 
 #[test]
 fn decoding_carries_the_immutable_claims() {
+    let bump = containers::Bump::default();
     let epoch = epoch();
     let sender = Sender::new();
     let frozen = random_object_ref();
@@ -660,7 +623,7 @@ fn decoding_carries_the_immutable_claims() {
             blocks: vec![block],
             rejected: vec![],
         },
-        &containers::Bump::default(),
+        &bump,
     );
     assert_eq!(commit.cache_misses, 1);
     let locked = commit.transactions[0].owned.as_ref().unwrap();
@@ -669,6 +632,7 @@ fn decoding_carries_the_immutable_claims() {
 
 #[test]
 fn the_stage_leaves_dropped_transactions_out_of_its_chunks() {
+    let bump = containers::Bump::default();
     let epoch = epoch();
     let sender = Sender::new();
     let object = random_object_ref();
@@ -707,16 +671,11 @@ fn the_stage_leaves_dropped_transactions_out_of_its_chunks() {
             .collect()
     };
     let decided = stage
-        .decide(
-            commit(1, &[(&first, &[]), (&second, &[])]),
-            &mut workqueue::Bump::default(),
-        )
+        .decide(commit(1, &[(&first, &[]), (&second, &[])]), &bump)
         .unwrap();
     // The first, its lock contested, is in the next round's chunks.
     assert!(users(&decided).is_empty());
-    let next = stage
-        .decide(commit(2, &[]), &mut workqueue::Bump::default())
-        .unwrap();
+    let next = stage.decide(commit(2, &[]), &bump).unwrap();
     assert_eq!(users(&next), vec![digest(&first)]);
     assert!(
         decided

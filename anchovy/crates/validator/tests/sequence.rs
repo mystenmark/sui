@@ -4,6 +4,7 @@
 //! Scheduling a commit: the order of its transactions, and the ordinals of
 //! their shared-object accesses.
 
+use containers::Bump;
 use messages::Message;
 use messages::base::ObjectId;
 use messages::transaction::SharedObjectMutability as Mutability;
@@ -68,21 +69,25 @@ fn config() -> ProtocolConfig {
     ProtocolConfig::get_for_version(ProtocolVersion::MAX, Chain::Unknown)
 }
 
-fn schedule(round: u32, transactions: Vec<VerifiedTransaction>) -> Schedule {
+fn schedule(round: u32, transactions: Vec<VerifiedTransaction>) -> Schedule<'static> {
     order_and_schedule(&mut Sequencer::new(), round, transactions)
 }
 
+/// In an arena of its own, which lives as long as the test.
 fn order_and_schedule(
     sequencer: &mut Sequencer,
     round: u32,
     transactions: Vec<VerifiedTransaction>,
-) -> Schedule {
-    let ordered = sequencer.order(&config(), transactions);
-    sequencer.schedule(prologue(round), None, ordered)
+) -> Schedule<'static> {
+    let bump: &'static Bump = Box::leak(Box::default());
+    let mut arena = containers::Vec::with_capacity_in(transactions.len(), bump);
+    arena.extend(transactions);
+    let ordered = sequencer.order(&config(), arena, bump);
+    sequencer.schedule(prologue(round), None, ordered, bump)
 }
 
 /// The generation each access reads, by transaction, prologue first.
-fn generations(schedule: &Schedule) -> Vec<Vec<u32>> {
+fn generations(schedule: &Schedule<'_>) -> Vec<Vec<u32>> {
     (0..schedule.len())
         .map(|i| {
             schedule
@@ -95,7 +100,7 @@ fn generations(schedule: &Schedule) -> Vec<Vec<u32>> {
 }
 
 /// The user transactions' digests, in schedule order.
-fn order(schedule: &Schedule) -> Vec<[u8; 32]> {
+fn order(schedule: &Schedule<'_>) -> Vec<[u8; 32]> {
     schedule
         .transactions
         .iter()

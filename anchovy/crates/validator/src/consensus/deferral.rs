@@ -143,14 +143,16 @@ pub fn encode_deferred(deferred: &[Deferred]) -> Vec<u8> {
 
 /// # Panics
 /// Unless `bytes` are as `encode_deferred` made them.
-pub fn decode_deferred(mut bytes: &[u8]) -> Vec<Deferred> {
+pub fn decode_deferred(mut bytes: &[u8]) -> impl Iterator<Item = Deferred> + '_ {
     fn take<'a>(bytes: &mut &'a [u8], n: usize) -> &'a [u8] {
         let (head, tail) = bytes.split_at(n);
         *bytes = tail;
         head
     }
-    let mut deferred = Vec::new();
-    while !bytes.is_empty() {
+    std::iter::from_fn(move || {
+        if bytes.is_empty() {
+            return None;
+        }
         let round = u32::from_le_bytes(take(&mut bytes, 4).try_into().expect("4 bytes"));
         let author = u32::from_le_bytes(take(&mut bytes, 4).try_into().expect("4 bytes"));
         let digest = take(&mut bytes, 32).try_into().expect("32 bytes");
@@ -160,7 +162,7 @@ pub fn decode_deferred(mut bytes: &[u8]) -> Vec<Deferred> {
         let transaction = Message::parse(take(&mut bytes, len).to_vec())
             .map_err(|(e, _)| e)
             .expect("a deferred transaction parses");
-        deferred.push(Deferred {
+        Some(Deferred {
             origin: (
                 BlockRef {
                     round,
@@ -170,7 +172,6 @@ pub fn decode_deferred(mut bytes: &[u8]) -> Vec<Deferred> {
                 index,
             ),
             transaction: checks::sequenced_by_consensus(transaction),
-        });
-    }
-    deferred
+        })
+    })
 }
