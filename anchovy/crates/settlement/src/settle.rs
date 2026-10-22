@@ -9,7 +9,7 @@ use containers::{BTreeMap, Bump};
 use std::hash::BuildHasher;
 
 use hashbrown::HashTable;
-use messages::base::{Digest, ObjectId};
+use messages::base::{Hashed, ObjectId};
 use messages::build::base::{
     AccountAddress, Digest as DigestB, ObjectDigest, ObjectId as ObjectIdB, SequenceNumber,
     SuiAddress,
@@ -42,7 +42,7 @@ const ED25519_SIGNATURE_LENGTH: usize = 1 + 64 + 32;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Built {
     pub bytes: Vec<u8>,
-    pub digest: [u8; 32],
+    pub digest: Hashed,
 }
 
 /// `VerifiedTransaction::new_system_transaction`: the kind, sent by `0x0`
@@ -72,7 +72,7 @@ pub fn system_transaction(kind: TransactionKind) -> Built {
     let mut bytes = Vec::with_capacity(4 + size + 2 + ED25519_SIGNATURE_LENGTH);
     bytes.extend_from_slice(&[1, 0, 0, 0]);
     bcs::serialize_into(&mut bytes, &data).expect("transaction data serializes");
-    let digest = Digest::of("TransactionData", &bytes[4..]).bytes;
+    let digest = Hashed::of("TransactionData", &bytes[4..]);
     bytes.extend_from_slice(&[1, ED25519_SIGNATURE_LENGTH as u8]);
     bytes.resize(bytes.len() + ED25519_SIGNATURE_LENGTH, 0);
     Built { bytes, digest }

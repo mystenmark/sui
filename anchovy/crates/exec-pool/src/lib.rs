@@ -144,7 +144,7 @@ impl Executor {
         let (digest, bytes): (TxDigest, &[u8]) = match &entry.transaction {
             ExecutableTransaction::User(transaction) => {
                 let signed = &transaction.get().0;
-                (signed.digest().bytes, signed.bytes())
+                (*signed.digest(), signed.bytes())
             }
             ExecutableTransaction::System(system) => (system.digest, &system.bytes),
         };
@@ -152,10 +152,7 @@ impl Executor {
         let stored = self.stored_effects(digest);
         // Executed and committed before a restart: its checkpoint will not
         // commit again, so what it produced is written at once.
-        let committed = stored.is_some()
-            && !self
-                .store
-                .is_uncommitted(&messages::base::Digest::new(digest));
+        let committed = stored.is_some() && !self.store.is_uncommitted(&digest);
 
         // 1. Its inputs, from the values its keys resolved to: the shared
         //    accesses' first, in access order (as the resolver keys them),
@@ -311,14 +308,14 @@ impl Executor {
                 ObjectOut::NotExist | ObjectOut::AccumulatorWriteV1(_) => {}
             }
         }
-        effects_keys.push(EffectsKey(digest));
+        effects_keys.push(EffectsKey(digest.into()));
     }
 
     /// The effects of the transaction with `digest`, if it executed already.
     fn stored_effects(&self, digest: TxDigest) -> Option<Message<TransactionEffects<'static>>> {
         let effects_digest = self
             .store
-            .executed_effects(&messages::base::Digest::new(digest))
+            .executed_effects(&digest)
             .expect("the store reads")?;
         Some(
             self.store
@@ -498,7 +495,7 @@ fn produced(
         }
         _ => Generation::Ended {
             version: effects.lamport_version,
-            transaction: digest,
+            transaction: digest.bytes,
         },
     }
 }
@@ -563,9 +560,10 @@ pub struct EffectsAvailability {
 impl Availability<EffectsKey> for EffectsAvailability {
     fn check(&mut self, keys: &[EffectsKey], found: &mut Vec<Option<()>>) {
         found.clear();
+        // A key may be a digest a client named, so a miss is not cached.
         found.extend(keys.iter().map(|EffectsKey(digest)| {
             self.store
-                .executed_effects(&messages::base::Digest::new(*digest))
+                .executed_effects_uncached(digest)
                 .expect("the store reads")
                 .map(|_| ())
         }));
@@ -693,7 +691,7 @@ mod tests {
                 transaction: ExecutableTransaction::System(SystemTransaction {
                     kind: SystemKind::Barrier { height: 0 },
                     bytes: vec![],
-                    digest: [0; 32],
+                    digest: messages::base::Hashed::of("TransactionData", &[]),
                 }),
                 shared: vec![],
                 origin: None,

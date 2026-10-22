@@ -59,9 +59,9 @@ impl Mainnet {
             store
                 .write_through(Commit {
                     executed: Some(Executed {
-                        digest: (*t.transaction.digest()).into(),
+                        digest: *t.transaction.digest(),
                         transaction: t.transaction.bytes().to_vec(),
-                        effects_digest: t.effects.digest.into(),
+                        effects_digest: t.effects.digest,
                         effects: t.effects.bytes.to_vec(),
                         events: None,
                     }),
@@ -91,8 +91,8 @@ impl Mainnet {
             .transactions
             .iter()
             .map(|t| ExecutedEffects {
-                digest: t.transaction.digest().bytes,
-                effects_digest: t.effects.digest.bytes,
+                digest: *t.transaction.digest(),
+                effects_digest: t.effects.digest,
                 effects: Arc::from(t.effects.bytes),
             })
             .collect()

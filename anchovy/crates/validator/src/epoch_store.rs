@@ -13,7 +13,7 @@ use blake2::{Blake2b, Digest as _};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use messages::base::{Digest, ObjectId, ObjectRef};
+use messages::base::{Digest, Hashed, ObjectId, ObjectRef};
 use store::Live;
 use store::epoch::{EpochDb, Space};
 
@@ -359,7 +359,7 @@ impl ConsensusOutput {
         q.open.processed.contains(digest)
             || q.processed.contains_key(digest)
             || q.db
-                .exists(Space::Processed, digest)
+                .exists(Space::Processed, &digest.bytes)
                 .expect("the epoch's database reads")
     }
 
@@ -384,7 +384,8 @@ impl ConsensusOutput {
         }
         q.db.get(Space::Locks, &lock_key(object))
             .expect("the epoch's database reads")
-            .map(|v| v[..].try_into().expect("a 32-byte digest"))
+            // This handler wrote it, from a transaction's computed digest.
+            .map(|v| Hashed::computed(Digest::new(v[..].try_into().expect("a 32-byte digest"))))
     }
 
     pub fn set_lock(&mut self, object: ObjectRef, holder: TxDigest) {
@@ -608,11 +609,15 @@ impl Quarantine {
         let mut new_jwks = None;
         for output in self.queued.drain(..=last) {
             for digest in output.processed {
-                batch.put(Space::Processed, digest.to_vec(), Vec::new());
+                batch.put(Space::Processed, digest.bytes.to_vec(), Vec::new());
                 release(&mut self.processed, &digest, |count| count);
             }
             for (object, holder) in output.locks {
-                batch.put(Space::Locks, lock_key(&object).to_vec(), holder.to_vec());
+                batch.put(
+                    Space::Locks,
+                    lock_key(&object).to_vec(),
+                    holder.bytes.to_vec(),
+                );
                 release(&mut self.locks, &object, |held| &mut held.1);
             }
             for (stream, (round, generation)) in output.streams {

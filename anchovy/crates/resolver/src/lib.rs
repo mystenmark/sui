@@ -281,7 +281,7 @@ impl Processor for VersionResolver {
                 let ExecutableTransaction::User(transaction) = &entry.transaction else {
                     unreachable!("only user transactions withdraw funds");
                 };
-                let digest = transaction.get().0.digest().bytes;
+                let digest = *transaction.get().0.digest();
                 self.keys.push(InputKey::Reserved(digest));
                 withdrawals.push(Withdrawal {
                     digest,

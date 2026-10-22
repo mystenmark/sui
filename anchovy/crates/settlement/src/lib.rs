@@ -14,7 +14,7 @@ use std::sync::Arc;
 use containers::{Bump, HeapHashMap};
 
 use messages::Message;
-use messages::base::{Digest, ObjectId};
+use messages::base::{Hashed, ObjectId};
 use messages::effects::{
     AccumulatorValue, ObjectIn, ObjectOut, TransactionEffects, VersionedEffects,
 };
@@ -49,10 +49,11 @@ fn push<W>(queue: &Queue<W>, item: W, to: &str) {
     }
 }
 
-/// The executed effects of `digest`, which its waiter released.
+/// The executed effects of `digest`, which its waiter released: this
+/// validator's own.
 fn executed(store: &store::Store, digest: &TxDigest) -> Effects {
     let effects_digest = store
-        .executed_effects(&Digest::new(*digest))
+        .executed_effects(digest)
         .expect("store read")
         .expect("a released transaction has executed");
     store
@@ -83,12 +84,13 @@ fn mutates_root(effects: &TransactionEffects<'_>) -> bool {
 fn to_executed(effects: &Effects) -> ExecutedEffects {
     let view = effects.get();
     let digest = match &view.version {
-        VersionedEffects::V1(v1) => v1.transaction_digest.bytes,
-        VersionedEffects::V2(v2) => v2.transaction_digest.bytes,
+        VersionedEffects::V1(v1) => *v1.transaction_digest,
+        VersionedEffects::V2(v2) => *v2.transaction_digest,
     };
     ExecutedEffects {
-        digest,
-        effects_digest: effects.digest().bytes,
+        // The executor that wrote the effects named the digest it computed.
+        digest: Hashed::computed(digest),
+        effects_digest: *effects.digest(),
         effects: Arc::from(effects.wire_bytes()),
     }
 }
@@ -232,7 +234,7 @@ impl SettlementScheduler {
         );
         let mut batch = WaitBatch::with_capacity(1, chunk.digests.len());
         let mut keys = containers::Vec::with_capacity_in(chunk.digests.len(), bump);
-        keys.extend(chunk.digests.iter().copied().map(EffectsKey));
+        keys.extend(chunk.digests.iter().map(|d| EffectsKey(**d)));
         batch.push(EffectsWaitItem::ChunkExecuted(chunk), keys);
         push(&self.effects, Command::Wait(batch), "effects waiter");
     }
@@ -271,7 +273,7 @@ impl SettlementScheduler {
         };
         let transaction = self
             .store
-            .transaction(&Digest::new(*digest))
+            .transaction(digest)
             .expect("store read")
             .expect("an executed transaction is stored");
         matches!(
@@ -340,7 +342,7 @@ impl SettlementScheduler {
                 height,
                 digests: settlements.clone(),
             },
-            settlements.iter().copied().map(EffectsKey),
+            settlements.iter().map(|d| EffectsKey(**d)),
         );
         push(&self.inputs, Command::Wait(transactions), "input waiter");
         push(&self.effects, Command::Wait(waits), "effects waiter");
@@ -386,7 +388,7 @@ impl SettlementScheduler {
                 height,
                 digests: vec![barrier],
             },
-            [EffectsKey(barrier)],
+            [EffectsKey(*barrier)],
         );
         push(&self.inputs, Command::Wait(transactions), "input waiter");
         push(&self.effects, Command::Wait(waits), "effects waiter");

@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use consensus::{Block, BlockRef, CommittedSubDag};
 use messages::Message;
+use messages::base::Hashed;
 use protocol_config::{Chain, ProtocolVersion};
 use sui_types::base_types::{ObjectRef, SequenceNumber, SuiAddress, random_object_ref};
 use sui_types::crypto::{AccountKeyPair, get_key_pair};
@@ -87,7 +88,7 @@ impl Sender {
 /// A signed transaction's BCS, and its digest.
 struct Tx {
     bytes: Vec<u8>,
-    digest: [u8; 32],
+    digest: Hashed,
 }
 
 fn parse(bytes: Vec<u8>) -> VerifiedTransaction {
@@ -98,8 +99,8 @@ fn id(r: &ObjectRef) -> messages::base::ObjectId {
     messages::base::ObjectId(r.0.into_bytes())
 }
 
-fn digest_of(t: &VerifiedTransaction) -> [u8; 32] {
-    t.get().0.digest().bytes
+fn digest_of(t: &VerifiedTransaction) -> Hashed {
+    *t.get().0.digest()
 }
 
 #[tokio::test]
@@ -162,7 +163,7 @@ async fn the_stage_records_each_committed_transaction_s_status() {
     );
 }
 
-fn digest(t: &Tx) -> [u8; 32] {
+fn digest(t: &Tx) -> Hashed {
     t.digest
 }
 
@@ -206,7 +207,7 @@ fn commit(index: u32, transactions: &[Claimed<'_>]) -> DecodedCommit {
 }
 
 /// The digests of the user transactions scheduled.
-fn scheduled(handled: &HandledCommit) -> Vec<[u8; 32]> {
+fn scheduled(handled: &HandledCommit) -> Vec<Hashed> {
     handled
         .schedule
         .transactions
@@ -219,7 +220,7 @@ fn scheduled(handled: &HandledCommit) -> Vec<[u8; 32]> {
 }
 
 /// The digests of the user transactions deferred to a later round.
-fn deferred(handled: &HandledCommit) -> Vec<[u8; 32]> {
+fn deferred(handled: &HandledCommit) -> Vec<Hashed> {
     handled
         .deferred
         .iter()
@@ -229,7 +230,7 @@ fn deferred(handled: &HandledCommit) -> Vec<[u8; 32]> {
 
 /// Each dropped transaction's digest, and the reference and holder of the
 /// lock it lost.
-fn conflicts(handled: &HandledCommit) -> Vec<([u8; 32], messages::base::ObjectRef, [u8; 32])> {
+fn conflicts(handled: &HandledCommit) -> Vec<(Hashed, messages::base::ObjectRef, Hashed)> {
     handled
         .dropped
         .iter()
@@ -659,7 +660,7 @@ fn the_stage_leaves_dropped_transactions_out_of_its_chunks() {
         Arc::new(validator::consensus::status::ConsensusTxStatusCache::new()),
         vec![([0; 96], 1)],
     );
-    let users = |decided: &validator::consensus::commit::Decided| -> Vec<[u8; 32]> {
+    let users = |decided: &validator::consensus::commit::Decided| -> Vec<Hashed> {
         decided
             .chunks
             .iter()

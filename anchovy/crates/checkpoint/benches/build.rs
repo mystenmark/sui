@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use checkpoint::{ContentsBuilder, ProtocolKey, summary};
-use messages::base::Digest;
+use messages::base::{Digest, Hashed};
 use messages::fast::Bump;
 use protocol_config::{Chain, ProtocolVersion};
 use store::{Commit, Executed, Store};
@@ -135,11 +135,13 @@ fn executed(count: usize, store: &Store) -> Vec<ExecutedEffects> {
                 vec![],
             );
             let effects_bytes = bcs::to_bytes(&effects).unwrap();
-            let effects_digest = Digest::of("TransactionEffects", &effects_bytes);
+            let effects_digest = Hashed::of("TransactionEffects", &effects_bytes);
+            // Computed by the reference's types, in this process.
+            let digest = Hashed::computed(Digest::new(digest.into_inner()));
             store
                 .write_through(Commit {
                     executed: Some(Executed {
-                        digest: Digest::new(digest.into_inner()),
+                        digest,
                         transaction: bcs::to_bytes(transaction.data()).unwrap(),
                         effects_digest,
                         effects: effects_bytes.clone(),
@@ -149,8 +151,8 @@ fn executed(count: usize, store: &Store) -> Vec<ExecutedEffects> {
                 })
                 .unwrap();
             ExecutedEffects {
-                digest: digest.into_inner(),
-                effects_digest: effects_digest.bytes,
+                digest,
+                effects_digest,
                 effects: Arc::from(effects_bytes),
             }
         })
@@ -179,7 +181,7 @@ fn main() {
     println!("txs   contents ns/tx  allocs/tx  read ns/tx  allocs/tx  summary ns  allocs  sign ns");
     for size in [100, 1000] {
         let mut effects = executed(size, &store);
-        let digests: Vec<Digest> = effects.iter().map(|e| Digest::new(e.digest)).collect();
+        let digests: Vec<Digest> = effects.iter().map(|e| e.digest.into()).collect();
         let rest = effects.split_off(size / 2);
         let chunks = Arc::new(ChunkTable::new());
         for (height, effects) in [(0, effects), (1, rest)] {

@@ -168,7 +168,7 @@ impl Validator {
         include_details: bool,
     ) -> Result<RawValidatorTransactionStatus, Failure> {
         let read = || {
-            execution::executed(&consensus.store, &digest)
+            execution::executed_uncached(&consensus.store, &messages::base::Digest::new(digest))
                 .map_err(|e| Status::internal(format!("{e:?}")))
         };
         let executed = if let Some(executed) = read()? {
@@ -176,7 +176,10 @@ impl Validator {
         } else {
             let (reply, done) = oneshot::channel();
             let mut batch = WaitBatch::with_capacity(1, 1);
-            batch.push(EffectsWaitItem::Executed(reply), [EffectsKey(digest)]);
+            batch.push(
+                EffectsWaitItem::Executed(reply),
+                [EffectsKey(messages::base::Digest::new(digest))],
+            );
             consensus
                 .effects
                 .try_push(Command::Wait(batch))

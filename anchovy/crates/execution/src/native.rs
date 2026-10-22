@@ -185,7 +185,7 @@ impl NativeExecution {
     ) -> Result<Outcome> {
         let kept = Kept::new();
         let reads = StoreReads::new(bump, store, &kept);
-        let digest = TransactionDigest::from(*data.digest());
+        let digest = *data.digest();
 
         let kinds = input_objects(data, bump).map_err(|e| Error::Native(format!("{e:?}")))?;
         let mut loaded = containers::Vec::with_capacity_in(kinds.len(), bump);
@@ -243,7 +243,7 @@ impl NativeExecution {
             *data.kind(),
             None,
             *data.sender(),
-            digest,
+            *digest,
             &runtime.move_vm,
             &self.epoch,
             self.epoch_start_timestamp_ms,
@@ -276,7 +276,7 @@ impl NativeExecution {
                     })
                     .collect(),
                 executed: Some(store::Executed {
-                    digest: digest_of(digest),
+                    digest,
                     transaction: transaction.to_vec(),
                     effects_digest: effects.digest,
                     effects: effects_bytes,
@@ -366,8 +366,4 @@ fn written(object: &Object<'_>) -> store::Written {
             .expect("written objects are sealed")
             .to_vec(),
     }
-}
-
-fn digest_of(digest: TransactionDigest) -> messages::base::Digest {
-    digest
 }

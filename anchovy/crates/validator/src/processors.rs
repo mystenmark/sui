@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use containers::Bump;
 use messages::Message;
+use messages::base::Hashed;
 use messages::transaction::{DigestPending, Transaction, TxState};
 use tokio::sync::oneshot;
 use workqueue::{Processor, Refusal, Refuse};
@@ -197,7 +198,7 @@ impl Processor for SignatureVerifier {
 }
 
 /// The transaction's results, if it executed.
-pub(crate) fn executed(store: &store::Store, digest: &[u8; 32]) -> Option<Outcome> {
+pub(crate) fn executed(store: &store::Store, digest: &Hashed) -> Option<Outcome> {
     match execution::executed(store, digest) {
         Ok(executed) => executed.map(|e| Outcome::Executed(Box::new(e))),
         Err(e) => Some(Outcome::Failed(format!("{e:?}"))),

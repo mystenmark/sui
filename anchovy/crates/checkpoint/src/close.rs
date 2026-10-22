@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use execution::epoch_start::SystemObjects;
 use fastcrypto::hash::MultisetHash;
-use messages::base::Digest;
+
 use messages::build::base::{AuthorityPublicKeyBytes, ChainIdentifier, SequenceNumber};
 use messages::build::system_transaction::{
     AuthenticatorStateExpire, Duration, EndOfEpochTransactionKind, StoredExecutionTimeObservations,
@@ -24,7 +24,7 @@ use validator::pipeline::items::{
     CheckpointContentsBuilt, CheckpointEffects, Chunk, EffectsWaitItem, EndOfEpoch, EpochClose,
     EpochCloserInput, ExecutableTransaction, ExecutedEffects, LastOfEpoch, ScheduledEntry,
 };
-use validator::pipeline::keys::EffectsKey;
+use validator::pipeline::keys::{EffectsKey, TxDigest};
 use validator::pipeline::tables::CheckpointStore;
 use waiter::{Command, WaitBatch};
 use workqueue::{Processor, Queue};
@@ -79,7 +79,7 @@ pub struct EpochCloser {
 /// The last checkpoint, between the steps above.
 struct Closing {
     built: CheckpointContentsBuilt,
-    change_epoch: [u8; 32],
+    change_epoch: TxDigest,
 }
 
 impl EpochCloser {
@@ -149,7 +149,10 @@ impl EpochCloser {
             "resolver",
         );
         let mut wait = WaitBatch::with_capacity(1, 1);
-        wait.push(EffectsWaitItem::ChangeEpochExecuted, [EffectsKey(digest)]);
+        wait.push(
+            EffectsWaitItem::ChangeEpochExecuted,
+            [EffectsKey(digest.into())],
+        );
         push(&self.effects, Command::Wait(wait), "effects waiter");
         self.closing = Some(Closing {
             built,
@@ -373,10 +376,10 @@ impl EpochCloser {
     }
 
     /// The change-epoch transaction's executed effects.
-    fn change_epoch_effects(&self, digest: [u8; 32]) -> ExecutedEffects {
+    fn change_epoch_effects(&self, digest: TxDigest) -> ExecutedEffects {
         let effects_digest = self
             .store
-            .executed_effects(&Digest::new(digest))
+            .executed_effects(&digest)
             .expect("the store reads")
             .expect("the change-epoch transaction executed");
         let effects = self
@@ -386,7 +389,7 @@ impl EpochCloser {
             .expect("executed effects are stored with their transaction");
         ExecutedEffects {
             digest,
-            effects_digest: effects_digest.bytes,
+            effects_digest: *effects.digest(),
             effects: effects.wire_bytes().into(),
         }
     }

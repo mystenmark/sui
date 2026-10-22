@@ -4,10 +4,10 @@
 //! The keys work waits on, one type per waiter. A key is notified only once
 //! the state its availability check reads holds it.
 
-use messages::base::ObjectId;
+use messages::base::{Digest, Hashed, ObjectId};
 
-/// A transaction digest.
-pub type TxDigest = [u8; 32];
+/// A transaction digest, as this validator computed it.
+pub type TxDigest = Hashed;
 
 /// A shared-object stream: an object id and the version its sharing started
 /// at, as the reference keys shared objects.
@@ -44,9 +44,10 @@ pub enum InputKey {
 }
 
 /// The effects waiter's key: a transaction's effects, executed. Available
-/// once the store holds its executed effects.
+/// once the store holds its executed effects. A plain digest, hashed whole:
+/// clients wait on digests they name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct EffectsKey(pub TxDigest);
+pub struct EffectsKey(pub Digest);
 
 /// An accumulator version, counted in commits: the state once every chunk
 /// of every commit before commit `.0` has settled. Commit `v`'s

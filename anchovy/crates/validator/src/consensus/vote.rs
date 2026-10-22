@@ -259,8 +259,9 @@ impl BlockVoter {
         // `handle_vote_transaction`: an executed transaction's inputs are
         // not checked. Its immutable claim still is, as the reference's: the
         // claim decides what the commit handler locks.
-        let digest = transaction.get().0.digest().bytes;
-        if execution::executed(&self.store, &digest)
+        if self
+            .store
+            .executed_effects(transaction.get().0.digest())
             .expect("the store reads")
             .is_none()
         {

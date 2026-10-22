@@ -17,7 +17,7 @@ use std::sync::Arc;
 use consensus::{Priority, TransactionClient};
 use messages::Message;
 use messages::arena::BumpAlloc;
-use messages::base::Digest;
+use messages::base::Hashed;
 use messages::checkpoint::{CheckpointContents, VersionedCheckpointContents};
 use messages::fast::Bump;
 use messages::reader::Reader;
@@ -131,7 +131,7 @@ fn contents_of(
     let mut stored = containers::Vec::with_capacity_in(effects.len(), bump);
     stored.extend(effects.iter().map(|e| {
         store
-            .transaction(&Digest::new(e.digest))
+            .transaction(&e.digest)
             .expect("the store reads")
             .expect("an executed transaction is stored with its effects")
     }));
@@ -298,8 +298,9 @@ impl Availability<ChunkSettled> for ChunkAvailability {
     }
 }
 
-/// The transactions of `contents` (`CheckpointContents` BCS), in order.
-pub(crate) fn transactions<'b>(contents: &[u8], bump: &'b Bump) -> containers::Vec<'b, Digest> {
+/// The transactions of `contents` (`CheckpointContents` BCS), which this
+/// validator built from the digests it computed, in order.
+pub(crate) fn transactions<'b>(contents: &[u8], bump: &'b Bump) -> containers::Vec<'b, Hashed> {
     let mut r = Reader::new(contents);
     let parsed = CheckpointContents::parse(&mut r, &mut BumpAlloc(bump))
         .and_then(|c| r.finish().map(|()| c))
@@ -307,10 +308,14 @@ pub(crate) fn transactions<'b>(contents: &[u8], bump: &'b Bump) -> containers::V
     let mut digests = containers::Vec::new_in(bump);
     match parsed.version {
         VersionedCheckpointContents::V1 { transactions, .. } => {
-            digests.extend(transactions.iter().map(|t| t.transaction));
+            digests.extend(transactions.iter().map(|t| Hashed::computed(t.transaction)));
         }
         VersionedCheckpointContents::V2(transactions) => {
-            digests.extend(transactions.iter().map(|t| t.digest.transaction));
+            digests.extend(
+                transactions
+                    .iter()
+                    .map(|t| Hashed::computed(t.digest.transaction)),
+            );
         }
     }
     digests

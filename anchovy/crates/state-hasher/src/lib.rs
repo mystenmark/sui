@@ -202,13 +202,16 @@ fn committed_effects(store: &store::Store, seq: u64, bump: &mut Bump) -> Vec<Exe
     digests
         .iter()
         .map(|d| {
+            // This validator built the checkpoint from digests it computed.
+            let digest = messages::base::Hashed::computed(d.transaction);
+            let effects_digest = messages::base::Hashed::computed(d.effects);
             let effects = store
-                .effects(&d.effects)
+                .effects(&effects_digest)
                 .expect("the store reads")
                 .expect("a committed transaction's effects are stored");
             ExecutedEffects {
-                digest: d.transaction.bytes,
-                effects_digest: d.effects.bytes,
+                digest,
+                effects_digest,
                 effects: effects.get().bytes.into(),
             }
         })

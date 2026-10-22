@@ -11,7 +11,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use messages::Message;
-use messages::base::{Digest, ObjectId};
+use messages::base::{Digest, Hashed, ObjectId};
 use messages::effects::TransactionEffects;
 use messages::transaction::SharedObjectMutability;
 use protocol_config::{Chain, ProtocolVersion};
@@ -230,7 +230,8 @@ impl Harness {
             .map_err(|(e, _)| e)
             .unwrap();
         let digest = match &view.get().version {
-            messages::effects::VersionedEffects::V2(v2) => *v2.transaction_digest,
+            // The built transaction's digest.
+            messages::effects::VersionedEffects::V2(v2) => Hashed::computed(*v2.transaction_digest),
             messages::effects::VersionedEffects::V1(_) => unreachable!(),
         };
         self.store
@@ -238,7 +239,7 @@ impl Harness {
                 executed: Some(store::Executed {
                     digest,
                     transaction: Vec::new(),
-                    effects_digest: (*view.digest()).into(),
+                    effects_digest: *view.digest(),
                     effects: effects.to_vec(),
                     events: None,
                 }),
@@ -269,7 +270,7 @@ impl Harness {
         let (waits, _, _) = drain(&self.effects);
         let settlements = if matches!(system(&sent[0]).kind, SystemKind::Settlement { .. }) {
             for s in &sent {
-                self.execute(&support::effects(system(s).digest, 20, &[], vec![]));
+                self.execute(&support::effects(system(s).digest.bytes, 20, &[], vec![]));
             }
             let digests: Vec<TxDigest> = sent.iter().map(|s| system(s).digest).collect();
             assert!(
@@ -289,7 +290,7 @@ impl Harness {
         assert!(sent.is_empty());
         let digest = system(&barrier).digest;
         self.execute(&support::effects(
-            digest,
+            digest.bytes,
             21,
             &[],
             vec![support::root_mutated(ISV, 20)],
@@ -333,7 +334,10 @@ fn digests_of(effects: &[Vec<u8>]) -> Vec<TxDigest> {
                 .map_err(|(e, _)| e)
                 .unwrap();
             match &view.get().version {
-                messages::effects::VersionedEffects::V2(v2) => v2.transaction_digest.bytes,
+                // The built system transactions' digests.
+                messages::effects::VersionedEffects::V2(v2) => {
+                    Hashed::computed(*v2.transaction_digest)
+                }
                 messages::effects::VersionedEffects::V1(_) => unreachable!(),
             }
         })
@@ -354,7 +358,7 @@ fn settles_a_chunk_end_to_end() {
     assert!(matches!(&waits[..], [EffectsWaitItem::ChunkExecuted(w)] if w.height == 10));
     assert_eq!(
         keys,
-        digests.iter().copied().map(EffectsKey).collect::<Vec<_>>()
+        digests.iter().map(|d| EffectsKey(**d)).collect::<Vec<_>>()
     );
 
     for e in &effects {
@@ -394,7 +398,7 @@ fn settles_a_chunk_end_to_end() {
 
     // The settlements created two accumulator objects.
     let settlement_effects = support::effects(
-        expected[0].digest,
+        expected[0].digest.bytes,
         20,
         &[],
         vec![
@@ -424,11 +428,11 @@ fn settles_a_chunk_end_to_end() {
         matches!(&waits[..], [EffectsWaitItem::SettlementExecuted { height: 10, digests }]
         if digests == &[expected_barrier.digest])
     );
-    assert_eq!(keys, vec![EffectsKey(expected_barrier.digest)]);
+    assert_eq!(keys, vec![EffectsKey(*expected_barrier.digest)]);
     assert!(h.chunks.get(10).is_none());
 
     h.execute(&support::effects(
-        expected_barrier.digest,
+        expected_barrier.digest.bytes,
         21,
         &[],
         vec![support::root_mutated(ISV, 20)],
@@ -538,7 +542,7 @@ fn chunks_settle_in_height_order_with_offsets_and_root_generations() {
     );
     assert_eq!(barrier.resolved_base, vec![(stream(), 3, 2)]);
     h.execute(&support::effects(
-        system(barrier).digest,
+        system(barrier).digest.bytes,
         30,
         &[],
         vec![support::root_mutated(ISV, 29)],
@@ -631,7 +635,8 @@ fn settled_balances_are_read_at_the_barriers_version() {
 fn withdrawal(n: u8, version: u64, amounts: &[(u16, u64)]) -> Withdrawal {
     let version = AccumulatorVersion(version);
     Withdrawal {
-        digest: [n; 32],
+        // A stand-in: a withdrawal without a transaction.
+        digest: Hashed::computed(Digest::new([n; 32])),
         reservations: amounts
             .iter()
             .map(|&(account, amount)| Reservation {
@@ -661,7 +666,7 @@ fn released(inputs: &Inbox<InputCommand>) -> Vec<(u8, ReservationStatus)> {
             let (InputKey::Reserved(digest), InputValue::Reserved(status)) = (key, value) else {
                 panic!("only `Reserved` keys");
             };
-            released.push((digest[0], status));
+            released.push((digest.bytes[0], status));
         }
     }
     released

@@ -20,8 +20,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use containers::HeapMessageMap;
 use messages::Message;
-use messages::base::{Digest, ObjectId};
+use messages::base::{Digest, Hashed, Lookup, ObjectId};
 use messages::effects::{TransactionEffects, TransactionEvents};
 use messages::object::{Object, Owner};
 use messages::transaction::SenderSignedData;
@@ -32,8 +33,14 @@ use crate::{Commit, Live, Removal, Removed, Result, Written};
 /// How many committed versions a slot keeps (the reference's `MAX_VERSIONS`).
 const COMMITTED_VERSIONS: usize = 3;
 const SHARDS: usize = 64;
-/// Shards of a map, by key hash.
-type Shards<K, V> = Box<[Mutex<HashMap<K, V>>]>;
+/// Shards of a map of computed digests, by key hash.
+type Shards<V> = Box<[Mutex<HeapMessageMap<Hashed, V>>]>;
+
+fn shards<V>() -> Shards<V> {
+    (0..SHARDS)
+        .map(|_| Mutex::new(containers::heap_message_map(0)))
+        .collect()
+}
 
 /// Ticket generations per structure. Collisions only cost cache fills.
 const GENERATIONS: usize = 16 * 1024;
@@ -219,20 +226,22 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// A transaction's data apart from its objects.
 struct TxData {
     transaction: Message<SenderSignedData<'static>>,
-    effects_digest: Digest,
+    effects_digest: Hashed,
     effects: Message<TransactionEffects<'static>>,
     events: Option<Message<TransactionEvents<'static>>>,
 }
 
 /// An executed, uncommitted transaction.
 struct TxRecord {
-    digest: Digest,
+    digest: Hashed,
     data: Arc<TxData>,
     written: Vec<(ObjectId, u64, Digest, Message<Object<'static>>)>,
     removed: Vec<Removed>,
 }
 
-/// A bounded cache of committed values by digest, with negative entries.
+/// A bounded cache of committed values by computed digest, with negative
+/// entries: only a computed digest's absence is cached, so a client cannot
+/// fill it with digests it chose.
 struct PointCache<V> {
     shards: Box<[Mutex<PointShard<V>>]>,
     generations: Generations,
@@ -240,8 +249,8 @@ struct PointCache<V> {
 }
 
 struct PointShard<V> {
-    entries: HashMap<Digest, Option<V>>,
-    order: VecDeque<Digest>,
+    entries: HeapMessageMap<Hashed, Option<V>>,
+    order: VecDeque<Hashed>,
 }
 
 impl<V: Clone> PointCache<V> {
@@ -250,7 +259,7 @@ impl<V: Clone> PointCache<V> {
             shards: (0..SHARDS)
                 .map(|_| {
                     Mutex::new(PointShard {
-                        entries: HashMap::new(),
+                        entries: containers::heap_message_map(0),
                         order: VecDeque::new(),
                     })
                 })
@@ -261,14 +270,17 @@ impl<V: Clone> PointCache<V> {
     }
 
     fn get(&self, key: &Digest) -> Found<V> {
-        match lock(&self.shards[shard(&key.bytes)]).entries.get(key) {
+        match lock(&self.shards[shard(&key.bytes)])
+            .entries
+            .get(&Lookup(key))
+        {
             Some(Some(value)) => Found::Hit(value.clone()),
             Some(None) => Found::Absent,
             None => Found::Miss,
         }
     }
 
-    fn insert(shard: &mut PointShard<V>, key: Digest, value: Option<V>, capacity: usize) {
+    fn insert(shard: &mut PointShard<V>, key: Hashed, value: Option<V>, capacity: usize) {
         if shard.entries.insert(key, value).is_none() {
             shard.order.push_back(key);
         }
@@ -281,21 +293,21 @@ impl<V: Clone> PointCache<V> {
     }
 
     /// A committed value: replaces anything, and outdates every ticket.
-    fn insert_committed(&self, key: Digest, value: V) {
+    fn insert_committed(&self, key: Hashed, value: V) {
         let mut shard = lock(&self.shards[shard(&key.bytes)]);
         self.generations.bump(&key.bytes);
         Self::insert(&mut shard, key, Some(value), self.capacity);
     }
 
     /// "Not in the database", if nothing happened to `key` since `ticket`.
-    fn insert_absent(&self, key: Digest, ticket: u64) {
+    fn insert_absent(&self, key: Hashed, ticket: u64) {
         let mut shard = lock(&self.shards[shard(&key.bytes)]);
         if self.generations.ticket(&key.bytes) == ticket && !shard.entries.contains_key(&key) {
             Self::insert(&mut shard, key, None, self.capacity);
         }
     }
 
-    fn invalidate(&self, key: &Digest) {
+    fn invalidate(&self, key: &Hashed) {
         let mut shard = lock(&self.shards[shard(&key.bytes)]);
         self.generations.bump(&key.bytes);
         shard.entries.remove(key);
@@ -309,8 +321,8 @@ pub struct Store {
     objects: Box<[Mutex<ObjectShard>]>,
     object_generations: Generations,
     /// Uncommitted transactions, by digest and by effects digest.
-    uncommitted: Shards<Digest, Arc<TxRecord>>,
-    uncommitted_effects: Shards<Digest, Arc<TxData>>,
+    uncommitted: Shards<Arc<TxRecord>>,
+    uncommitted_effects: Shards<Arc<TxData>>,
     committed: PointCache<Arc<TxData>>,
     committed_effects: PointCache<Message<TransactionEffects<'static>>>,
     /// The last checkpoint committed by this cache.
@@ -330,8 +342,8 @@ impl Store {
             capacity,
             objects: (0..SHARDS).map(|_| Mutex::default()).collect(),
             object_generations: Generations::new(),
-            uncommitted: (0..SHARDS).map(|_| Mutex::default()).collect(),
-            uncommitted_effects: (0..SHARDS).map(|_| Mutex::default()).collect(),
+            uncommitted: shards(),
+            uncommitted_effects: shards(),
             committed: PointCache::new(capacity.transactions),
             committed_effects: PointCache::new(capacity.transactions),
             last_committed: Mutex::new(last_committed),
@@ -414,7 +426,7 @@ impl Store {
     pub fn commit_checkpoint(
         &self,
         seq: u64,
-        transactions: &[Digest],
+        transactions: &[messages::base::Hashed],
         checkpoint: Vec<u8>,
         certified: Vec<u8>,
         bump: &containers::Bump,
@@ -436,7 +448,7 @@ impl Store {
     fn commit(
         &self,
         seq: u64,
-        transactions: &[Digest],
+        transactions: &[messages::base::Hashed],
         checkpoint: Vec<u8>,
         certified: Option<Vec<u8>>,
         epoch_start: Option<Vec<u8>>,
@@ -550,7 +562,7 @@ impl Store {
         Ok(())
     }
 
-    fn invalidate(&self, ids: &[ObjectId], executed: Option<(Digest, Digest)>) {
+    fn invalidate(&self, ids: &[ObjectId], executed: Option<(Hashed, Hashed)>) {
         for id in ids {
             let mut shard = self.objects(id);
             self.object_generations.bump(&id.0);
@@ -715,7 +727,7 @@ impl Store {
 
     fn uncommitted(&self, digest: &Digest) -> Option<Arc<TxData>> {
         lock(&self.uncommitted[shard(&digest.bytes)])
-            .get(digest)
+            .get(&Lookup(digest))
             .map(|r| r.data.clone())
     }
 
@@ -741,23 +753,29 @@ impl Store {
         }
     }
 
-    /// The digest of the effects of the transaction, if it executed.
-    pub fn executed_effects(&self, transaction: &Digest) -> Result<Option<Digest>> {
+    /// The digest of the effects of the transaction, if it executed; its
+    /// absence cached.
+    pub fn executed_effects(&self, transaction: &Hashed) -> Result<Option<Hashed>> {
         let ticket = self.committed.generations.ticket(&transaction.bytes);
+        let found = self.executed_effects_uncached(transaction)?;
+        if found.is_none() {
+            self.committed.insert_absent(*transaction, ticket);
+        }
+        Ok(found)
+    }
+
+    /// `executed_effects` of a digest from outside, as a request names it:
+    /// its absence is not cached.
+    pub fn executed_effects_uncached(&self, transaction: &Digest) -> Result<Option<Hashed>> {
         match self.cached_tx(transaction) {
             Found::Hit(data) => Ok(Some(data.effects_digest)),
             Found::Absent => Ok(None),
-            Found::Miss => {
-                let found = self.db.executed_effects(transaction)?;
-                if found.is_none() {
-                    self.committed.insert_absent(*transaction, ticket);
-                }
-                Ok(found)
-            }
+            // Written by `put_executed`, from a computed digest.
+            Found::Miss => Ok(self.db.executed_effects(transaction)?.map(Hashed::computed)),
         }
     }
 
-    pub fn effects(&self, digest: &Digest) -> Result<Option<Message<TransactionEffects<'static>>>> {
+    pub fn effects(&self, digest: &Hashed) -> Result<Option<Message<TransactionEffects<'static>>>> {
         let ticket = self.committed_effects.generations.ticket(&digest.bytes);
         if let Some(data) = lock(&self.uncommitted_effects[shard(&digest.bytes)]).get(digest) {
             return Ok(Some(data.effects.clone()));

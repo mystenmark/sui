@@ -635,21 +635,24 @@ impl Network {
     }
 
     /// The effects digest of `transaction`, if executed.
-    fn executed(&self, transaction: &Transaction) -> Option<messages::base::Digest> {
+    fn executed(&self, transaction: &Transaction) -> Option<messages::base::Hashed> {
         let digest = messages::base::Digest::new(transaction.digest().into_inner());
-        self.store().executed_effects(&digest).unwrap()
+        self.store().executed_effects_uncached(&digest).unwrap()
     }
 
-    fn wait_executed(&self, transaction: &Transaction) -> messages::base::Digest {
+    fn wait_executed(&self, transaction: &Transaction) -> messages::base::Hashed {
         wait_for(&format!("{} to execute", transaction.digest()), || {
             self.executed(transaction)
         })
     }
 
     fn effects(&self, digest: &TransactionDigest) -> TransactionEffects {
-        let executed = execution::executed(self.store(), &digest.into_inner())
-            .unwrap()
-            .unwrap_or_else(|| panic!("{digest} executed"));
+        let executed = execution::executed_uncached(
+            self.store(),
+            &messages::base::Digest::new(digest.into_inner()),
+        )
+        .unwrap()
+        .unwrap_or_else(|| panic!("{digest} executed"));
         bcs::from_bytes(&executed.effects).unwrap()
     }
 
@@ -1213,7 +1216,11 @@ fn back_to_back_commits_execute_in_order_and_certify() {
     let share = network.share(network.coin(0));
     network.commit(vec![consensus_transaction(&share)]);
     let effects = wait_for("the share to execute", || {
-        execution::executed(network.store(), &share.digest().into_inner()).unwrap()
+        execution::executed_uncached(
+            network.store(),
+            &messages::base::Digest::new(share.digest().into_inner()),
+        )
+        .unwrap()
     });
     let effects: TransactionEffects = bcs::from_bytes(&effects.effects).unwrap();
     let (shared_ref, _) = effects
@@ -1368,9 +1375,12 @@ fn an_owned_conflict_in_one_commit_drops_the_later_and_defers_the_earlier() {
     }
     assert!(!network.contents(seq).contains(first.digest()));
     assert!(
-        execution::executed(network.store(), &second.digest().into_inner())
-            .unwrap()
-            .is_none()
+        execution::executed_uncached(
+            network.store(),
+            &messages::base::Digest::new(second.digest().into_inner()),
+        )
+        .unwrap()
+        .is_none()
     );
     assert_no_panics();
 }

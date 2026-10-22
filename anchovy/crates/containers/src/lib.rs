@@ -7,6 +7,7 @@
 use std::hash::{BuildHasher, Hasher};
 
 pub use arena::Bump;
+pub use hashbrown::Equivalent;
 
 pub type Vec<'a, T> = allocator_api2::vec::Vec<T, &'a Bump>;
 pub type Box<'a, T> = allocator_api2::boxed::Box<T, &'a Bump>;

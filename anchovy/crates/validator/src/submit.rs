@@ -141,8 +141,7 @@ impl Processor for SubmitChecker {
         let epoch = self.epoch.clone();
         let mut outcomes = Vec::with_capacity(transactions.len());
         for transaction in &transactions {
-            let digest = transaction.get().0.digest().bytes;
-            if let Some(outcome) = executed(&self.store, &digest) {
+            if let Some(outcome) = executed(&self.store, transaction.get().0.digest()) {
                 outcomes.push(outcome);
                 continue;
             }

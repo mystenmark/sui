@@ -114,9 +114,12 @@ impl Member {
 
     /// Whether `transaction` has executed here.
     fn executed(&self, transaction: &Transaction) -> bool {
-        execution::executed(self.store(), &transaction.digest().into_inner())
-            .unwrap()
-            .is_some()
+        execution::executed_uncached(
+            self.store(),
+            &messages::base::Digest::new(transaction.digest().into_inner()),
+        )
+        .unwrap()
+        .is_some()
     }
 
     /// The checkpoint listing `transaction`, if committed and certified.
@@ -331,9 +334,12 @@ impl Network {
         {
             assert!(Instant::now() < deadline, "executed in time");
         }
-        let executed = execution::executed(member.store(), &transaction.digest().into_inner())
-            .unwrap()
-            .expect("executed");
+        let executed = execution::executed_uncached(
+            member.store(),
+            &messages::base::Digest::new(transaction.digest().into_inner()),
+        )
+        .unwrap()
+        .expect("executed");
         let effects: TransactionEffects = bcs::from_bytes(&executed.effects).unwrap();
         assert_eq!(effects.status(), &ExecutionStatus::Success);
         effects

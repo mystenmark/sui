@@ -200,9 +200,12 @@ impl ForkReport {
                 }
                 Some(our_effects) if our_effects != their_effects => {
                     let theirs = cache.get_executed_effects(digest);
-                    let ours = execution::executed(&self.store, &digest.into_inner())
-                        .unwrap()
-                        .map(|e| bcs::from_bytes::<TransactionEffects>(&e.effects).unwrap());
+                    let ours = execution::executed_uncached(
+                        &self.store,
+                        &messages::base::Digest::new(digest.into_inner()),
+                    )
+                    .unwrap()
+                    .map(|e| bcs::from_bytes::<TransactionEffects>(&e.effects).unwrap());
                     writeln!(
                         diff,
                         "{digest}: effects differ\nsui: {theirs:#?}\nanchovy: {ours:#?}"
@@ -810,8 +813,11 @@ impl Anchovy {
     }
 
     fn effects(&self, digest: &TransactionDigest) -> Option<TransactionEffects> {
-        let executed =
-            execution::executed(&self.node().perpetual.store, &digest.into_inner()).unwrap()?;
+        let executed = execution::executed_uncached(
+            &self.node().perpetual.store,
+            &messages::base::Digest::new(digest.into_inner()),
+        )
+        .unwrap()?;
         Some(bcs::from_bytes(&executed.effects).unwrap())
     }
 }

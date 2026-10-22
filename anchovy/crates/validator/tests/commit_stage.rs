@@ -13,6 +13,7 @@ use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest as _};
 use consensus::BlockRef;
 use messages::Message;
+use messages::base::Hashed;
 use protocol_config::{Chain, ProtocolVersion};
 use sui_types::base_types::{ObjectID, SequenceNumber, SuiAddress, random_object_ref};
 use sui_types::crypto::{AccountKeyPair, get_key_pair};
@@ -198,9 +199,9 @@ fn commit(index: u32, round: u32, timestamp_ms: u64, transactions: &[Vec<u8>]) -
     }
 }
 
-fn digest_of(transaction: &ExecutableTransaction) -> [u8; 32] {
+fn digest_of(transaction: &ExecutableTransaction) -> Hashed {
     match transaction {
-        ExecutableTransaction::User(t) => t.get().0.digest().bytes,
+        ExecutableTransaction::User(t) => *t.get().0.digest(),
         ExecutableTransaction::System(t) => t.digest,
     }
 }
@@ -256,7 +257,7 @@ fn reference_state_digest(timestamps: &VecDeque<u64>) -> AdditionalConsensusStat
 /// The prologue digest of a commit splitting a coin, after a commit carrying
 /// an observation of splits if `observed`, with the stage restarted between
 /// them if `restart`, as consensus replays the window of earlier commits.
-fn prologue_after(observed: bool, restart: bool, split: &[u8]) -> [u8; 32] {
+fn prologue_after(observed: bool, restart: bool, split: &[u8]) -> Hashed {
     let mut bump = containers::Bump::default();
     let epoch = epoch(10_000, 0);
     let dir = tempfile::tempdir().unwrap();
@@ -329,7 +330,7 @@ fn the_prologue_is_sui_s_byte_for_byte() {
             ConsensusDeterminedVersionAssignments::CancelledTransactionsV2(vec![]),
             reference_state_digest(&window),
         );
-        assert_eq!(prologue.digest, expected.digest().into_inner());
+        assert_eq!(prologue.digest.bytes, expected.digest().into_inner());
         assert_eq!(prologue.bytes, bcs::to_bytes(expected.inner()).unwrap());
     }
 }

@@ -238,6 +238,25 @@ impl std::hash::Hash for Hashed {
 
 impl containers::DigestKey for Hashed {}
 
+/// A digest from anywhere, to look up in a table keyed by [`Hashed`]: it
+/// hashes as a `Hashed` does, so finds the same entry, but is not one, so
+/// nothing inserts it. A lookup cannot flood a table; only inserts grow it.
+pub struct Lookup<'a>(pub &'a Digest);
+
+impl std::hash::Hash for Lookup<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(u64::from_le_bytes(
+            self.0.bytes[..8].try_into().expect("eight bytes"),
+        ));
+    }
+}
+
+impl containers::Equivalent<Hashed> for Lookup<'_> {
+    fn equivalent(&self, key: &Hashed) -> bool {
+        *self.0 == key.0
+    }
+}
+
 impl fmt::Debug for Hashed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)

@@ -113,7 +113,7 @@ fn a_chain_of_shared_writes_executes_across_generations_and_rounds() {
     // D ended the stream; E, writing it, keeps it ended.
     let ended = Generation::Ended {
         version: d.lamport_version().value(),
-        transaction: digests[4],
+        transaction: digests[4].bytes,
     };
     assert_eq!(node.generations.get(stream, 12, 1), Some(ended));
     assert_eq!(node.generations.get(stream, 13, 1), Some(ended));
@@ -148,7 +148,7 @@ fn deleting_a_shared_object_ends_its_stream_for_its_readers() {
         node.generations.get(stream, 5, 1),
         Some(Generation::Ended {
             version: lamport.value(),
-            transaction: deleter,
+            transaction: deleter.bytes,
         })
     );
     // The reader still executes, against the reference's stream-ended marker.
@@ -199,7 +199,7 @@ fn keys_are_notified_only_once_visible() {
     }
     let inputs: Vec<InputKey> = resolved.iter().map(|(key, _)| *key).collect();
 
-    assert_eq!(effects, digests.map(EffectsKey).to_vec());
+    assert_eq!(effects, digests.map(|d| EffectsKey(*d)).to_vec());
     let transferred = node.effects(digests[0]).unwrap();
     for (object, _, _) in transferred.all_changed_objects() {
         assert!(inputs.contains(&InputKey::ObjectVersion {

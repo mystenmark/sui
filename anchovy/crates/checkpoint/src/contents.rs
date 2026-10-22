@@ -106,8 +106,8 @@ pub fn build(
                 containers::Vec::<UserSignature<'_>>::with_capacity_in(listed.len(), bump);
             signatures.extend(listed.iter().map(|s| (s.0, None)));
             contents.push(
-                Digest::new(executed.digest),
-                Digest::new(executed.effects_digest),
+                executed.digest.into(),
+                executed.effects_digest.into(),
                 signatures.leak(),
             );
         }
@@ -152,8 +152,8 @@ fn contents_v1<'a>(
     w.u8(0);
     w.len_prefix(effects.len());
     for executed in effects {
-        w.digest(&Digest::new(executed.digest));
-        w.digest(&Digest::new(executed.effects_digest));
+        w.digest(&executed.digest);
+        w.digest(&executed.effects_digest);
     }
     w.len_prefix(transactions.len());
     for transaction in transactions {

@@ -6,7 +6,7 @@
 //! mainnet checkpoint.
 
 use messages::Message;
-use messages::base::Digest;
+use messages::base::{Digest, Hashed};
 use messages::checkpoint::CheckpointData;
 use store::{Commit, Executed, Live, Removal, Removed, Store, Written};
 
@@ -137,8 +137,9 @@ fn executed_transactions_round_trip_and_survive_reopening() {
     let dir = tempfile::tempdir().unwrap();
     let checkpoint = checkpoint();
     let tx = &checkpoint.get().transactions[1];
-    let digest = Digest::from(*tx.transaction.digest());
-    let effects_digest = Digest::new([7; 32]);
+    let digest = *tx.transaction.digest();
+    // A stand-in: the store does not check it against the effects.
+    let effects_digest = Hashed::computed(Digest::new([7; 32]));
     let events = tx.events.map(|e| e.bytes.to_vec());
     {
         let store = Store::open(dir.path()).unwrap();

@@ -65,12 +65,12 @@ pub struct HandledCommit<'b> {
     /// Each scheduled user transaction's block and position, by digest.
     pub origins: containers::MessageMap<'b, Hashed, (BlockRef, TransactionIndex)>,
     /// Transactions processed in earlier commits, or earlier in this one.
-    pub duplicates: containers::Vec<'b, (BlockRef, TransactionIndex, [u8; 32])>,
+    pub duplicates: containers::Vec<'b, (BlockRef, TransactionIndex, TxDigest)>,
     /// Transactions deferred to a later round, in schedule order.
-    pub deferred: containers::Vec<'b, (BlockRef, TransactionIndex, [u8; 32])>,
+    pub deferred: containers::Vec<'b, (BlockRef, TransactionIndex, TxDigest)>,
     /// Transactions dropped before scheduling, in consensus order. Like the
     /// reference's, they are processed: a later inclusion is a duplicate.
-    pub dropped: containers::Vec<'b, (BlockRef, TransactionIndex, [u8; 32], DropReason)>,
+    pub dropped: containers::Vec<'b, (BlockRef, TransactionIndex, TxDigest, DropReason)>,
     /// Each scheduled user transaction's execution time estimate, in
     /// microseconds, in schedule order: what the reference's
     /// `IndirectStateObserver` sees.
@@ -192,8 +192,7 @@ impl CommitHandler {
             owned,
         } in commit.transactions
         {
-            let hashed = *transaction.get().0.digest();
-            let digest = hashed.bytes;
+            let digest = *transaction.get().0.digest();
             let owned = match owned {
                 Ok(owned) => owned,
                 Err(e) => {
@@ -208,7 +207,7 @@ impl CommitHandler {
                 dropped.push((block, index, digest, conflict));
                 continue;
             }
-            taken.extend(owned.iter().map(|r| (*r, hashed)));
+            taken.extend(owned.iter().map(|r| (*r, digest)));
             locked.push((block, index, transaction));
         }
 
@@ -218,13 +217,13 @@ impl CommitHandler {
         let mut origins = containers::message_map(bump, locked.len());
         let mut duplicates = containers::Vec::new_in(bump);
         for (block, index, transaction) in locked {
-            let hashed = *transaction.get().0.digest();
-            if self.output.is_processed(&hashed.bytes) {
-                duplicates.push((block, index, hashed.bytes));
+            let digest = *transaction.get().0.digest();
+            if self.output.is_processed(&digest) {
+                duplicates.push((block, index, digest));
                 continue;
             }
-            self.output.set_processed(hashed.bytes);
-            origins.insert(hashed, (block, index));
+            self.output.set_processed(digest);
+            origins.insert(digest, (block, index));
             accepted.push(transaction);
         }
 
@@ -277,7 +276,7 @@ impl CommitHandler {
                 let key = DeferralKey::next_round(round, from);
                 if key.within_limit(config.max_deferral_rounds_for_congestion_control()) {
                     let origin = origins.remove(&hashed).expect("each transaction's origin");
-                    deferred_here.push((origin.0, origin.1, hashed.bytes));
+                    deferred_here.push((origin.0, origin.1, hashed));
                     deferred
                         .entry(key)
                         .or_insert_with(|| containers::Vec::new_in(bump))
@@ -684,8 +683,8 @@ impl CommitStage {
                     (ExecutableTransaction::System(system), digest, None)
                 }
                 Scheduled::User(transaction) => {
-                    let digest = transaction.get().0.digest().bytes;
-                    let origin = origins[transaction.get().0.digest()];
+                    let digest = *transaction.get().0.digest();
+                    let origin = origins[&digest];
                     (
                         ExecutableTransaction::User(transaction),
                         digest,
@@ -1252,7 +1251,7 @@ fn system_transaction(
     };
     let bytes = bcs::to_bytes(&transaction).expect("a transaction serializes");
     // The data follows the one-element sequence's length and the intent.
-    let digest = messages::base::Digest::of("TransactionData", &bytes[4..4 + size]).bytes;
+    let digest = Hashed::of("TransactionData", &bytes[4..4 + size]);
     SystemTransaction {
         kind: system,
         bytes,
