@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use containers::Bump;
 use messages::Message;
-use messages::base::{Digest, ObjectId};
+use messages::base::{Hashed, ObjectId};
 use messages::object::Object;
 use messages::transaction::{Attested, DigestPending, HasDigest, Transaction, TxState};
 use validation::{sender_signed, verify};
@@ -183,7 +183,7 @@ impl SignatureChecks {
             Cached(SignerIndices),
             /// Verified but for its Ed25519 checks, `deferred[checks]`.
             Pending {
-                key: Digest,
+                key: Hashed,
                 indices: SignerIndices,
                 checks: std::ops::Range<usize>,
             },

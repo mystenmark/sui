@@ -84,18 +84,32 @@ pub fn hash_set<K>(bump: &Bump, capacity: usize) -> HashSet<'_, K> {
 /// clustering of inserting one map's keys, in its iteration order, into
 /// another. Iteration order is therefore random and must not reach output.
 ///
-/// The key's `Hash` impl must call `write_u64` once with those bytes and
-/// nothing else; `messages::base::Digest` does.
+/// Keys must be [`DigestKey`]s, which only the constructors here check: a
+/// `DigestHasher` cannot be made elsewhere.
 pub type MessageMap<'a, K, V> = hashbrown::HashMap<K, V, DigestHasher, &'a Bump>;
 pub type MessageSet<'a, K> = hashbrown::HashSet<K, DigestHasher, &'a Bump>;
 
-pub fn message_map<K, V>(bump: &Bump, capacity: usize) -> MessageMap<'_, K, V> {
+/// [`MessageMap`] on the heap, for tables that outlive an arena.
+pub type HeapMessageMap<K, V> = hashbrown::HashMap<K, V, DigestHasher>;
+
+pub fn message_map<K: DigestKey, V>(bump: &Bump, capacity: usize) -> MessageMap<'_, K, V> {
     MessageMap::with_capacity_and_hasher_in(capacity, DigestHasher::new(), bump)
 }
 
-pub fn message_set<K>(bump: &Bump, capacity: usize) -> MessageSet<'_, K> {
+pub fn message_set<K: DigestKey>(bump: &Bump, capacity: usize) -> MessageSet<'_, K> {
     MessageSet::with_capacity_and_hasher_in(capacity, DigestHasher::new(), bump)
 }
+
+pub fn heap_message_map<K: DigestKey, V>(capacity: usize) -> HeapMessageMap<K, V> {
+    HeapMessageMap::with_capacity_and_hasher(capacity, DigestHasher::new())
+}
+
+/// A key a [`DigestHasher`] may hash: its `Hash` calls `write_u64` once,
+/// with eight bytes of a hash this process computed. A client can choose a
+/// digest it sends freely, and keys sharing eight bytes share a bucket
+/// whatever the seed; a computed hash it can only steer by grinding.
+/// Implemented by `messages::base::Hashed`, which only hashing makes.
+pub trait DigestKey: std::hash::Hash + Eq {}
 
 #[derive(Clone, Copy)]
 pub struct DigestHasher {
@@ -107,18 +121,12 @@ impl DigestHasher {
     /// Fresh secrets for one map. std's `RandomState` is keyed from the OS
     /// and distinct per instance; foldhash's is not meant to resist
     /// flooding.
-    pub fn new() -> DigestHasher {
+    fn new() -> DigestHasher {
         let keys = std::hash::RandomState::new();
         DigestHasher {
             seed: keys.hash_one(0u64),
             multiplier: keys.hash_one(1u64),
         }
-    }
-}
-
-impl Default for DigestHasher {
-    fn default() -> DigestHasher {
-        DigestHasher::new()
     }
 }
 
@@ -295,6 +303,8 @@ mod tests {
             state.write_u64(u64::from_le_bytes(self.0[..8].try_into().unwrap()));
         }
     }
+
+    impl DigestKey for Key {}
 
     #[test]
     fn every_container_lives_in_the_arena() {

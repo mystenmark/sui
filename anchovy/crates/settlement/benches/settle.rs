@@ -156,7 +156,7 @@ fn commit(store: &store::Store, effects: &[u8]) {
             executed: Some(store::Executed {
                 digest: *v2.transaction_digest,
                 transaction: Vec::new(),
-                effects_digest: *view.digest(),
+                effects_digest: (*view.digest()).into(),
                 effects: effects.to_vec(),
                 events: None,
             }),

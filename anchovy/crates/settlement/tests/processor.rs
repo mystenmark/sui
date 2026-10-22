@@ -238,7 +238,7 @@ impl Harness {
                 executed: Some(store::Executed {
                     digest,
                     transaction: Vec::new(),
-                    effects_digest: *view.digest(),
+                    effects_digest: (*view.digest()).into(),
                     effects: effects.to_vec(),
                     events: None,
                 }),

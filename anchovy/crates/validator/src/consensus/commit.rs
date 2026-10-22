@@ -22,7 +22,7 @@ use ::consensus::{BlockRef, TransactionIndex};
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest as _};
 use containers::Bump;
-use messages::base::{Digest, ObjectRef};
+use messages::base::{Hashed, ObjectRef};
 use messages::build::system_transaction::{Jwk, JwkId};
 use protocol_config::ProtocolConfig;
 use workqueue::Processor;
@@ -63,7 +63,7 @@ pub struct HandledCommit<'b> {
     pub commit_index: u32,
     pub schedule: Schedule<'b>,
     /// Each scheduled user transaction's block and position, by digest.
-    pub origins: containers::MessageMap<'b, Digest, (BlockRef, TransactionIndex)>,
+    pub origins: containers::MessageMap<'b, Hashed, (BlockRef, TransactionIndex)>,
     /// Transactions processed in earlier commits, or earlier in this one.
     pub duplicates: containers::Vec<'b, (BlockRef, TransactionIndex, [u8; 32])>,
     /// Transactions deferred to a later round, in schedule order.
@@ -192,7 +192,8 @@ impl CommitHandler {
             owned,
         } in commit.transactions
         {
-            let digest = transaction.get().0.digest().bytes;
+            let hashed = *transaction.get().0.digest();
+            let digest = hashed.bytes;
             let owned = match owned {
                 Ok(owned) => owned,
                 Err(e) => {
@@ -202,16 +203,12 @@ impl CommitHandler {
                 }
             };
             if let Err(conflict) = self.lock(digest, &owned) {
-                contested.extend(
-                    owned
-                        .iter()
-                        .filter_map(|r| taken.get(r).copied().map(Digest::new)),
-                );
+                contested.extend(owned.iter().filter_map(|r| taken.get(r).copied()));
                 self.output.set_processed(digest);
                 dropped.push((block, index, digest, conflict));
                 continue;
             }
-            taken.extend(owned.iter().map(|r| (*r, digest)));
+            taken.extend(owned.iter().map(|r| (*r, hashed)));
             locked.push((block, index, transaction));
         }
 
@@ -221,13 +218,13 @@ impl CommitHandler {
         let mut origins = containers::message_map(bump, locked.len());
         let mut duplicates = containers::Vec::new_in(bump);
         for (block, index, transaction) in locked {
-            let digest = transaction.get().0.digest().bytes;
-            if self.output.is_processed(&digest) {
-                duplicates.push((block, index, digest));
+            let hashed = *transaction.get().0.digest();
+            if self.output.is_processed(&hashed.bytes) {
+                duplicates.push((block, index, hashed.bytes));
                 continue;
             }
-            self.output.set_processed(digest);
-            origins.insert(Digest::new(digest), (block, index));
+            self.output.set_processed(hashed.bytes);
+            origins.insert(hashed, (block, index));
             accepted.push(transaction);
         }
 
@@ -254,8 +251,9 @@ impl CommitHandler {
         let mut transactions = containers::Vec::with_capacity_in(accepted.len(), bump);
         for (key, deferred) in self.output.take_deferred(DeferralKey::due_by(round)) {
             for deferred in decode_deferred(&deferred) {
-                previously_deferred.insert(Digest::new(deferred.digest()), key);
-                origins.insert(Digest::new(deferred.digest()), deferred.origin);
+                let hashed = *deferred.transaction.get().0.digest();
+                previously_deferred.insert(hashed, key);
+                origins.insert(hashed, deferred.origin);
                 transactions.push(deferred.transaction);
             }
         }
@@ -271,18 +269,15 @@ impl CommitHandler {
         let mut admitted = containers::Vec::with_capacity_in(ordered.len(), bump);
         let mut estimates_us = containers::Vec::with_capacity_in(ordered.len(), bump);
         for transaction in ordered {
-            let digest = transaction.get().0.digest().bytes;
-            if contested.contains(&Digest::new(digest)) && config.defer_owned_object_double_spend()
-            {
+            let hashed = *transaction.get().0.digest();
+            if contested.contains(&hashed) && config.defer_owned_object_double_spend() {
                 let from = previously_deferred
-                    .get(&Digest::new(digest))
+                    .get(&hashed)
                     .map_or(round, DeferralKey::deferred_from_round);
                 let key = DeferralKey::next_round(round, from);
                 if key.within_limit(config.max_deferral_rounds_for_congestion_control()) {
-                    let origin = origins
-                        .remove(&Digest::new(digest))
-                        .expect("each transaction's origin");
-                    deferred_here.push((origin.0, origin.1, digest));
+                    let origin = origins.remove(&hashed).expect("each transaction's origin");
+                    deferred_here.push((origin.0, origin.1, hashed.bytes));
                     deferred
                         .entry(key)
                         .or_insert_with(|| containers::Vec::new_in(bump))
@@ -690,7 +685,7 @@ impl CommitStage {
                 }
                 Scheduled::User(transaction) => {
                     let digest = transaction.get().0.digest().bytes;
-                    let origin = origins[&Digest::new(digest)];
+                    let origin = origins[transaction.get().0.digest()];
                     (
                         ExecutableTransaction::User(transaction),
                         digest,

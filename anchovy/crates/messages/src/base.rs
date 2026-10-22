@@ -157,20 +157,90 @@ pub type SequenceNumber = u64;
 
 /// A 32-byte digest as it sits on the wire: a length byte, always 32, then
 /// the bytes.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// A digest as bytes from anywhere: the wire, a request, a peer. Its hash
+/// covers every byte; only a [`Hashed`] keys a `containers::MessageMap`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(C)]
 pub struct Digest {
     len: u8,
     pub bytes: [u8; 32],
 }
 
-/// The first eight bytes, in one `write_u64`, which is what
-/// `containers::MessageMap` expects and all the hashing a digest needs.
-impl std::hash::Hash for Digest {
+/// A digest this process computed by hashing, now or before: a client can
+/// steer one only by grinding what is hashed, so the first eight bytes, in
+/// one `write_u64`, are all the hashing it needs as a
+/// `containers::MessageMap` key. Made by hashing, by the digests views
+/// compute while parsing, or by [`Hashed::computed`], a claim made at the
+/// call.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(transparent)]
+pub struct Hashed(Digest);
+
+impl Hashed {
+    /// A placeholder for a digest not computed yet.
+    pub(crate) const ZERO: Hashed = Hashed(Digest::ZERO);
+
+    /// `Digest::of`, kept as computed.
+    pub fn of(type_name: &str, bcs_bytes: &[u8]) -> Hashed {
+        use blake2::digest::consts::U32;
+        use blake2::{Blake2b, Digest as _};
+        let mut hasher = Blake2b::<U32>::new();
+        hasher.update(type_name.as_bytes());
+        hasher.update(b"::");
+        hasher.update(bcs_bytes);
+        Hashed(Digest::new(hasher.finalize().into()))
+    }
+
+    /// `digest`, which this process computed: never bytes from the wire, a
+    /// request or a peer that it has not hashed itself. Say why at the call.
+    pub fn computed(digest: Digest) -> Hashed {
+        Hashed(digest)
+    }
+
+    pub fn digest(&self) -> &Digest {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for Hashed {
+    type Target = Digest;
+
+    fn deref(&self) -> &Digest {
+        &self.0
+    }
+}
+
+impl From<Hashed> for Digest {
+    fn from(hashed: Hashed) -> Digest {
+        hashed.0
+    }
+}
+
+impl PartialEq<Digest> for Hashed {
+    fn eq(&self, other: &Digest) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<Hashed> for Digest {
+    fn eq(&self, other: &Hashed) -> bool {
+        *self == other.0
+    }
+}
+
+impl std::hash::Hash for Hashed {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         state.write_u64(u64::from_le_bytes(
-            self.bytes[..8].try_into().expect("eight bytes"),
+            self.0.bytes[..8].try_into().expect("eight bytes"),
         ));
+    }
+}
+
+impl containers::DigestKey for Hashed {}
+
+impl fmt::Debug for Hashed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
     }
 }
 
@@ -188,13 +258,7 @@ impl Digest {
     /// The reference's digest of a hashed type: Blake2b-256 over the type's
     /// serde name, `::`, and its BCS bytes.
     pub fn of(type_name: &str, bcs_bytes: &[u8]) -> Digest {
-        use blake2::digest::consts::U32;
-        use blake2::{Blake2b, Digest as _};
-        let mut hasher = Blake2b::<U32>::new();
-        hasher.update(type_name.as_bytes());
-        hasher.update(b"::");
-        hasher.update(bcs_bytes);
-        Digest::new(hasher.finalize().into())
+        Hashed::of(type_name, bcs_bytes).0
     }
 
     pub fn parse<'a>(r: &mut Reader<'a>) -> Result<&'a Digest> {

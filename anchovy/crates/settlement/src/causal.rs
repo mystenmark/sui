@@ -8,6 +8,8 @@ use containers::{BTreeMap, BTreeSet, Bump, Vec};
 use messages::effects::{ObjectIn, TransactionEffects, UnchangedConsensusKind, VersionedEffects};
 use messages::object::Owner;
 
+use messages::base::Hashed;
+
 type Digest = messages::base::Digest;
 type ObjectKey = ([u8; 32], u64);
 
@@ -15,7 +17,8 @@ type ObjectKey = ([u8; 32], u64);
 /// With `keep_schedule_order` (`disable_effects_tx_dependencies`) that is
 /// schedule order. Otherwise the prologue, if `prologue_first`, stays first
 /// and the rest are sorted causally, independently of their given order.
-/// The order and the sort's tables are in `bump`.
+/// The order and the sort's tables are in `bump`. The effects are this
+/// validator's own, as its executor wrote them.
 pub fn checkpoint_order<'b>(
     effects: &[&TransactionEffects<'_>],
     prologue_first: bool,
@@ -38,6 +41,12 @@ fn transaction_digest(effects: &TransactionEffects<'_>) -> Digest {
         VersionedEffects::V1(v1) => *v1.transaction_digest,
         VersionedEffects::V2(v2) => *v2.transaction_digest,
     }
+}
+
+/// `transaction_digest`, as a key: the executor that wrote the effects named
+/// the digest it computed.
+fn hashed_digest(effects: &TransactionEffects<'_>) -> Hashed {
+    Hashed::computed(transaction_digest(effects))
 }
 
 fn dependencies<'a>(effects: &TransactionEffects<'a>) -> &'a [Digest] {
@@ -89,9 +98,10 @@ fn causal_sort<'b>(
 ) {
     let effects_rest = &effects[skip..];
     let mut readers = containers::hash_map::<ObjectKey, Vec<Digest>>(bump, 0);
-    let mut overwrites = containers::message_map::<Digest, Vec<ObjectKey>>(bump, 0);
+    let mut overwrites = containers::message_map::<Hashed, Vec<ObjectKey>>(bump, 0);
     for e in effects_rest {
         let digest = transaction_digest(e);
+        let hashed = hashed_digest(e);
         consensus_accesses(
             e,
             |key| {
@@ -102,7 +112,7 @@ fn causal_sort<'b>(
             },
             |key| {
                 overwrites
-                    .entry(digest)
+                    .entry(hashed)
                     .or_insert_with(|| Vec::new_in(bump))
                     .push(key);
             },
@@ -114,7 +124,7 @@ fn causal_sort<'b>(
         let digest = transaction_digest(e);
         let mut deps = BTreeSet::new_in(bump);
         deps.extend(dependencies(e).iter().copied());
-        for key in overwrites.get(&digest).into_iter().flatten() {
+        for key in overwrites.get(&hashed_digest(e)).into_iter().flatten() {
             deps.extend(readers.get(key).into_iter().flatten().copied());
         }
         not_seen.insert(digest, (skip + i, deps));

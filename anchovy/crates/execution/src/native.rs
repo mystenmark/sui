@@ -185,7 +185,7 @@ impl NativeExecution {
     ) -> Result<Outcome> {
         let kept = Kept::new();
         let reads = StoreReads::new(bump, store, &kept);
-        let digest = *data.digest();
+        let digest = TransactionDigest::from(*data.digest());
 
         let kinds = input_objects(data, bump).map_err(|e| Error::Native(format!("{e:?}")))?;
         let mut loaded = containers::Vec::with_capacity_in(kinds.len(), bump);

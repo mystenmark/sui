@@ -8,10 +8,9 @@
 
 use blake2::Blake2b;
 use blake2::digest::consts::U32;
-use containers::DigestHasher;
-use hashbrown::HashMap;
+use containers::HeapMessageMap;
 use messages::Message;
-use messages::base::Digest;
+use messages::base::{Digest, Hashed};
 use messages::transaction::{GenericSignature, Intent, SenderSignedData, Transaction};
 
 use super::Valid;
@@ -30,8 +29,8 @@ pub(crate) struct SignatureCache {
     /// The epoch's number, part of each key.
     epoch: u64,
     /// Each verified transaction's signer indices, by key.
-    current: HashMap<Digest, SignerIndices, DigestHasher>,
-    previous: HashMap<Digest, SignerIndices, DigestHasher>,
+    current: HeapMessageMap<Hashed, SignerIndices>,
+    previous: HeapMessageMap<Hashed, SignerIndices>,
     generation: usize,
     hits: u64,
     misses: u64,
@@ -40,7 +39,7 @@ pub(crate) struct SignatureCache {
 impl SignatureCache {
     /// Holds up to `2 * generation` entries, allocated here and never grown.
     pub(crate) fn new(epoch: u64, generation: usize) -> SignatureCache {
-        let table = || HashMap::with_capacity_and_hasher(generation, DigestHasher::new());
+        let table = || containers::heap_message_map(generation);
         SignatureCache {
             epoch,
             current: table(),
@@ -81,7 +80,7 @@ impl SignatureCache {
     pub(crate) fn lookup(
         &mut self,
         transaction: &Message<Transaction<'static, Valid>>,
-    ) -> (Digest, Option<SignerIndices>) {
+    ) -> (Hashed, Option<SignerIndices>) {
         let key = key(self.epoch, &transaction.get().0);
         let cached = self
             .current
@@ -103,7 +102,7 @@ impl SignatureCache {
 
     /// Only a verification inserts, never a hit: resubmitting what is cached
     /// cannot push anything else out.
-    pub(crate) fn insert(&mut self, key: Digest, indices: SignerIndices) {
+    pub(crate) fn insert(&mut self, key: Hashed, indices: SignerIndices) {
         if self.current.len() >= self.generation {
             std::mem::swap(&mut self.current, &mut self.previous);
             // Keeps its table: no allocation after construction.
@@ -117,7 +116,7 @@ impl SignatureCache {
 /// commits to the data's bytes, from which the rest of the data view was
 /// parsed. Signatures are length-prefixed, so no two lists of them hash
 /// alike.
-fn key(epoch: u64, transaction: &SenderSignedData<'_, Valid>) -> Digest {
+fn key(epoch: u64, transaction: &SenderSignedData<'_, Valid>) -> Hashed {
     key_of(
         epoch,
         transaction.digest(),
@@ -131,7 +130,7 @@ fn key_of(
     digest: &Digest,
     intent: Intent,
     signatures: &[GenericSignature<'_>],
-) -> Digest {
+) -> Hashed {
     use blake2::Digest as _;
     let mut hasher = Blake2b::<U32>::new();
     hasher.update(DOMAIN);
@@ -143,7 +142,8 @@ fn key_of(
         hasher.update((signature.0.len() as u64).to_le_bytes());
         hasher.update(signature.0);
     }
-    Digest::new(hasher.finalize().into())
+    // Hashed just now.
+    Hashed::computed(Digest::new(hasher.finalize().into()))
 }
 
 #[cfg(test)]
@@ -225,9 +225,8 @@ mod tests {
         let mut cache = SignatureCache::new(5, 4);
         let capacities = (cache.current.capacity(), cache.previous.capacity());
         for n in 0..100_u64 {
-            let mut key = [0; 32];
-            key[..8].copy_from_slice(&n.to_le_bytes());
-            cache.insert(Digest::new(key), SignerIndices::default());
+            let key = Hashed::of("key", &n.to_le_bytes());
+            cache.insert(key, SignerIndices::default());
         }
         let after = (cache.current.capacity(), cache.previous.capacity());
         // The tables may have swapped places.

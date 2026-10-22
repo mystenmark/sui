@@ -59,9 +59,9 @@ impl Mainnet {
             store
                 .write_through(Commit {
                     executed: Some(Executed {
-                        digest: *t.transaction.digest(),
+                        digest: (*t.transaction.digest()).into(),
                         transaction: t.transaction.bytes().to_vec(),
-                        effects_digest: t.effects.digest,
+                        effects_digest: t.effects.digest.into(),
                         effects: t.effects.bytes.to_vec(),
                         events: None,
                     }),

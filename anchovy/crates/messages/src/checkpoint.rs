@@ -3,8 +3,8 @@
 
 use crate::arena::Alloc;
 use crate::base::{
-    AuthorityPublicKeyBytes, CheckpointContentsDigest, CheckpointDigest, Digest, TransactionDigest,
-    TransactionEffectsDigest, U64Le,
+    AuthorityPublicKeyBytes, CheckpointContentsDigest, CheckpointDigest, Digest, Hashed,
+    TransactionDigest, TransactionEffectsDigest, U64Le,
 };
 use crate::effects::{GasCostSummary, TransactionEffects, TransactionEvents};
 use crate::error::{ParseError, Result};
@@ -78,7 +78,7 @@ pub struct CheckpointSummary<'a> {
     /// The exact encoding, which is what gets hashed and signed.
     pub bytes: &'a [u8],
     /// Computed once, from `bytes`, while parsing.
-    pub digest: CheckpointDigest,
+    pub digest: Hashed,
     pub epoch: u64,
     pub sequence_number: u64,
     pub network_total_transactions: u64,
@@ -125,9 +125,9 @@ impl<'a> CheckpointSummary<'a> {
         Ok(CheckpointSummary {
             bytes,
             digest: if A::BUILD {
-                Digest::of("CheckpointSummary", bytes)
+                Hashed::of("CheckpointSummary", bytes)
             } else {
-                Digest::ZERO
+                Hashed::ZERO
             },
             epoch,
             sequence_number,
@@ -240,8 +240,8 @@ pub struct CheckpointContents<'a> {
 impl<'a> CheckpointContents<'a> {
     /// Hashed on demand: the reference does not treat the contents as a
     /// message, only the summary that commits to them.
-    pub fn digest(&self) -> CheckpointContentsDigest {
-        Digest::of("CheckpointContents", self.bytes)
+    pub fn digest(&self) -> Hashed {
+        Hashed::of("CheckpointContents", self.bytes)
     }
 
     pub fn parse<A: Alloc<'a>>(r: &mut Reader<'a>, a: &mut A) -> Result<CheckpointContents<'a>> {
@@ -407,13 +407,13 @@ crate::base::assert_wire_layout!(
 );
 
 impl crate::message::Digested for CheckpointSummary<'_> {
-    fn digest(&self) -> &Digest {
+    fn digest(&self) -> &Hashed {
         &self.digest
     }
 }
 
 impl crate::message::Digested for CertifiedCheckpointSummary<'_> {
-    fn digest(&self) -> &Digest {
+    fn digest(&self) -> &Hashed {
         &self.data.digest
     }
 }

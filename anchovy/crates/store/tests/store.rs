@@ -137,7 +137,7 @@ fn executed_transactions_round_trip_and_survive_reopening() {
     let dir = tempfile::tempdir().unwrap();
     let checkpoint = checkpoint();
     let tx = &checkpoint.get().transactions[1];
-    let digest = *tx.transaction.digest();
+    let digest = Digest::from(*tx.transaction.digest());
     let effects_digest = Digest::new([7; 32]);
     let events = tx.events.map(|e| e.bytes.to_vec());
     {

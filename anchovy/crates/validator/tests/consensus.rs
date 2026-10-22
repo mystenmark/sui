@@ -429,7 +429,7 @@ fn scheduled(handled: &HandledCommit<'_>) -> Vec<TransactionIndex> {
         .iter()
         .filter_map(|t| match t {
             validator::consensus::sequence::Scheduled::User(t) => {
-                Some(handled.origins[&messages::base::Digest::new(t.get().0.digest().bytes)].1)
+                Some(handled.origins[t.get().0.digest()].1)
             }
             validator::consensus::sequence::Scheduled::Prologue(_)
             | validator::consensus::sequence::Scheduled::AuthenticatorStateUpdate(_) => None,
