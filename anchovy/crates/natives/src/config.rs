@@ -165,10 +165,15 @@ fn consistent_value_before_current_epoch(
 
 fn unpack_struct<const N: usize>(s: Value) -> PartialVMResult<[Value; N]> {
     let s: Struct = s.value_as()?;
-    s.unpack().collect::<Vec<_>>().try_into().map_err(|e| {
-        PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
-            .with_message(format!("struct expected to have {N} fields: {e:?}"))
-    })
+    let mut fields = s.unpack();
+    let unpacked: [Option<Value>; N] = std::array::from_fn(|_| fields.next());
+    if fields.next().is_some() || unpacked.iter().any(Option::is_none) {
+        return Err(
+            PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                .with_message(format!("struct expected to have {N} fields")),
+        );
+    }
+    Ok(unpacked.map(|field| field.expect("checked above")))
 }
 
 fn unpack_option(option: Value, type_param: &Type) -> PartialVMResult<Option<Value>> {
