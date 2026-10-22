@@ -138,7 +138,7 @@ async fn the_stage_records_each_committed_transaction_s_status() {
     let mut decoded = commit(1, &[(&first, &[]), (&second, &[])]);
     let block = decoded.leader;
     decoded.rejected = vec![(block, 2)];
-    stage.process(decoded);
+    stage.process(decoded, &mut workqueue::Bump::default());
     let status = |index| {
         statuses.notify_read(ConsensusPosition {
             epoch: epoch.epoch,
@@ -262,7 +262,7 @@ fn the_later_of_two_transactions_spending_one_object_in_a_commit_is_dropped() {
         .handle(
             &epoch,
             commit(1, &[(&first, &[]), (&second, &[])]),
-            &mut containers::Bump::default(),
+            &mut workqueue::Bump::default(),
         )
         .unwrap();
     // The holder of the contested lock waits a round, as a penalty.
@@ -278,7 +278,7 @@ fn the_later_of_two_transactions_spending_one_object_in_a_commit_is_dropped() {
         .handle(
             &epoch,
             commit(2, &[(&second, &[])]),
-            &mut containers::Bump::default(),
+            &mut workqueue::Bump::default(),
         )
         .unwrap();
     assert_eq!(scheduled(&decided), vec![digest(&first)]);
@@ -304,7 +304,7 @@ fn a_deferred_transaction_outlives_a_restart() {
         .handle(
             &epoch,
             commit(1, &[(&first, &[]), (&second, &[])]),
-            &mut containers::Bump::default(),
+            &mut workqueue::Bump::default(),
         )
         .unwrap();
     assert_eq!(deferred(&decided), vec![digest(&first)]);
@@ -325,7 +325,7 @@ fn a_deferred_transaction_outlives_a_restart() {
     let (_, output, _) = EpochStore::open(dir.path(), 0);
     let mut handler = CommitHandler::new(output, 1, vec![([0; 96], 10_000)], &epoch.config, None);
     let decided = handler
-        .handle(&epoch, commit(2, &[]), &mut containers::Bump::default())
+        .handle(&epoch, commit(2, &[]), &mut workqueue::Bump::default())
         .unwrap();
     assert_eq!(scheduled(&decided), vec![digest(&first)]);
 }
@@ -385,7 +385,7 @@ fn a_key_a_quorum_voted_for_is_added_by_the_next_commit_across_a_restart() {
         .handle(
             &epoch,
             with_votes(1, vec![vote(0, "a"), vote(1, "a"), vote(0, "b")]),
-            &mut containers::Bump::default(),
+            &mut workqueue::Bump::default(),
         )
         .unwrap();
     assert!(updated_keys(&decided).is_empty());
@@ -410,16 +410,16 @@ fn a_key_a_quorum_voted_for_is_added_by_the_next_commit_across_a_restart() {
         .handle(
             &epoch,
             with_votes(2, vec![vote(2, "b")]),
-            &mut containers::Bump::default(),
+            &mut workqueue::Bump::default(),
         )
         .unwrap();
     assert_eq!(updated_keys(&decided), ["a"]);
     let decided = second
-        .handle(&epoch, commit(3, &[]), &mut containers::Bump::default())
+        .handle(&epoch, commit(3, &[]), &mut workqueue::Bump::default())
         .unwrap();
     assert_eq!(updated_keys(&decided), ["b"]);
     let decided = second
-        .handle(&epoch, commit(4, &[]), &mut containers::Bump::default())
+        .handle(&epoch, commit(4, &[]), &mut workqueue::Bump::default())
         .unwrap();
     assert!(updated_keys(&decided).is_empty());
 }
@@ -436,7 +436,7 @@ fn a_shared_gas_coin_conflicts_like_any_owned_input() {
         .handle(
             &epoch,
             commit(1, &[(&first, &[]), (&second, &[])]),
-            &mut containers::Bump::default(),
+            &mut workqueue::Bump::default(),
         )
         .unwrap();
     assert_eq!(deferred(&decided), vec![digest(&first)]);
@@ -462,7 +462,7 @@ fn a_lock_holds_across_commits_for_its_version_only() {
         .handle(
             &epoch,
             commit(1, &[(&first, &[])]),
-            &mut containers::Bump::default(),
+            &mut workqueue::Bump::default(),
         )
         .unwrap();
     assert_eq!(scheduled(&decided), vec![digest(&first)]);
@@ -470,7 +470,7 @@ fn a_lock_holds_across_commits_for_its_version_only() {
         .handle(
             &epoch,
             commit(2, &[(&again, &[]), (&later, &[])]),
-            &mut containers::Bump::default(),
+            &mut workqueue::Bump::default(),
         )
         .unwrap();
     assert_eq!(scheduled(&decided), vec![digest(&later)]);
@@ -505,7 +505,7 @@ fn inputs_claimed_immutable_are_not_locked() {
                     (&unclaimed[1], &[]),
                 ],
             ),
-            &mut containers::Bump::default(),
+            &mut workqueue::Bump::default(),
         )
         .unwrap();
     // The handler goes by the claim, which voting verified: without it, the
@@ -533,7 +533,7 @@ fn a_transaction_with_invalid_inputs_is_dropped_and_locks_nothing() {
         .handle(
             &epoch,
             commit(1, &[(&twice, &[]), (&valid, &[])]),
-            &mut containers::Bump::default(),
+            &mut workqueue::Bump::default(),
         )
         .unwrap();
     assert_eq!(scheduled(&decided), vec![digest(&valid)]);
@@ -582,7 +582,7 @@ fn handlers_fed_the_same_commits_decide_alike_and_a_replay_changes_nothing() {
             .map(|c| {
                 decisions(
                     &handler
-                        .handle(&epoch, c, &mut containers::Bump::default())
+                        .handle(&epoch, c, &mut workqueue::Bump::default())
                         .unwrap(),
                 )
             })
@@ -597,7 +597,7 @@ fn handlers_fed_the_same_commits_decide_alike_and_a_replay_changes_nothing() {
     for c in commits() {
         assert!(
             handler
-                .handle(&epoch, c, &mut containers::Bump::default())
+                .handle(&epoch, c, &mut workqueue::Bump::default())
                 .is_none()
         );
     }
@@ -605,11 +605,7 @@ fn handlers_fed_the_same_commits_decide_alike_and_a_replay_changes_nothing() {
     // sharing one, lost it, and the first waits a round.
     let (output, _dir) = consensus_output();
     let decided = new_handler(output)
-        .handle(
-            &epoch,
-            commits().remove(0),
-            &mut containers::Bump::default(),
-        )
+        .handle(&epoch, commits().remove(0), &mut workqueue::Bump::default())
         .unwrap();
     assert_eq!(deferred(&decided)[0], digest(&transactions[0]));
     assert_eq!(decided.dropped[0].2, digest(&transactions[1]));
@@ -702,11 +698,16 @@ fn the_stage_leaves_dropped_transactions_out_of_its_chunks() {
             .collect()
     };
     let decided = stage
-        .decide(commit(1, &[(&first, &[]), (&second, &[])]))
+        .decide(
+            commit(1, &[(&first, &[]), (&second, &[])]),
+            &mut workqueue::Bump::default(),
+        )
         .unwrap();
     // The first, its lock contested, is in the next round's chunks.
     assert!(users(&decided).is_empty());
-    let next = stage.decide(commit(2, &[])).unwrap();
+    let next = stage
+        .decide(commit(2, &[]), &mut workqueue::Bump::default())
+        .unwrap();
     assert_eq!(users(&next), vec![digest(&first)]);
     assert!(
         decided

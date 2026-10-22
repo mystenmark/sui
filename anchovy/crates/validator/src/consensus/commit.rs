@@ -414,10 +414,6 @@ impl CommitHandler {
     }
 }
 
-/// The commit handler's arena: enough for a commit's temporaries without a
-/// second chunk.
-const ARENA_BYTES: usize = 64 * 1024;
-
 /// The accumulator root (`SUI_ACCUMULATOR_ROOT_OBJECT_ID`), which each
 /// chunk's settlement writes.
 const ACCUMULATOR_ROOT: messages::base::ObjectId = messages::base::ObjectId::from_u16(0xacc);
@@ -557,8 +553,6 @@ pub struct CommitStage {
     start: EpochStart,
     queue: CheckpointQueue,
     commit_times: CommitIntervalObserver,
-    /// The handler's temporaries, for one commit at a time.
-    bump: Bump,
     /// Commits through this one were decided before a restart: replayed,
     /// they only rebuild the commit interval observer, which is in memory,
     /// as the reference's prior commits do.
@@ -610,7 +604,6 @@ impl CommitStage {
             start,
             queue,
             commit_times: CommitIntervalObserver::default(),
-            bump: Bump::with_capacity(ARENA_BYTES),
             prior_through,
             last_commit: record.map(|r| r.commit_index),
             closed: record.is_some_and(|r| r.closed),
@@ -632,7 +625,7 @@ impl CommitStage {
 
     /// Decides `commit` and lays it out in chunks and checkpoints, or
     /// nothing if it was handled before or follows the epoch's last.
-    pub fn decide(&mut self, commit: DecodedCommit) -> Option<Decided> {
+    pub fn decide(&mut self, commit: DecodedCommit, bump: &mut Bump) -> Option<Decided> {
         let epoch = &self.epoch.clone();
         if commit.commit_index <= self.prior_through {
             self.commit_times.observe(
@@ -652,7 +645,7 @@ impl CommitStage {
             dropped,
             estimates_us,
             ..
-        } = self.handler.handle(epoch, commit, &mut self.bump)?;
+        } = self.handler.handle(epoch, commit, bump)?;
         let config = &epoch.config;
         let Some(&Scheduled::Prologue(prologue)) = schedule.transactions.first() else {
             unreachable!("a schedule starts with its prologue");
@@ -914,9 +907,9 @@ impl Processor for CommitStage {
     type Output = ();
 
     /// Handles `commit`, then answers it: consensus may send the next.
-    fn process(&mut self, mut commit: DecodedCommit) -> Option<()> {
+    fn process(&mut self, mut commit: DecodedCommit, bump: &mut Bump) -> Option<()> {
         let handled = commit.handled.take();
-        let decided = self.handle(commit);
+        let decided = self.handle(commit, bump);
         if let Some(handled) = handled {
             match &self.backpressure {
                 Some(backpressure) => backpressure.answer(handled),
@@ -931,7 +924,7 @@ impl Processor for CommitStage {
 }
 
 impl CommitStage {
-    fn handle(&mut self, mut commit: DecodedCommit) -> Option<()> {
+    fn handle(&mut self, mut commit: DecodedCommit, bump: &mut Bump) -> Option<()> {
         let leader_round = commit.leader.round;
         let rejected = std::mem::take(&mut commit.rejected);
         let positions: Vec<(BlockRef, TransactionIndex)> = commit
@@ -940,7 +933,7 @@ impl CommitStage {
             .map(|t| (t.block, t.index))
             .collect();
         let commit_index = commit.commit_index;
-        let decided = self.decide(commit)?;
+        let decided = self.decide(commit, bump)?;
         let record = CommitRecord {
             commit_index,
             leader_round,
@@ -954,7 +947,7 @@ impl CommitStage {
             .finish(&record, self.queue.height, self.queue.pending.is_empty());
         // What became of each transaction, for its submitter: dropped, or
         // finalized (scheduled, or a duplicate of one that was).
-        let mut dropped = containers::hash_set(&self.bump, decided.dropped.len());
+        let mut dropped = containers::hash_set(bump, decided.dropped.len());
         dropped.extend(decided.dropped.iter().map(|(b, i, ..)| (*b, *i)));
         self.statuses.set_statuses(
             rejected

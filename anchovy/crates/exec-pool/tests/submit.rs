@@ -51,10 +51,14 @@ impl Submission {
         let request = Request::new(vec![parsed], reply);
         let verified = self
             .validator
-            .process(request)
-            .and_then(|valid| self.verifier.process(valid))
+            .process(request, &mut workqueue::Bump::default())
+            .and_then(|valid| {
+                self.verifier
+                    .process(valid, &mut workqueue::Bump::default())
+            })
             .expect("valid and verified");
-        self.checker.process(verified);
+        self.checker
+            .process(verified, &mut workqueue::Bump::default());
         answer
     }
 }
@@ -92,7 +96,7 @@ fn a_transaction_is_readied_for_consensus_and_its_wait_woken_once_executed() {
         },
         transactions: vec![consensus_bytes.clone()],
     };
-    assert_eq!(voter.vote(block), Ok(vec![]));
+    assert_eq!(voter.vote(block, &workqueue::Bump::default()), Ok(vec![]));
 
     // A wait for its effects is woken once it executes.
     let (settlement, settlement_inbox) = workqueue::queue::<SettlementInput>(16);
@@ -106,11 +110,20 @@ fn a_transaction_is_readied_for_consensus_and_its_wait_woken_once_executed() {
     let (reply, mut woken) = tokio::sync::oneshot::channel();
     let mut batch = WaitBatch::new();
     batch.push(EffectsWaitItem::Executed(reply), [EffectsKey(digest)]);
-    assert!(waiter.process(Command::Wait(batch)).is_none());
+    assert!(
+        waiter
+            .process(Command::Wait(batch), &mut workqueue::Bump::default())
+            .is_none()
+    );
     let executable = node.executable(transfer, vec![], vec![]);
-    node.executor.process(vec![executable]);
+    node.executor
+        .process(vec![executable], &mut workqueue::Bump::default());
     let notify = node.notified_effects.try_pop().expect("effects notified");
-    router.send(waiter.process(notify).expect("the wait is ready"));
+    router.send(
+        waiter
+            .process(notify, &mut workqueue::Bump::default())
+            .expect("the wait is ready"),
+    );
     assert_eq!(woken.try_recv(), Ok(()));
     assert!(settlement_inbox.try_pop().is_none());
 

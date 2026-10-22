@@ -291,7 +291,8 @@ fn ours(
         .iter()
         .map(|b| Message::parse(b.clone()).map_err(|(e, _)| e).unwrap())
         .collect();
-    let mut builder = SettlementBuilder::new(seq, offset);
+    let bump = containers::Bump::default();
+    let mut builder = SettlementBuilder::new(seq, offset, &bump);
     for (i, e) in parsed.iter().enumerate() {
         builder.add(i as u64, e.get());
     }

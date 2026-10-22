@@ -204,7 +204,8 @@ fn main() {
             timestamp_ms: 0,
             root_state: None,
         };
-        let mut bump = Bump::with_capacity(4096);
+        // As a worker's arena: reset after each item, never freed.
+        let mut bump = Bump::with_capacity(1 << 20);
 
         let rounds = 100;
         let (mut contents_time, mut contents_allocs) = (Duration::ZERO, 0);
@@ -219,14 +220,14 @@ fn main() {
             };
             let before = ALLOCATIONS.load(Ordering::Relaxed);
             let start = Instant::now();
-            let (built, built_effects) = builder.build(pending);
+            let (built, built_effects) = builder.build(pending, &mut bump);
             let took = start.elapsed();
             let allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
             assert_eq!(built_effects.len(), size);
 
             let before = ALLOCATIONS.load(Ordering::Relaxed);
             let start = Instant::now();
-            let summary = summary::build(&built, Some(&previous), &epoch, &mut bump);
+            let summary = summary::build(&built, Some(&previous), &epoch, &bump);
             let summary_took = start.elapsed();
             let summary_allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
 
@@ -242,6 +243,7 @@ fn main() {
                 summary_allocs += summary_allocated;
                 sign_time += sign_took;
             }
+            bump.reset();
         }
         // The part of the contents that is reading the transactions.
         let before = ALLOCATIONS.load(Ordering::Relaxed);

@@ -184,7 +184,10 @@ fn a_valid_transfer_is_accepted_and_cached() {
         vec![user_transaction(&node.transfer(node.gas()), &[no_alias()])],
     );
     let reference = block.reference;
-    assert_eq!(node.voter().vote(block), Ok(vec![]));
+    assert_eq!(
+        node.voter().vote(block, &containers::Bump::default()),
+        Ok(vec![])
+    );
     let entries = node.cache.take(&reference).unwrap();
     assert_eq!(entries.len(), 1);
     assert!(entries[0].is_some());
@@ -209,11 +212,14 @@ fn a_signature_that_does_not_verify_fails_alone() {
     );
     let reference = block.reference;
     let mut voter = node.voter();
-    assert_eq!(voter.vote(block.clone()), Ok(vec![1]));
+    assert_eq!(
+        voter.vote(block.clone(), &containers::Bump::default()),
+        Ok(vec![1])
+    );
     let entries = node.cache.take(&reference).unwrap();
     assert!(entries[0].is_some() && entries[1].is_none() && entries[2].is_some());
     // Again, the valid two from the signature cache.
-    assert_eq!(voter.vote(block), Ok(vec![1]));
+    assert_eq!(voter.vote(block, &containers::Bump::default()), Ok(vec![1]));
 }
 
 #[test]
@@ -232,7 +238,10 @@ fn bad_signatures_and_spent_inputs_are_rejected() {
         ],
     );
     let reference = block.reference;
-    assert_eq!(node.voter().vote(block), Ok(vec![0, 1]));
+    assert_eq!(
+        node.voter().vote(block, &containers::Bump::default()),
+        Ok(vec![0, 1])
+    );
     // A bad signature is not kept; a transaction whose inputs failed is, as a
     // quorum may still accept it.
     let entries = node.cache.take(&reference).unwrap();
@@ -250,12 +259,18 @@ fn alias_claims_must_match_the_signatures() {
         3,
         vec![user_transaction(&transaction, &[aliases(&[(0, Some(5))])])],
     );
-    assert_eq!(node.voter().vote(changed), Ok(vec![0]));
+    assert_eq!(
+        node.voter().vote(changed, &containers::Bump::default()),
+        Ok(vec![0])
+    );
     // No claim, or one naming a signature the transaction lacks: the block is
     // invalid.
     for claims in [vec![], vec![aliases(&[(1, None)])]] {
         let invalid = block(4, vec![user_transaction(&transaction, &claims)]);
-        let verdict = node.voter().vote(invalid).unwrap_err();
+        let verdict = node
+            .voter()
+            .vote(invalid, &containers::Bump::default())
+            .unwrap_err();
         assert_eq!(verdict.index, 0);
     }
 }
@@ -271,7 +286,10 @@ fn an_executed_transaction_is_accepted_though_its_inputs_are_spent() {
         .unwrap();
     node.store.write_through(outcome.commit).unwrap();
     let block = block(5, vec![user_transaction(&transaction, &[no_alias()])]);
-    assert_eq!(node.voter().vote(block), Ok(vec![]));
+    assert_eq!(
+        node.voter().vote(block, &containers::Bump::default()),
+        Ok(vec![])
+    );
 }
 
 /// `TransactionClaim::ImmutableInputObjects`.
@@ -295,7 +313,10 @@ fn a_false_immutable_claim_is_rejected_and_cached_as_claimed() {
         )],
     );
     let reference = block.reference;
-    assert_eq!(node.voter().vote(block), Ok(vec![0]));
+    assert_eq!(
+        node.voter().vote(block, &containers::Bump::default()),
+        Ok(vec![0])
+    );
     // The handler locks by the claim, whatever this validator voted: if a
     // quorum accepts it, the coin it claims immutable is not locked.
     let entries = node.cache.take(&reference).unwrap();
@@ -323,7 +344,10 @@ fn an_executed_transaction_s_immutable_claim_is_still_verified() {
             &[no_alias(), immutable(&[gas.0])],
         )],
     );
-    assert_eq!(node.voter().vote(block), Ok(vec![0]));
+    assert_eq!(
+        node.voter().vote(block, &containers::Bump::default()),
+        Ok(vec![0])
+    );
 }
 
 #[test]
@@ -338,7 +362,10 @@ fn undecodable_and_deprecated_transactions_invalidate_the_block() {
     for bad in [truncated, v1] {
         let block = block(6, vec![user_transaction(&transaction, &[no_alias()]), bad]);
         let reference = block.reference;
-        let verdict = node.voter().vote(block).unwrap_err();
+        let verdict = node
+            .voter()
+            .vote(block, &containers::Bump::default())
+            .unwrap_err();
         assert_eq!(verdict.index, 1, "{}", verdict.reason);
         assert!(node.cache.take(&reference).is_none());
     }
@@ -353,7 +380,10 @@ fn other_kinds_are_accepted_and_not_cached() {
     .unwrap();
     let block = block(7, vec![end_of_publish]);
     let reference = block.reference;
-    assert_eq!(node.voter().vote(block), Ok(vec![]));
+    assert_eq!(
+        node.voter().vote(block, &containers::Bump::default()),
+        Ok(vec![])
+    );
     assert_eq!(node.cache.take(&reference).unwrap().len(), 1);
 }
 
@@ -394,7 +424,7 @@ impl Committer {
     fn handle(&mut self, epoch: &EpochState, commit: CommittedSubDag) -> Option<HandledCommit> {
         let decoded = self.decoder.decode(commit);
         self.handler
-            .handle(&epoch.params, decoded, &mut containers::Bump::default())
+            .handle(&epoch.params, decoded, &mut workqueue::Bump::default())
     }
 }
 
@@ -450,7 +480,11 @@ fn a_voted_block_s_transactions_come_from_the_cache() {
         1,
         vec![user_transaction(&node.transfer(node.gas()), &[no_alias()])],
     );
-    assert_eq!(node.voter().vote(block.clone()), Ok(vec![]));
+    assert_eq!(
+        node.voter()
+            .vote(block.clone(), &containers::Bump::default()),
+        Ok(vec![])
+    );
     let handled = committer(&node)
         .handle(&node.epoch, commit(1, 1, vec![block], vec![]))
         .unwrap();
@@ -539,7 +573,11 @@ fn the_first_of_two_transactions_spending_one_coin_wins() {
     let second = user_transaction(&node.transfer(gas), &[no_alias()]);
     let block = block(1, vec![first, second]);
     // Both pass voting: neither has executed when the block is voted on.
-    assert_eq!(node.voter().vote(block.clone()), Ok(vec![]));
+    assert_eq!(
+        node.voter()
+            .vote(block.clone(), &containers::Bump::default()),
+        Ok(vec![])
+    );
     let handled = committer(&node)
         .handle(&node.epoch, commit(1, 1, vec![block], vec![]))
         .unwrap();
@@ -558,7 +596,10 @@ fn blocks_below_the_gc_round_are_evicted() {
     let recent = block(depth + 2, vec![]);
     let leader = block(depth + 3, vec![]);
     for b in [&old, &recent] {
-        assert_eq!(node.voter().vote(b.clone()), Ok(vec![]));
+        assert_eq!(
+            node.voter().vote(b.clone(), &containers::Bump::default()),
+            Ok(vec![])
+        );
     }
     committer(&node)
         .handle(
@@ -639,7 +680,7 @@ fn handlers_decide_alike_whatever_has_executed() {
                     .handle(
                         &node.epoch.params,
                         decoder.decode(c.clone()),
-                        &mut containers::Bump::default(),
+                        &mut workqueue::Bump::default(),
                     )
                     .unwrap();
                 let order: Vec<_> =

@@ -5,7 +5,7 @@
 //! reference's `AccumulatorSettlementTxBuilder` and
 //! `build_accumulator_barrier_tx` build them.
 
-use std::collections::BTreeMap;
+use containers::{BTreeMap, Bump};
 use std::hash::BuildHasher;
 
 use hashbrown::HashTable;
@@ -241,19 +241,20 @@ fn is_sui_balance(tag: &TypeTagView<'_>) -> bool {
 }
 
 /// A chunk's accumulator events, merged per accumulator object.
-pub struct SettlementBuilder {
+pub struct SettlementBuilder<'b> {
     /// Iterated to build the transactions, so ordered by object id.
-    updates: BTreeMap<[u8; 32], Update>,
+    updates: BTreeMap<'b, [u8; 32], Update>,
     checkpoint_seq: u64,
     tx_index_offset: u64,
 }
 
-impl SettlementBuilder {
+impl<'b> SettlementBuilder<'b> {
     /// A builder for a chunk of checkpoint `checkpoint_seq` whose first
-    /// transaction is the checkpoint's `tx_index_offset`th.
-    pub fn new(checkpoint_seq: u64, tx_index_offset: u64) -> SettlementBuilder {
+    /// transaction is the checkpoint's `tx_index_offset`th, its table in
+    /// `bump`.
+    pub fn new(checkpoint_seq: u64, tx_index_offset: u64, bump: &'b Bump) -> SettlementBuilder<'b> {
         SettlementBuilder {
-            updates: BTreeMap::new(),
+            updates: BTreeMap::new_in(bump),
             checkpoint_seq,
             tx_index_offset,
         }

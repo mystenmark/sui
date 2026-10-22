@@ -137,7 +137,7 @@ fn main() {
         for (round, batch) in batches.into_iter().enumerate() {
             let before = ALLOCATIONS.load(Ordering::Relaxed);
             let start = Instant::now();
-            aggregator.process(batch);
+            aggregator.process(batch, &mut workqueue::Bump::default());
             let took = start.elapsed();
             let allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
             assert_eq!(certified.try_pop().unwrap().seq, round as u64);

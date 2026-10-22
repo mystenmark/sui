@@ -254,7 +254,7 @@ impl Processor for VersionResolver {
     type Input = Chunk;
     type Output = ();
 
-    fn process(&mut self, chunk: Chunk) -> Option<()> {
+    fn process(&mut self, chunk: Chunk, _bump: &mut workqueue::Bump) -> Option<()> {
         let Chunk {
             version,
             root_version,

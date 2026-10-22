@@ -74,7 +74,6 @@ pub struct EpochCloser {
     hasher: Queue<CheckpointEffects>,
     summary: Queue<Vec<CheckpointContentsBuilt>>,
     closing: Option<Closing>,
-    bump: Bump,
 }
 
 /// The last checkpoint, between the steps above.
@@ -104,12 +103,11 @@ impl EpochCloser {
             hasher,
             summary,
             closing: None,
-            bump: Bump::with_capacity(crate::ARENA),
         }
     }
 
     /// Step 1 and 2.
-    fn close(&mut self, built: CheckpointContentsBuilt) {
+    fn close(&mut self, built: CheckpointContentsBuilt, bump: &Bump) {
         let seq = built.pending.seq;
         let close = built
             .pending
@@ -120,7 +118,7 @@ impl EpochCloser {
             .checkpoints
             .built(seq - 1)
             .expect("a checkpoint is released once the previous one is built");
-        let kinds = self.end_of_epoch_kinds(&built, &close);
+        let kinds = self.end_of_epoch_kinds(&built, &close, bump);
         let epoch = &self.epoch;
         let transaction = end_of_epoch_transaction(
             epoch.epoch,
@@ -166,6 +164,7 @@ impl EpochCloser {
         &mut self,
         built: &CheckpointContentsBuilt,
         close: &EpochClose,
+        bump: &Bump,
     ) -> Vec<EndOfEpochTransactionKind> {
         let config = &self.epoch.config;
         let objects = self.objects;
@@ -207,7 +206,7 @@ impl EpochCloser {
         if let PerObjectCongestionControlMode::ExecutionTimeEstimate(params) =
             config.per_object_congestion_control_mode()
         {
-            let observations = self.stored_observations(built, close, &params);
+            let observations = self.stored_observations(built, close, &params, bump);
             kinds.push(EndOfEpochTransactionKind::StoreExecutionTimeObservations(
                 observations,
             ));
@@ -269,14 +268,14 @@ impl EpochCloser {
         built: &CheckpointContentsBuilt,
         close: &EpochClose,
         params: &ExecutionTimeEstimateParams,
+        bump: &Bump,
     ) -> StoredExecutionTimeObservations {
         let last_before = built.pending.seq - 1;
         let first = last_before
             .saturating_sub(params.stored_observations_num_included_checkpoints - 1)
             .max(close.first_checkpoint);
         let observations = &close.observations;
-        let flags = Bump::with_capacity(observations.len());
-        let mut used = containers::Vec::with_capacity_in(observations.len(), &flags);
+        let mut used = containers::Vec::with_capacity_in(observations.len(), bump);
         used.resize(observations.len(), false);
         for seq in first..=last_before {
             let contents = self
@@ -285,9 +284,9 @@ impl EpochCloser {
                 .expect("the epoch's checkpoints are built")
                 .contents
                 .clone();
-            self.mark_used(&contents, observations, &mut used);
+            self.mark_used(&contents, observations, &mut used, bump);
         }
-        self.mark_used(&built.contents, observations, &mut used);
+        self.mark_used(&built.contents, observations, &mut used, bump);
         let limit = usize::try_from(params.stored_observations_limit).unwrap_or(usize::MAX);
         StoredExecutionTimeObservations::V1(
             observations
@@ -320,8 +319,9 @@ impl EpochCloser {
         contents: &[u8],
         observations: &[(Key, Vec<([u8; 96], std::time::Duration)>)],
         used: &mut [bool],
+        bump: &Bump,
     ) {
-        for digest in crate::transactions(contents, &mut self.bump) {
+        for digest in crate::transactions(contents, bump) {
             let transaction = self
                 .store
                 .transaction(&digest)
@@ -341,7 +341,7 @@ impl EpochCloser {
     }
 
     /// Step 3.
-    fn executed(&mut self) {
+    fn executed(&mut self, bump: &mut Bump) {
         let change_epoch = self
             .closing
             .as_ref()
@@ -359,7 +359,7 @@ impl EpochCloser {
             &self.epoch,
             closing.built.pending.clone(),
             &effects,
-            &mut self.bump,
+            bump,
         );
         push(
             &self.hasher,
@@ -420,13 +420,13 @@ impl Processor for EpochCloser {
     type Input = EpochCloserInput;
     type Output = ();
 
-    fn process(&mut self, input: EpochCloserInput) -> Option<()> {
+    fn process(&mut self, input: EpochCloserInput, bump: &mut Bump) -> Option<()> {
         match input {
             EpochCloserInput::Built(ready) => {
                 let mut passed = Vec::with_capacity(ready.len());
                 for built in ready {
                     if built.pending.close.is_some() {
-                        self.close(built);
+                        self.close(built, bump);
                     } else {
                         passed.push(built);
                     }
@@ -435,7 +435,7 @@ impl Processor for EpochCloser {
                     push(&self.summary, passed, "summary builder");
                 }
             }
-            EpochCloserInput::ChangeEpochExecuted => self.executed(),
+            EpochCloserInput::ChangeEpochExecuted => self.executed(bump),
             EpochCloserInput::Root(root) => self.rooted(root),
         }
         None

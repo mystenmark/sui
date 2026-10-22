@@ -219,7 +219,7 @@ fn resolve(epoch: &Arc<EpochParams>, rng: &mut Rng) {
                 let chunk = chunk(round, &transactions);
                 let before = ALLOCATIONS.load(Ordering::Relaxed);
                 let start = Instant::now();
-                resolver.process(chunk);
+                resolver.process(chunk, &mut workqueue::Bump::default());
                 let took = start.elapsed();
                 let allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
                 let Some(Command::Wait(batch)) = inbox.try_pop() else {

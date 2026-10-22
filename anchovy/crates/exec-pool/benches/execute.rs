@@ -72,7 +72,8 @@ fn run(name: &str, node: &mut Node, executables: Vec<Executable>) {
         }
         let before = ALLOCATIONS.load(Ordering::Relaxed);
         let start = Instant::now();
-        node.executor.process(batch);
+        node.executor
+            .process(batch, &mut workqueue::Bump::default());
         elapsed += start.elapsed();
         allocations += ALLOCATIONS.load(Ordering::Relaxed) - before;
         while node.notified_inputs.try_pop().is_some() {}

@@ -85,7 +85,7 @@ fn main() {
             };
             let before = ALLOCATIONS.load(Ordering::Relaxed);
             let start = Instant::now();
-            processor.process(item);
+            processor.process(item, &mut workqueue::Bump::default());
             let took = start.elapsed();
             let allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
             assert!(hashes.root(seq).is_some());

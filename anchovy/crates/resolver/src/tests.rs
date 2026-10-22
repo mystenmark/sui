@@ -563,7 +563,11 @@ fn a_resolved_chunk_waits_in_the_input_waiter_until_its_keys_are_available() {
             spend,
         ],
     };
-    assert!(resolver.process(link(chunk)).is_none());
+    assert!(
+        resolver
+            .process(link(chunk), &mut workqueue::Bump::default())
+            .is_none()
+    );
     let Some(Command::Wait(mut batch)) = inbox.try_pop() else {
         panic!("a wait");
     };
@@ -641,7 +645,7 @@ fn a_resolved_chunk_waits_in_the_input_waiter_until_its_keys_are_available() {
         checkpoint_seq: 2,
         entries: vec![system(vec![access(clock, Mutable, 2, 0)])],
     };
-    resolver.process(link(next));
+    resolver.process(link(next), &mut workqueue::Bump::default());
     let Some(Command::Wait(mut batch)) = inbox.try_pop() else {
         panic!("a wait");
     };
@@ -663,7 +667,7 @@ fn an_empty_chunk_waits_for_nothing() {
         checkpoint_seq: 0,
         entries: vec![],
     };
-    resolver.process(chunk);
+    resolver.process(chunk, &mut workqueue::Bump::default());
     assert!(inbox.try_pop().is_none());
 }
 
@@ -819,7 +823,7 @@ fn a_withdrawing_transaction_waits_on_its_reservations_instead_of_its_inputs() {
             user(vec![], vec![], gas),
         ],
     };
-    resolver.process(chunk);
+    resolver.process(chunk, &mut workqueue::Bump::default());
     let expected: Vec<Reservation> = amounts
         .iter()
         .map(|&(account, amount)| Reservation {

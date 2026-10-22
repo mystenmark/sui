@@ -40,7 +40,6 @@ pub struct CheckpointCommitter {
     backpressure: Arc<Backpressure>,
     /// The epoch's last checkpoint, once committed.
     ended: watch::Sender<Option<u64>>,
-    bump: Bump,
 }
 
 impl CheckpointCommitter {
@@ -61,27 +60,27 @@ impl CheckpointCommitter {
             consensus_output,
             backpressure,
             ended,
-            bump: Bump::with_capacity(super::ARENA),
         }
     }
 
     /// # Panics
     /// If this validator did not build `certified`, its contents do not
     /// parse, or the store's commit panics.
-    fn commit(&mut self, certified: &CertifiedCheckpoint) {
+    fn commit(&mut self, certified: &CertifiedCheckpoint, bump: &Bump) {
         let seq = certified.seq;
         let built = self
             .checkpoints
             .built(seq)
             .expect("a checkpoint is certified only once built here");
-        let transactions = crate::transactions(&built.contents, &mut self.bump);
+        let transactions = crate::transactions(&built.contents, bump);
         self.store.commit_checkpoint(
             seq,
             &transactions,
             built.encode(),
             certified.summary.to_vec(),
         );
-        let digests: Vec<[u8; 32]> = transactions.iter().map(|d| d.bytes).collect();
+        let mut digests = containers::Vec::with_capacity_in(transactions.len(), bump);
+        digests.extend(transactions.iter().map(|d| d.bytes));
         self.generations.commit(&digests);
         self.consensus_output.committed_through(built.last_height);
         self.chunks.prune_through(built.last_height);
@@ -97,9 +96,10 @@ impl Processor for CheckpointCommitter {
     type Input = Vec<CertifiedCheckpoint>;
     type Output = ();
 
-    fn process(&mut self, certified: Vec<CertifiedCheckpoint>) -> Option<()> {
+    fn process(&mut self, certified: Vec<CertifiedCheckpoint>, bump: &mut Bump) -> Option<()> {
         for checkpoint in &certified {
-            self.commit(checkpoint);
+            self.commit(checkpoint, bump);
+            bump.reset();
         }
         None
     }

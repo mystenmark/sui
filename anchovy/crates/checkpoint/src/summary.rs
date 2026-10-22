@@ -49,13 +49,12 @@ pub fn rolling_gas(
 
 /// The summary of `built`, in epoch `params`, after `previous` (`None` only
 /// for checkpoint 0), as the reference's `CheckpointSummary::new`, with its
-/// end-of-epoch data if it is the epoch's last. `bump` is scratch, reset
-/// here.
+/// end-of-epoch data if it is the epoch's last, with temporaries in `bump`.
 pub fn build(
     built: &CheckpointContentsBuilt,
     previous: Option<&BuiltCheckpoint>,
     params: &EpochParams,
-    bump: &mut Bump,
+    bump: &Bump,
 ) -> Summary {
     let epoch = params.epoch;
     let network_total_transactions =
@@ -63,22 +62,18 @@ pub fn build(
     let epoch_rolling_gas = rolling_gas(built, previous, epoch);
 
     let version_specific_data = match params.config.checkpoint_summary_version_specific_data {
-        None | Some(0) => Vec::new(),
-        Some(1) => version_specific_data_v1(&built.randomness_rounds),
+        None | Some(0) => containers::Vec::new_in(bump),
+        Some(1) => version_specific_data_v1(&built.randomness_rounds, bump),
         Some(v) => panic!("unknown checkpoint summary version-specific data version {v}"),
     };
-    let commitments: Vec<(CheckpointCommitmentKind, Digest)> = built
-        .artifacts_digest
-        .iter()
-        .map(|d| {
-            (
-                CheckpointCommitmentKind::CheckpointArtifactsDigest,
-                Digest::new(*d),
-            )
-        })
-        .collect();
+    let mut commitments = containers::Vec::new_in(bump);
+    commitments.extend(built.artifacts_digest.iter().map(|d| {
+        (
+            CheckpointCommitmentKind::CheckpointArtifactsDigest,
+            Digest::new(*d),
+        )
+    }));
 
-    bump.reset();
     let mut summary = SummaryBuilder::new_in(
         bump,
         epoch,
@@ -141,8 +136,11 @@ fn summary_epoch(summary: &[u8]) -> u64 {
 }
 
 /// `CheckpointVersionSpecificData::V1 { randomness_rounds }` BCS.
-fn version_specific_data_v1(randomness_rounds: &[u64]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(6 + 8 * randomness_rounds.len());
+fn version_specific_data_v1<'b>(
+    randomness_rounds: &[u64],
+    bump: &'b Bump,
+) -> containers::Vec<'b, u8> {
+    let mut out = containers::Vec::with_capacity_in(6 + 8 * randomness_rounds.len(), bump);
     out.push(0);
     let mut n = randomness_rounds.len();
     loop {
@@ -193,9 +191,10 @@ mod tests {
 
     #[test]
     fn version_specific_data_lengths() {
-        assert_eq!(version_specific_data_v1(&[]), vec![0, 0]);
+        let bump = Bump::default();
+        assert_eq!(*version_specific_data_v1(&[], &bump), [0, 0]);
         let rounds: Vec<u64> = (0..130).collect();
-        let bytes = version_specific_data_v1(&rounds);
+        let bytes = version_specific_data_v1(&rounds, &bump);
         assert_eq!(&bytes[..3], &[0, 0x82, 0x01]);
         assert_eq!(bytes.len(), 3 + 8 * 130);
     }

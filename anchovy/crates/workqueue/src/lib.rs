@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+pub use arena::Bump;
 use crossbeam_channel::{Receiver, Select, Sender, TryRecvError, TrySendError};
 
 /// Handles one work item at a time on a worker thread. Its state belongs to
@@ -29,9 +30,15 @@ pub trait Processor {
     type Output;
 
     /// What it returns, if anything, goes to the worker's sink for it;
-    /// `None` when the item is dealt with here.
-    fn process(&mut self, item: Self::Input) -> Option<Self::Output>;
+    /// `None` when the item is dealt with here. `bump` holds the item's
+    /// temporaries: the worker's arena, shared by its processors and reset
+    /// after each item, but never freed. A processor may reset it between
+    /// parts of one item.
+    fn process(&mut self, item: Self::Input, bump: &mut Bump) -> Option<Self::Output>;
 }
+
+/// A worker's arena to start with; it grows to its largest item's need.
+const ARENA_BYTES: usize = 64 * 1024;
 
 /// Where a processor's outputs go.
 pub trait Sink<T>: Send {
@@ -246,7 +253,7 @@ impl Worker {
     /// impl Processor for Takes {
     ///     type Input = String;
     ///     type Output = ();
-    ///     fn process(&mut self, _: String) -> Option<()> {
+    ///     fn process(&mut self, _: String, _bump: &mut Bump) -> Option<()> {
     ///         None
     ///     }
     /// }
@@ -353,7 +360,7 @@ enum Step {
 
 trait Slot {
     fn register<'a>(&'a self, select: &mut Select<'a>) -> usize;
-    fn step(&self) -> Step;
+    fn step(&self, bump: &mut Bump) -> Step;
 }
 
 impl<P: Processor, K: Sink<P::Output>> Slot for Built<P, K> {
@@ -361,7 +368,7 @@ impl<P: Processor, K: Sink<P::Output>> Slot for Built<P, K> {
         select.recv(&self.inbox)
     }
 
-    fn step(&self) -> Step {
+    fn step(&self, bump: &mut Bump) -> Step {
         match self.inbox.try_recv() {
             Ok(item) => {
                 let (processor, sink) = &mut *self.stage.borrow_mut();
@@ -369,10 +376,11 @@ impl<P: Processor, K: Sink<P::Output>> Slot for Built<P, K> {
                 // later item, down. Its reply sender is dropped, which its
                 // sender sees.
                 let ran = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    if let Some(output) = processor.process(item) {
+                    if let Some(output) = processor.process(item, bump) {
                         sink.send(output);
                     }
                 }));
+                bump.reset();
                 if ran.is_err() && self.abort_on_panic {
                     // The panic hook has already reported it.
                     std::process::abort();
@@ -391,6 +399,7 @@ impl<P: Processor, K: Sink<P::Output>> Slot for Built<P, K> {
 }
 
 fn run(slots: &[Box<dyn Slot>], stop: &Receiver<()>) {
+    let mut bump = Bump::with_capacity(ARENA_BYTES);
     let mut select = Select::new();
     let stop_index = select.recv(stop);
     let indices: Vec<usize> = slots.iter().map(|s| s.register(&mut select)).collect();
@@ -405,7 +414,7 @@ fn run(slots: &[Box<dyn Slot>], stop: &Receiver<()>) {
             .iter()
             .position(|&i| i == ready)
             .expect("a registered index");
-        match slots[slot].step() {
+        match slots[slot].step(&mut bump) {
             Step::Ran | Step::Empty => {}
             // No queue can send to it again; stop waiting on it.
             Step::Closed => select.remove(ready),
@@ -439,7 +448,7 @@ mod tests {
         type Input = (usize, mpsc::Sender<Echoed>);
         type Output = ();
 
-        fn process(&mut self, (n, reply): Self::Input) -> Option<()> {
+        fn process(&mut self, (n, reply): Self::Input, _bump: &mut Bump) -> Option<()> {
             assert_ne!(n, 13, "unlucky");
             self.seen += 1;
             reply.send((n, thread_name(), self.seen)).unwrap();
@@ -455,7 +464,7 @@ mod tests {
         type Input = mpsc::Sender<String>;
         type Output = ();
 
-        fn process(&mut self, reply: mpsc::Sender<String>) -> Option<()> {
+        fn process(&mut self, reply: mpsc::Sender<String>, _bump: &mut Bump) -> Option<()> {
             reply.send(thread_name()).unwrap();
             None
         }
@@ -502,7 +511,7 @@ mod tests {
         type Input = Job<u32>;
         type Output = Job<String>;
 
-        fn process(&mut self, job: Job<u32>) -> Option<Job<String>> {
+        fn process(&mut self, job: Job<u32>, _bump: &mut Bump) -> Option<Job<String>> {
             Some(Job {
                 value: format!("#{}", job.value),
                 reply: job.reply,
@@ -517,7 +526,7 @@ mod tests {
         type Input = Job<String>;
         type Output = ();
 
-        fn process(&mut self, job: Job<String>) -> Option<()> {
+        fn process(&mut self, job: Job<String>, _bump: &mut Bump) -> Option<()> {
             job.reply
                 .send(Ok(format!("{} on {}", job.value, thread_name())))
                 .unwrap();
@@ -613,7 +622,7 @@ mod tests {
         type Input = ();
         type Output = ();
 
-        fn process(&mut self, (): ()) -> Option<()> {
+        fn process(&mut self, (): (), _bump: &mut Bump) -> Option<()> {
             let _ = self.0.recv();
             None
         }
@@ -704,7 +713,7 @@ mod tests {
         type Input = ();
         type Output = ();
 
-        fn process(&mut self, (): ()) -> Option<()> {
+        fn process(&mut self, (): (), _bump: &mut Bump) -> Option<()> {
             None
         }
     }
@@ -737,7 +746,7 @@ mod tests {
         type Input = u32;
         type Output = u32;
 
-        fn process(&mut self, n: u32) -> Option<u32> {
+        fn process(&mut self, n: u32, _bump: &mut Bump) -> Option<u32> {
             std::thread::sleep(std::time::Duration::from_millis(2));
             if n % 2 == 1 {
                 self.kept.push(n);
@@ -754,7 +763,7 @@ mod tests {
         type Input = u32;
         type Output = ();
 
-        fn process(&mut self, n: u32) -> Option<()> {
+        fn process(&mut self, n: u32, _bump: &mut Bump) -> Option<()> {
             std::thread::sleep(std::time::Duration::from_millis(2));
             self.0.lock().unwrap().push(n);
             None

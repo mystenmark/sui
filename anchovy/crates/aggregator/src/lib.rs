@@ -593,7 +593,11 @@ impl Processor for CheckpointAggregator {
     type Input = Vec<CheckpointSignature>;
     type Output = Vec<CertifiedCheckpoint>;
 
-    fn process(&mut self, ready: Vec<CheckpointSignature>) -> Option<Vec<CertifiedCheckpoint>> {
+    fn process(
+        &mut self,
+        ready: Vec<CheckpointSignature>,
+        _bump: &mut workqueue::Bump,
+    ) -> Option<Vec<CertifiedCheckpoint>> {
         let mut certified = Vec::new();
         for signature in &ready {
             self.add(signature, &mut certified);

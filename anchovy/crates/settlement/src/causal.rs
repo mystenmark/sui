@@ -4,41 +4,43 @@
 //! The order of a chunk's effects in its checkpoint, as the reference's
 //! `CausalOrder::order_for_checkpoint` gives it.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-
+use containers::{BTreeMap, BTreeSet, Bump, Vec};
 use messages::effects::{ObjectIn, TransactionEffects, UnchangedConsensusKind, VersionedEffects};
 use messages::object::Owner;
 
-type Digest = [u8; 32];
+type Digest = messages::base::Digest;
 type ObjectKey = ([u8; 32], u64);
 
 /// The positions of `effects`, given in schedule order, in checkpoint order.
 /// With `keep_schedule_order` (`disable_effects_tx_dependencies`) that is
 /// schedule order. Otherwise the prologue, if `prologue_first`, stays first
 /// and the rest are sorted causally, independently of their given order.
-pub fn checkpoint_order(
+/// The order and the sort's tables are in `bump`.
+pub fn checkpoint_order<'b>(
     effects: &[&TransactionEffects<'_>],
     prologue_first: bool,
     keep_schedule_order: bool,
-) -> Vec<usize> {
+    bump: &'b Bump,
+) -> Vec<'b, usize> {
+    let mut order = Vec::with_capacity_in(effects.len(), bump);
     if keep_schedule_order || effects.is_empty() {
-        return (0..effects.len()).collect();
+        order.extend(0..effects.len());
+        return order;
     }
     let skip = usize::from(prologue_first);
-    let mut order = Vec::with_capacity(effects.len());
     order.extend(0..skip);
-    causal_sort(effects, skip, &mut order);
+    causal_sort(effects, skip, &mut order, bump);
     order
 }
 
 fn transaction_digest(effects: &TransactionEffects<'_>) -> Digest {
     match &effects.version {
-        VersionedEffects::V1(v1) => v1.transaction_digest.bytes,
-        VersionedEffects::V2(v2) => v2.transaction_digest.bytes,
+        VersionedEffects::V1(v1) => *v1.transaction_digest,
+        VersionedEffects::V2(v2) => *v2.transaction_digest,
     }
 }
 
-fn dependencies<'a>(effects: &TransactionEffects<'a>) -> &'a [messages::base::Digest] {
+fn dependencies<'a>(effects: &TransactionEffects<'a>) -> &'a [Digest] {
     match &effects.version {
         VersionedEffects::V1(v1) => v1.dependencies,
         VersionedEffects::V2(v2) => v2.dependencies,
@@ -79,23 +81,39 @@ fn consensus_accesses(
 /// each transaction after its dependencies, and after the readers of every
 /// version it overwrites. Ties go to the smallest digest, and a
 /// transaction's dependencies are visited largest digest first.
-fn causal_sort(effects: &[&TransactionEffects<'_>], skip: usize, order: &mut Vec<usize>) {
+fn causal_sort<'b>(
+    effects: &[&TransactionEffects<'_>],
+    skip: usize,
+    order: &mut Vec<'b, usize>,
+    bump: &'b Bump,
+) {
     let effects_rest = &effects[skip..];
-    let mut readers: HashMap<ObjectKey, Vec<Digest>> = HashMap::new();
-    let mut overwrites: HashMap<Digest, Vec<ObjectKey>> = HashMap::new();
+    let mut readers = containers::hash_map::<ObjectKey, Vec<Digest>>(bump, 0);
+    let mut overwrites = containers::message_map::<Digest, Vec<ObjectKey>>(bump, 0);
     for e in effects_rest {
         let digest = transaction_digest(e);
         consensus_accesses(
             e,
-            |key| readers.entry(key).or_default().push(digest),
-            |key| overwrites.entry(digest).or_default().push(key),
+            |key| {
+                readers
+                    .entry(key)
+                    .or_insert_with(|| Vec::new_in(bump))
+                    .push(digest);
+            },
+            |key| {
+                overwrites
+                    .entry(digest)
+                    .or_insert_with(|| Vec::new_in(bump))
+                    .push(key);
+            },
         );
     }
 
-    let mut not_seen: BTreeMap<Digest, (usize, BTreeSet<Digest>)> = BTreeMap::new();
+    let mut not_seen: BTreeMap<Digest, (usize, BTreeSet<Digest>)> = BTreeMap::new_in(bump);
     for (i, e) in effects_rest.iter().enumerate() {
         let digest = transaction_digest(e);
-        let mut deps: BTreeSet<Digest> = dependencies(e).iter().map(|d| d.bytes).collect();
+        let mut deps = BTreeSet::new_in(bump);
+        deps.extend(dependencies(e).iter().copied());
         for key in overwrites.get(&digest).into_iter().flatten() {
             deps.extend(readers.get(key).into_iter().flatten().copied());
         }
@@ -104,14 +122,19 @@ fn causal_sort(effects: &[&TransactionEffects<'_>], skip: usize, order: &mut Vec
 
     // Each frame: a transaction, and its dependencies not yet visited, in
     // ascending order so that `pop` takes the largest.
-    let mut stack: Vec<(usize, Vec<Digest>)> = Vec::new();
+    let frame = |index, deps: BTreeSet<Digest>| {
+        let mut ascending = Vec::with_capacity_in(deps.len(), bump);
+        ascending.extend(deps);
+        (index, ascending)
+    };
+    let mut stack: Vec<(usize, Vec<Digest>)> = Vec::new_in(bump);
     while let Some((_, (index, deps))) = not_seen.pop_first() {
-        stack.push((index, deps.into_iter().collect()));
+        stack.push(frame(index, deps));
         while let Some((index, deps)) = stack.last_mut() {
             let mut next = None;
             while let Some(dep) = deps.pop() {
                 if let Some((dep_index, dep_deps)) = not_seen.remove(&dep) {
-                    next = Some((dep_index, dep_deps.into_iter().collect()));
+                    next = Some(frame(dep_index, dep_deps));
                     break;
                 }
             }

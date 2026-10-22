@@ -180,7 +180,13 @@ fn signatures_in_a_voted_block_wait_for_the_local_checkpoint() {
     let (mut voter, _dir) = voter(queue);
     let (seven, seven_tx) = signature(7);
     let (_, eight_tx) = signature(8);
-    assert_eq!(voter.vote(block(vec![seven_tx, eight_tx])), Ok(vec![]));
+    assert_eq!(
+        voter.vote(
+            block(vec![seven_tx, eight_tx]),
+            &containers::Bump::default()
+        ),
+        Ok(vec![])
+    );
 
     let routed = routed(&inbox);
     assert_eq!(routed.len(), 2);
@@ -194,6 +200,13 @@ fn signatures_in_an_invalid_block_are_not_routed() {
     let (queue, inbox) = workqueue::queue(4);
     let (mut voter, _dir) = voter(queue);
     let (_, transaction) = signature(7);
-    assert!(voter.vote(block(vec![transaction, vec![0xff]])).is_err());
+    assert!(
+        voter
+            .vote(
+                block(vec![transaction, vec![0xff]]),
+                &containers::Bump::default()
+            )
+            .is_err()
+    );
     assert!(inbox.try_pop().is_none());
 }

@@ -127,7 +127,9 @@ impl Setup {
     }
 
     fn feed(&mut self, signatures: Vec<CheckpointSignature>) {
-        let certified = self.aggregator.process(signatures);
+        let certified = self
+            .aggregator
+            .process(signatures, &mut workqueue::Bump::default());
         assert!(certified.as_ref().is_none_or(|c| !c.is_empty()));
         self.committer.extend(certified.unwrap_or_default());
     }

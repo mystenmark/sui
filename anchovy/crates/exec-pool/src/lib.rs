@@ -502,7 +502,7 @@ impl Processor for Executor {
     type Input = Vec<Executable>;
     type Output = ();
 
-    fn process(&mut self, ready: Vec<Executable>) -> Option<()> {
+    fn process(&mut self, ready: Vec<Executable>, _bump: &mut workqueue::Bump) -> Option<()> {
         let mut resolved_keys = Vec::new();
         let mut effects_keys = Vec::with_capacity(ready.len());
         let mut deposits = Vec::new();

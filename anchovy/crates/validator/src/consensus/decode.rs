@@ -355,7 +355,11 @@ impl Processor for CommitDecoder {
     type Input = CommitRequest;
     type Output = DecodedCommit;
 
-    fn process(&mut self, request: CommitRequest) -> Option<DecodedCommit> {
+    fn process(
+        &mut self,
+        request: CommitRequest,
+        _bump: &mut workqueue::Bump,
+    ) -> Option<DecodedCommit> {
         let mut decoded = self.decode(request.commit);
         decoded.handled = request.handled;
         Some(decoded)

@@ -42,10 +42,6 @@ pub fn of_objects(digests: impl IntoIterator<Item = [u8; 32]>) -> StateHash {
     hash
 }
 
-/// Arena for parsing one transaction's effects; larger effects spill into
-/// extra chunks, freed at the next reset.
-const PARSE_ARENA: usize = 64 * 1024;
-
 /// What one checkpoint's effects add to the live object set and remove from
 /// it, as the reference's `accumulate_effects_v3` (effects V2): every
 /// created, mutated or unwrapped object's new digest is inserted, and every
@@ -247,7 +243,6 @@ pub struct StateHasher {
     /// Computed, but some earlier checkpoint is not; whether each is its
     /// epoch's last.
     pending: BTreeMap<u64, (StateHash, bool)>,
-    bump: Bump,
 }
 
 impl StateHasher {
@@ -260,7 +255,6 @@ impl StateHasher {
             next: first,
             root: prior,
             pending: BTreeMap::new(),
-            bump: Bump::with_capacity(PARSE_ARENA),
         }
     }
 }
@@ -278,13 +272,13 @@ impl Processor for StateHasher {
     type Input = CheckpointEffects;
     type Output = ();
 
-    fn process(&mut self, effects: CheckpointEffects) -> Option<()> {
+    fn process(&mut self, effects: CheckpointEffects, bump: &mut Bump) -> Option<()> {
         let seq = effects.seq;
         assert!(
             seq >= self.next && !self.pending.contains_key(&seq),
             "checkpoint {seq} hashed twice"
         );
-        let hash = accumulate(&effects.effects, &mut self.bump);
+        let hash = accumulate(&effects.effects, bump);
         self.hashes.insert_checkpoint(seq, &hash);
         self.pending.insert(seq, (hash, effects.last_of_epoch));
         while let Some((hash, last_of_epoch)) = self.pending.remove(&self.next) {

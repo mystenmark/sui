@@ -318,8 +318,8 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
             let (reply, _verdict) = oneshot::channel();
             let request = Request::new(vec![decode(bytes)], reply);
             let accepted = validator
-                .process(request)
-                .and_then(|valid| verifier.process(valid))
+                .process(request, &mut workqueue::Bump::default())
+                .and_then(|valid| verifier.process(valid, &mut workqueue::Bump::default()))
                 .is_some();
             black_box(accepted);
         }

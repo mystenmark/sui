@@ -112,8 +112,9 @@ fn bench_build(size: usize, effects: &[Vec<u8>], max_updates: Option<u32>) {
     let rounds = 50;
     let (mut elapsed, mut allocations) = (Duration::ZERO, 0);
     for round in 0..=rounds {
+        let bump = containers::Bump::with_capacity(64 * 1024);
         let (built, took, allocated) = measure(|| {
-            let mut builder = SettlementBuilder::new(1, 0);
+            let mut builder = SettlementBuilder::new(1, 0, &bump);
             for (i, e) in parsed.iter().enumerate() {
                 builder.add(i as u64, e.get());
             }
@@ -239,21 +240,31 @@ fn bench_process(size: usize, effects: &[Vec<u8>]) {
                 base: None,
             },
         };
-        scheduler.process(SettlementInput::Chunk(chunk.clone()));
+        scheduler.process(
+            SettlementInput::Chunk(chunk.clone()),
+            &mut workqueue::Bump::default(),
+        );
         drain(&effects_in);
 
-        let ((), mut took, mut allocated) =
-            measure(|| _ = scheduler.process(SettlementInput::ChunkExecuted(chunk)));
+        let ((), mut took, mut allocated) = measure(|| {
+            _ = scheduler.process(
+                SettlementInput::ChunkExecuted(chunk),
+                &mut workqueue::Bump::default(),
+            );
+        });
         let settlements: Vec<[u8; 32]> = drain(&inputs_in).iter().map(digest_of).collect();
         drain(&effects_in);
         for d in &settlements {
             commit(&store, &support::effects(*d, 2 * height, &[], vec![]));
         }
         let ((), t, a) = measure(|| {
-            _ = scheduler.process(SettlementInput::SettlementExecuted {
-                height,
-                digests: settlements,
-            });
+            _ = scheduler.process(
+                SettlementInput::SettlementExecuted {
+                    height,
+                    digests: settlements,
+                },
+                &mut workqueue::Bump::default(),
+            );
         });
         took += t;
         allocated += a;
@@ -269,10 +280,13 @@ fn bench_process(size: usize, effects: &[Vec<u8>]) {
             ),
         );
         let ((), t, a) = measure(|| {
-            _ = scheduler.process(SettlementInput::SettlementExecuted {
-                height,
-                digests: vec![barrier],
-            });
+            _ = scheduler.process(
+                SettlementInput::SettlementExecuted {
+                    height,
+                    digests: vec![barrier],
+                },
+                &mut workqueue::Bump::default(),
+            );
         });
         took += t;
         allocated += a;

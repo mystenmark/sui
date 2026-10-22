@@ -71,7 +71,8 @@ fn order(effects: &[Message<View<'static>>], prologue_first: bool) -> Vec<u8> {
         messages::effects::VersionedEffects::V2(v2) => v2.transaction_digest.bytes[0],
         messages::effects::VersionedEffects::V1(_) => unreachable!(),
     };
-    checkpoint_order(&views, prologue_first, false)
+    checkpoint_order(&views, prologue_first, false, &containers::Bump::default())
+        .to_vec()
         .into_iter()
         .map(digest)
         .collect()
@@ -119,5 +120,6 @@ fn the_prologue_stays_first() {
 fn schedule_order_when_effects_carry_no_dependencies() {
     let all = [effects(3, &[], None), effects(1, &[3], None)];
     let views: Vec<&View<'_>> = all.iter().map(Message::get).collect();
-    assert_eq!(checkpoint_order(&views, true, true), [0, 1]);
+    let bump = containers::Bump::default();
+    assert_eq!(checkpoint_order(&views, true, true, &bump)[..], [0, 1]);
 }

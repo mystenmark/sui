@@ -175,7 +175,8 @@ fn keys_are_notified_only_once_visible() {
     ];
     assert!(node.notified_inputs.try_pop().is_none());
 
-    node.executor.process(batch);
+    node.executor
+        .process(batch, &mut workqueue::Bump::default());
     // `drain_checked` asserts each key is visible as it takes it.
     let (resolved, effects) = node.drain_checked();
     // Each key resolves to what it names: an object at its version, a
@@ -226,11 +227,10 @@ fn an_executed_transaction_republishes_its_generation_from_its_effects() {
         .map_err(|(e, _)| e)
         .unwrap();
     let again = validator::checks::sequenced_by_consensus(again);
-    node.executor.process(vec![node.executable(
-        increment,
-        vec![shared.access(true, 4, 0)],
-        vec![],
-    )]);
+    node.executor.process(
+        vec![node.executable(increment, vec![shared.access(true, 4, 0)], vec![])],
+        &mut workqueue::Bump::default(),
+    );
     node.drain_checked();
     let produced = node.generations.get(stream, 4, 1).unwrap();
     let live = node.live(shared.id).unwrap();
@@ -250,11 +250,10 @@ fn an_executed_transaction_republishes_its_generation_from_its_effects() {
         effects,
         funds,
     );
-    executor.process(vec![node.executable(
-        again,
-        vec![shared.access(true, 9, 0)],
-        vec![],
-    )]);
+    executor.process(
+        vec![node.executable(again, vec![shared.access(true, 9, 0)], vec![])],
+        &mut workqueue::Bump::default(),
+    );
     assert_eq!(node.generations.get(stream, 9, 1), Some(produced));
     assert_eq!(node.live(shared.id).unwrap(), live, "not executed again");
     assert!(
@@ -274,18 +273,16 @@ fn a_reader_of_generation_zero_reads_it_after_the_writer_ran() {
     let read = node.read(node.coin(2), shared);
     let (writer, reader) = (digest(&write), digest(&read));
 
-    node.executor.process(vec![node.executable(
-        write,
-        vec![shared.access(true, 7, 0)],
-        vec![],
-    )]);
+    node.executor.process(
+        vec![node.executable(write, vec![shared.access(true, 7, 0)], vec![])],
+        &mut workqueue::Bump::default(),
+    );
     node.drain_checked();
     assert!(version(node.generations.get(stream, 7, 1)) > initial);
-    node.executor.process(vec![node.executable(
-        read,
-        vec![shared.access(false, 7, 0)],
-        vec![],
-    )]);
+    node.executor.process(
+        vec![node.executable(read, vec![shared.access(false, 7, 0)], vec![])],
+        &mut workqueue::Bump::default(),
+    );
     node.drain_checked();
 
     assert_eq!(version(node.generations.get(stream, 7, 0)), initial);

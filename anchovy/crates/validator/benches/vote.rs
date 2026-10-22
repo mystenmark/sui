@@ -146,6 +146,8 @@ fn main() {
     let mode = std::env::var("MODE").ok();
     let cache = Arc::new(ConsensusTxCache::new());
     let mut warm_voter = BlockVoter::new(epoch.clone(), store.clone(), cache.clone());
+    // As a worker's arena: reset after each block, never freed.
+    let mut bump = containers::Bump::with_capacity(64 * 1024);
     println!("signatures  txs    vote µs/tx  allocs/tx");
     for label in ["cold", "warm"] {
         if mode.as_deref().is_some_and(|m| m != label) {
@@ -154,7 +156,8 @@ fn main() {
         if label == "warm" {
             // Verify every signature once, unmeasured.
             for block in &blocks {
-                warm_voter.vote(block.clone()).unwrap();
+                warm_voter.vote(block.clone(), &bump).unwrap();
+                bump.reset();
                 cache.take(&block.reference);
             }
         }
@@ -172,9 +175,10 @@ fn main() {
                 let block = block.clone();
                 let before = ALLOCATIONS.load(Ordering::Relaxed);
                 let start = Instant::now();
-                let verdict = voter.vote(block);
+                let verdict = voter.vote(block, &bump);
                 elapsed += start.elapsed();
                 allocations += ALLOCATIONS.load(Ordering::Relaxed) - before;
+                bump.reset();
                 assert_eq!(verdict, Ok(vec![]));
             }
             // The cache's entries are freed outside the measurement.

@@ -294,7 +294,8 @@ impl Node {
     pub fn execute_owned(&mut self, transaction: VerifiedTransaction) -> TransactionEffects {
         let digest = digest(&transaction);
         let executable = self.executable(transaction, vec![], vec![]);
-        self.executor.process(vec![executable]);
+        self.executor
+            .process(vec![executable], &mut workqueue::Bump::default());
         self.drain_checked();
         self.effects(digest).unwrap()
     }
@@ -450,7 +451,8 @@ impl InputWaiter {
                 return batches;
             }
             batches += 1;
-            node.executor.process(ready);
+            node.executor
+                .process(ready, &mut workqueue::Bump::default());
             let (inputs, _) = node.drain_checked();
             self.waiter.resolve(inputs);
         }

@@ -8,8 +8,10 @@ pub mod causal;
 pub mod funds;
 pub mod settle;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+
+use containers::{Bump, HeapHashMap};
 
 use messages::Message;
 use messages::base::{Digest, ObjectId};
@@ -234,7 +236,7 @@ impl SettlementScheduler {
         push(&self.effects, Command::Wait(batch), "effects waiter");
     }
 
-    fn chunk_executed(&mut self, chunk: ChunkSettlement) {
+    fn chunk_executed(&mut self, chunk: ChunkSettlement, bump: &mut Bump) {
         let effects: Vec<Effects> = chunk
             .digests
             .iter()
@@ -242,20 +244,25 @@ impl SettlementScheduler {
             .collect();
         let keep = self.epoch.config.disable_effects_tx_dependencies();
         let prologue_first = !keep && self.is_prologue(chunk.digests.first());
-        let views: Vec<&TransactionEffects<'_>> = effects.iter().map(Message::get).collect();
-        let order = causal::checkpoint_order(&views, prologue_first, keep);
-        drop(views);
-        let mut slots: Vec<Option<Effects>> = effects.into_iter().map(Some).collect();
-        let effects = order
-            .into_iter()
-            .map(|i| slots[i].take().expect("a permutation"))
-            .collect();
+        let effects = {
+            let bump = &*bump;
+            let mut views = containers::Vec::with_capacity_in(effects.len(), bump);
+            views.extend(effects.iter().map(Message::get));
+            let order = causal::checkpoint_order(&views, prologue_first, keep, bump);
+            drop(views);
+            let mut slots = containers::Vec::with_capacity_in(effects.len(), bump);
+            slots.extend(effects.into_iter().map(Some));
+            order
+                .iter()
+                .map(|&i| slots[i].take().expect("a permutation"))
+                .collect()
+        };
         let pending = self
             .pending
             .get_mut(&chunk.height)
             .expect("a chunk executes after it is seen");
         pending.stage = Stage::Ordered { chunk, effects };
-        self.advance();
+        self.advance(bump);
     }
 
     /// Whether `digest` is a consensus commit prologue, which checkpoint
@@ -279,7 +286,7 @@ impl SettlementScheduler {
     }
 
     /// Starts settling the first pending chunk, if its effects are ordered.
-    fn advance(&mut self) {
+    fn advance(&mut self, bump: &Bump) {
         let Some(mut entry) = self.pending.first_entry() else {
             return;
         };
@@ -297,7 +304,7 @@ impl SettlementScheduler {
             Some((seq, count)) if seq == chunk.checkpoint_seq => count,
             _ => 0,
         };
-        let mut builder = SettlementBuilder::new(chunk.checkpoint_seq, offset);
+        let mut builder = SettlementBuilder::new(chunk.checkpoint_seq, offset, bump);
         for (i, e) in effects.iter().enumerate() {
             builder.add(i as u64, e.get());
         }
@@ -397,7 +404,7 @@ impl SettlementScheduler {
         };
     }
 
-    fn settlement_executed(&mut self, height: u64, digests: &[TxDigest]) {
+    fn settlement_executed(&mut self, height: u64, digests: &[TxDigest], bump: &Bump) {
         let mut entry = self
             .pending
             .first_entry()
@@ -425,7 +432,7 @@ impl SettlementScheduler {
                 entry.remove();
                 let barrier = executed(&self.store, &barrier);
                 self.settled(&chunk, &effects, &settlements, &barrier);
-                self.advance();
+                self.advance(bump);
             }
             Stage::Executing | Stage::Ordered { .. } => {
                 panic!("settlement effects for a chunk not settling")
@@ -549,12 +556,12 @@ impl Processor for SettlementScheduler {
     type Input = SettlementInput;
     type Output = ();
 
-    fn process(&mut self, input: SettlementInput) -> Option<()> {
+    fn process(&mut self, input: SettlementInput, bump: &mut Bump) -> Option<()> {
         match input {
             SettlementInput::Chunk(chunk) => self.chunk(chunk),
-            SettlementInput::ChunkExecuted(chunk) => self.chunk_executed(chunk),
+            SettlementInput::ChunkExecuted(chunk) => self.chunk_executed(chunk, bump),
             SettlementInput::SettlementExecuted { height, digests } => {
-                self.settlement_executed(height, &digests);
+                self.settlement_executed(height, &digests, bump);
             }
         }
         None
@@ -642,8 +649,8 @@ pub struct FundsReserver {
     next_ticket: Ticket,
     /// Each unresolved reservation's transaction, by the transaction's
     /// first ticket, and its index there.
-    owners: HashMap<Ticket, (Ticket, usize)>,
-    waiting: HashMap<Ticket, Waiting>,
+    owners: HeapHashMap<Ticket, (Ticket, usize)>,
+    waiting: HeapHashMap<Ticket, Waiting>,
     resolved: Vec<(Ticket, ReservationStatus)>,
 }
 
@@ -655,8 +662,8 @@ impl FundsReserver {
             ledger: Ledger::new(),
             root_version: None,
             next_ticket: 0,
-            owners: HashMap::new(),
-            waiting: HashMap::new(),
+            owners: HeapHashMap::default(),
+            waiting: HeapHashMap::default(),
             resolved: Vec::new(),
         }
     }
@@ -777,7 +784,7 @@ impl Processor for FundsReserver {
     type Input = FundsCommand;
     type Output = ();
 
-    fn process(&mut self, command: FundsCommand) -> Option<()> {
+    fn process(&mut self, command: FundsCommand, _bump: &mut Bump) -> Option<()> {
         match command {
             FundsCommand::Reserve(withdrawals) => {
                 for withdrawal in withdrawals {

@@ -214,7 +214,9 @@ fn main() {
                 let request = commit(index, &transactions(commit_size, objects, &mut rng));
                 let before = ALLOCATIONS.load(Ordering::Relaxed);
                 let begin = Instant::now();
-                stage.process(request).unwrap();
+                stage
+                    .process(request, &mut workqueue::Bump::default())
+                    .unwrap();
                 let took = begin.elapsed();
                 let allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
                 let mut emitted = 0;
