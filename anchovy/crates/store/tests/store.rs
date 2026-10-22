@@ -297,3 +297,34 @@ fn checkpoints_commit_in_order() {
     store.commit_genesis_checkpoint(vec![], vec![]);
     store.commit_checkpoint(2, &[], vec![], vec![], &containers::Bump::default());
 }
+
+/// A digest a request names, not executed, is answered from its own
+/// negative cache, which the transaction's later execution clears.
+#[test]
+fn a_named_digest_s_absence_is_cached_until_it_executes() {
+    let dir = tempfile::tempdir().unwrap();
+    let checkpoint = checkpoint();
+    let tx = &checkpoint.get().transactions[1];
+    let digest = *tx.transaction.digest();
+    let named = Digest::from(digest);
+    let store = Store::open(dir.path()).unwrap();
+    assert_eq!(store.executed_effects_named(&named).unwrap(), None);
+    assert_eq!(store.executed_effects_named(&named).unwrap(), None);
+    store
+        .write_through(Commit {
+            written: written(checkpoint.get()),
+            removed: vec![],
+            executed: Some(Executed {
+                digest,
+                transaction: tx.transaction.bytes().to_vec(),
+                effects_digest: tx.effects.digest,
+                effects: tx.effects.bytes.to_vec(),
+                events: tx.events.map(|e| e.bytes.to_vec()),
+            }),
+        })
+        .unwrap();
+    assert_eq!(
+        store.executed_effects_named(&named).unwrap(),
+        Some(tx.effects.digest)
+    );
+}

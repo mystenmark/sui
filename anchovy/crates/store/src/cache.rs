@@ -15,12 +15,12 @@
 //! uncommitted transaction; committed ones in a bounded cache, with
 //! negative entries.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use containers::HeapMessageMap;
+use containers::{HeapMessageMap, Sharder};
 use messages::Message;
 use messages::base::{Digest, Hashed, Lookup, ObjectId};
 use messages::effects::{TransactionEffects, TransactionEvents};
@@ -33,13 +33,36 @@ use crate::{Commit, Live, Removal, Removed, Result, Written};
 /// How many committed versions a slot keeps (the reference's `MAX_VERSIONS`).
 const COMMITTED_VERSIONS: usize = 3;
 const SHARDS: usize = 64;
-/// Shards of a map of computed digests, by key hash.
-type Shards<V> = Box<[Mutex<HeapMessageMap<Hashed, V>>]>;
+/// `SHARDS` locked parts of a structure, each 32-byte key's picked with
+/// per-instance secrets: a client cannot grind keys into one shard.
+struct Sharded<T> {
+    shards: Box<[Mutex<T>]>,
+    sharder: Sharder,
+}
+
+impl<T> Sharded<T> {
+    fn new(make: impl FnMut() -> T) -> Sharded<T> {
+        let mut make = make;
+        Sharded {
+            shards: (0..SHARDS).map(|_| Mutex::new(make())).collect(),
+            sharder: Sharder::new(),
+        }
+    }
+
+    fn lock(&self, key: &[u8; 32]) -> MutexGuard<'_, T> {
+        lock(&self.shards[self.sharder.pick(key, SHARDS)])
+    }
+
+    fn all(&self) -> impl Iterator<Item = &Mutex<T>> {
+        self.shards.iter()
+    }
+}
+
+/// Shards of a map of computed digests.
+type Shards<V> = Sharded<HeapMessageMap<Hashed, V>>;
 
 fn shards<V>() -> Shards<V> {
-    (0..SHARDS)
-        .map(|_| Mutex::new(containers::heap_message_map(0)))
-        .collect()
+    Sharded::new(|| containers::heap_message_map(0))
 }
 
 /// Ticket generations per structure. Collisions only cost cache fills.
@@ -183,18 +206,25 @@ impl ObjectShard {
     }
 }
 
-/// Generation numbers, by key hash. A reader takes one before reading a
-/// slower layer; anything that could make its answer stale bumps it; the
-/// reader fills a cache only if it is unchanged.
-struct Generations(Box<[AtomicU64]>);
+/// Generation numbers, by keyed hash: a client cannot grind keys onto a
+/// hot key's counter to keep it out of the cache. A reader takes one before
+/// reading a slower layer; anything that could make its answer stale bumps
+/// it; the reader fills a cache only if it is unchanged.
+struct Generations {
+    counters: Box<[AtomicU64]>,
+    sharder: Sharder,
+}
 
 impl Generations {
     fn new() -> Generations {
-        Generations((0..GENERATIONS).map(|_| AtomicU64::new(0)).collect())
+        Generations {
+            counters: (0..GENERATIONS).map(|_| AtomicU64::new(0)).collect(),
+            sharder: Sharder::new(),
+        }
     }
 
     fn of(&self, key: &[u8; 32]) -> &AtomicU64 {
-        &self.0[hash(key) % GENERATIONS]
+        &self.counters[self.sharder.pick(key, GENERATIONS)]
     }
 
     fn ticket(&self, key: &[u8; 32]) -> u64 {
@@ -204,18 +234,6 @@ impl Generations {
     fn bump(&self, key: &[u8; 32]) {
         self.of(key).fetch_add(1, Ordering::AcqRel);
     }
-}
-
-fn hash(key: &[u8; 32]) -> usize {
-    let mut h = 0u64;
-    for chunk in key.chunks_exact(8) {
-        h = h.rotate_left(17) ^ u64::from_le_bytes(chunk.try_into().expect("eight bytes"));
-    }
-    h.wrapping_mul(0x9e37_79b9_7f4a_7c15) as usize
-}
-
-fn shard(key: &[u8; 32]) -> usize {
-    (hash(key) >> 32) % SHARDS
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -240,42 +258,51 @@ struct TxRecord {
 }
 
 /// A bounded cache of committed values by computed digest, with negative
-/// entries: only a computed digest's absence is cached, so a client cannot
-/// fill it with digests it chose.
+/// entries.
 struct PointCache<V> {
-    shards: Box<[Mutex<PointShard<V>>]>,
+    shards: Sharded<PointShard<V>>,
     generations: Generations,
     capacity: usize,
 }
 
 struct PointShard<V> {
+    /// Values and absences by computed digest, hashed cheaply.
     entries: HeapMessageMap<Hashed, Option<V>>,
     order: VecDeque<Hashed>,
+    /// Absences of digests requests named, which a client chooses: hashed
+    /// whole, by `SipHash`.
+    named_absent: HashSet<Digest>,
+    named_order: VecDeque<Digest>,
+}
+
+impl<V> PointShard<V> {
+    fn forget_named(&mut self, key: &Digest) {
+        if self.named_absent.remove(key) {
+            self.named_order.retain(|d| d != key);
+        }
+    }
 }
 
 impl<V: Clone> PointCache<V> {
     fn new(capacity: usize) -> PointCache<V> {
         PointCache {
-            shards: (0..SHARDS)
-                .map(|_| {
-                    Mutex::new(PointShard {
-                        entries: containers::heap_message_map(0),
-                        order: VecDeque::new(),
-                    })
-                })
-                .collect(),
+            shards: Sharded::new(|| PointShard {
+                entries: containers::heap_message_map(0),
+                order: VecDeque::new(),
+                named_absent: HashSet::new(),
+                named_order: VecDeque::new(),
+            }),
             generations: Generations::new(),
             capacity: capacity.div_ceil(SHARDS),
         }
     }
 
     fn get(&self, key: &Digest) -> Found<V> {
-        match lock(&self.shards[shard(&key.bytes)])
-            .entries
-            .get(&Lookup(key))
-        {
+        let shard = self.shards.lock(&key.bytes);
+        match shard.entries.get(&Lookup(key)) {
             Some(Some(value)) => Found::Hit(value.clone()),
             Some(None) => Found::Absent,
+            None if shard.named_absent.contains(key) => Found::Absent,
             None => Found::Miss,
         }
     }
@@ -294,23 +321,43 @@ impl<V: Clone> PointCache<V> {
 
     /// A committed value: replaces anything, and outdates every ticket.
     fn insert_committed(&self, key: Hashed, value: V) {
-        let mut shard = lock(&self.shards[shard(&key.bytes)]);
+        let mut shard = self.shards.lock(&key.bytes);
         self.generations.bump(&key.bytes);
+        shard.forget_named(&key);
         Self::insert(&mut shard, key, Some(value), self.capacity);
     }
 
     /// "Not in the database", if nothing happened to `key` since `ticket`.
     fn insert_absent(&self, key: Hashed, ticket: u64) {
-        let mut shard = lock(&self.shards[shard(&key.bytes)]);
+        let mut shard = self.shards.lock(&key.bytes);
         if self.generations.ticket(&key.bytes) == ticket && !shard.entries.contains_key(&key) {
             Self::insert(&mut shard, key, None, self.capacity);
         }
     }
 
+    /// `insert_absent` of a digest a request named.
+    fn insert_named_absent(&self, key: Digest, ticket: u64) {
+        let mut shard = self.shards.lock(&key.bytes);
+        if self.generations.ticket(&key.bytes) != ticket
+            || shard.entries.contains_key(&Lookup(&key))
+            || !shard.named_absent.insert(key)
+        {
+            return;
+        }
+        shard.named_order.push_back(key);
+        while shard.named_absent.len() > self.capacity {
+            let Some(old) = shard.named_order.pop_front() else {
+                break;
+            };
+            shard.named_absent.remove(&old);
+        }
+    }
+
     fn invalidate(&self, key: &Hashed) {
-        let mut shard = lock(&self.shards[shard(&key.bytes)]);
+        let mut shard = self.shards.lock(&key.bytes);
         self.generations.bump(&key.bytes);
         shard.entries.remove(key);
+        shard.forget_named(key);
     }
 }
 
@@ -318,7 +365,7 @@ impl<V: Clone> PointCache<V> {
 pub struct Store {
     db: Db,
     capacity: Capacity,
-    objects: Box<[Mutex<ObjectShard>]>,
+    objects: Sharded<ObjectShard>,
     object_generations: Generations,
     /// Uncommitted transactions, by digest and by effects digest.
     uncommitted: Shards<Arc<TxRecord>>,
@@ -340,7 +387,7 @@ impl Store {
         Ok(Store {
             db,
             capacity,
-            objects: (0..SHARDS).map(|_| Mutex::default()).collect(),
+            objects: Sharded::new(ObjectShard::default),
             object_generations: Generations::new(),
             uncommitted: shards(),
             uncommitted_effects: shards(),
@@ -351,7 +398,7 @@ impl Store {
     }
 
     fn objects(&self, id: &ObjectId) -> MutexGuard<'_, ObjectShard> {
-        lock(&self.objects[shard(&id.0)])
+        self.objects.lock(&id.0)
     }
 
     // ---- Writes ----
@@ -401,10 +448,13 @@ impl Store {
             written,
             removed: outputs.removed,
         });
-        lock(&self.uncommitted_effects[shard(&data.effects_digest.bytes)])
+        self.uncommitted_effects
+            .lock(&data.effects_digest.bytes)
             .insert(data.effects_digest, data.clone());
-        let previous =
-            lock(&self.uncommitted[shard(&executed.digest.bytes)]).insert(executed.digest, record);
+        let previous = self
+            .uncommitted
+            .lock(&executed.digest.bytes)
+            .insert(executed.digest, record);
         assert!(previous.is_none(), "{:?} written twice", executed.digest);
     }
 
@@ -466,7 +516,7 @@ impl Store {
         records.extend(
             transactions
                 .iter()
-                .filter_map(|d| lock(&self.uncommitted[shard(&d.bytes)]).get(d).cloned()),
+                .filter_map(|d| self.uncommitted.lock(&d.bytes).get(d).cloned()),
         );
 
         // 1. Durable before anything leaves memory.
@@ -515,9 +565,12 @@ impl Store {
             self.committed.insert_committed(record.digest, data.clone());
             self.committed_effects
                 .insert_committed(data.effects_digest, data.effects.clone());
-            lock(&self.uncommitted_effects[shard(&data.effects_digest.bytes)])
+            self.uncommitted_effects
+                .lock(&data.effects_digest.bytes)
                 .remove(&data.effects_digest);
-            lock(&self.uncommitted[shard(&record.digest.bytes)]).remove(&record.digest);
+            self.uncommitted
+                .lock(&record.digest.bytes)
+                .remove(&record.digest);
         }
         *lock(&self.last_committed) = Some(seq);
     }
@@ -584,7 +637,7 @@ impl Store {
     /// gone (restart, tests). Every reader's ticket is outdated, so none
     /// can cache a dropped version.
     pub fn clear_uncommitted(&self) {
-        for shard in &self.objects {
+        for shard in self.objects.all() {
             let mut shard = lock(shard);
             let ObjectShard { slots, .. } = &mut *shard;
             for (id, slot) in slots.iter_mut() {
@@ -595,10 +648,10 @@ impl Store {
             }
             slots.retain(|_, slot| slot.in_memory() || slot.db_latest.is_some());
         }
-        for shard in &self.uncommitted {
+        for shard in self.uncommitted.all() {
             lock(shard).clear();
         }
-        for shard in &self.uncommitted_effects {
+        for shard in self.uncommitted_effects.all() {
             lock(shard).clear();
         }
     }
@@ -610,7 +663,7 @@ impl Store {
     }
 
     pub fn uncommitted_transactions(&self) -> usize {
-        self.uncommitted.iter().map(|s| lock(s).len()).sum()
+        self.uncommitted.all().map(|s| lock(s).len()).sum()
     }
 
     // ---- Object reads ----
@@ -726,7 +779,8 @@ impl Store {
     // ---- Transaction reads ----
 
     fn uncommitted(&self, digest: &Digest) -> Option<Arc<TxData>> {
-        lock(&self.uncommitted[shard(&digest.bytes)])
+        self.uncommitted
+            .lock(&digest.bytes)
             .get(&Lookup(digest))
             .map(|r| r.data.clone())
     }
@@ -757,16 +811,25 @@ impl Store {
     /// absence cached.
     pub fn executed_effects(&self, transaction: &Hashed) -> Result<Option<Hashed>> {
         let ticket = self.committed.generations.ticket(&transaction.bytes);
-        let found = self.executed_effects_uncached(transaction)?;
+        let found = self.lookup_executed_effects(transaction)?;
         if found.is_none() {
             self.committed.insert_absent(*transaction, ticket);
         }
         Ok(found)
     }
 
-    /// `executed_effects` of a digest from outside, as a request names it:
-    /// its absence is not cached.
-    pub fn executed_effects_uncached(&self, transaction: &Digest) -> Result<Option<Hashed>> {
+    /// `executed_effects` of a digest a request names, which a client
+    /// chooses: its absence is cached apart, hashed whole.
+    pub fn executed_effects_named(&self, transaction: &Digest) -> Result<Option<Hashed>> {
+        let ticket = self.committed.generations.ticket(&transaction.bytes);
+        let found = self.lookup_executed_effects(transaction)?;
+        if found.is_none() {
+            self.committed.insert_named_absent(*transaction, ticket);
+        }
+        Ok(found)
+    }
+
+    fn lookup_executed_effects(&self, transaction: &Digest) -> Result<Option<Hashed>> {
         match self.cached_tx(transaction) {
             Found::Hit(data) => Ok(Some(data.effects_digest)),
             Found::Absent => Ok(None),
@@ -777,7 +840,7 @@ impl Store {
 
     pub fn effects(&self, digest: &Hashed) -> Result<Option<Message<TransactionEffects<'static>>>> {
         let ticket = self.committed_effects.generations.ticket(&digest.bytes);
-        if let Some(data) = lock(&self.uncommitted_effects[shard(&digest.bytes)]).get(digest) {
+        if let Some(data) = self.uncommitted_effects.lock(&digest.bytes).get(digest) {
             return Ok(Some(data.effects.clone()));
         }
         match self.committed_effects.get(digest) {

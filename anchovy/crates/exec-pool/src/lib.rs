@@ -560,10 +560,10 @@ pub struct EffectsAvailability {
 impl Availability<EffectsKey> for EffectsAvailability {
     fn check(&mut self, keys: &[EffectsKey], found: &mut Vec<Option<()>>) {
         found.clear();
-        // A key may be a digest a client named, so a miss is not cached.
+        // A key may be a digest a client named.
         found.extend(keys.iter().map(|EffectsKey(digest)| {
             self.store
-                .executed_effects_uncached(digest)
+                .executed_effects_named(digest)
                 .expect("the store reads")
                 .map(|_| ())
         }));

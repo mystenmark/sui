@@ -200,7 +200,7 @@ impl ForkReport {
                 }
                 Some(our_effects) if our_effects != their_effects => {
                     let theirs = cache.get_executed_effects(digest);
-                    let ours = execution::executed_uncached(
+                    let ours = execution::executed_named(
                         &self.store,
                         &messages::base::Digest::new(digest.into_inner()),
                     )
@@ -813,7 +813,7 @@ impl Anchovy {
     }
 
     fn effects(&self, digest: &TransactionDigest) -> Option<TransactionEffects> {
-        let executed = execution::executed_uncached(
+        let executed = execution::executed_named(
             &self.node().perpetual.store,
             &messages::base::Digest::new(digest.into_inner()),
         )

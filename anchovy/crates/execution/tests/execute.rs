@@ -111,7 +111,7 @@ fn transfers_execute_one_after_another() {
     ));
     assert_eq!(effects.status(), &ExecutionStatus::Success, "{effects:?}");
     // Its results read back as the reference answers for an executed one.
-    let executed = execution::executed_uncached(
+    let executed = execution::executed_named(
         &node.store,
         &messages::base::Digest::new(effects.transaction_digest().into_inner()),
     )
@@ -141,7 +141,7 @@ fn transfers_execute_one_after_another() {
     changed.sort();
     assert_eq!(decode(&executed.output_objects), changed);
     assert!(
-        execution::executed_uncached(&node.store, &messages::base::Digest::new([7; 32]))
+        execution::executed_named(&node.store, &messages::base::Digest::new([7; 32]))
             .unwrap()
             .is_none(),
         "never executed"

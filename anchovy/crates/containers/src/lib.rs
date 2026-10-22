@@ -165,12 +165,57 @@ impl Hasher for DigestHasher64 {
         unreachable!("digest keys hash by write_u64 only")
     }
 
-    /// foldhash's mix: the two halves of a 128-bit product, xored, spread
-    /// every input bit over the low bits hashbrown picks buckets with.
     #[inline]
     fn finish(&self) -> u64 {
-        let product = u128::from(self.value ^ self.keys.seed) * u128::from(self.keys.multiplier);
-        (product as u64) ^ ((product >> 64) as u64)
+        fold(self.value ^ self.keys.seed, self.keys.multiplier)
+    }
+}
+
+/// foldhash's mix: the two halves of a 128-bit product, xored, spread every
+/// input bit over the low bits hashbrown picks buckets with.
+#[inline]
+fn fold(a: u64, b: u64) -> u64 {
+    let product = u128::from(a) * u128::from(b);
+    (product as u64) ^ ((product >> 64) as u64)
+}
+
+/// Spreads 32-byte keys over slots (shards, ticket counters) with
+/// per-instance secrets: one keyed fold per word, far cheaper than `SipHash`.
+/// Without the secrets a client cannot grind keys into one slot. For slot
+/// choice only, where a collision costs contention, never a probe chain.
+#[derive(Clone, Copy)]
+pub struct Sharder {
+    seed: u64,
+    multiplier: u64,
+}
+
+impl Sharder {
+    /// Fresh secrets, as `DigestHasher::new` makes them.
+    pub fn new() -> Sharder {
+        let keys = std::hash::RandomState::new();
+        Sharder {
+            seed: keys.hash_one(0u64),
+            multiplier: keys.hash_one(1u64) | 1,
+        }
+    }
+
+    /// `key`'s slot among `slots`.
+    #[inline]
+    pub fn pick(&self, key: &[u8; 32], slots: usize) -> usize {
+        let mut h = self.seed;
+        for word in key.chunks_exact(8) {
+            h = fold(
+                h ^ u64::from_le_bytes(word.try_into().expect("eight bytes")),
+                self.multiplier,
+            );
+        }
+        ((u128::from(h) * slots as u128) >> 64) as usize
+    }
+}
+
+impl Default for Sharder {
+    fn default() -> Sharder {
+        Sharder::new()
     }
 }
 
@@ -330,6 +375,27 @@ mod tests {
         assert_eq!(*boxed, 42);
         assert_eq!(bump.chunks(), 1);
         assert!(bump.allocated() > 0);
+    }
+
+    #[test]
+    fn sharders_are_seeded_apart_and_spread_keys() {
+        let (a, b) = (Sharder::new(), Sharder::new());
+        let key = |n: u8| {
+            let mut key = [0; 32];
+            key[31] = n;
+            key
+        };
+        // Keys differing only in their last byte, as system object ids do.
+        let picks = |s: &Sharder| {
+            (0..=255)
+                .map(|n| s.pick(&key(n), 64))
+                .collect::<std::vec::Vec<_>>()
+        };
+        assert_ne!(picks(&a), picks(&b));
+        let mut used = picks(&a);
+        used.sort_unstable();
+        used.dedup();
+        assert!(used.len() > 32, "{} of 64 shards", used.len());
     }
 
     #[test]

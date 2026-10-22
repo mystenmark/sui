@@ -637,7 +637,7 @@ impl Network {
     /// The effects digest of `transaction`, if executed.
     fn executed(&self, transaction: &Transaction) -> Option<messages::base::Hashed> {
         let digest = messages::base::Digest::new(transaction.digest().into_inner());
-        self.store().executed_effects_uncached(&digest).unwrap()
+        self.store().executed_effects_named(&digest).unwrap()
     }
 
     fn wait_executed(&self, transaction: &Transaction) -> messages::base::Hashed {
@@ -647,7 +647,7 @@ impl Network {
     }
 
     fn effects(&self, digest: &TransactionDigest) -> TransactionEffects {
-        let executed = execution::executed_uncached(
+        let executed = execution::executed_named(
             self.store(),
             &messages::base::Digest::new(digest.into_inner()),
         )
@@ -1216,7 +1216,7 @@ fn back_to_back_commits_execute_in_order_and_certify() {
     let share = network.share(network.coin(0));
     network.commit(vec![consensus_transaction(&share)]);
     let effects = wait_for("the share to execute", || {
-        execution::executed_uncached(
+        execution::executed_named(
             network.store(),
             &messages::base::Digest::new(share.digest().into_inner()),
         )
@@ -1375,7 +1375,7 @@ fn an_owned_conflict_in_one_commit_drops_the_later_and_defers_the_earlier() {
     }
     assert!(!network.contents(seq).contains(first.digest()));
     assert!(
-        execution::executed_uncached(
+        execution::executed_named(
             network.store(),
             &messages::base::Digest::new(second.digest().into_inner()),
         )

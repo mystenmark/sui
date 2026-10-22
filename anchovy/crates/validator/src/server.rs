@@ -168,7 +168,7 @@ impl Validator {
         include_details: bool,
     ) -> Result<RawValidatorTransactionStatus, Failure> {
         let read = || {
-            execution::executed_uncached(&consensus.store, &messages::base::Digest::new(digest))
+            execution::executed_named(&consensus.store, &messages::base::Digest::new(digest))
                 .map_err(|e| Status::internal(format!("{e:?}")))
         };
         let executed = if let Some(executed) = read()? {

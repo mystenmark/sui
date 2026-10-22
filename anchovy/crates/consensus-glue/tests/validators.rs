@@ -114,7 +114,7 @@ impl Member {
 
     /// Whether `transaction` has executed here.
     fn executed(&self, transaction: &Transaction) -> bool {
-        execution::executed_uncached(
+        execution::executed_named(
             self.store(),
             &messages::base::Digest::new(transaction.digest().into_inner()),
         )
@@ -334,7 +334,7 @@ impl Network {
         {
             assert!(Instant::now() < deadline, "executed in time");
         }
-        let executed = execution::executed_uncached(
+        let executed = execution::executed_named(
             member.store(),
             &messages::base::Digest::new(transaction.digest().into_inner()),
         )

@@ -412,10 +412,10 @@ pub fn executed(store: &store::Store, transaction: &Hashed) -> Result<Option<Exe
     complete(store, transaction, effects_digest)
 }
 
-/// `executed` of a digest from outside, as a request names it: its absence
-/// is not cached.
-pub fn executed_uncached(store: &store::Store, transaction: &Digest) -> Result<Option<Executed>> {
-    let effects_digest = store.executed_effects_uncached(transaction)?;
+/// `executed` of a digest a request names, which a client chooses (see
+/// `store::Store::executed_effects_named`).
+pub fn executed_named(store: &store::Store, transaction: &Digest) -> Result<Option<Executed>> {
+    let effects_digest = store.executed_effects_named(transaction)?;
     complete(store, transaction, effects_digest)
 }
 
