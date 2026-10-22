@@ -105,29 +105,26 @@ chunk). Every processor's own arena is gone, and the temporaries of the
 commit stage, settlement scheduler, block voter, signature checks, submit
 checker and checkpoint builders are in it.
 
-Remaining std collections and heap temporaries on hot paths:
-- `validation::inputs::check` (`input_objects`, receiving, loaded, coins
-  Vecs and `BTreeSet`s): needs the caller's arena.
-- Commit handler: `HandledCommit` (`origins`, accepted, duplicates,
-  deferred, estimates), `Sequencer::order`/`schedule`, `decide`'s entries,
-  `emit`'s heights, `decode_deferred`, `set_statuses`' woken,
-  `update_median`.
-- Commit decoder: `owned_inputs_to_lock`'s inputs.
-- Execution: `input_objects`/`receiving_objects` copies, `Kept`'s Vec,
-  `StoreReads::parse` copies; exec-pool's `provided` and `written`.
-- Resolver: a fresh arena per withdrawing transaction.
-- Settlement: `WaitBatch` key Vecs, the effects Vec before reordering,
-  reservations cloned, `Merged::Events` and `build`'s chunk, BCS to hash.
-- Checkpoint: `contents_of`'s Vecs are in the arena; still `summary::sign`'s
-  message, `SummaryBuilder`'s resolved list, `GenerationTable::commit`,
-  `Store::commit_checkpoint`'s records.
-- Aggregator: `certify`'s keys, `certified_bytes`' bitmap.
-- Natives: fixed-size values built through Vecs.
-- Long-lived tables with SipHash: store cache shards, epoch store
-  quarantine and output maps, aggregator `Committee.index`, status
-  waiters (digest keys: `MessageMap`; others foldhash).
+Also in the arena now: input checks and input lists, commit handling
+(`HandledCommit`, `Decided`, `Schedule`), resolver, settlement, aggregator,
+checkpoint signing and committing, exec-pool, status wakeups; natives build
+fixed-size values without vectors.
 
-Next: randomness (anchovy takes no part in DKG or in generating
-randomness, which reaches sui validators over their own network), protocol
-upgrades (capabilities, which anchovy neither submits nor counts),
-congestion control (deferral by the estimates), a sui validator's crash.
+Found on the way: a store read racing an object's first commit reported an
+inconsistency (`racing_readers_never_see_an_older_version`, ~1 in 8 runs
+under load); it now retries until the commit's live row is visible.
+
+Deliberately left:
+- SipHash tables whose keys clients choose: the store cache's slots and
+  point caches (misses are cached, for ids and digests any request names)
+  and the status cache's waiters. `DigestHasher` hashes eight bytes and is
+  only safe for keys that are real hashes. The store cache picks shards by
+  an unkeyed hash, so keys can be ground into one shard: contention, not a
+  flood.
+- Epoch store consensus-output maps (std SipHash): keyed by committed
+  digests and references, so `MessageMap` would be safe, but each needs a
+  key type hashing by one `write_u64`; small gain.
+- Execution: `Kept`'s heap Vec, `StoreReads::parse` copies, and written
+  objects parsed twice (exec-pool and store); native execution keeps its
+  own arena under its state lock rather than the worker's.
+- `Ptb::pure` serializes a value before finding it is a duplicate.
