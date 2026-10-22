@@ -317,6 +317,11 @@ fn result(outcome: Outcome) -> RawSubmitTxResult {
     }
 }
 
+/// The reference's `SuiErrorKind::EpochEnded`.
+fn epoch_ended() -> Status {
+    Status::unavailable("EpochEnded")
+}
+
 fn rejection(rejected: &Rejected) -> Status {
     match rejected {
         Rejected::Invalid(e) => Status::invalid_argument(format!("{:?}: {}", e.kind, e.detail)),
@@ -357,7 +362,9 @@ impl validator_server::Validator for Validator {
     /// given the position it was submitted at, whatever consensus decided
     /// there first if that was not to finalize it: rejected or dropped, or
     /// expired, never committed. Effects can come first, from the same
-    /// transaction committed at another position.
+    /// transaction committed at another position. A position whose epoch
+    /// ends is answered `EpochEnded`, as the reference's: consensus may have
+    /// dropped the transaction, so the client resubmits.
     async fn wait_for_effects(
         &self,
         request: Request<RawWaitForEffectsRequest>,
@@ -381,9 +388,9 @@ impl validator_server::Validator for Validator {
         loop {
             let epoch = self.current.get().await;
             let consensus = &epoch.consensus;
-            // A position from an earlier epoch has no status here: its
-            // effects answer.
-            let position = position.filter(|p| p.epoch == epoch.epoch.params.epoch);
+            if position.is_some_and(|p| p.epoch < epoch.epoch.params.epoch) {
+                return Err(epoch_ended());
+            }
             if let Some(position) = &position
                 && consensus.statuses.too_far_ahead(position)
             {
@@ -410,7 +417,10 @@ impl validator_server::Validator for Validator {
                     })),
                     Err(failure) => failure,
                 },
-                () = self.current.ended(&epoch) => Failure::EpochEnded,
+                () = self.current.ended(&epoch) => match position {
+                    Some(_) => return Err(epoch_ended()),
+                    None => Failure::EpochEnded,
+                },
             };
             self.retry(failure, &epoch).await?;
         }

@@ -42,9 +42,6 @@ const RGP: u64 = 1000;
 const BUDGET: u64 = 50_000_000;
 const SUI: u64 = 1_000_000_000;
 const TIMEOUT: Duration = Duration::from_mins(1);
-/// How long a client waits for a transaction's effects before submitting it
-/// again.
-const RESUBMIT_AFTER: Duration = Duration::from_secs(10);
 /// Longer than any test: commits carry the wall clock, and genesis starts
 /// the first epoch at time 0.
 const FOREVER_MS: u64 = 1 << 50;
@@ -395,8 +392,9 @@ impl Network {
     }
 }
 
-/// Submits `transaction` through `service`, then waits for its effects for
-/// a while: whether they came.
+/// Submits `transaction` through `service`, then waits for its effects:
+/// whether they came, or its epoch ended first and it must be submitted
+/// again.
 async fn submit_and_wait(service: &Validator, transaction: &Transaction) -> bool {
     let request = RawSubmitTxRequest {
         transactions: vec![bcs::to_bytes(transaction).unwrap().into()],
@@ -420,16 +418,18 @@ async fn submit_and_wait(service: &Validator, transaction: &Transaction) -> bool
         include_details: false,
         ping_type: None,
     };
-    let Ok(status) = tokio::time::timeout(
-        RESUBMIT_AFTER,
+    let status = tokio::time::timeout(
+        TIMEOUT,
         service.wait_for_effects(tonic::Request::new(request)),
     )
     .await
-    else {
-        return false;
+    .expect("answered in time");
+    let status = match status {
+        Ok(status) => status,
+        Err(status) if status.message() == "EpochEnded" => return false,
+        Err(status) => panic!("{status:?}"),
     };
-    let RawValidatorTransactionStatus::Executed(_) = status.unwrap().into_inner().inner.unwrap()
-    else {
+    let RawValidatorTransactionStatus::Executed(_) = status.into_inner().inner.unwrap() else {
         panic!("executed");
     };
     true
