@@ -114,16 +114,24 @@ Found on the way: a store read racing an object's first commit reported an
 inconsistency (`racing_readers_never_see_an_older_version`, ~1 in 8 runs
 under load); it now retries until the commit's live row is visible.
 
+Digests by provenance: `messages::base::Hashed` is a digest this process
+computed (by hashing, by parsing, or by a commented `Hashed::computed`
+claim); a plain `Digest` hashes all its bytes. `MessageMap` takes only
+`Hashed` keys, so a client-chosen digest can never key one. The pipeline's
+`TxDigest` is `Hashed`; the store's transaction and effects caches key by it
+and cache a miss only for a computed digest (`executed_effects_uncached` for
+a digest a request names).
+
 Deliberately left:
-- SipHash tables whose keys clients choose: the store cache's slots and
-  point caches (misses are cached, for ids and digests any request names)
-  and the status cache's waiters. `DigestHasher` hashes eight bytes and is
-  only safe for keys that are real hashes. The store cache picks shards by
-  an unkeyed hash, so keys can be ground into one shard: contention, not a
-  flood.
-- Epoch store consensus-output maps (std SipHash): keyed by committed
-  digests and references, so `MessageMap` would be safe, but each needs a
-  key type hashing by one `write_u64`; small gain.
+- SipHash tables whose keys clients choose: the store cache's object slots
+  (misses cached for any id an input names) and the status cache's waiters
+  (keyed by the client's position). The effects waiter's key is a plain
+  digest, hashed whole. The store cache picks shards by an unkeyed hash:
+  keys can be ground into one shard (contention, not a flood).
+- Epoch store consensus-output maps (std SipHash): their keys are now
+  `Hashed`, so they could move to `MessageMap`.
+- The causal sort: needed while `disable_effects_tx_dependencies` is off
+  (mainnet, and before protocol 138).
 - Execution: `Kept`'s heap Vec, `StoreReads::parse` copies, and written
   objects parsed twice (exec-pool and store); native execution keeps its
   own arena under its state lock rather than the worker's.
