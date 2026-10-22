@@ -501,48 +501,74 @@ impl Network {
     }
 
     /// `execute` for `transactions` submitted in one request, so in one
-    /// block.
+    /// block; submitted again while an epoch ends before they execute.
     fn execute_together(&mut self, transactions: &[&Transaction]) -> Vec<TransactionEffects> {
-        let service = Validator::over(self.anchovy.node().perpetual.current.clone());
-        self.runtime.block_on(async {
-            let request = RawSubmitTxRequest {
-                transactions: transactions
-                    .iter()
-                    .map(|t| bcs::to_bytes(t).unwrap().into())
-                    .collect(),
-                submit_type: SubmitTxType::Default as i32,
+        let owned: Vec<Transaction> = transactions.iter().map(|t| (*t).clone()).collect();
+        loop {
+            let service = Validator::over(self.anchovy.node().perpetual.current.clone());
+            let executed = self.run("effects", Self::submit_and_wait(service, owned.clone()));
+            if executed {
+                return self.agree_on(transactions);
+            }
+        }
+    }
+
+    /// Runs `task` on the runtime to completion, moving anchovy into each
+    /// next epoch meanwhile, as `Node::run` would.
+    fn run<T: Send + 'static>(
+        &mut self,
+        what: &str,
+        task: impl Future<Output = T> + Send + 'static,
+    ) -> T {
+        let task = self.runtime.spawn(task);
+        self.wait_for(what, |_| task.is_finished().then_some(()));
+        self.runtime.block_on(task).unwrap()
+    }
+
+    /// Submits `transactions` through `service` in one request, then waits
+    /// for their effects: whether they came, or an epoch ended first.
+    async fn submit_and_wait(service: Validator, transactions: Vec<Transaction>) -> bool {
+        let request = RawSubmitTxRequest {
+            transactions: transactions
+                .iter()
+                .map(|t| bcs::to_bytes(t).unwrap().into())
+                .collect(),
+            submit_type: SubmitTxType::Default as i32,
+        };
+        let submitted = tokio::time::timeout(
+            TIMEOUT,
+            service.submit_transaction(tonic::Request::new(request)),
+        )
+        .await
+        .expect("submitted in time")
+        .unwrap();
+        for (transaction, result) in transactions.iter().zip(submitted.into_inner().results) {
+            let position = match result.inner.unwrap() {
+                RawValidatorSubmitStatus::Submitted(position) => Some(position),
+                RawValidatorSubmitStatus::Executed(_) => None,
+                status @ RawValidatorSubmitStatus::Rejected(_) => {
+                    panic!("not submitted: {status:?}")
+                }
             };
-            let submitted = tokio::time::timeout(
+            let request = RawWaitForEffectsRequest {
+                transaction_digest: Some(transaction.digest().into_inner().to_vec().into()),
+                consensus_position: position,
+                include_details: false,
+                ping_type: None,
+            };
+            let answer = tokio::time::timeout(
                 TIMEOUT,
-                service.submit_transaction(tonic::Request::new(request)),
+                service.wait_for_effects(tonic::Request::new(request)),
             )
             .await
-            .expect("submitted in time")
-            .unwrap();
-            for (transaction, result) in transactions.iter().zip(submitted.into_inner().results) {
-                let position = match result.inner.unwrap() {
-                    RawValidatorSubmitStatus::Submitted(position) => Some(position),
-                    RawValidatorSubmitStatus::Executed(_) => None,
-                    status @ RawValidatorSubmitStatus::Rejected(_) => {
-                        panic!("not submitted: {status:?}")
-                    }
-                };
-                let request = RawWaitForEffectsRequest {
-                    transaction_digest: Some(transaction.digest().into_inner().to_vec().into()),
-                    consensus_position: position,
-                    include_details: false,
-                    ping_type: None,
-                };
-                tokio::time::timeout(
-                    TIMEOUT,
-                    service.wait_for_effects(tonic::Request::new(request)),
-                )
-                .await
-                .expect("answered in time")
-                .unwrap();
+            .expect("answered in time");
+            match answer {
+                Ok(_) => {}
+                Err(status) if status.message() == "EpochEnded" => return false,
+                Err(status) => panic!("{status:?}"),
             }
-        });
-        self.agree_on(transactions)
+        }
+        true
     }
 
     /// Submits `transactions` through anchovy's RPC service in one request,
@@ -552,14 +578,14 @@ impl Network {
         transactions: &[&Transaction],
     ) -> Vec<RawValidatorSubmitStatus> {
         let service = Validator::over(self.anchovy.node().perpetual.current.clone());
-        self.runtime.block_on(async {
-            let request = RawSubmitTxRequest {
-                transactions: transactions
-                    .iter()
-                    .map(|t| bcs::to_bytes(t).unwrap().into())
-                    .collect(),
-                submit_type: SubmitTxType::Default as i32,
-            };
+        let request = RawSubmitTxRequest {
+            transactions: transactions
+                .iter()
+                .map(|t| bcs::to_bytes(t).unwrap().into())
+                .collect(),
+            submit_type: SubmitTxType::Default as i32,
+        };
+        self.run("submission", async move {
             let submitted = tokio::time::timeout(
                 TIMEOUT,
                 service.submit_transaction(tonic::Request::new(request)),
