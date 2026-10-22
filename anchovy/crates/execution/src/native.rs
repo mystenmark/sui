@@ -192,12 +192,12 @@ impl NativeExecution {
         let reads = StoreReads::new(bump, store, &kept);
         let digest = *data.digest();
 
-        let kinds = input_objects(data).map_err(|e| Error::Native(format!("{e:?}")))?;
+        let kinds = input_objects(data, bump).map_err(|e| Error::Native(format!("{e:?}")))?;
         let mut loaded = containers::Vec::with_capacity_in(kinds.len(), bump);
         for kind in &kinds {
             loaded.push(load(&reads, kind, provided)?);
         }
-        let receiving = receiving_objects(data);
+        let receiving = receiving_objects(data, bump);
         let mut receiving_refs = containers::Vec::with_capacity_in(receiving.len(), bump);
         receiving_refs.extend(receiving.iter().map(|r| exec_types::base::object_ref(r)));
         // The root's live version is the version of its live object (the store keys objects by

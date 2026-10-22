@@ -30,8 +30,9 @@ impl CachedTransaction {
     pub fn new(
         transaction: VerifiedTransaction,
         immutable: &[messages::base::ObjectId],
+        bump: &containers::Bump,
     ) -> CachedTransaction {
-        let owned = owned_inputs_to_lock(&transaction, immutable);
+        let owned = owned_inputs_to_lock(&transaction, immutable, bump);
         CachedTransaction { transaction, owned }
     }
 }

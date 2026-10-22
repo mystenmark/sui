@@ -291,8 +291,14 @@ pub fn check_inputs(
     epoch: &EpochState,
     store: &store::Store,
     transaction: VerifiedTransaction,
+    bump: &Bump,
 ) -> Result<InputsCheckedTransaction, validation::Error> {
-    validation::inputs::check(&transaction.get().0, &epoch.context(), &StoreObjects(store))?;
+    validation::inputs::check(
+        &transaction.get().0,
+        &epoch.context(),
+        &StoreObjects(store),
+        bump,
+    )?;
     Ok(transaction.relabel(&Witness(PhantomData)))
 }
 
@@ -311,8 +317,14 @@ pub fn inputs_pass(
     epoch: &EpochState,
     store: &store::Store,
     transaction: &VerifiedTransaction,
+    bump: &Bump,
 ) -> Result<(), validation::Error> {
-    validation::inputs::check(&transaction.get().0, &epoch.context(), &StoreObjects(store))
+    validation::inputs::check(
+        &transaction.get().0,
+        &epoch.context(),
+        &StoreObjects(store),
+        bump,
+    )
 }
 
 struct StoreObjects<'a>(&'a store::Store);

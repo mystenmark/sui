@@ -184,7 +184,8 @@ impl BlockVoter {
                     {
                         rejects.push(*index as TransactionIndex);
                     }
-                    entries[*index] = Some(CachedTransaction::new(transaction, &claims.immutable));
+                    entries[*index] =
+                        Some(CachedTransaction::new(transaction, &claims.immutable, bump));
                 }
                 Err(_) => rejects.push(*index as TransactionIndex),
             }
@@ -263,7 +264,7 @@ impl BlockVoter {
             .expect("the store reads")
             .is_none()
         {
-            checks::inputs_pass(epoch, &self.store, transaction)?;
+            checks::inputs_pass(epoch, &self.store, transaction, bump)?;
         }
         if !claims.immutable.is_empty() {
             verify_immutable_object_claims(&self.store, transaction, &claims.immutable, bump)?;
@@ -545,7 +546,7 @@ fn verify_immutable_object_claims(
     claimed_ids: &[ObjectId],
     bump: &Bump,
 ) -> Result<(), RejectReason> {
-    let inputs = input_objects(transaction.get().0.data())?;
+    let inputs = input_objects(transaction.get().0.data(), bump)?;
     let mut owned: containers::Vec<'_, messages::base::ObjectRef> = containers::Vec::new_in(bump);
     owned.extend(inputs.iter().filter_map(|kind| match kind {
         InputKind::ImmOrOwned(r) => Some(*r),

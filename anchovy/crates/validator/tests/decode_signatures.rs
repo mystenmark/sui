@@ -114,7 +114,10 @@ fn committed_signatures_wait_for_the_local_checkpoint() {
         AuthorityPublicKeyBytes::ZERO,
     ))
     .unwrap();
-    let output = decoder.decode(commit(vec![seven_tx, end_of_publish, eight_tx], vec![]));
+    let output = decoder.decode(
+        commit(vec![seven_tx, end_of_publish, eight_tx], vec![]),
+        &containers::Bump::default(),
+    );
     assert!(output.transactions.is_empty());
     assert_eq!((output.cache_hits, output.cache_misses), (0, 0));
 
@@ -133,7 +136,10 @@ fn rejected_signatures_are_not_routed() {
     let mut decoder = CommitDecoder::new(Arc::new(epoch()), Arc::new(ConsensusTxCache::new()))
         .with_signatures(queue);
     let (_, transaction) = signature(7);
-    decoder.decode(commit(vec![transaction], vec![0]));
+    decoder.decode(
+        commit(vec![transaction], vec![0]),
+        &containers::Bump::default(),
+    );
     assert!(inbox.try_pop().is_none());
 }
 
@@ -141,7 +147,10 @@ fn rejected_signatures_are_not_routed() {
 fn unrouted_signatures_are_left_out() {
     let mut decoder = CommitDecoder::new(Arc::new(epoch()), Arc::new(ConsensusTxCache::new()));
     let (_, transaction) = signature(7);
-    let output = decoder.decode(commit(vec![transaction], vec![]));
+    let output = decoder.decode(
+        commit(vec![transaction], vec![]),
+        &containers::Bump::default(),
+    );
     assert!(output.transactions.is_empty());
 }
 

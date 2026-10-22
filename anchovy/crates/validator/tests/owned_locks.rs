@@ -185,7 +185,13 @@ fn commit(index: u32, transactions: &[Claimed<'_>]) -> DecodedCommit {
             .enumerate()
             .map(|(i, (t, immutable))| {
                 let immutable: Vec<_> = immutable.iter().map(id).collect();
-                CommittedTransaction::new(block, i as u16, parse(t.bytes.clone()), &immutable)
+                CommittedTransaction::new(
+                    block,
+                    i as u16,
+                    parse(t.bytes.clone()),
+                    &immutable,
+                    &containers::Bump::default(),
+                )
             })
             .collect(),
         observations: Vec::new(),
@@ -645,14 +651,17 @@ fn decoding_carries_the_immutable_claims() {
         transactions: vec![user_transaction(&bytes, &[frozen])],
     };
     let mut decoder = CommitDecoder::new(epoch.clone(), Arc::new(ConsensusTxCache::new()));
-    let commit = decoder.decode(CommittedSubDag {
-        commit_index: 1,
-        digest: [0; 32],
-        leader: block.reference,
-        timestamp_ms: 0,
-        blocks: vec![block],
-        rejected: vec![],
-    });
+    let commit = decoder.decode(
+        CommittedSubDag {
+            commit_index: 1,
+            digest: [0; 32],
+            leader: block.reference,
+            timestamp_ms: 0,
+            blocks: vec![block],
+            rejected: vec![],
+        },
+        &containers::Bump::default(),
+    );
     assert_eq!(commit.cache_misses, 1);
     let locked = commit.transactions[0].owned.as_ref().unwrap();
     assert_eq!(locked, &vec![wire(&owned), wire(&gas)]);

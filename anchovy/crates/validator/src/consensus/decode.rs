@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use ::consensus::{BlockRef, CommittedSubDag, TransactionIndex};
+use containers::Bump;
 use messages::Message;
 use messages::base::{ObjectId, ObjectRef};
 use messages::build::system_transaction::{Jwk, JwkId};
@@ -79,8 +80,9 @@ impl CommittedTransaction {
         index: TransactionIndex,
         transaction: VerifiedTransaction,
         immutable: &[ObjectId],
+        bump: &Bump,
     ) -> CommittedTransaction {
-        let owned = owned_inputs_to_lock(&transaction, immutable);
+        let owned = owned_inputs_to_lock(&transaction, immutable, bump);
         CommittedTransaction {
             block,
             index,
@@ -101,8 +103,9 @@ pub type OwnedInputs = Result<Vec<ObjectRef>, validation::Error>;
 pub fn owned_inputs_to_lock(
     transaction: &VerifiedTransaction,
     immutable: &[ObjectId],
+    bump: &Bump,
 ) -> OwnedInputs {
-    let inputs = input_objects(transaction.get().0.data())?;
+    let inputs = input_objects(transaction.get().0.data(), bump)?;
     Ok(inputs
         .iter()
         .filter_map(|input| match input {
@@ -167,7 +170,7 @@ impl CommitDecoder {
     /// skipped, checkpoint signatures go to the built waiter if routed,
     /// and other kinds are left out. Then the cache drops the blocks of
     /// rounds consensus no longer commits.
-    pub fn decode(&mut self, commit: CommittedSubDag) -> DecodedCommit {
+    pub fn decode(&mut self, commit: CommittedSubDag, bump: &Bump) -> DecodedCommit {
         let CommittedSubDag {
             commit_index,
             digest,
@@ -215,7 +218,7 @@ impl CommitDecoder {
                 } else {
                     // Not voted on here, rejected here, or not a user
                     // transaction.
-                    match decode_transaction(bytes) {
+                    match decode_transaction(bytes, bump) {
                         Decoded::User(entry) => {
                             decoded.cache_misses += 1;
                             (entry.transaction, entry.owned)
@@ -307,7 +310,7 @@ pub(crate) fn checkpoint_signature(
 /// # Panics
 /// If it does not decode: every committed block passed this validator's
 /// voting, which decodes each of its transactions.
-fn decode_transaction(bytes: Vec<u8>) -> Decoded {
+fn decode_transaction(bytes: Vec<u8>, bump: &Bump) -> Decoded {
     let transaction = Message::<ConsensusTransaction<'static>>::parse(bytes)
         .map_err(|(e, _)| e)
         .expect("a committed transaction decodes");
@@ -316,7 +319,7 @@ fn decode_transaction(bytes: Vec<u8>) -> Decoded {
     }
     let immutable = match transaction.get().kind() {
         ConsensusTransactionKind::UserTransactionV2(user) => {
-            claimed_immutable(user.claims()).to_vec()
+            containers::vec_from_slice(bump, claimed_immutable(user.claims()))
         }
         ConsensusTransactionKind::ExecutionTimeObservation(observation) => {
             return Decoded::Observations(SharedObservations {
@@ -348,19 +351,15 @@ fn decode_transaction(bytes: Vec<u8>) -> Decoded {
             .into_user_transaction()
             .expect("a user transaction"),
     );
-    Decoded::User(CachedTransaction::new(transaction, &immutable))
+    Decoded::User(CachedTransaction::new(transaction, &immutable, bump))
 }
 
 impl Processor for CommitDecoder {
     type Input = CommitRequest;
     type Output = DecodedCommit;
 
-    fn process(
-        &mut self,
-        request: CommitRequest,
-        _bump: &mut workqueue::Bump,
-    ) -> Option<DecodedCommit> {
-        let mut decoded = self.decode(request.commit);
+    fn process(&mut self, request: CommitRequest, bump: &mut Bump) -> Option<DecodedCommit> {
+        let mut decoded = self.decode(request.commit, bump);
         decoded.handled = request.handled;
         Some(decoded)
     }

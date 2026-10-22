@@ -134,12 +134,15 @@ fn main() {
 
         let mut elapsed = Duration::ZERO;
         let mut allocations = 0;
+        // As a worker's arena: reset after each item, never freed.
+        let mut bump = workqueue::Bump::default();
         for (round, batch) in batches.into_iter().enumerate() {
             let before = ALLOCATIONS.load(Ordering::Relaxed);
             let start = Instant::now();
-            aggregator.process(batch, &mut workqueue::Bump::default());
+            aggregator.process(batch, &mut bump);
             let took = start.elapsed();
             let allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
+            bump.reset();
             assert_eq!(certified.try_pop().unwrap().seq, round as u64);
             // The first round warms up.
             if round > 0 {

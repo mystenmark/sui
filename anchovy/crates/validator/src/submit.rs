@@ -53,7 +53,7 @@ impl SubmitChecker {
 
         // The owned inputs that are immutable, in input order.
         let mut immutable = containers::Vec::new_in(bump);
-        for input in input_objects(data)? {
+        for input in input_objects(data, bump)? {
             let InputKind::ImmOrOwned(r) = input else {
                 continue;
             };
@@ -146,7 +146,7 @@ impl Processor for SubmitChecker {
                 outcomes.push(outcome);
                 continue;
             }
-            let submission = checks::inputs_pass(&epoch, &self.store, transaction)
+            let submission = checks::inputs_pass(&epoch, &self.store, transaction, bump)
                 .and_then(|()| self.consensus_transaction(&epoch, transaction, bump));
             outcomes.push(match submission {
                 Ok(bytes) => Outcome::Submit(bytes),

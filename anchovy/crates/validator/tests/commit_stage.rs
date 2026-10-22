@@ -184,6 +184,7 @@ fn commit(index: u32, round: u32, timestamp_ms: u64, transactions: &[Vec<u8>]) -
                         Message::parse(bytes.clone()).map_err(|(e, _)| e).unwrap(),
                     ),
                     &[],
+                    &containers::Bump::default(),
                 )
             })
             .collect(),

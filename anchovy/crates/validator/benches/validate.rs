@@ -313,14 +313,18 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
     );
     let mut validator = TransactionValidator::new(epoch.clone());
     let mut verifier = SignatureVerifier::new(epoch.clone());
+    // As a worker's arena: reset after each item, never freed.
+    let mut bump = workqueue::Bump::default();
     let mut both = |verifier: &mut SignatureVerifier, txs: &[Bytes]| {
         for bytes in txs {
             let (reply, _verdict) = oneshot::channel();
             let request = Request::new(vec![decode(bytes)], reply);
-            let accepted = validator
-                .process(request, &mut workqueue::Bump::default())
-                .and_then(|valid| verifier.process(valid, &mut workqueue::Bump::default()))
+            let valid = validator.process(request, &mut bump);
+            bump.reset();
+            let accepted = valid
+                .and_then(|valid| verifier.process(valid, &mut bump))
                 .is_some();
+            bump.reset();
             black_box(accepted);
         }
     };

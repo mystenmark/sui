@@ -422,7 +422,7 @@ struct Committer {
 
 impl Committer {
     fn handle(&mut self, epoch: &EpochState, commit: CommittedSubDag) -> Option<HandledCommit> {
-        let decoded = self.decoder.decode(commit);
+        let decoded = self.decoder.decode(commit, &containers::Bump::default());
         self.handler
             .handle(&epoch.params, decoded, &mut workqueue::Bump::default())
     }
@@ -679,7 +679,7 @@ fn handlers_decide_alike_whatever_has_executed() {
                 let decided = handler
                     .handle(
                         &node.epoch.params,
-                        decoder.decode(c.clone()),
+                        decoder.decode(c.clone(), &containers::Bump::default()),
                         &mut workqueue::Bump::default(),
                     )
                     .unwrap();

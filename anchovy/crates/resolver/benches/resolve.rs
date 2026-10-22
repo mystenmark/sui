@@ -215,13 +215,16 @@ fn resolve(epoch: &Arc<EpochParams>, rng: &mut Rng) {
             let mut elapsed = Duration::ZERO;
             let mut allocations = 0;
             let rounds = 200;
+            // As a worker's arena: reset after each item, never freed.
+            let mut bump = workqueue::Bump::default();
             for round in 0..=rounds {
                 let chunk = chunk(round, &transactions);
                 let before = ALLOCATIONS.load(Ordering::Relaxed);
                 let start = Instant::now();
-                resolver.process(chunk, &mut workqueue::Bump::default());
+                resolver.process(chunk, &mut bump);
                 let took = start.elapsed();
                 let allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
+                bump.reset();
                 let Some(Command::Wait(batch)) = inbox.try_pop() else {
                     panic!("a wait");
                 };
