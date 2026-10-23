@@ -13,7 +13,7 @@ use std::cell::Cell;
 
 use tokio::sync::oneshot;
 use validator::processors::{Request, SignatureVerifier, TransactionValidator};
-use workqueue::Processor;
+use workqueue::{Bump, Processor};
 
 struct Counting;
 
@@ -39,20 +39,23 @@ static COUNTING: Counting = Counting;
 
 /// Runs one transaction through the processors, each one's output the next
 /// one's input, counting their allocations; the request and its reply
-/// channel are the handler's, made before counting. Returns whether it was
-/// verified.
+/// channel are the handler's, made before counting. `bump` is reset after
+/// each processor, as a worker's arena. Returns whether it was verified.
 fn process(
     validator: &mut TransactionValidator,
     verifier: &mut SignatureVerifier,
     case: &common::Case,
+    bump: &mut Bump,
 ) -> (bool, usize) {
     let (reply, _verdict) = oneshot::channel();
     let request = Request::new(vec![case.parse().unwrap()], reply);
     let before = ALLOCATIONS.with(Cell::get);
-    let accepted = validator
-        .process(request)
-        .and_then(|valid| verifier.process(valid))
+    let valid = validator.process(request, bump);
+    bump.reset();
+    let accepted = valid
+        .and_then(|valid| verifier.process(valid, bump))
         .is_some();
+    bump.reset();
     let allocations = ALLOCATIONS.with(Cell::get) - before;
     (accepted, allocations)
 }
@@ -74,14 +77,15 @@ fn verifying_allocates_nothing_once_warm() {
     let epoch = common::mainnet_epoch(epoch);
     let mut validator = TransactionValidator::new(epoch.clone());
     let mut warm = SignatureVerifier::new(epoch.clone());
+    let mut bump = Bump::default();
     for case in &cases {
-        process(&mut validator, &mut warm, case);
+        process(&mut validator, &mut warm, case, &mut bump);
     }
     let mut accepted = 0;
     for case in &cases {
         // A cache that has not seen it, made before counting: it is verified.
         let mut verifier = SignatureVerifier::new(epoch.clone());
-        let (ok, allocations) = process(&mut validator, &mut verifier, case);
+        let (ok, allocations) = process(&mut validator, &mut verifier, case, &mut bump);
         assert_eq!(verifier.cache_stats().0, 0);
         if ok && plain_signatures(case) {
             accepted += 1;
@@ -98,14 +102,15 @@ fn a_cache_hit_allocates_nothing() {
     let epoch = common::mainnet_epoch(epoch);
     let mut validator = TransactionValidator::new(epoch.clone());
     let mut verifier = SignatureVerifier::new(epoch.clone());
+    let mut bump = Bump::default();
     let accepted: Vec<_> = cases
         .iter()
-        .filter(|case| process(&mut validator, &mut verifier, case).0)
+        .filter(|case| process(&mut validator, &mut verifier, case, &mut bump).0)
         .collect();
     assert!(!accepted.is_empty());
     let (hits, _) = verifier.cache_stats();
     for case in &accepted {
-        let (ok, allocations) = process(&mut validator, &mut verifier, case);
+        let (ok, allocations) = process(&mut validator, &mut verifier, case, &mut bump);
         assert!(ok);
         assert_eq!(allocations, 0, "{}", case.label);
     }

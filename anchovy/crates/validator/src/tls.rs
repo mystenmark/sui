@@ -72,6 +72,11 @@ impl NetworkKey {
             .expect("any 32 bytes are an Ed25519 secret")
     }
 
+    /// The secret, for the parts that sign with the key themselves.
+    pub fn secret(&self) -> [u8; 32] {
+        self.0
+    }
+
     /// The public key clients pin.
     pub fn public_key(&self) -> [u8; 32] {
         self.key_pair()

@@ -4,7 +4,7 @@
 //! The epoch store over a real database.
 
 use messages::Message;
-use messages::base::{Digest, ObjectId, ObjectRef};
+use messages::base::{Digest, Hashed, ObjectId, ObjectRef};
 use messages::checkpoint::CheckpointData;
 use store::{Commit, Live, Store, Written};
 use validator::epoch_store::{ConsensusOutput, EpochStore};
@@ -93,13 +93,13 @@ fn generations_are_written_once_their_producer_commits() {
     };
     {
         let table = table(&dir);
-        table.record(stream(1), 3, 1, version(2), [1; 32], false);
-        table.record(stream(2), 7, 1, ended, [2; 32], false);
-        table.record(stream(3), 4, 1, version(5), [3; 32], true);
+        table.record(stream(1), 3, 1, version(2), tx(1), false);
+        table.record(stream(2), 7, 1, ended, tx(2), false);
+        table.record(stream(3), 4, 1, version(5), tx(3), true);
         assert_eq!(table.get(stream(1), 3, 1), Some(version(2)));
         assert_eq!(table.get(stream(2), 7, 1), Some(ended));
         assert_eq!(table.get(stream(1), 3, 2), None);
-        table.commit(&[[1; 32]]);
+        table.commit(&[tx(1)], &containers::Bump::default());
         assert_eq!(table.get(stream(1), 3, 1), Some(version(2)));
         // A stream's start, recorded once.
         assert_eq!(
@@ -117,6 +117,11 @@ fn generations_are_written_once_their_producer_commits() {
     assert_eq!(table.get(stream(2), 7, 1), None);
     assert_eq!(table.get(stream(3), 4, 1), Some(version(5)));
     assert_eq!(table.get(stream(4), 3, 0), Some(version(8)));
+}
+
+/// A transaction digest, as computed.
+fn tx(n: u8) -> Hashed {
+    Hashed::of("TransactionData", &[n])
 }
 
 fn object(n: u8) -> ObjectRef {
@@ -138,9 +143,9 @@ fn commit(
     height: u64,
     drained: bool,
 ) {
-    output.set_processed([digest; 32]);
+    output.set_processed(tx(digest));
     if let Some(n) = lock {
-        output.set_lock(object(n), [digest; 32]);
+        output.set_lock(object(n), tx(digest));
     }
     output.set_stream(stream(s), last);
     output.finish_commit(vec![record], height, drained);
@@ -160,9 +165,9 @@ fn consensus_output_is_written_once_its_checkpoints_commit() {
         commit(&mut output, 2, 2, Some(2), (1, (2, 1)), 11, false);
         commit(&mut output, 3, 3, None, (2, (3, 1)), 12, true);
         for n in 1..=3 {
-            assert!(output.is_processed(&[n; 32]));
+            assert!(output.is_processed(&tx(n)));
         }
-        assert_eq!(output.lock_holder(&object(2)), Some([2; 32]));
+        assert_eq!(output.lock_holder(&object(2)), Some(tx(2)));
         assert_eq!(output.stream(&stream(1)), Some((2, 1)));
         assert_eq!(output.record(), None);
 
@@ -173,15 +178,15 @@ fn consensus_output_is_written_once_its_checkpoints_commit() {
         // Stream 1, written by commit 1 and again by commit 2, reads as
         // commit 2 left it.
         assert_eq!(output.stream(&stream(1)), Some((2, 1)));
-        assert!(output.is_processed(&[2; 32]));
+        assert!(output.is_processed(&tx(2)));
     }
     {
         // A restart finds commit 1's output only.
         let (_, mut output, _) = EpochStore::open(dir.path(), 0);
         assert_eq!(output.record(), Some(vec![1]));
-        assert!(output.is_processed(&[1; 32]));
-        assert!(!output.is_processed(&[2; 32]));
-        assert_eq!(output.lock_holder(&object(1)), Some([1; 32]));
+        assert!(output.is_processed(&tx(1)));
+        assert!(!output.is_processed(&tx(2)));
+        assert_eq!(output.lock_holder(&object(1)), Some(tx(1)));
         assert_eq!(output.lock_holder(&object(2)), None);
         assert_eq!(output.stream(&stream(1)), Some((1, 1)));
         assert_eq!(output.stream(&stream(2)), None);
@@ -195,8 +200,8 @@ fn consensus_output_is_written_once_its_checkpoints_commit() {
         assert_eq!(output.record(), Some(vec![3]));
     }
     let (_, output, _) = EpochStore::open(dir.path(), 0);
-    assert!(output.is_processed(&[3; 32]));
-    assert_eq!(output.lock_holder(&object(2)), Some([2; 32]));
+    assert!(output.is_processed(&tx(3)));
+    assert_eq!(output.lock_holder(&object(2)), Some(tx(2)));
     assert_eq!(output.stream(&stream(1)), Some((2, 1)));
     assert_eq!(output.stream(&stream(2)), Some((3, 1)));
 }

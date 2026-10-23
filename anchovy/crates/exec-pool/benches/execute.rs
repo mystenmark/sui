@@ -65,6 +65,8 @@ fn run(name: &str, node: &mut Node, executables: Vec<Executable>) {
     let mut elapsed = Duration::ZERO;
     let mut allocations = 0;
     let mut executables = executables.into_iter();
+    // As a worker's arena: reset after each item, never freed.
+    let mut bump = workqueue::Bump::default();
     loop {
         let batch: Vec<Executable> = executables.by_ref().take(BATCH).collect();
         if batch.is_empty() {
@@ -72,9 +74,10 @@ fn run(name: &str, node: &mut Node, executables: Vec<Executable>) {
         }
         let before = ALLOCATIONS.load(Ordering::Relaxed);
         let start = Instant::now();
-        node.executor.process(batch);
+        node.executor.process(batch, &mut bump);
         elapsed += start.elapsed();
         allocations += ALLOCATIONS.load(Ordering::Relaxed) - before;
+        bump.reset();
         while node.notified_inputs.try_pop().is_some() {}
         while node.notified_effects.try_pop().is_some() {}
     }

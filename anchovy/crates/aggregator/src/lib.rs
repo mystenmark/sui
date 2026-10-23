@@ -4,10 +4,11 @@
 //! Certifying checkpoints from the committee's signatures
 //! (`docs/consensus_pipeline.md`, Checkpointing).
 
+use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use containers::Bump;
 use fastcrypto::bls12381::min_sig::{
     BLS12381AggregateSignature, BLS12381PublicKey, BLS12381Signature,
 };
@@ -15,6 +16,7 @@ use fastcrypto::traits::{AggregateAuthenticator, ToFromBytes, VerifyingKey};
 use messages::base::Digest;
 use roaring::RoaringBitmap;
 use tracing::{error, warn};
+use validator::pipeline::backpressure::Backpressure;
 use validator::pipeline::items::{
     BuiltWaitItem, BuiltWaits, CertifiedCheckpoint, CheckpointSignature,
 };
@@ -53,7 +55,8 @@ struct Member {
 pub struct Committee {
     epoch: u64,
     members: Vec<Member>,
-    index: HashMap<[u8; 96], u32>,
+    /// Each member's public key bytes, by position: sorted.
+    names: Vec<[u8; 96]>,
     total: Stake,
 }
 
@@ -66,14 +69,17 @@ impl Committee {
     ) -> Result<Committee, CommitteeError> {
         let mut sorted: Vec<([u8; 96], Stake)> = members.into_iter().collect();
         sorted.sort_unstable_by_key(|a| a.0);
-        let mut index = HashMap::with_capacity(sorted.len());
+        if sorted.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(CommitteeError::Duplicate);
+        }
+        assert!(
+            u32::try_from(sorted.len()).is_ok(),
+            "fewer than 2^32 members"
+        );
+        let names = sorted.iter().map(|(name, _)| *name).collect();
         let mut out = Vec::with_capacity(sorted.len());
         let mut total: Stake = 0;
-        for (i, (name, stake)) in sorted.into_iter().enumerate() {
-            let position = u32::try_from(i).expect("fewer than 2^32 members");
-            if index.insert(name, position).is_some() {
-                return Err(CommitteeError::Duplicate);
-            }
+        for (name, stake) in sorted {
             let key =
                 BLS12381PublicKey::from_bytes(&name).map_err(|_| CommitteeError::InvalidKey)?;
             total = total.checked_add(stake).expect("total stake fits in u64");
@@ -82,7 +88,7 @@ impl Committee {
         Ok(Committee {
             epoch,
             members: out,
-            index,
+            names,
             total,
         })
     }
@@ -110,7 +116,8 @@ impl Committee {
     }
 
     fn position(&self, name: &[u8; 96]) -> Option<u32> {
-        self.index.get(name).copied()
+        let position = self.names.binary_search(name).ok()?;
+        Some(u32::try_from(position).expect("fewer than 2^32 members"))
     }
 
     fn member(&self, position: u32) -> &Member {
@@ -262,6 +269,11 @@ impl Pending {
 
     /// Records a signature over a summary other than the local one: a fork,
     /// here or there. It never counts toward the local summary's quorum.
+    ///
+    /// # Panics
+    /// Once a quorum has signed the other summary: the network certified a
+    /// checkpoint this validator did not build, which sui finds when state
+    /// sync brings it the certificate, and halts on.
     fn add_other(
         &mut self,
         committee: &Committee,
@@ -292,6 +304,13 @@ impl Pending {
         let (signers, stake) = self.others.entry(digest).or_default();
         signers.push(position);
         *stake += member.stake;
+        assert!(
+            *stake < committee.quorum_threshold(),
+            "fork: a quorum certified checkpoint {} {:?}, not the {:?} this validator built",
+            self.local.seq,
+            Digest::new(digest),
+            Digest::new(self.local.digest),
+        );
         self.vote(position, member.stake);
         warn!(
             seq = self.local.seq,
@@ -305,6 +324,9 @@ impl Pending {
 
     /// sui's `check_for_split_brain`: no quorum is reachable on any summary
     /// whatever the members yet to sign do.
+    ///
+    /// # Panics
+    /// On a split brain, in a debug build, as sui's `debug_fatal!`.
     fn check_split_brain(&mut self, committee: &Committee) {
         let plurality = self
             .others
@@ -328,6 +350,13 @@ impl Pending {
                 ?factions,
                 "checkpoint split brain: no summary can reach a quorum"
             );
+            debug_assert!(
+                false,
+                "checkpoint split brain at checkpoint {}: ours {:?} with stake {}, others {factions:?}",
+                self.local.seq,
+                Digest::new(self.local.digest),
+                self.stake,
+            );
         }
     }
 
@@ -335,17 +364,23 @@ impl Pending {
     /// that verify reach a quorum. Like sui's `StakeAggregator::insert`, the
     /// aggregate is verified first, and only if it fails is each signature,
     /// evicting those that do not verify.
-    fn certify(&mut self, committee: &Committee, scratch: &mut Vec<u8>) -> Option<Vec<u8>> {
+    fn certify(
+        &mut self,
+        committee: &Committee,
+        scratch: &mut Vec<u8>,
+        bump: &Bump,
+    ) -> Option<Vec<u8>> {
         let threshold = committee.quorum_threshold();
         if self.stake < threshold {
             return None;
         }
         let message = signing_message(scratch, &self.local.summary, committee.epoch);
-        let keys: Vec<BLS12381PublicKey> = self
-            .signatures
-            .keys()
-            .map(|&p| committee.member(p).key.clone())
-            .collect();
+        let mut keys = containers::Vec::with_capacity_in(self.signatures.len(), bump);
+        keys.extend(
+            self.signatures
+                .keys()
+                .map(|&p| committee.member(p).key.clone()),
+        );
         let aggregate =
             BLS12381AggregateSignature::aggregate(self.signatures.values().map(|c| &c.signature))
                 .ok()?;
@@ -387,15 +422,12 @@ impl Pending {
     fn certified_bytes(&self, epoch: u64, aggregate: &BLS12381AggregateSignature) -> Vec<u8> {
         let signers = RoaringBitmap::from_sorted_iter(self.signatures.keys().copied())
             .expect("positions iterate in order");
-        let mut bitmap = Vec::with_capacity(signers.serialized_size());
-        signers
-            .serialize_into(&mut bitmap)
-            .expect("writing to a vector does not fail");
-        let mut bytes = Vec::with_capacity(self.local.summary.len() + 8 + 48 + 5 + bitmap.len());
+        let bitmap = signers.serialized_size();
+        let mut bytes = Vec::with_capacity(self.local.summary.len() + 8 + 48 + 5 + bitmap);
         bytes.extend_from_slice(&self.local.summary);
         bytes.extend_from_slice(&epoch.to_le_bytes());
         bytes.extend_from_slice(aggregate.as_ref());
-        let mut len = bitmap.len();
+        let mut len = bitmap;
         loop {
             let byte = (len & 0x7f) as u8;
             len >>= 7;
@@ -405,7 +437,9 @@ impl Pending {
             }
             bytes.push(byte | 0x80);
         }
-        bytes.extend_from_slice(&bitmap);
+        signers
+            .serialize_into(&mut bytes)
+            .expect("writing to a vector does not fail");
         bytes
     }
 }
@@ -436,13 +470,15 @@ impl Pending {
 ///   `CheckpointBuilt(seq)`, for the fork check;
 /// - `CheckpointCommitter`: `Vec<CertifiedCheckpoint>`, in sequence order.
 ///
-/// Reads: the checkpoint store.
+/// Reads: the checkpoint store. Writes: backpressure's certified watermark.
 pub struct CheckpointAggregator {
     committee: Arc<Committee>,
     checkpoints: Arc<CheckpointStore>,
     state_sync: Queue<CertifiedCheckpoint>,
     /// Where certified checkpoints wait to be checked for a fork, once wired.
     fork_checks: Option<BuiltWaits>,
+    /// Told of each checkpoint certified, once wired.
+    backpressure: Option<Arc<Backpressure>>,
     /// The checkpoint to certify next; every earlier one is certified.
     next: u64,
     pending: BTreeMap<u64, Pending>,
@@ -461,6 +497,7 @@ impl CheckpointAggregator {
             checkpoints,
             state_sync,
             fork_checks: None,
+            backpressure: None,
             next,
             pending: BTreeMap::new(),
             scratch: Vec::new(),
@@ -474,7 +511,19 @@ impl CheckpointAggregator {
         self
     }
 
-    fn add(&mut self, signature: &CheckpointSignature, certified: &mut Vec<CertifiedCheckpoint>) {
+    /// Tells `backpressure` of each checkpoint certified.
+    #[must_use]
+    pub fn with_backpressure(mut self, backpressure: Arc<Backpressure>) -> CheckpointAggregator {
+        self.backpressure = Some(backpressure);
+        self
+    }
+
+    fn add(
+        &mut self,
+        signature: &CheckpointSignature,
+        certified: &mut Vec<CertifiedCheckpoint>,
+        bump: &Bump,
+    ) {
         let seq = signature.seq;
         if seq < self.next {
             return;
@@ -511,15 +560,15 @@ impl CheckpointAggregator {
             return;
         }
         if pending.add_local(committee, position, &signed, &mut self.scratch) && seq == self.next {
-            self.certify_in_order(certified);
+            self.certify_in_order(certified, bump);
         }
     }
 
     /// Certifies `next`, then each later checkpoint that already has a
     /// quorum.
-    fn certify_in_order(&mut self, certified: &mut Vec<CertifiedCheckpoint>) {
+    fn certify_in_order(&mut self, certified: &mut Vec<CertifiedCheckpoint>, bump: &Bump) {
         while let Some(pending) = self.pending.get_mut(&self.next) {
-            let Some(summary) = pending.certify(&self.committee, &mut self.scratch) else {
+            let Some(summary) = pending.certify(&self.committee, &mut self.scratch, bump) else {
                 return;
             };
             let seq = self.next;
@@ -529,6 +578,10 @@ impl CheckpointAggregator {
                 seq,
                 summary: summary.into(),
             };
+            // Before the committer can commit it.
+            if let Some(backpressure) = &self.backpressure {
+                backpressure.certified(seq);
+            }
             if self.state_sync.try_push(checkpoint.clone()).is_err() {
                 warn!(seq, "state sync refused a certified checkpoint");
             }
@@ -556,10 +609,14 @@ impl Processor for CheckpointAggregator {
     type Input = Vec<CheckpointSignature>;
     type Output = Vec<CertifiedCheckpoint>;
 
-    fn process(&mut self, ready: Vec<CheckpointSignature>) -> Option<Vec<CertifiedCheckpoint>> {
+    fn process(
+        &mut self,
+        ready: Vec<CheckpointSignature>,
+        bump: &mut Bump,
+    ) -> Option<Vec<CertifiedCheckpoint>> {
         let mut certified = Vec::new();
         for signature in &ready {
-            self.add(signature, &mut certified);
+            self.add(signature, &mut certified, bump);
         }
         (!certified.is_empty()).then_some(certified)
     }

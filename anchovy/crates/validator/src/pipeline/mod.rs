@@ -8,6 +8,7 @@
 //! crates (`resolver`, `exec-pool`, `settlement`, `checkpoint`,
 //! `state-hasher`, `aggregator`), wired together by `node`.
 
+pub mod backpressure;
 pub mod items;
 pub mod keys;
 pub mod tables;

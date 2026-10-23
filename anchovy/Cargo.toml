@@ -5,6 +5,8 @@ members = [
     "crates/arena",
     "crates/checkpoint",
     "crates/consensus",
+    "crates/compat",
+    "crates/consensus-glue",
     "crates/containers",
     "crates/exec-types",
     "crates/exec-pool",
@@ -38,6 +40,10 @@ blake2 = "=0.10.6"
 tidehunter = { git = "https://github.com/mystenlabs/tidehunter.git", rev = "f8bc93cf6a973d31fbbe6fa7c2b643ddd8e83ddf" }
 tempfile = "3.20.0"
 # Sui's executor, its types and its framework, linked only by `execution`.
+consensus-core = { path = "../consensus/core" }
+consensus-types = { path = "../consensus/types" }
+mysten-metrics = { path = "../crates/mysten-metrics" }
+consensus-config = { path = "../consensus/config" }
 sui-execution = { path = "../sui-execution" }
 sui-framework = { path = "../crates/sui-framework" }
 sui-protocol-config = { path = "../crates/sui-protocol-config" }
@@ -46,6 +52,11 @@ sui-types = { path = "../crates/sui-types" }
 # Builds a genesis with a system state and validators, for tests.
 sui-genesis-builder = { path = "../crates/sui-genesis-builder" }
 sui-config = { path = "../crates/sui-config" }
+sui-core = { path = "../crates/sui-core" }
+sui-node = { path = "../crates/sui-node" }
+sui-swarm = { path = "../crates/sui-swarm" }
+sui-swarm-config = { path = "../crates/sui-swarm-config" }
+telemetry-subscribers = { path = "../crates/telemetry-subscribers" }
 move-core-types = { path = "../external-crates/move/crates/move-core-types" }
 move-binary-format = { path = "../external-crates/move/crates/move-binary-format" }
 move-vm-runtime = { path = "../external-crates/move/crates/move-vm-runtime" }
@@ -66,6 +77,7 @@ aggregator = { path = "crates/aggregator" }
 arena = { path = "crates/arena" }
 checkpoint = { path = "crates/checkpoint" }
 consensus = { path = "crates/consensus" }
+consensus-glue = { path = "crates/consensus-glue" }
 containers = { path = "crates/containers" }
 exec-pool = { path = "crates/exec-pool" }
 execution = { path = "crates/execution" }
@@ -117,6 +129,7 @@ insta = { version = "1", features = ["yaml"] }
 bytes = "1.11"
 crossbeam-channel = "0.5.15"
 prost = "0.14.1"
+futures = "0.3.28"
 tokio = { version = "1.52", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1.17", default-features = false }
 tonic = { version = "0.14.6", default-features = false, features = ["codegen", "router", "server", "transport"] }

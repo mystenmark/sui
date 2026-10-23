@@ -16,8 +16,11 @@ use std::sync::Arc;
 
 use consensus::{Priority, TransactionClient};
 use messages::Message;
-use messages::base::Digest;
+use messages::arena::BumpAlloc;
+use messages::base::Hashed;
+use messages::checkpoint::{CheckpointContents, VersionedCheckpointContents};
 use messages::fast::Bump;
+use messages::reader::Reader;
 use messages::transaction::SenderSignedData;
 use validator::epoch::EpochParams;
 use validator::pipeline::items::{
@@ -33,10 +36,6 @@ pub use built::{BuiltAvailability, BuiltRouter, check_fork};
 pub use close::EpochCloser;
 pub use commit::CheckpointCommitter;
 pub use key::ProtocolKey;
-
-/// Arena for one checkpoint's parsed effects and contents; a larger
-/// checkpoint spills into extra chunks, freed at the next reset.
-const ARENA: usize = 1 << 20;
 
 /// Pushes `item` to `queue`. Inside the pipeline a full queue is a sizing
 /// bug, not load to shed; a closed one means the pipeline is shutting down.
@@ -75,7 +74,6 @@ pub struct ContentsBuilder {
     store: Arc<store::Store>,
     hasher: Queue<CheckpointEffects>,
     built: BuiltWaits,
-    bump: Bump,
 }
 
 impl ContentsBuilder {
@@ -92,15 +90,16 @@ impl ContentsBuilder {
             store,
             hasher,
             built,
-            bump: Bump::with_capacity(ARENA),
         }
     }
 
     /// The contents of `pending`, whose chunks have settled, and its
     /// effects in checkpoint order.
+    /// `bump` is reset first.
     pub fn build(
         &mut self,
         pending: PendingCheckpoint,
+        bump: &mut Bump,
     ) -> (CheckpointContentsBuilt, Vec<ExecutedEffects>) {
         let mut effects = Vec::new();
         for &height in &pending.heights {
@@ -110,12 +109,13 @@ impl ContentsBuilder {
                 .expect("a ready checkpoint's chunks are in the chunk table");
             effects.extend(chunk.effects.iter().cloned());
         }
-        let built = contents_of(&self.store, &self.epoch, pending, &effects, &mut self.bump);
+        let built = contents_of(&self.store, &self.epoch, pending, &effects, bump);
         (built, effects)
     }
 }
 
-/// `pending`'s contents, of `effects` in checkpoint order.
+/// `pending`'s contents, of `effects` in checkpoint order. `bump` is reset
+/// first: a checkpoint's temporaries can be large.
 ///
 /// # Panics
 /// If the store cannot be read or lacks an executed transaction.
@@ -126,16 +126,21 @@ fn contents_of(
     effects: &[ExecutedEffects],
     bump: &mut Bump,
 ) -> CheckpointContentsBuilt {
-    let stored: Vec<Message<SenderSignedData<'static>>> = effects
-        .iter()
-        .map(|e| {
-            store
-                .transaction(&Digest::new(e.digest))
-                .expect("the store reads")
-                .expect("an executed transaction is stored with its effects")
-        })
-        .collect();
-    let transactions: Vec<SenderSignedData<'_>> = stored.iter().map(|m| *m.get()).collect();
+    bump.reset();
+    let bump = &*bump;
+    let mut stored = containers::Vec::with_capacity_in(effects.len(), bump);
+    stored.extend(effects.iter().map(|e| {
+        store
+            .transaction(&e.digest)
+            .expect("the store reads")
+            .expect("an executed transaction is stored with its effects")
+    }));
+    let mut transactions = containers::Vec::with_capacity_in(stored.len(), bump);
+    transactions.extend(
+        stored
+            .iter()
+            .map(|m: &Message<SenderSignedData<'static>>| *m.get()),
+    );
     let contents = contents::build(&epoch.config, effects, &transactions, bump);
     CheckpointContentsBuilt {
         transaction_count: effects.len() as u64,
@@ -153,11 +158,11 @@ impl Processor for ContentsBuilder {
     type Input = Vec<PendingCheckpoint>;
     type Output = ();
 
-    fn process(&mut self, ready: Vec<PendingCheckpoint>) -> Option<()> {
+    fn process(&mut self, ready: Vec<PendingCheckpoint>, bump: &mut Bump) -> Option<()> {
         let mut waits = WaitBatch::with_capacity(ready.len(), ready.len());
         for pending in ready {
             let seq = pending.seq;
-            let (mut built, effects) = self.build(pending);
+            let (mut built, effects) = self.build(pending, bump);
             if built.pending.close.is_some() {
                 // Built again, and hashed, with the change-epoch transaction.
                 built.last = Some(LastOfEpoch::Effects(effects));
@@ -203,7 +208,6 @@ pub struct SummaryBuilder {
     key: Arc<ProtocolKey>,
     built: BuiltWaits,
     consensus: TransactionClient,
-    bump: Bump,
 }
 
 impl SummaryBuilder {
@@ -220,7 +224,6 @@ impl SummaryBuilder {
             key,
             built,
             consensus,
-            bump: Bump::with_capacity(4096),
         }
     }
 }
@@ -229,9 +232,10 @@ impl Processor for SummaryBuilder {
     type Input = Vec<CheckpointContentsBuilt>;
     type Output = ();
 
-    fn process(&mut self, ready: Vec<CheckpointContentsBuilt>) -> Option<()> {
+    fn process(&mut self, ready: Vec<CheckpointContentsBuilt>, bump: &mut Bump) -> Option<()> {
+        let bump = &*bump;
         let mut resolved = Vec::with_capacity(ready.len());
-        let mut signatures = Vec::with_capacity(ready.len());
+        let mut signatures = containers::Vec::with_capacity_in(ready.len(), bump);
         for built in ready {
             let seq = built.pending.seq;
             let previous = seq.checked_sub(1).map(|previous| {
@@ -239,11 +243,12 @@ impl Processor for SummaryBuilder {
                     .built(previous)
                     .expect("a checkpoint is released once the previous one is built")
             });
-            let summary = summary::build(&built, previous.as_deref(), &self.epoch, &mut self.bump);
+            let summary = summary::build(&built, previous.as_deref(), &self.epoch, bump);
             signatures.push(summary::signature_transaction(
                 &self.key,
                 &summary.bytes,
                 self.epoch.epoch,
+                bump,
             ));
             let checkpoint = BuiltCheckpoint {
                 seq,
@@ -291,4 +296,27 @@ impl Availability<ChunkSettled> for ChunkAvailability {
         found.clear();
         found.extend(keys.iter().map(|k| self.chunks.get(k.0).map(|_| ())));
     }
+}
+
+/// The transactions of `contents` (`CheckpointContents` BCS), which this
+/// validator built from the digests it computed, in order.
+pub(crate) fn transactions<'b>(contents: &[u8], bump: &'b Bump) -> containers::Vec<'b, Hashed> {
+    let mut r = Reader::new(contents);
+    let parsed = CheckpointContents::parse(&mut r, &mut BumpAlloc(bump))
+        .and_then(|c| r.finish().map(|()| c))
+        .expect("built contents parse");
+    let mut digests = containers::Vec::new_in(bump);
+    match parsed.version {
+        VersionedCheckpointContents::V1 { transactions, .. } => {
+            digests.extend(transactions.iter().map(|t| Hashed::computed(t.transaction)));
+        }
+        VersionedCheckpointContents::V2(transactions) => {
+            digests.extend(
+                transactions
+                    .iter()
+                    .map(|t| Hashed::computed(t.digest.transaction)),
+            );
+        }
+    }
+    digests
 }

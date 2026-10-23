@@ -6,8 +6,7 @@ use std::marker::PhantomData;
 use crate::Message;
 use crate::arena::{Alloc, Ref};
 use crate::base::{
-    ChainIdentifier, Digest, ObjectId, ObjectRef, SequenceNumber, SuiAddress, TransactionDigest,
-    U32Le, U64Le,
+    ChainIdentifier, Hashed, ObjectId, ObjectRef, SequenceNumber, SuiAddress, U32Le, U64Le,
 };
 use crate::error::{ParseError, Result};
 use crate::object::GenesisObject;
@@ -671,12 +670,12 @@ pub struct TransactionData<'a, S: TxState = DigestReady> {
     expiration: TransactionExpiration<'a>,
     index: TransactionIndex<'a>,
     /// Zero until computed; readable only in `DigestReady`.
-    digest: TransactionDigest,
+    digest: Hashed,
     state: PhantomData<S>,
 }
 
 impl<S: HasDigest> TransactionData<'_, S> {
-    pub fn digest(&self) -> &TransactionDigest {
+    pub fn digest(&self) -> &Hashed {
         &self.digest
     }
 }
@@ -749,9 +748,9 @@ impl<'a, S: ParseState> TransactionData<'a, S> {
         Ok(TransactionData {
             bytes,
             digest: if A::BUILD && S::COMPUTED_WHILE_PARSING {
-                Digest::of("TransactionData", bytes)
+                Hashed::of("TransactionData", bytes)
             } else {
-                Digest::ZERO
+                Hashed::ZERO
             },
             kind,
             sender,
@@ -817,7 +816,7 @@ pub struct SenderSignedData<'a, S: TxState = DigestReady> {
 
 impl<S: HasDigest> SenderSignedData<'_, S> {
     /// The transaction digest: that of the `TransactionData`.
-    pub fn digest(&self) -> &TransactionDigest {
+    pub fn digest(&self) -> &Hashed {
         &self.data.digest
     }
 }
@@ -982,7 +981,7 @@ impl crate::message::ViewUpdate<Transaction<'static, DigestPending>> for Compute
     #[inline]
     fn apply(self, view: &mut Transaction<'_, DigestPending>) {
         let data = &mut view.0.data;
-        data.digest = Digest::of("TransactionData", data.bytes);
+        data.digest = Hashed::of("TransactionData", data.bytes);
     }
 }
 
@@ -1031,13 +1030,13 @@ crate::impl_wire!(Transaction<S>, guess = 34);
 crate::base::assert_wire_layout!(SharedObjectArg = 41, Intent = 3);
 
 impl<S: HasDigest> crate::message::Digested for TransactionData<'_, S> {
-    fn digest(&self) -> &Digest {
+    fn digest(&self) -> &Hashed {
         &self.digest
     }
 }
 
 impl<S: HasDigest> crate::message::Digested for SenderSignedData<'_, S> {
-    fn digest(&self) -> &Digest {
+    fn digest(&self) -> &Hashed {
         &self.data.digest
     }
 }

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use aggregator::Committee;
 use checkpoint::ProtocolKey;
 use consensus::TransactionClient;
+use execution::system_state::Member;
 use messages::base::Digest;
 use protocol_config::Chain;
 use validator::current::CurrentEpoch;
@@ -19,6 +20,7 @@ use validator::epoch::EpochState;
 use validator::epoch_store::EpochStore;
 use validator::pipeline::items::CertifiedCheckpoint;
 use validator::pipeline::tables::BuiltCheckpoint;
+use validator::tls::NetworkKey;
 use workqueue::Queue;
 
 use crate::{ConsensusOutput, Pipeline};
@@ -33,8 +35,9 @@ pub struct EpochRecord {
     pub reference_gas_price: u64,
     pub epoch_start_timestamp_ms: u64,
     pub epoch_duration_ms: u64,
-    /// Each member's protocol key and stake.
-    pub committee: Vec<([u8; 96], u64)>,
+    /// Each member, by protocol key: the checkpoint committee's name and
+    /// stake, and consensus's keys and address.
+    pub committee: Vec<Member>,
     /// The checkpoint the epoch's first checkpoint follows: the previous
     /// epoch's last, or genesis.
     pub previous_checkpoint: u64,
@@ -63,64 +66,84 @@ impl EpochRecord {
         }
     }
 
-    const FIXED: usize = 6 * 8;
-    const MEMBER: usize = 96 + 8;
-
     pub fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(
-            Self::FIXED + 16 + self.committee.len() * Self::MEMBER + self.root_state.len(),
-        );
-        for word in [
+        let committee: Vec<_> = self
+            .committee
+            .iter()
+            .map(|m| {
+                (
+                    m.name.to_vec(),
+                    m.stake,
+                    m.consensus_key,
+                    m.network_key,
+                    &m.address,
+                    &m.hostname,
+                )
+            })
+            .collect();
+        bcs::to_bytes(&(
             self.epoch,
             self.protocol_version,
             self.reference_gas_price,
             self.epoch_start_timestamp_ms,
             self.epoch_duration_ms,
             self.previous_checkpoint,
-            self.committee.len() as u64,
-        ] {
-            bytes.extend_from_slice(&word.to_le_bytes());
-        }
-        for (key, stake) in &self.committee {
-            bytes.extend_from_slice(key);
-            bytes.extend_from_slice(&stake.to_le_bytes());
-        }
-        bytes.extend_from_slice(&(self.root_state.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(&self.root_state);
-        bytes
+            committee,
+            &self.root_state,
+        ))
+        .expect("a record encodes")
     }
 
     /// # Panics
     /// If `bytes` is not what `encode` wrote.
     pub fn decode(bytes: &[u8]) -> EpochRecord {
-        let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().expect("a word"));
-        let members = usize::try_from(word(Self::FIXED)).expect("a committee fits in memory");
-        let committee_end = Self::FIXED + 8 + members * Self::MEMBER;
-        let committee = (0..members)
-            .map(|i| {
-                let at = Self::FIXED + 8 + i * Self::MEMBER;
-                (
-                    bytes[at..at + 96].try_into().expect("a protocol key"),
-                    word(at + 96),
-                )
-            })
-            .collect();
-        let root_len = usize::try_from(word(committee_end)).expect("a root fits in memory");
-        assert_eq!(
-            bytes.len(),
-            committee_end + 8 + root_len,
-            "an epoch start record"
+        type Encoded = (
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            u64,
+            Vec<(Vec<u8>, u64, [u8; 32], [u8; 32], String, String)>,
+            Vec<u8>,
         );
-        EpochRecord {
-            epoch: word(0),
-            protocol_version: word(8),
-            reference_gas_price: word(16),
-            epoch_start_timestamp_ms: word(24),
-            epoch_duration_ms: word(32),
-            previous_checkpoint: word(40),
+        let (
+            epoch,
+            protocol_version,
+            reference_gas_price,
+            epoch_start_timestamp_ms,
+            epoch_duration_ms,
+            previous_checkpoint,
             committee,
-            root_state: bytes[committee_end + 8..].to_vec(),
+            root_state,
+        ): Encoded = bcs::from_bytes(bytes).expect("an epoch start record decodes");
+        EpochRecord {
+            epoch,
+            protocol_version,
+            reference_gas_price,
+            epoch_start_timestamp_ms,
+            epoch_duration_ms,
+            previous_checkpoint,
+            committee: committee
+                .into_iter()
+                .map(
+                    |(name, stake, consensus_key, network_key, address, hostname)| Member {
+                        name: name.try_into().expect("a 96-byte protocol key"),
+                        stake,
+                        consensus_key,
+                        network_key,
+                        address,
+                        hostname,
+                    },
+                )
+                .collect(),
+            root_state,
         }
+    }
+
+    /// Each member's protocol key and stake: the checkpoint committee.
+    pub fn stakes(&self) -> impl Iterator<Item = ([u8; 96], u64)> + '_ {
+        self.committee.iter().map(|m| (m.name, m.stake))
     }
 
     /// The current epoch's record.
@@ -162,6 +185,35 @@ pub fn genesis(
     );
 }
 
+/// What starting an epoch's consensus takes.
+pub struct ConsensusStart {
+    pub epoch: Arc<EpochState>,
+    pub record: EpochRecord,
+    /// Where it delivers, and from which commit.
+    pub output: ConsensusOutput,
+    /// Where it keeps its data.
+    pub dir: PathBuf,
+}
+
+/// The node's consensus: started for each epoch, stopped before the node
+/// reconfigures.
+pub trait Consensus {
+    /// Starts the epoch's consensus; its transaction client.
+    fn start(&mut self, start: ConsensusStart) -> TransactionClient;
+
+    /// Stops the running epoch's consensus.
+    fn stop(&mut self);
+}
+
+/// A consensus that is started, and never needs stopping: the tests'.
+impl<F: FnMut(&Arc<EpochState>, ConsensusOutput) -> TransactionClient> Consensus for F {
+    fn start(&mut self, start: ConsensusStart) -> TransactionClient {
+        self(&start.epoch, start.output)
+    }
+
+    fn stop(&mut self) {}
+}
+
 /// What the node keeps across epochs.
 pub struct Perpetual {
     pub store: Arc<store::Store>,
@@ -173,7 +225,18 @@ pub struct Perpetual {
     pub chain: Chain,
     /// The genesis checkpoint's digest.
     pub chain_identifier: Digest,
-    pub protocol_key: Arc<ProtocolKey>,
+    pub keys: ValidatorKeys,
+}
+
+/// The validator's keys, as sui's `NodeConfig` holds them. The protocol key
+/// (BLS) names it in every committee and signs its checkpoints; consensus
+/// signs its blocks with the worker key and secures its network with the
+/// network key, both Ed25519.
+pub struct ValidatorKeys {
+    pub protocol: Arc<ProtocolKey>,
+    /// The worker key's Ed25519 secret.
+    pub worker: [u8; 32],
+    pub network: NetworkKey,
 }
 
 /// One epoch: its state, its committee and its pipeline, built from the
@@ -192,10 +255,7 @@ impl Epoch {
     ///
     /// # Panics
     /// If the store cannot be read, or the record's committee is invalid.
-    pub fn start(
-        perpetual: &Perpetual,
-        consensus: impl FnOnce(&Arc<EpochState>, ConsensusOutput) -> TransactionClient,
-    ) -> Epoch {
+    pub fn start(perpetual: &Perpetual, consensus: &mut impl Consensus) -> Epoch {
         let record = EpochRecord::load(&perpetual.store);
         let state = Arc::new(EpochState::starting_at(
             perpetual.chain,
@@ -208,8 +268,7 @@ impl Epoch {
             [],
         ));
         let committee = Arc::new(
-            Committee::new(record.epoch, record.committee.iter().copied())
-                .expect("the epoch's committee is valid"),
+            Committee::new(record.epoch, record.stakes()).expect("the epoch's committee is valid"),
         );
         let (epoch_store, consensus_output, builder_output) =
             EpochStore::open(&perpetual.epochs, record.epoch);
@@ -219,9 +278,16 @@ impl Epoch {
             &epoch_store,
             consensus_output,
             builder_output,
-            &perpetual.protocol_key,
+            &perpetual.keys.protocol,
             &committee,
-            |output| consensus(&state, output),
+            |output| {
+                consensus.start(ConsensusStart {
+                    epoch: state.clone(),
+                    record: record.clone(),
+                    output,
+                    dir: store::epoch::consensus_dir(&perpetual.epochs, record.epoch),
+                })
+            },
             perpetual.state_sync.clone(),
             &record,
         );
@@ -345,10 +411,7 @@ impl Node {
     ///
     /// # Panics
     /// If an epoch is running.
-    pub fn start_epoch(
-        &mut self,
-        consensus: impl FnOnce(&Arc<EpochState>, ConsensusOutput) -> TransactionClient,
-    ) -> &Epoch {
+    pub fn start_epoch(&mut self, consensus: &mut impl Consensus) -> &Epoch {
         assert!(self.running.is_none(), "one epoch at a time");
         if epoch_ended(&self.perpetual.store) {
             reconfigure(&self.perpetual.store);
@@ -378,17 +441,15 @@ impl Node {
     }
 
     /// Runs epoch after epoch, for good, starting each one's consensus with
-    /// `consensus`.
-    pub async fn run(
-        mut self,
-        mut consensus: impl FnMut(&Arc<EpochState>, ConsensusOutput) -> TransactionClient,
-    ) {
+    /// `consensus`, and stopping it before reconfiguring.
+    pub async fn run(mut self, mut consensus: impl Consensus) {
         loop {
             let mut ended = self.start_epoch(&mut consensus).pipeline.ended.clone();
             ended
                 .wait_for(Option::is_some)
                 .await
                 .expect("the committer lives as long as the epoch");
+            consensus.stop();
             // Joining the epoch's workers blocks.
             self = tokio::task::spawn_blocking(move || {
                 self.finish_epoch();

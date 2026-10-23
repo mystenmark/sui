@@ -164,12 +164,7 @@ impl NativeExecution {
             funds,
             assigned_accumulator,
         );
-        if arena.chunks() > 1 {
-            // Grow the first chunk so that later transactions this large fit in it.
-            *arena = Bump::with_capacity(arena.allocated().next_power_of_two().max(ARENA_CAPACITY));
-        } else {
-            arena.reset();
-        }
+        arena.reset();
         if runtime.package_cache.len() > self.max_packages {
             *runtime = Runtime::new(&self.config).expect("a runtime builds as it did at the start");
         }
@@ -192,12 +187,12 @@ impl NativeExecution {
         let reads = StoreReads::new(bump, store, &kept);
         let digest = *data.digest();
 
-        let kinds = input_objects(data).map_err(|e| Error::Native(format!("{e:?}")))?;
+        let kinds = input_objects(data, bump).map_err(|e| Error::Native(format!("{e:?}")))?;
         let mut loaded = containers::Vec::with_capacity_in(kinds.len(), bump);
         for kind in &kinds {
             loaded.push(load(&reads, kind, provided)?);
         }
-        let receiving = receiving_objects(data);
+        let receiving = receiving_objects(data, bump);
         let mut receiving_refs = containers::Vec::with_capacity_in(receiving.len(), bump);
         receiving_refs.extend(receiving.iter().map(|r| exec_types::base::object_ref(r)));
         // The root's live version is the version of its live object (the store keys objects by
@@ -248,7 +243,7 @@ impl NativeExecution {
             *data.kind(),
             None,
             *data.sender(),
-            digest,
+            *digest,
             &runtime.move_vm,
             &self.epoch,
             self.epoch_start_timestamp_ms,
@@ -281,7 +276,7 @@ impl NativeExecution {
                     })
                     .collect(),
                 executed: Some(store::Executed {
-                    digest: digest_of(digest),
+                    digest,
                     transaction: transaction.to_vec(),
                     effects_digest: effects.digest,
                     effects: effects_bytes,
@@ -371,8 +366,4 @@ fn written(object: &Object<'_>) -> store::Written {
             .expect("written objects are sealed")
             .to_vec(),
     }
-}
-
-fn digest_of(digest: TransactionDigest) -> messages::base::Digest {
-    digest
 }

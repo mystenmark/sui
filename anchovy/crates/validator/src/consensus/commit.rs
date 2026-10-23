@@ -14,20 +14,32 @@
 //! `CommitStage` lays the schedule out in chunks and checkpoints for the
 //! pipeline. Congestion control is not here yet.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ::consensus::{BlockRef, TransactionIndex};
-use messages::base::ObjectRef;
-use workqueue::{Processor, Refusal, Refuse};
+use blake2::digest::consts::U32;
+use blake2::{Blake2b, Digest as _};
+use containers::Bump;
+use messages::base::{Hashed, ObjectRef};
+use messages::build::system_transaction::{Jwk, JwkId};
+use protocol_config::ProtocolConfig;
+use workqueue::Processor;
 
-use crate::consensus::decode::{CommittedTransaction, DecodedCommit, OwnedInputs};
+use crate::consensus::decode::{CommittedTransaction, DecodedCommit};
+use crate::consensus::deferral::{DeferralKey, Deferred, decode_deferred, encode_deferred};
+use crate::consensus::execution_time::{
+    ExecutionTimeEstimator, Key, decode_estimates, encode_estimates,
+};
+use crate::consensus::jwk::{JwkAggregator, JwkVote, decode_vote, encode_vote, jwk_order};
 use crate::consensus::sequence::{
-    Prologue, Schedule, Scheduled, Sequencer, SharedAccess, SharedOrdinal,
+    AuthenticatorUpdate, Prologue, Schedule, Scheduled, Sequencer, SharedAccess, SharedOrdinal,
 };
 use crate::consensus::status::{ConsensusTxStatus, ConsensusTxStatusCache};
 use crate::epoch::EpochParams;
 use crate::epoch_store::ConsensusOutput;
+use crate::pipeline::backpressure::Backpressure;
 use crate::pipeline::items::{
     Chunk, ChunkSettlement, EpochClose, ExecutableTransaction, PendingCheckpoint, ScheduledEntry,
     SettlementInput, SystemKind, SystemTransaction,
@@ -47,23 +59,24 @@ pub enum DropReason {
 /// A commit the handler decided: its schedule, where each scheduled
 /// transaction came from, and the transactions it had processed before.
 #[derive(Debug)]
-pub struct HandledCommit {
+pub struct HandledCommit<'b> {
     pub commit_index: u32,
-    pub schedule: Schedule,
+    pub schedule: Schedule<'b>,
     /// Each scheduled user transaction's block and position, by digest.
-    pub origins: HashMap<[u8; 32], (BlockRef, TransactionIndex)>,
+    pub origins: containers::MessageMap<'b, Hashed, (BlockRef, TransactionIndex)>,
     /// Transactions processed in earlier commits, or earlier in this one.
-    pub duplicates: Vec<(BlockRef, TransactionIndex, [u8; 32])>,
+    pub duplicates: containers::Vec<'b, (BlockRef, TransactionIndex, TxDigest)>,
+    /// Transactions deferred to a later round, in schedule order.
+    pub deferred: containers::Vec<'b, (BlockRef, TransactionIndex, TxDigest)>,
     /// Transactions dropped before scheduling, in consensus order. Like the
     /// reference's, they are processed: a later inclusion is a duplicate.
-    pub dropped: Vec<(BlockRef, TransactionIndex, [u8; 32], DropReason)>,
+    pub dropped: containers::Vec<'b, (BlockRef, TransactionIndex, TxDigest, DropReason)>,
+    /// Each scheduled user transaction's execution time estimate, in
+    /// microseconds, in schedule order: what the reference's
+    /// `IndirectStateObserver` sees.
+    pub estimates_us: containers::Vec<'b, u64>,
     pub cache_hits: usize,
     pub cache_misses: usize,
-}
-
-/// A full queue drops the commit; consensus replays commits not handled.
-impl Refuse for HandledCommit {
-    fn refuse(self, _: Refusal) {}
 }
 
 /// The consensus handler. What it decided, beyond the commit in hand, is
@@ -71,10 +84,12 @@ impl Refuse for HandledCommit {
 /// - the user transactions processed this epoch;
 /// - the owned references locked this epoch, and the transaction holding
 ///   each: the reference's `owned_object_locked_transactions`;
-/// - each shared-object stream's last scheduled generation.
+/// - each shared-object stream's last scheduled generation;
+/// - the transactions deferred to later rounds, by `DeferralKey`;
+/// - the execution time observations taken.
 ///
-/// Each is only looked up, never iterated, so no order of theirs can reach
-/// an output.
+/// Each is only looked up, or iterated in key order, so no order of a hash
+/// table's can reach an output.
 ///
 /// Run inside `CommitStage`, which feeds it decoded commits and lays out
 /// what it decides.
@@ -83,15 +98,50 @@ pub struct CommitHandler {
     last_commit: u32,
     output: ConsensusOutput,
     sequencer: Sequencer,
+    execution_times: ExecutionTimeEstimator,
+    jwks: JwkAggregator,
+    /// The JSON web keys that became active in the last commit handled,
+    /// which the next adds to the authenticator state.
+    new_jwks: Vec<(JwkId, Jwk)>,
+    /// The authenticator state's initial shared version, if the epoch
+    /// agrees keys: the reference's `authenticator_state_enabled`.
+    authenticator: Option<u64>,
 }
 
 impl CommitHandler {
-    /// A handler that has handled the commits through `last_commit`.
-    pub fn new(output: ConsensusOutput, last_commit: u32) -> CommitHandler {
+    /// A handler of `committee`'s commits (each member's name and stake, by
+    /// index), that has handled those through `last_commit`, with what the
+    /// commits written observed and voted for restored. `authenticator` is
+    /// the authenticator state's initial shared version, if it exists.
+    pub fn new(
+        output: ConsensusOutput,
+        last_commit: u32,
+        committee: Vec<([u8; 96], u64)>,
+        config: &ProtocolConfig,
+        authenticator: Option<u64>,
+    ) -> CommitHandler {
+        let mut execution_times = ExecutionTimeEstimator::new(committee.clone(), config);
+        for (generation, author, estimates) in output.execution_time_observations() {
+            execution_times.restore(author, generation, &decode_estimates(&estimates));
+        }
+        let mut jwks =
+            JwkAggregator::new(committee, config.max_jwk_votes_per_validator_per_epoch());
+        for vote in output.jwk_votes() {
+            let (author, key) = decode_vote(&vote);
+            jwks.restore(author, key);
+        }
+        let new_jwks = output
+            .new_jwks()
+            .map(|keys| bcs::from_bytes(&keys).expect("keys as encoded"))
+            .unwrap_or_default();
         CommitHandler {
             last_commit,
             output,
             sequencer: Sequencer::new(),
+            execution_times,
+            jwks,
+            new_jwks,
+            authenticator: authenticator.filter(|_| config.enable_jwk_consensus_updates()),
         }
     }
 
@@ -103,7 +153,13 @@ impl CommitHandler {
 
     /// Decides `commit`, or nothing if it was handled before. It takes only
     /// what consensus agrees on: the epoch's parameters and the commit.
-    pub fn handle(&mut self, epoch: &EpochParams, commit: DecodedCommit) -> Option<HandledCommit> {
+    /// `bump` holds the decision's temporaries.
+    pub fn handle<'b>(
+        &mut self,
+        epoch: &EpochParams,
+        commit: DecodedCommit,
+        bump: &'b Bump,
+    ) -> Option<HandledCommit<'b>> {
         // 1. A commit handled before is skipped.
         if commit.commit_index <= self.last_commit {
             return None;
@@ -117,18 +173,18 @@ impl CommitHandler {
             commit_digest: commit.digest,
         };
 
-        // 2. Deduplicate against the transactions processed before: this
-        //    handler's own record, never the store. Then lock owned inputs in
-        //    consensus order, as the reference's `filter_consensus_txns`.
-        //
-        //    The reference locks before deduplicating, and a lock held by the
-        //    same digest is no conflict. Deduplicating first decides the
-        //    same: a repeat either won all its locks or was dropped, and is
-        //    dropped again either way.
-        let mut accepted = Vec::with_capacity(commit.transactions.len());
-        let mut origins = HashMap::with_capacity(commit.transactions.len());
-        let mut duplicates = Vec::new();
-        let mut dropped = Vec::new();
+        let round = u64::from(commit.leader.round);
+        let config = &epoch.config;
+
+        // 2. Lock owned inputs in consensus order, as the reference's
+        //    `filter_consensus_txns`: a transaction an input of which another
+        //    holds is dropped, and if that one took it earlier in this
+        //    commit, the holder is contested. Dropped transactions are
+        //    processed: a later inclusion is a duplicate.
+        let mut taken = containers::hash_map(bump, commit.transactions.len());
+        let mut contested = containers::message_set(bump, 0);
+        let mut locked = containers::Vec::with_capacity_in(commit.transactions.len(), bump);
+        let mut dropped = containers::Vec::new_in(bump);
         for CommittedTransaction {
             block,
             index,
@@ -136,49 +192,170 @@ impl CommitHandler {
             owned,
         } in commit.transactions
         {
-            let digest = transaction.get().0.digest().bytes;
+            let digest = *transaction.get().0.digest();
+            let owned = match owned {
+                Ok(owned) => owned,
+                Err(e) => {
+                    self.output.set_processed(digest);
+                    dropped.push((block, index, digest, DropReason::Inputs(e)));
+                    continue;
+                }
+            };
+            if let Err(conflict) = self.lock(digest, &owned) {
+                contested.extend(owned.iter().filter_map(|r| taken.get(r).copied()));
+                self.output.set_processed(digest);
+                dropped.push((block, index, digest, conflict));
+                continue;
+            }
+            taken.extend(owned.iter().map(|r| (*r, digest)));
+            locked.push((block, index, transaction));
+        }
+
+        // 3. Deduplicate against the transactions processed before, this
+        //    handler's own record: `deduplicate_consensus_txns`.
+        let mut accepted = containers::Vec::with_capacity_in(locked.len(), bump);
+        let mut origins = containers::message_map(bump, locked.len());
+        let mut duplicates = containers::Vec::new_in(bump);
+        for (block, index, transaction) in locked {
+            let digest = *transaction.get().0.digest();
             if self.output.is_processed(&digest) {
                 duplicates.push((block, index, digest));
                 continue;
             }
             self.output.set_processed(digest);
-            if let Err(drop) = self.lock(digest, owned) {
-                dropped.push((block, index, digest, drop));
-                continue;
-            }
             origins.insert(digest, (block, index));
             accepted.push(transaction);
         }
 
-        // 3. The schedule: the prologue, the transactions in protocol order,
-        //    shared accesses with their ordinals, linked to earlier rounds.
-        let mut schedule = self.sequencer.schedule(&epoch.config, prologue, accepted);
+        // 4. The commit's execution time observations, before its
+        //    transactions are estimated.
+        for shared in &commit.observations {
+            if self.execution_times.observe(shared) {
+                self.output.put_execution_time_observations(
+                    shared.author,
+                    shared.generation,
+                    encode_estimates(&shared.estimates),
+                );
+            }
+        }
+
+        // 5. The keys voted for (`process_jwks`), and the update adding those
+        //    that became active in the last commit
+        //    (`create_authenticator_state_update`).
+        let update = self.jwk_update(&commit.jwks);
+
+        // 6. The transactions deferred to this round, then the commit's, in
+        //    protocol order: `merge_and_reorder_transactions`.
+        let mut previously_deferred = containers::message_map(bump, 0);
+        let mut transactions = containers::Vec::with_capacity_in(accepted.len(), bump);
+        for (key, deferred) in self.output.take_deferred(DeferralKey::due_by(round)) {
+            for deferred in decode_deferred(&deferred) {
+                let hashed = *deferred.transaction.get().0.digest();
+                previously_deferred.insert(hashed, key);
+                origins.insert(hashed, deferred.origin);
+                transactions.push(deferred.transaction);
+            }
+        }
+        transactions.extend(accepted);
+        let ordered = self.sequencer.order(config, transactions, bump);
+
+        // 7. Each, in order, deferred or estimated and scheduled:
+        //    `handle_deferral_and_cancellation`. A contested holder is
+        //    deferred a round, as a penalty for the double spend.
+        let mut deferred: containers::BTreeMap<DeferralKey, containers::Vec<Deferred>> =
+            containers::BTreeMap::new_in(bump);
+        let mut deferred_here = containers::Vec::new_in(bump);
+        let mut admitted = containers::Vec::with_capacity_in(ordered.len(), bump);
+        let mut estimates_us = containers::Vec::with_capacity_in(ordered.len(), bump);
+        for transaction in ordered {
+            let hashed = *transaction.get().0.digest();
+            if contested.contains(&hashed) && config.defer_owned_object_double_spend() {
+                let from = previously_deferred
+                    .get(&hashed)
+                    .map_or(round, DeferralKey::deferred_from_round);
+                let key = DeferralKey::next_round(round, from);
+                if key.within_limit(config.max_deferral_rounds_for_congestion_control()) {
+                    let origin = origins.remove(&hashed).expect("each transaction's origin");
+                    deferred_here.push((origin.0, origin.1, hashed));
+                    deferred
+                        .entry(key)
+                        .or_insert_with(|| containers::Vec::new_in(bump))
+                        .push(Deferred {
+                            origin,
+                            transaction,
+                        });
+                    continue;
+                }
+            }
+            estimates_us.push(self.execution_times.estimate_us(&transaction));
+            admitted.push(transaction);
+        }
+        for (key, transactions) in deferred {
+            self.output.defer(key, encode_deferred(&transactions));
+        }
+
+        // 8. The schedule: the prologue, the update, then the transactions,
+        //    with shared accesses and their ordinals, linked to earlier
+        //    rounds.
+        let mut schedule = self.sequencer.schedule(prologue, update, admitted, bump);
         self.link(schedule.all_accesses_mut());
         Some(HandledCommit {
             commit_index: commit.commit_index,
             schedule,
             origins,
             duplicates,
+            deferred: deferred_here,
             dropped,
+            estimates_us,
             cache_hits: commit.cache_hits,
             cache_misses: commit.cache_misses,
         })
     }
 
-    /// Locks `owned` for `digest`, unless one of them is locked already:
-    /// `try_acquire_owned_object_locks_post_consensus`. Every reference is
-    /// checked before any is locked, so a transaction listing one twice
-    /// does not conflict with itself.
-    fn lock(&mut self, digest: TxDigest, owned: OwnedInputs) -> Result<(), DropReason> {
-        let owned = owned.map_err(DropReason::Inputs)?;
-        if let Some((object, holder)) = owned
-            .iter()
-            .find_map(|r| self.output.lock_holder(r).map(|holder| (*r, holder)))
-        {
+    /// The execution time observations so far, as the epoch's last commit
+    /// stores them for the next epoch.
+    pub fn execution_time_observations(&self) -> Vec<(Key, Vec<([u8; 96], Duration)>)> {
+        self.execution_times.observations()
+    }
+
+    /// Counts `votes`, and takes the keys that became active in the last
+    /// commit: the update adding them, if any; none unless the epoch agrees
+    /// keys.
+    fn jwk_update(&mut self, votes: &[JwkVote]) -> Option<AuthenticatorUpdate> {
+        let initial_shared_version = self.authenticator?;
+        let mut active = Vec::new();
+        for vote in votes {
+            let Some(activated) = self.jwks.vote(vote) else {
+                continue;
+            };
+            let key = (vote.id.clone(), vote.jwk.clone());
+            self.output.put_jwk_vote(encode_vote(vote.author, &key));
+            if activated {
+                active.push(key);
+            }
+        }
+        self.output
+            .set_new_jwks(bcs::to_bytes(&active).expect("keys serialize"));
+        let keys = std::mem::replace(&mut self.new_jwks, active);
+        (!keys.is_empty()).then_some(AuthenticatorUpdate {
+            initial_shared_version,
+            keys,
+        })
+    }
+
+    /// Locks `owned` for `digest`, unless another transaction holds one of
+    /// them: `try_acquire_owned_object_locks_post_consensus`. Every
+    /// reference is checked before any is locked, so a transaction listing
+    /// one twice does not conflict with itself.
+    fn lock(&mut self, digest: TxDigest, owned: &[ObjectRef]) -> Result<(), DropReason> {
+        if let Some((object, holder)) = owned.iter().find_map(|r| {
+            let holder = self.output.lock_holder(r)?;
+            (holder != digest).then_some((*r, holder))
+        }) {
             return Err(DropReason::LockConflict { object, holder });
         }
         for object in owned {
-            self.output.set_lock(object, digest);
+            self.output.set_lock(*object, digest);
         }
         Ok(())
     }
@@ -296,15 +473,15 @@ impl CommitRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EpochStart {
     /// The checkpoint before the epoch's first (the previous epoch's last, or
-    /// the genesis checkpoint, 0): the epoch's first checkpoint follows it,
-    /// its first chunk follows `previous_height`, and its checkpoint
-    /// intervals count from `previous_timestamp_ms`. A restart replays the
-    /// epoch's commits from its first, rebuilding the handler's other state.
+    /// the genesis checkpoint, 0): the epoch's first checkpoint follows it.
+    /// Chunk heights count from 1 each epoch, as the reference's, whose
+    /// settlement transactions carry them.
     pub previous_checkpoint: u64,
-    pub previous_height: u64,
-    pub previous_timestamp_ms: u64,
     /// The accumulator root's stream starts at this version.
     pub accumulator_root_initial_shared_version: u64,
+    /// The authenticator state's, if it exists: absent before the end of
+    /// the epoch that creates it.
+    pub authenticator_initial_shared_version: Option<u64>,
     /// The root's version the epoch's first chunk reads: where version
     /// assignment starts it (`Store::start_version`).
     pub accumulator_root_version: u64,
@@ -316,17 +493,17 @@ pub struct EpochStart {
 
 /// What `CommitStage` decided about one commit, in emission order.
 #[derive(Debug)]
-pub struct Decided {
+pub struct Decided<'b> {
     /// The commit's chunks, by height.
-    pub chunks: Vec<Chunk>,
+    pub chunks: containers::Vec<'b, Chunk>,
     /// Each chunk's settlement work, by height.
-    pub settlements: Vec<ChunkSettlement>,
+    pub settlements: containers::Vec<'b, ChunkSettlement>,
     /// The checkpoints the commit completed, by sequence number. A commit
     /// may complete none (its chunks wait for a later commit's), or several.
-    pub checkpoints: Vec<PendingCheckpoint>,
+    pub checkpoints: containers::Vec<'b, PendingCheckpoint>,
     /// The transactions dropped before scheduling, in consensus order. They
     /// are in no chunk, so never in a checkpoint.
-    pub dropped: Vec<(BlockRef, TransactionIndex, TxDigest, DropReason)>,
+    pub dropped: containers::Vec<'b, (BlockRef, TransactionIndex, TxDigest, DropReason)>,
 }
 
 /// The consensus handler as the pipeline runs it: decides each commit (see
@@ -337,9 +514,8 @@ pub struct Decided {
 ///
 /// Not here yet, as the design leaves them for later:
 /// - deferral and cancellation: the prologue lists no cancelled
-///   transactions, and its additional state digest folds in no execution
-///   time estimates, so it matches the reference's only for a commit with
-///   no user transactions (the reference estimates each one's cost);
+///   transactions, and execution time estimates budget nothing (they only
+///   go into the prologue's additional state digest);
 /// - randomness: transactions using it are scheduled last in the commit's
 ///   chunks, not in chunks of their own;
 /// - the end of the epoch, beyond a stand-in: the first commit at or past the
@@ -383,6 +559,7 @@ pub struct CommitStage {
     settlements_out: workqueue::Queue<SettlementInput>,
     checkpoints_out: workqueue::Queue<waiter::Command<ChunkSettled, PendingCheckpoint>>,
     statuses: Arc<ConsensusTxStatusCache>,
+    backpressure: Option<Arc<Backpressure>>,
 }
 
 impl CommitStage {
@@ -394,21 +571,25 @@ impl CommitStage {
         settlements: workqueue::Queue<SettlementInput>,
         checkpoints: workqueue::Queue<waiter::Command<ChunkSettled, PendingCheckpoint>>,
         statuses: Arc<ConsensusTxStatusCache>,
+        committee: Vec<([u8; 96], u64)>,
     ) -> CommitStage {
         // From the last commit written, if any; else the epoch's start.
         let record = output.record().map(|bytes| CommitRecord::decode(&bytes));
         let queue = match record {
             Some(r) => CheckpointQueue::resumed(r.height, r.next_seq, r.last_built_timestamp),
-            None => CheckpointQueue::new(
-                start.previous_checkpoint,
-                start.previous_height,
-                start.previous_timestamp_ms,
-            ),
+            None => CheckpointQueue::new(start.previous_checkpoint),
         };
         let prior_through = record.map_or(0, |r| r.commit_index);
+        let handler = CommitHandler::new(
+            output,
+            prior_through,
+            committee,
+            &epoch.config,
+            start.authenticator_initial_shared_version,
+        );
         CommitStage {
             epoch,
-            handler: CommitHandler::new(output, prior_through),
+            handler,
             start,
             queue,
             commit_times: CommitIntervalObserver::default(),
@@ -420,12 +601,20 @@ impl CommitStage {
             settlements_out: settlements,
             checkpoints_out: checkpoints,
             statuses,
+            backpressure: None,
         }
+    }
+
+    /// Answers each commit through `backpressure`, which may withhold it.
+    #[must_use]
+    pub fn with_backpressure(mut self, backpressure: Arc<Backpressure>) -> CommitStage {
+        self.backpressure = Some(backpressure);
+        self
     }
 
     /// Decides `commit` and lays it out in chunks and checkpoints, or
     /// nothing if it was handled before or follows the epoch's last.
-    pub fn decide(&mut self, commit: DecodedCommit) -> Option<Decided> {
+    pub fn decide<'b>(&mut self, commit: DecodedCommit, bump: &'b Bump) -> Option<Decided<'b>> {
         let epoch = &self.epoch.clone();
         if commit.commit_index <= self.prior_through {
             self.commit_times.observe(
@@ -443,8 +632,9 @@ impl CommitStage {
             mut schedule,
             origins,
             dropped,
+            estimates_us,
             ..
-        } = self.handler.handle(epoch, commit)?;
+        } = self.handler.handle(epoch, commit, bump)?;
         let config = &epoch.config;
         let Some(&Scheduled::Prologue(prologue)) = schedule.transactions.first() else {
             unreachable!("a schedule starts with its prologue");
@@ -459,18 +649,21 @@ impl CommitStage {
         self.last_commit = Some(prologue.commit_index);
 
         // 1. The prologue, with the state digest of the commits through
-        //    this one.
+        //    this one and the estimates of the transactions it schedules.
         self.commit_times.observe(
             config.get_consensus_commit_rate_estimation_window_size(),
             prologue.timestamp_ms,
         );
-        let mut prologue_transaction =
-            Some(prologue_transaction(&prologue, &self.commit_times.digest()));
+        let digest = self
+            .commit_times
+            .digest(&indirect_state_digest(estimates_us));
+        let mut prologue_transaction = Some(prologue_transaction(&prologue, &digest));
 
         // 2. Each transaction with its shared accesses, in schedule order.
-        let transactions = std::mem::take(&mut schedule.transactions);
-        let mut entries = Vec::with_capacity(transactions.len());
-        let mut digests = Vec::with_capacity(transactions.len());
+        let transactions =
+            std::mem::replace(&mut schedule.transactions, containers::Vec::new_in(bump));
+        let mut entries = containers::Vec::with_capacity_in(transactions.len(), bump);
+        let mut digests = containers::Vec::with_capacity_in(transactions.len(), bump);
         for (i, scheduled) in transactions.into_iter().enumerate() {
             let (transaction, digest, origin) = match scheduled {
                 Scheduled::Prologue(_) => {
@@ -478,8 +671,19 @@ impl CommitStage {
                     let digest = system.digest;
                     (ExecutableTransaction::System(system), digest, None)
                 }
+                Scheduled::AuthenticatorStateUpdate(keys) => {
+                    let system = authenticator_state_update_transaction(
+                        &prologue,
+                        self.start
+                            .authenticator_initial_shared_version
+                            .expect("the authenticator state exists"),
+                        keys,
+                    );
+                    let digest = system.digest;
+                    (ExecutableTransaction::System(system), digest, None)
+                }
                 Scheduled::User(transaction) => {
-                    let digest = transaction.get().0.digest().bytes;
+                    let digest = *transaction.get().0.digest();
                     let origin = origins[&digest];
                     (
                         ExecutableTransaction::User(transaction),
@@ -530,7 +734,7 @@ impl CommitStage {
         });
 
         // 4. Chunks and checkpoints.
-        let mut decided = self.chunk(epoch, &prologue, entries, digests, close);
+        let mut decided = self.chunk(epoch, &prologue, entries, digests, close, bump);
         decided.dropped = dropped;
         Some(decided)
     }
@@ -538,25 +742,26 @@ impl CommitStage {
     /// Chunks of at most `max_transactions_per_checkpoint`, each with the
     /// next height, queued into checkpoints: the reference's
     /// `create_pending_checkpoints`.
-    fn chunk(
+    fn chunk<'b>(
         &mut self,
         epoch: &Arc<EpochParams>,
         prologue: &Prologue,
-        entries: Vec<ScheduledEntry>,
-        digests: Vec<TxDigest>,
+        entries: containers::Vec<'b, ScheduledEntry>,
+        digests: containers::Vec<'b, TxDigest>,
         close: Option<Vec<SharedAccess>>,
-    ) -> Decided {
+        bump: &'b Bump,
+    ) -> Decided<'b> {
         let config = &epoch.config;
         let max = usize::try_from(config.max_transactions_per_checkpoint())
             .expect("a checkpoint's size fits in usize");
         let chunk_count = entries.len().div_ceil(max);
         let mut decided = Decided {
-            chunks: Vec::with_capacity(chunk_count),
-            settlements: Vec::with_capacity(chunk_count),
-            checkpoints: Vec::new(),
-            dropped: Vec::new(),
+            chunks: containers::Vec::with_capacity_in(chunk_count, bump),
+            settlements: containers::Vec::with_capacity_in(chunk_count, bump),
+            checkpoints: containers::Vec::new_in(bump),
+            dropped: containers::Vec::new_in(bump),
         };
-        let mut flushed = Vec::new();
+        let mut flushed = containers::Vec::new_in(bump);
         let mut entries = entries.into_iter();
         let mut digests = digests.into_iter();
         for position in 0..chunk_count {
@@ -612,15 +817,14 @@ impl CommitStage {
         if close.is_some() {
             flushed.extend(self.queue.flush_forced());
         }
-        decided.checkpoints = flushed
-            .into_iter()
-            .map(|f| PendingCheckpoint {
+        decided
+            .checkpoints
+            .extend(flushed.into_iter().map(|f| PendingCheckpoint {
                 seq: f.seq,
                 heights: f.heights,
                 timestamp_ms: f.timestamp_ms,
                 close: None,
-            })
-            .collect();
+            }));
         if let Some(shared) = close {
             let last = decided
                 .checkpoints
@@ -631,12 +835,14 @@ impl CommitStage {
                 round: prologue.round,
                 root_version: self.root_version,
                 shared,
+                first_checkpoint: self.start.previous_checkpoint + 1,
+                observations: self.handler.execution_time_observations(),
             });
         }
         decided
     }
 
-    fn emit(&mut self, decided: Decided) {
+    fn emit(&mut self, decided: Decided<'_>, bump: &Bump) {
         // Dropped transactions go nowhere: no processor waits on them yet.
         let Decided {
             chunks,
@@ -645,6 +851,9 @@ impl CommitStage {
             dropped: _,
         } = decided;
         for chunk in chunks {
+            if let Some(backpressure) = &self.backpressure {
+                backpressure.scheduled(chunk.height, chunk.entries.len());
+            }
             push(&self.chunks_out, chunk, "resolver");
         }
         for settlement in settlements {
@@ -658,11 +867,8 @@ impl CommitStage {
             let keys = checkpoints.iter().map(|c| c.heights.len()).sum();
             let mut batch = waiter::WaitBatch::with_capacity(checkpoints.len(), keys);
             for checkpoint in checkpoints {
-                let heights: Vec<_> = checkpoint
-                    .heights
-                    .iter()
-                    .map(|&h| ChunkSettled(h))
-                    .collect();
+                let mut heights = containers::Vec::with_capacity_in(checkpoint.heights.len(), bump);
+                heights.extend(checkpoint.heights.iter().map(|&h| ChunkSettled(h)));
                 batch.push(checkpoint, heights);
             }
             push(
@@ -687,16 +893,31 @@ impl Processor for CommitStage {
     type Input = DecodedCommit;
     type Output = ();
 
-    fn process(&mut self, mut commit: DecodedCommit) -> Option<()> {
+    /// Handles `commit`, then answers it: consensus may send the next.
+    fn process(&mut self, mut commit: DecodedCommit, bump: &mut Bump) -> Option<()> {
+        let handled = commit.handled.take();
+        let decided = self.handle(commit, bump);
+        if let Some(handled) = handled {
+            match &self.backpressure {
+                Some(backpressure) => backpressure.answer(handled),
+                // Consensus may have stopped waiting; nothing to do then.
+                None => {
+                    let _ = handled.send(());
+                }
+            }
+        }
+        decided
+    }
+}
+
+impl CommitStage {
+    fn handle(&mut self, mut commit: DecodedCommit, bump: &Bump) -> Option<()> {
         let leader_round = commit.leader.round;
         let rejected = std::mem::take(&mut commit.rejected);
-        let positions: Vec<(BlockRef, TransactionIndex)> = commit
-            .transactions
-            .iter()
-            .map(|t| (t.block, t.index))
-            .collect();
+        let mut positions = containers::Vec::with_capacity_in(commit.transactions.len(), bump);
+        positions.extend(commit.transactions.iter().map(|t| (t.block, t.index)));
         let commit_index = commit.commit_index;
-        let decided = self.decide(commit)?;
+        let decided = self.decide(commit, bump)?;
         let record = CommitRecord {
             commit_index,
             leader_round,
@@ -710,8 +931,8 @@ impl Processor for CommitStage {
             .finish(&record, self.queue.height, self.queue.pending.is_empty());
         // What became of each transaction, for its submitter: dropped, or
         // finalized (scheduled, or a duplicate of one that was).
-        let dropped: HashSet<(BlockRef, TransactionIndex)> =
-            decided.dropped.iter().map(|(b, i, ..)| (*b, *i)).collect();
+        let mut dropped = containers::hash_set(bump, decided.dropped.len());
+        dropped.extend(decided.dropped.iter().map(|(b, i, ..)| (*b, *i)));
         self.statuses.set_statuses(
             rejected
                 .into_iter()
@@ -724,8 +945,9 @@ impl Processor for CommitStage {
                     };
                     (b, i, status)
                 })),
+            bump,
         );
-        self.emit(decided);
+        self.emit(decided, bump);
         self.statuses.update_leader_round(leader_round);
         Some(())
     }
@@ -754,17 +976,15 @@ struct CheckpointQueue {
 }
 
 impl CheckpointQueue {
-    fn new(
-        previous_checkpoint: u64,
-        previous_height: u64,
-        previous_timestamp_ms: u64,
-    ) -> CheckpointQueue {
+    /// No checkpoint cut yet this epoch: as the reference's, its first
+    /// commit cuts one, whatever the interval.
+    fn new(previous_checkpoint: u64) -> CheckpointQueue {
         CheckpointQueue {
-            last_built_timestamp: previous_timestamp_ms,
+            last_built_timestamp: 0,
             pending: Vec::new(),
             pending_timestamp: 0,
             pending_transactions: 0,
-            height: previous_height,
+            height: 0,
             next_seq: previous_checkpoint + 1,
         }
     }
@@ -795,7 +1015,7 @@ impl CheckpointQueue {
         transactions: usize,
         timestamp_ms: u64,
         max: usize,
-        flushed: &mut Vec<Flushed>,
+        flushed: &mut containers::Vec<'_, Flushed>,
     ) -> u64 {
         if self.pending_transactions > 0 && self.pending_transactions + transactions > max {
             flushed.extend(self.flush_forced());
@@ -851,20 +1071,12 @@ impl CommitIntervalObserver {
         self.timestamps.push_back(timestamp_ms);
     }
 
-    /// The reference's `AdditionalConsensusState::digest` folded, by its
-    /// `IndirectStateObserver::fold_with`, with an observer that saw
-    /// nothing.
-    ///
-    /// TODO: the reference's observer also sees each user transaction's
-    /// execution-time estimate (congestion control), so this matches it
-    /// only for commits without user transactions.
-    fn digest(&self) -> [u8; 32] {
-        use blake2::digest::consts::U32;
-        use blake2::{Blake2b, Digest as _};
+    /// The reference's `AdditionalConsensusState::digest`, folded with the
+    /// commit's `indirect` state digest by `IndirectStateObserver::fold_with`.
+    fn digest(&self, indirect: &[u8; 32]) -> [u8; 32] {
         let state = Blake2b::<U32>::digest(
             bcs::to_bytes(&self.timestamps).expect("a sequence of u64 serializes"),
         );
-        let indirect = Blake2b::<U32>::digest([]);
         let mut fold = Blake2b::<U32>::new();
         // Each digest as BCS: its length, then its bytes.
         fold.update([32]);
@@ -873,6 +1085,18 @@ impl CommitIntervalObserver {
         fold.update(indirect);
         fold.finalize().into()
     }
+}
+
+/// The reference's `IndirectStateObserver` digest: what it observed of a
+/// commit, each scheduled user transaction's execution time estimate, as
+/// BCS of `Some(estimate_us)`.
+fn indirect_state_digest(estimates_us: impl IntoIterator<Item = u64>) -> [u8; 32] {
+    let mut hash = Blake2b::<U32>::new();
+    for estimate in estimates_us {
+        hash.update([1]);
+        hash.update(estimate.to_le_bytes());
+    }
+    hash.finalize().into()
 }
 
 /// `prologue`'s `ConsensusCommitPrologueV4`, as the reference's
@@ -906,16 +1130,50 @@ pub fn prologue_transaction(
     )
 }
 
-/// The change-epoch transaction ending `epoch`: an `EndOfEpochTransaction`
-/// of `ChangeEpoch` alone, starting epoch `epoch + 1` at
+/// The `AuthenticatorStateUpdate` of the commit `prologue` begins, adding
+/// `keys`, as the reference's `authenticator_state_update_transaction`: in
+/// the order of `jwk_lt`, as validated this epoch.
+pub fn authenticator_state_update_transaction(
+    prologue: &Prologue,
+    initial_shared_version: u64,
+    mut keys: Vec<(JwkId, Jwk)>,
+) -> SystemTransaction {
+    use messages::build::base::SequenceNumber;
+    use messages::build::system_transaction::{ActiveJwk, AuthenticatorStateUpdate};
+    use messages::build::transaction::TransactionKind;
+
+    keys.sort_by(jwk_order);
+    let kind = TransactionKind::AuthenticatorStateUpdate(AuthenticatorStateUpdate {
+        epoch: prologue.epoch,
+        round: u64::from(prologue.round),
+        new_active_jwks: keys
+            .into_iter()
+            .map(|(jwk_id, jwk)| ActiveJwk {
+                jwk_id,
+                jwk,
+                epoch: prologue.epoch,
+            })
+            .collect(),
+        authenticator_obj_initial_shared_version: SequenceNumber(initial_shared_version),
+    });
+    system_transaction(
+        kind,
+        SystemKind::AuthenticatorStateUpdate {
+            round: prologue.round,
+        },
+    )
+}
+
+/// The transaction ending `epoch`: an `EndOfEpochTransaction` of `kinds`,
+/// then `ChangeEpoch`, starting epoch `epoch + 1` at
 /// `epoch_start_timestamp_ms` with `protocol_version` and no new system
 /// packages, and charging the epoch's gas totals `gas` (computation,
-/// storage, rebate, non-refundable).
-///
-/// Not yet: the other end-of-epoch kinds the reference includes when its
-/// protocol flags hold (R2.8 of `docs/reconfiguration_reference.md`).
-pub fn change_epoch_transaction(
+/// storage, rebate, non-refundable). The reference's
+/// `create_and_execute_advance_epoch_tx`; `kinds` are what it puts before
+/// `ChangeEpoch`.
+pub fn end_of_epoch_transaction(
     epoch: u64,
+    mut kinds: Vec<messages::build::system_transaction::EndOfEpochTransactionKind>,
     protocol_version: u64,
     gas: [u64; 4],
     epoch_start_timestamp_ms: u64,
@@ -925,20 +1183,20 @@ pub fn change_epoch_transaction(
     use messages::build::transaction::TransactionKind;
 
     let [computation, storage, rebate, non_refundable] = gas;
-    let kind =
-        TransactionKind::EndOfEpochTransaction(vec![EndOfEpochTransactionKind::ChangeEpoch(
-            ChangeEpoch {
-                epoch: epoch + 1,
-                protocol_version: ProtocolVersion(protocol_version),
-                storage_charge: storage,
-                computation_charge: computation,
-                storage_rebate: rebate,
-                non_refundable_storage_fee: non_refundable,
-                epoch_start_timestamp_ms,
-                system_packages: Vec::new(),
-            },
-        )]);
-    system_transaction(kind, SystemKind::ChangeEpoch { epoch })
+    kinds.push(EndOfEpochTransactionKind::ChangeEpoch(ChangeEpoch {
+        epoch: epoch + 1,
+        protocol_version: ProtocolVersion(protocol_version),
+        storage_charge: storage,
+        computation_charge: computation,
+        storage_rebate: rebate,
+        non_refundable_storage_fee: non_refundable,
+        epoch_start_timestamp_ms,
+        system_packages: Vec::new(),
+    }));
+    system_transaction(
+        TransactionKind::EndOfEpochTransaction(kinds),
+        SystemKind::ChangeEpoch { epoch },
+    )
 }
 
 /// A system transaction of `kind`: sent by the zero address, with no gas
@@ -974,11 +1232,7 @@ fn system_transaction(
         },
         expiration: TransactionExpiration::None,
     });
-    let digest = messages::base::Digest::of(
-        "TransactionData",
-        &bcs::to_bytes(&data).expect("transaction data serializes"),
-    )
-    .bytes;
+    let size = bcs::serialized_size(&data).expect("transaction data serializes");
     let transaction = Transaction {
         data: SenderSignedData(SenderSignedTransaction {
             intent_message: IntentMessage {
@@ -995,9 +1249,12 @@ fn system_transaction(
         }),
         auth_signature: EmptySignInfo {},
     };
+    let bytes = bcs::to_bytes(&transaction).expect("a transaction serializes");
+    // The data follows the one-element sequence's length and the intent.
+    let digest = Hashed::of("TransactionData", &bytes[4..4 + size]);
     SystemTransaction {
         kind: system,
-        bytes: bcs::to_bytes(&transaction).expect("a transaction serializes"),
+        bytes,
         digest,
     }
 }
@@ -1015,8 +1272,9 @@ mod tests {
 
     #[test]
     fn a_chunk_that_does_not_fit_cuts_the_checkpoint_before_it() {
-        let mut queue = CheckpointQueue::new(0, 0, 0);
-        let mut flushed = Vec::new();
+        let mut queue = CheckpointQueue::new(0);
+        let bump = Bump::default();
+        let mut flushed = containers::Vec::new_in(&bump);
         for (transactions, timestamp) in [(3, 10), (2, 10), (2, 20)] {
             let height = queue.next_height();
             queue.push_chunk(height, transactions, timestamp, 5, &mut flushed);
@@ -1036,8 +1294,9 @@ mod tests {
 
     #[test]
     fn a_chunk_larger_than_the_limit_is_a_checkpoint_of_its_own() {
-        let mut queue = CheckpointQueue::new(7, 0, 0);
-        let mut flushed = Vec::new();
+        let mut queue = CheckpointQueue::new(7);
+        let bump = Bump::default();
+        let mut flushed = containers::Vec::new_in(&bump);
         let height = queue.next_height();
         assert_eq!(queue.push_chunk(height, 9, 0, 5, &mut flushed), 8);
         assert!(flushed.is_empty());
@@ -1048,8 +1307,9 @@ mod tests {
 
     #[test]
     fn checkpoints_are_cut_once_the_interval_has_passed_by_commit_time() {
-        let mut queue = CheckpointQueue::new(0, 0, 0);
-        let mut flushed = Vec::new();
+        let mut queue = CheckpointQueue::new(0);
+        let bump = Bump::default();
+        let mut flushed = containers::Vec::new_in(&bump);
         let mut cut = Vec::new();
         for timestamp in [100, 150, 250, 300, 449, 450] {
             let height = queue.next_height();
@@ -1074,8 +1334,9 @@ mod tests {
         for t in [2000, 3000, 4000] {
             short.observe(3, t);
         }
-        assert_eq!(long.digest(), short.digest());
+        let none = indirect_state_digest([]);
+        assert_eq!(long.digest(&none), short.digest(&none));
         short.observe(3, 5000);
-        assert_ne!(long.digest(), short.digest());
+        assert_ne!(long.digest(&none), short.digest(&none));
     }
 }

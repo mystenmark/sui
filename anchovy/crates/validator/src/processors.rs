@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use containers::Bump;
 use messages::Message;
+use messages::base::Hashed;
 use messages::transaction::{DigestPending, Transaction, TxState};
 use tokio::sync::oneshot;
 use workqueue::{Processor, Refusal, Refuse};
@@ -97,9 +98,6 @@ pub enum Rejected {
     ShuttingDown,
 }
 
-/// Enough for the temporaries of nearly every transaction.
-const ARENA_BYTES: usize = 64 * 1024;
-
 /// Validates a request's transactions (`checks::validate`) and passes the
 /// valid ones on; a request whose first transaction fails ends here.
 ///
@@ -108,15 +106,11 @@ const ARENA_BYTES: usize = 64 * 1024;
 /// answered directly.
 pub struct TransactionValidator {
     epoch: Arc<EpochState>,
-    bump: Bump,
 }
 
 impl TransactionValidator {
     pub fn new(epoch: Arc<EpochState>) -> TransactionValidator {
-        TransactionValidator {
-            epoch,
-            bump: Bump::with_capacity(ARENA_BYTES),
-        }
+        TransactionValidator { epoch }
     }
 }
 
@@ -124,14 +118,17 @@ impl Processor for TransactionValidator {
     type Input = Request<DigestPending>;
     type Output = Request<Valid>;
 
-    fn process(&mut self, request: Request<DigestPending>) -> Option<Request<Valid>> {
+    fn process(
+        &mut self,
+        request: Request<DigestPending>,
+        bump: &mut Bump,
+    ) -> Option<Request<Valid>> {
         let Request {
             transactions,
             then: _,
             reply,
         } = request;
-        let (valid, failure) =
-            checks::validate(transactions, &self.epoch.context(), &mut self.bump);
+        let (valid, failure) = checks::validate(transactions, &self.epoch.context(), bump);
         let request = Request {
             transactions: valid,
             then: failure,
@@ -180,13 +177,13 @@ impl Processor for SignatureVerifier {
     type Input = Request<Valid>;
     type Output = Request<Verified>;
 
-    fn process(&mut self, request: Request<Valid>) -> Option<Request<Verified>> {
+    fn process(&mut self, request: Request<Valid>, bump: &mut Bump) -> Option<Request<Verified>> {
         let Request {
             transactions,
             then,
             reply,
         } = request;
-        match (self.checks.verify(transactions), then) {
+        match (self.checks.verify(transactions, bump), then) {
             (Ok(verified), None) => Some(Request {
                 transactions: verified,
                 then: None,
@@ -201,7 +198,7 @@ impl Processor for SignatureVerifier {
 }
 
 /// The transaction's results, if it executed.
-pub(crate) fn executed(store: &store::Store, digest: &[u8; 32]) -> Option<Outcome> {
+pub(crate) fn executed(store: &store::Store, digest: &Hashed) -> Option<Outcome> {
     match execution::executed(store, digest) {
         Ok(executed) => executed.map(|e| Outcome::Executed(Box::new(e))),
         Err(e) => Some(Outcome::Failed(format!("{e:?}"))),

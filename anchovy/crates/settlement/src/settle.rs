@@ -5,11 +5,11 @@
 //! reference's `AccumulatorSettlementTxBuilder` and
 //! `build_accumulator_barrier_tx` build them.
 
-use std::collections::BTreeMap;
+use containers::{BTreeMap, Bump};
 use std::hash::BuildHasher;
 
 use hashbrown::HashTable;
-use messages::base::{Digest, ObjectId};
+use messages::base::{Hashed, ObjectId};
 use messages::build::base::{
     AccountAddress, Digest as DigestB, ObjectDigest, ObjectId as ObjectIdB, SequenceNumber,
     SuiAddress,
@@ -42,7 +42,7 @@ const ED25519_SIGNATURE_LENGTH: usize = 1 + 64 + 32;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Built {
     pub bytes: Vec<u8>,
-    pub digest: [u8; 32],
+    pub digest: Hashed,
 }
 
 /// `VerifiedTransaction::new_system_transaction`: the kind, sent by `0x0`
@@ -65,14 +65,14 @@ pub fn system_transaction(kind: TransactionKind) -> Built {
         },
         expiration: TransactionExpiration::None,
     });
-    let data = bcs::to_bytes(&data).expect("transaction data serializes");
-    let digest = Digest::of("TransactionData", &data).bytes;
     // `SenderSignedData` is a one-element sequence of the intent (three zero
     // bytes, `Intent::sui_transaction`), the data, and one signature; the
     // envelope's `EmptySignInfo` adds nothing.
-    let mut bytes = Vec::with_capacity(4 + data.len() + 2 + ED25519_SIGNATURE_LENGTH);
+    let size = bcs::serialized_size(&data).expect("transaction data serializes");
+    let mut bytes = Vec::with_capacity(4 + size + 2 + ED25519_SIGNATURE_LENGTH);
     bytes.extend_from_slice(&[1, 0, 0, 0]);
-    bytes.extend_from_slice(&data);
+    bcs::serialize_into(&mut bytes, &data).expect("transaction data serializes");
+    let digest = Hashed::of("TransactionData", &bytes[4..]);
     bytes.extend_from_slice(&[1, ED25519_SIGNATURE_LENGTH as u8]);
     bytes.resize(bytes.len() + ED25519_SIGNATURE_LENGTH, 0);
     Built { bytes, digest }
@@ -176,18 +176,18 @@ struct EventCommitment {
 }
 
 /// `MergedValueIntermediate`.
-enum Merged {
+enum Merged<'b> {
     Sum(u128),
     SumPair(u128, u128),
-    Events(Vec<EventCommitment>),
+    Events(containers::Vec<'b, EventCommitment>),
 }
 
-impl Merged {
-    fn zero(value: &AccumulatorValue<'_>) -> Merged {
+impl<'b> Merged<'b> {
+    fn zero(value: &AccumulatorValue<'_>, bump: &'b Bump) -> Merged<'b> {
         match value {
             AccumulatorValue::Integer(_) => Merged::Sum(0),
             AccumulatorValue::IntegerTuple(..) => Merged::SumPair(0, 0),
-            AccumulatorValue::EventDigest(_) => Merged::Events(Vec::new()),
+            AccumulatorValue::EventDigest(_) => Merged::Events(containers::Vec::new_in(bump)),
         }
     }
 
@@ -212,11 +212,11 @@ impl Merged {
 }
 
 /// One accumulator's changes over a chunk.
-struct Update {
+struct Update<'b> {
     address: [u8; 32],
     ty: TypeTag,
-    merge: Merged,
-    split: Merged,
+    merge: Merged<'b>,
+    split: Merged<'b>,
     /// SUI deposited into and withdrawn from the accumulator, in the
     /// settlement's terms: deposits are its input, withdrawals its output.
     input_sui: u64,
@@ -241,21 +241,24 @@ fn is_sui_balance(tag: &TypeTagView<'_>) -> bool {
 }
 
 /// A chunk's accumulator events, merged per accumulator object.
-pub struct SettlementBuilder {
+pub struct SettlementBuilder<'b> {
     /// Iterated to build the transactions, so ordered by object id.
-    updates: BTreeMap<[u8; 32], Update>,
+    updates: BTreeMap<'b, [u8; 32], Update<'b>>,
     checkpoint_seq: u64,
     tx_index_offset: u64,
+    bump: &'b Bump,
 }
 
-impl SettlementBuilder {
+impl<'b> SettlementBuilder<'b> {
     /// A builder for a chunk of checkpoint `checkpoint_seq` whose first
-    /// transaction is the checkpoint's `tx_index_offset`th.
-    pub fn new(checkpoint_seq: u64, tx_index_offset: u64) -> SettlementBuilder {
+    /// transaction is the checkpoint's `tx_index_offset`th, its table in
+    /// `bump`.
+    pub fn new(checkpoint_seq: u64, tx_index_offset: u64, bump: &'b Bump) -> SettlementBuilder<'b> {
         SettlementBuilder {
-            updates: BTreeMap::new(),
+            updates: BTreeMap::new_in(bump),
             checkpoint_seq,
             tx_index_offset,
+            bump,
         }
     }
 
@@ -280,8 +283,8 @@ impl SettlementBuilder {
             let update = self.updates.entry(change.id.0).or_insert_with(|| Update {
                 address: write.address.0,
                 ty: TypeTag::from(&write.ty),
-                merge: Merged::zero(&write.value),
-                split: Merged::zero(&write.value),
+                merge: Merged::zero(&write.value, self.bump),
+                split: Merged::zero(&write.value, self.bump),
                 input_sui: 0,
                 output_sui: 0,
             });
@@ -318,7 +321,8 @@ impl SettlementBuilder {
         let mut updates = self.updates.into_values().peekable();
         let mut built = Vec::new();
         while updates.peek().is_some() {
-            let chunk: Vec<Update> = updates.by_ref().take(per_transaction).collect();
+            let mut chunk = containers::Vec::new_in(self.bump);
+            chunk.extend(updates.by_ref().take(per_transaction));
             let (input_sui, output_sui) = chunk
                 .iter()
                 .fold((0, 0), |(i, o), u| (i + u.input_sui, o + u.output_sui));
@@ -337,7 +341,7 @@ impl SettlementBuilder {
 }
 
 /// `MergedValue::add_move_call`.
-fn settle(ptb: &mut Ptb, update: Update, checkpoint_seq: u64) {
+fn settle(ptb: &mut Ptb, update: Update<'_>, checkpoint_seq: u64) {
     let is_balance = matches!(&update.ty, TypeTag::Struct(s)
         if s.address.0 == FRAMEWORK && s.module == "balance" && s.name == "Balance");
     let address = ptb.pure(SuiAddress(update.address));

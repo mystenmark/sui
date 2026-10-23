@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use consensus::{Block, BlockRef, CommittedSubDag};
 use messages::Message;
+use messages::base::Hashed;
 use protocol_config::{Chain, ProtocolVersion};
 use sui_types::base_types::{ObjectRef, SequenceNumber, SuiAddress, random_object_ref};
 use sui_types::crypto::{AccountKeyPair, get_key_pair};
@@ -87,7 +88,7 @@ impl Sender {
 /// A signed transaction's BCS, and its digest.
 struct Tx {
     bytes: Vec<u8>,
-    digest: [u8; 32],
+    digest: Hashed,
 }
 
 fn parse(bytes: Vec<u8>) -> VerifiedTransaction {
@@ -98,8 +99,8 @@ fn id(r: &ObjectRef) -> messages::base::ObjectId {
     messages::base::ObjectId(r.0.into_bytes())
 }
 
-fn digest_of(t: &VerifiedTransaction) -> [u8; 32] {
-    t.get().0.digest().bytes
+fn digest_of(t: &VerifiedTransaction) -> Hashed {
+    *t.get().0.digest()
 }
 
 #[tokio::test]
@@ -108,6 +109,7 @@ async fn the_stage_records_each_committed_transaction_s_status() {
         ConsensusPosition, ConsensusTxStatus, ConsensusTxStatusCache, StatusResult,
     };
     use workqueue::Processor;
+    let mut bump = containers::Bump::default();
     let epoch = epoch();
     let sender = Sender::new();
     let object = random_object_ref();
@@ -122,9 +124,8 @@ async fn the_stage_records_each_committed_transaction_s_status() {
         epoch.clone(),
         EpochStart {
             previous_checkpoint: 0,
-            previous_height: 0,
-            previous_timestamp_ms: 0,
             accumulator_root_initial_shared_version: 1,
+            authenticator_initial_shared_version: None,
             accumulator_root_version: 1,
             epoch_start_timestamp_ms: 0,
             epoch_duration_ms: u64::MAX,
@@ -134,11 +135,12 @@ async fn the_stage_records_each_committed_transaction_s_status() {
         settlements,
         checkpoints,
         statuses.clone(),
+        vec![([0; 96], 1)],
     );
     let mut decoded = commit(1, &[(&first, &[]), (&second, &[])]);
     let block = decoded.leader;
     decoded.rejected = vec![(block, 2)];
-    stage.process(decoded);
+    stage.process(decoded, &mut bump);
     let status = |index| {
         statuses.notify_read(ConsensusPosition {
             epoch: epoch.epoch,
@@ -161,7 +163,7 @@ async fn the_stage_records_each_committed_transaction_s_status() {
     );
 }
 
-fn digest(t: &Tx) -> [u8; 32] {
+fn digest(t: &Tx) -> Hashed {
     t.digest
 }
 
@@ -170,6 +172,7 @@ type Claimed<'a> = (&'a Tx, &'a [ObjectRef]);
 
 /// Commit `index`, one block, of `transactions` in consensus order.
 fn commit(index: u32, transactions: &[Claimed<'_>]) -> DecodedCommit {
+    let bump = containers::Bump::default();
     let block = BlockRef {
         round: index,
         author: 1,
@@ -185,31 +188,49 @@ fn commit(index: u32, transactions: &[Claimed<'_>]) -> DecodedCommit {
             .enumerate()
             .map(|(i, (t, immutable))| {
                 let immutable: Vec<_> = immutable.iter().map(id).collect();
-                CommittedTransaction::new(block, i as u16, parse(t.bytes.clone()), &immutable)
+                CommittedTransaction::new(
+                    block,
+                    i as u16,
+                    parse(t.bytes.clone()),
+                    &immutable,
+                    &bump,
+                )
             })
             .collect(),
+        observations: Vec::new(),
+        jwks: Vec::new(),
         rejected: Vec::new(),
         cache_hits: 0,
         cache_misses: transactions.len(),
+        handled: None,
     }
 }
 
 /// The digests of the user transactions scheduled.
-fn scheduled(handled: &HandledCommit) -> Vec<[u8; 32]> {
+fn scheduled(handled: &HandledCommit) -> Vec<Hashed> {
     handled
         .schedule
         .transactions
         .iter()
         .filter_map(|t| match t {
             Scheduled::User(t) => Some(digest_of(t)),
-            Scheduled::Prologue(_) => None,
+            Scheduled::Prologue(_) | Scheduled::AuthenticatorStateUpdate(_) => None,
         })
+        .collect()
+}
+
+/// The digests of the user transactions deferred to a later round.
+fn deferred(handled: &HandledCommit) -> Vec<Hashed> {
+    handled
+        .deferred
+        .iter()
+        .map(|(.., digest)| *digest)
         .collect()
 }
 
 /// Each dropped transaction's digest, and the reference and holder of the
 /// lock it lost.
-fn conflicts(handled: &HandledCommit) -> Vec<([u8; 32], messages::base::ObjectRef, [u8; 32])> {
+fn conflicts(handled: &HandledCommit) -> Vec<(Hashed, messages::base::ObjectRef, Hashed)> {
     handled
         .dropped
         .iter()
@@ -228,43 +249,184 @@ fn wire(r: &ObjectRef) -> messages::base::ObjectRef {
     }
 }
 
+/// A handler of a committee of one, that has handled no commit.
+fn new_handler(output: validator::epoch_store::ConsensusOutput) -> CommitHandler {
+    let config = protocol_config::ProtocolConfig::get_for_version(
+        protocol_config::ProtocolVersion::MAX,
+        protocol_config::Chain::Unknown,
+    );
+    CommitHandler::new(output, 0, vec![([0; 96], 10_000)], &config, None)
+}
+
 #[test]
 fn the_later_of_two_transactions_spending_one_object_in_a_commit_is_dropped() {
+    let bump = containers::Bump::default();
     let epoch = epoch();
     let sender = Sender::new();
     let object = random_object_ref();
     let first = sender.transaction(random_object_ref(), &[object]);
     let second = sender.transaction(random_object_ref(), &[object]);
     let (output, _dir) = consensus_output();
-    let mut handler = CommitHandler::new(output, 0);
+    let mut handler = new_handler(output);
     let decided = handler
-        .handle(&epoch, commit(1, &[(&first, &[]), (&second, &[])]))
+        .handle(&epoch, commit(1, &[(&first, &[]), (&second, &[])]), &bump)
+        .unwrap();
+    // The holder of the contested lock waits a round, as a penalty.
+    assert!(scheduled(&decided).is_empty());
+    assert_eq!(deferred(&decided), vec![digest(&first)]);
+    assert_eq!(
+        conflicts(&decided),
+        vec![(digest(&second), wire(&object), digest(&first))]
+    );
+    // Included again, the dropped one loses the lock again, as locks are
+    // taken before deduplication; the deferred one is scheduled.
+    let decided = handler
+        .handle(&epoch, commit(2, &[(&second, &[])]), &bump)
         .unwrap();
     assert_eq!(scheduled(&decided), vec![digest(&first)]);
     assert_eq!(
         conflicts(&decided),
         vec![(digest(&second), wire(&object), digest(&first))]
     );
-    // Dropped, it is processed: included again, it is a duplicate.
+    assert!(decided.duplicates.is_empty());
+}
+
+#[test]
+fn a_deferred_transaction_outlives_a_restart() {
+    let bump = containers::Bump::default();
+    let epoch = epoch();
+    let sender = Sender::new();
+    let object = random_object_ref();
+    let first = sender.transaction(random_object_ref(), &[object]);
+    let second = sender.transaction(random_object_ref(), &[object]);
+    let dir = tempfile::tempdir().unwrap();
+    let (_, output, _) = EpochStore::open(dir.path(), 0);
+    let committed = output.committed_checkpoints();
+    let mut handler = new_handler(output);
     let decided = handler
-        .handle(&epoch, commit(2, &[(&second, &[])]))
+        .handle(&epoch, commit(1, &[(&first, &[]), (&second, &[])]), &bump)
         .unwrap();
-    assert!(scheduled(&decided).is_empty() && decided.dropped.is_empty());
-    assert_eq!(decided.duplicates.len(), 1);
+    assert_eq!(deferred(&decided), vec![digest(&first)]);
+    // The commit's output is written once its checkpoint commits.
+    let record = validator::consensus::commit::CommitRecord {
+        commit_index: 1,
+        leader_round: 1,
+        height: 1,
+        next_seq: 2,
+        last_built_timestamp: 0,
+        root_version: 1,
+        closed: false,
+    };
+    handler.finish(&record, 1, true);
+    committed.committed_through(1);
+    drop((handler, committed));
+
+    let (_, output, _) = EpochStore::open(dir.path(), 0);
+    let mut handler = CommitHandler::new(output, 1, vec![([0; 96], 10_000)], &epoch.config, None);
+    let decided = handler.handle(&epoch, commit(2, &[]), &bump).unwrap();
+    assert_eq!(scheduled(&decided), vec![digest(&first)]);
+}
+
+/// The keys a commit's authenticator state update adds.
+fn updated_keys(handled: &HandledCommit) -> Vec<String> {
+    handled
+        .schedule
+        .transactions
+        .iter()
+        .filter_map(|t| match t {
+            Scheduled::AuthenticatorStateUpdate(keys) => Some(keys),
+            _ => None,
+        })
+        .flatten()
+        .map(|(id, _)| id.kid.clone())
+        .collect()
+}
+
+#[test]
+fn a_key_a_quorum_voted_for_is_added_by_the_next_commit_across_a_restart() {
+    use messages::build::system_transaction::{Jwk, JwkId};
+    use validator::consensus::jwk::JwkVote;
+    let bump = containers::Bump::default();
+    let epoch = epoch();
+    // Two of three: 6,667 of 10,000, a quorum.
+    let members: Vec<_> = [3_334, 3_333, 3_333]
+        .into_iter()
+        .zip(0u8..)
+        .map(|(stake, i)| ([i; 96], stake))
+        .collect();
+    let vote = |author: u8, kid: &str| JwkVote {
+        author: u32::from(author),
+        authority: [author; 96],
+        id: JwkId {
+            iss: "https://issuer".to_owned(),
+            kid: kid.to_owned(),
+        },
+        jwk: Jwk {
+            kty: "RSA".to_owned(),
+            e: "AQAB".to_owned(),
+            n: "n".to_owned(),
+            alg: "RS256".to_owned(),
+        },
+    };
+    let handler = |output| CommitHandler::new(output, 0, members.clone(), &epoch.config, Some(1));
+    let with_votes = |index: u32, votes: Vec<JwkVote>| {
+        let mut commit = commit(index, &[]);
+        commit.jwks = votes;
+        commit
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (_, output, _) = EpochStore::open(dir.path(), 0);
+    let committed = output.committed_checkpoints();
+    let mut first = handler(output);
+    // "a" becomes active in commit 1; "b" has one vote of two.
+    let decided = first
+        .handle(
+            &epoch,
+            with_votes(1, vec![vote(0, "a"), vote(1, "a"), vote(0, "b")]),
+            &bump,
+        )
+        .unwrap();
+    assert!(updated_keys(&decided).is_empty());
+    let record = validator::consensus::commit::CommitRecord {
+        commit_index: 1,
+        leader_round: 1,
+        height: 1,
+        next_seq: 2,
+        last_built_timestamp: 0,
+        root_version: 1,
+        closed: false,
+    };
+    first.finish(&record, 1, true);
+    committed.committed_through(1);
+    drop((first, committed));
+
+    // Restarted: commit 2 adds "a", and a second vote makes "b" active,
+    // which commit 3 adds.
+    let (_, output, _) = EpochStore::open(dir.path(), 0);
+    let mut second = CommitHandler::new(output, 1, members.clone(), &epoch.config, Some(1));
+    let decided = second
+        .handle(&epoch, with_votes(2, vec![vote(2, "b")]), &bump)
+        .unwrap();
+    assert_eq!(updated_keys(&decided), ["a"]);
+    let decided = second.handle(&epoch, commit(3, &[]), &bump).unwrap();
+    assert_eq!(updated_keys(&decided), ["b"]);
+    let decided = second.handle(&epoch, commit(4, &[]), &bump).unwrap();
+    assert!(updated_keys(&decided).is_empty());
 }
 
 #[test]
 fn a_shared_gas_coin_conflicts_like_any_owned_input() {
+    let bump = containers::Bump::default();
     let epoch = epoch();
     let sender = Sender::new();
     let gas = random_object_ref();
     let first = sender.transaction(gas, &[]);
     let second = sender.transaction(gas, &[random_object_ref()]);
     let (output, _dir) = consensus_output();
-    let decided = CommitHandler::new(output, 0)
-        .handle(&epoch, commit(1, &[(&first, &[]), (&second, &[])]))
+    let decided = new_handler(output)
+        .handle(&epoch, commit(1, &[(&first, &[]), (&second, &[])]), &bump)
         .unwrap();
-    assert_eq!(scheduled(&decided), vec![digest(&first)]);
+    assert_eq!(deferred(&decided), vec![digest(&first)]);
     assert_eq!(
         conflicts(&decided),
         vec![(digest(&second), wire(&gas), digest(&first))]
@@ -273,6 +435,7 @@ fn a_shared_gas_coin_conflicts_like_any_owned_input() {
 
 #[test]
 fn a_lock_holds_across_commits_for_its_version_only() {
+    let bump = containers::Bump::default();
     let epoch = epoch();
     let sender = Sender::new();
     let object = random_object_ref();
@@ -282,11 +445,13 @@ fn a_lock_holds_across_commits_for_its_version_only() {
     let again = sender.transaction(random_object_ref(), &[object]);
     let later = sender.transaction(random_object_ref(), &[next]);
     let (output, _dir) = consensus_output();
-    let mut handler = CommitHandler::new(output, 0);
-    let decided = handler.handle(&epoch, commit(1, &[(&first, &[])])).unwrap();
+    let mut handler = new_handler(output);
+    let decided = handler
+        .handle(&epoch, commit(1, &[(&first, &[])]), &bump)
+        .unwrap();
     assert_eq!(scheduled(&decided), vec![digest(&first)]);
     let decided = handler
-        .handle(&epoch, commit(2, &[(&again, &[]), (&later, &[])]))
+        .handle(&epoch, commit(2, &[(&again, &[]), (&later, &[])]), &bump)
         .unwrap();
     assert_eq!(scheduled(&decided), vec![digest(&later)]);
     assert_eq!(
@@ -297,6 +462,7 @@ fn a_lock_holds_across_commits_for_its_version_only() {
 
 #[test]
 fn inputs_claimed_immutable_are_not_locked() {
+    let bump = containers::Bump::default();
     let epoch = epoch();
     let sender = Sender::new();
     let frozen = random_object_ref();
@@ -308,7 +474,7 @@ fn inputs_claimed_immutable_are_not_locked() {
         .collect();
     let claim = [frozen];
     let (output, _dir) = consensus_output();
-    let decided = CommitHandler::new(output, 0)
+    let decided = new_handler(output)
         .handle(
             &epoch,
             commit(
@@ -320,18 +486,16 @@ fn inputs_claimed_immutable_are_not_locked() {
                     (&unclaimed[1], &[]),
                 ],
             ),
+            &bump,
         )
         .unwrap();
     // The handler goes by the claim, which voting verified: without it, the
     // object is locked like an owned one.
     assert_eq!(
         scheduled(&decided),
-        vec![
-            digest(&claiming[0]),
-            digest(&claiming[1]),
-            digest(&unclaimed[0])
-        ]
+        vec![digest(&claiming[0]), digest(&claiming[1])]
     );
+    assert_eq!(deferred(&decided), vec![digest(&unclaimed[0])]);
     assert_eq!(
         conflicts(&decided),
         vec![(digest(&unclaimed[1]), wire(&frozen), digest(&unclaimed[0]))]
@@ -340,14 +504,15 @@ fn inputs_claimed_immutable_are_not_locked() {
 
 #[test]
 fn a_transaction_with_invalid_inputs_is_dropped_and_locks_nothing() {
+    let bump = containers::Bump::default();
     let epoch = epoch();
     let sender = Sender::new();
     let object = random_object_ref();
     let twice = sender.transaction(random_object_ref(), &[object, object]);
     let valid = sender.transaction(random_object_ref(), &[object]);
     let (output, _dir) = consensus_output();
-    let decided = CommitHandler::new(output, 0)
-        .handle(&epoch, commit(1, &[(&twice, &[]), (&valid, &[])]))
+    let decided = new_handler(output)
+        .handle(&epoch, commit(1, &[(&twice, &[]), (&valid, &[])]), &bump)
         .unwrap();
     assert_eq!(scheduled(&decided), vec![digest(&valid)]);
     let [(_, _, dropped, DropReason::Inputs(e))] = &decided.dropped[..] else {
@@ -363,15 +528,17 @@ fn decisions(handled: &HandledCommit) -> String {
         .map(|i| handled.schedule.accesses(i).to_vec())
         .collect();
     format!(
-        "{:?} {accesses:?} {:?} {:?}",
+        "{:?} {accesses:?} {:?} {:?} {:?}",
         scheduled(handled),
         handled.dropped,
-        handled.duplicates
+        handled.duplicates,
+        handled.deferred
     )
 }
 
 #[test]
 fn handlers_fed_the_same_commits_decide_alike_and_a_replay_changes_nothing() {
+    let bump = containers::Bump::default();
     let epoch = epoch();
     let sender = Sender::new();
     let objects: Vec<_> = (0..4).map(|_| random_object_ref()).collect();
@@ -391,25 +558,25 @@ fn handlers_fed_the_same_commits_decide_alike_and_a_replay_changes_nothing() {
     let decide = |handler: &mut CommitHandler| -> Vec<String> {
         commits()
             .into_iter()
-            .map(|c| decisions(&handler.handle(&epoch, c).unwrap()))
+            .map(|c| decisions(&handler.handle(&epoch, c, &bump).unwrap()))
             .collect()
     };
     let (output, _dir) = consensus_output();
-    let mut handler = CommitHandler::new(output, 0);
+    let mut handler = new_handler(output);
     let first = decide(&mut handler);
     let (other, _other_dir) = consensus_output();
-    assert_eq!(first, decide(&mut CommitHandler::new(other, 0)));
+    assert_eq!(first, decide(&mut new_handler(other)));
     // Consensus replays commits after a restart; those handled are skipped.
     for c in commits() {
-        assert!(handler.handle(&epoch, c).is_none());
+        assert!(handler.handle(&epoch, c, &bump).is_none());
     }
     // The first commit's first transaction took two objects; its second,
-    // sharing one, lost it.
+    // sharing one, lost it, and the first waits a round.
     let (output, _dir) = consensus_output();
-    let decided = CommitHandler::new(output, 0)
-        .handle(&epoch, commits().remove(0))
+    let decided = new_handler(output)
+        .handle(&epoch, commits().remove(0), &bump)
         .unwrap();
-    assert_eq!(scheduled(&decided)[0], digest(&transactions[0]));
+    assert_eq!(deferred(&decided)[0], digest(&transactions[0]));
     assert_eq!(decided.dropped[0].2, digest(&transactions[1]));
 }
 
@@ -432,6 +599,7 @@ fn user_transaction(transaction: &[u8], immutable: &[ObjectRef]) -> Vec<u8> {
 
 #[test]
 fn decoding_carries_the_immutable_claims() {
+    let bump = containers::Bump::default();
     let epoch = epoch();
     let sender = Sender::new();
     let frozen = random_object_ref();
@@ -447,14 +615,17 @@ fn decoding_carries_the_immutable_claims() {
         transactions: vec![user_transaction(&bytes, &[frozen])],
     };
     let mut decoder = CommitDecoder::new(epoch.clone(), Arc::new(ConsensusTxCache::new()));
-    let commit = decoder.decode(CommittedSubDag {
-        commit_index: 1,
-        digest: [0; 32],
-        leader: block.reference,
-        timestamp_ms: 0,
-        blocks: vec![block],
-        rejected: vec![],
-    });
+    let commit = decoder.decode(
+        CommittedSubDag {
+            commit_index: 1,
+            digest: [0; 32],
+            leader: block.reference,
+            timestamp_ms: 0,
+            blocks: vec![block],
+            rejected: vec![],
+        },
+        &bump,
+    );
     assert_eq!(commit.cache_misses, 1);
     let locked = commit.transactions[0].owned.as_ref().unwrap();
     assert_eq!(locked, &vec![wire(&owned), wire(&gas)]);
@@ -462,6 +633,7 @@ fn decoding_carries_the_immutable_claims() {
 
 #[test]
 fn the_stage_leaves_dropped_transactions_out_of_its_chunks() {
+    let bump = containers::Bump::default();
     let epoch = epoch();
     let sender = Sender::new();
     let object = random_object_ref();
@@ -475,9 +647,8 @@ fn the_stage_leaves_dropped_transactions_out_of_its_chunks() {
         epoch.clone(),
         EpochStart {
             previous_checkpoint: 0,
-            previous_height: 0,
-            previous_timestamp_ms: 0,
             accumulator_root_initial_shared_version: 1,
+            authenticator_initial_shared_version: None,
             accumulator_root_version: 1,
             epoch_start_timestamp_ms: 0,
             epoch_duration_ms: u64::MAX,
@@ -487,20 +658,26 @@ fn the_stage_leaves_dropped_transactions_out_of_its_chunks() {
         settlements,
         checkpoints,
         Arc::new(validator::consensus::status::ConsensusTxStatusCache::new()),
+        vec![([0; 96], 1)],
     );
+    let users = |decided: &validator::consensus::commit::Decided| -> Vec<Hashed> {
+        decided
+            .chunks
+            .iter()
+            .flat_map(|c| &c.entries)
+            .filter_map(|e| match &e.transaction {
+                ExecutableTransaction::User(t) => Some(digest_of(t)),
+                ExecutableTransaction::System(_) => None,
+            })
+            .collect()
+    };
     let decided = stage
-        .decide(commit(1, &[(&first, &[]), (&second, &[])]))
+        .decide(commit(1, &[(&first, &[]), (&second, &[])]), &bump)
         .unwrap();
-    let users: Vec<_> = decided
-        .chunks
-        .iter()
-        .flat_map(|c| &c.entries)
-        .filter_map(|e| match &e.transaction {
-            ExecutableTransaction::User(t) => Some(digest_of(t)),
-            ExecutableTransaction::System(_) => None,
-        })
-        .collect();
-    assert_eq!(users, vec![digest(&first)]);
+    // The first, its lock contested, is in the next round's chunks.
+    assert!(users(&decided).is_empty());
+    let next = stage.decide(commit(2, &[]), &bump).unwrap();
+    assert_eq!(users(&next), vec![digest(&first)]);
     assert!(
         decided
             .settlements

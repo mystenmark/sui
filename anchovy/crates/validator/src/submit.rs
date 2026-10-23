@@ -31,36 +31,29 @@ use crate::processors::{Outcome, Request, executed};
 pub struct SubmitChecker {
     epoch: Arc<EpochState>,
     pub store: Arc<store::Store>,
-    bump: Bump,
 }
-
-/// Enough for a transaction's parsed signatures.
-const ARENA_BYTES: usize = 16 * 1024;
 
 impl SubmitChecker {
     pub fn new(epoch: Arc<EpochState>, store: Arc<store::Store>) -> SubmitChecker {
-        SubmitChecker {
-            epoch,
-            store,
-            bump: Bump::with_capacity(ARENA_BYTES),
-        }
+        SubmitChecker { epoch, store }
     }
 
     /// The `ConsensusTransaction` BCS the reference's `submit_transaction`
     /// sends for `transaction`: a `UserTransactionV2` with its claims.
     fn consensus_transaction(
-        &mut self,
+        &self,
         epoch: &EpochState,
         transaction: &VerifiedTransaction,
+        bump: &Bump,
     ) -> Result<Vec<u8>, validation::Error> {
         let signed = &transaction.get().0;
         let data = signed.data();
         let mut claims = 0u8;
-        let mut encoded = Vec::new();
+        let mut encoded = containers::Vec::new_in(bump);
 
         // The owned inputs that are immutable, in input order.
-        let mut immutable = Vec::new();
-        for input in input_objects(data)? {
+        let mut immutable = containers::Vec::new_in(bump);
+        for input in input_objects(data, bump)? {
             let InputKind::ImmOrOwned(r) = input else {
                 continue;
             };
@@ -85,14 +78,13 @@ impl SubmitChecker {
         if config.address_aliases() {
             claims += 1;
             if config.fix_checkpoint_signature_mapping() {
-                self.bump.reset();
-                let (signatures, _) = sender_signed::deserialization_checks(signed, &self.bump)?;
+                let (signatures, _) = sender_signed::deserialization_checks(signed, bump)?;
                 let indices = validation::verify::signer_signature_indices(
                     signed,
                     signatures,
                     &epoch.verifier,
                     &[],
-                    &self.bump,
+                    bump,
                 )?;
                 encoded.push(2);
                 uleb128(&mut encoded, indices.as_slice().len());
@@ -102,12 +94,9 @@ impl SubmitChecker {
             } else {
                 let sponsor =
                     (data.gas_data().owner != data.sender()).then_some(data.gas_data().owner);
-                let signers: Vec<_> = [Some(data.sender()), sponsor]
-                    .into_iter()
-                    .flatten()
-                    .collect();
+                let signers = [Some(data.sender()), sponsor].into_iter().flatten();
                 encoded.push(0);
-                uleb128(&mut encoded, signers.len());
+                uleb128(&mut encoded, signers.clone().count());
                 for signer in signers {
                     encoded.extend_from_slice(&signer.0);
                     encoded.push(0);
@@ -131,7 +120,7 @@ impl SubmitChecker {
 /// `ConsensusTransactionKind::UserTransactionV2`'s variant index.
 const USER_TRANSACTION_V2: u8 = 12;
 
-fn uleb128(out: &mut Vec<u8>, mut n: usize) {
+fn uleb128(out: &mut containers::Vec<'_, u8>, mut n: usize) {
     while n >= 0x80 {
         out.push((n as u8) | 0x80);
         n >>= 7;
@@ -143,7 +132,7 @@ impl Processor for SubmitChecker {
     type Input = Request<Verified>;
     type Output = ();
 
-    fn process(&mut self, request: Request<Verified>) -> Option<()> {
+    fn process(&mut self, request: Request<Verified>, bump: &mut Bump) -> Option<()> {
         let Request {
             transactions,
             then: _,
@@ -152,13 +141,12 @@ impl Processor for SubmitChecker {
         let epoch = self.epoch.clone();
         let mut outcomes = Vec::with_capacity(transactions.len());
         for transaction in &transactions {
-            let digest = transaction.get().0.digest().bytes;
-            if let Some(outcome) = executed(&self.store, &digest) {
+            if let Some(outcome) = executed(&self.store, transaction.get().0.digest()) {
                 outcomes.push(outcome);
                 continue;
             }
-            let submission = checks::inputs_pass(&epoch, &self.store, transaction)
-                .and_then(|()| self.consensus_transaction(&epoch, transaction));
+            let submission = checks::inputs_pass(&epoch, &self.store, transaction, bump)
+                .and_then(|()| self.consensus_transaction(&epoch, transaction, bump));
             outcomes.push(match submission {
                 Ok(bytes) => Outcome::Submit(bytes),
                 Err(e) => Outcome::Rejected(e),

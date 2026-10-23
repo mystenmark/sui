@@ -21,6 +21,7 @@ use tokio::sync::mpsc;
 use validator::consensus::decode::CommitRequest;
 use validator::current::CurrentEpoch;
 use validator::epoch::EpochParams;
+use validator::epoch::EpochState;
 
 const TIMEOUT: Duration = Duration::from_mins(1);
 const COMMIT_INTERVAL_MS: u64 = 10_000;
@@ -63,6 +64,7 @@ impl Started {
                 }],
                 rejected: vec![],
             },
+            handled: None,
         });
     }
 }
@@ -87,22 +89,24 @@ fn the_node_runs_epoch_after_epoch() {
         state_sync,
         chain: Chain::Unknown,
         chain_identifier: Digest::new(genesis.chain_identifier),
-        protocol_key: Arc::new(checkpoint::ProtocolKey::new(genesis::protocol_key_pair())),
+        keys: genesis::validator_keys(),
     };
 
     let (started, epochs) = std::sync::mpsc::channel();
     let runtime = tokio::runtime::Runtime::new().unwrap();
-    runtime.spawn(Node::new(perpetual).run(move |epoch, output| {
-        let (client, normal, priority) = TransactionClient::new(64);
-        started
-            .send(Started {
-                params: epoch.params.clone(),
-                output,
-                lanes: (normal, priority),
-            })
-            .unwrap();
-        client
-    }));
+    runtime.spawn(Node::new(perpetual).run(
+        move |epoch: &Arc<EpochState>, output: ConsensusOutput| {
+            let (client, normal, priority) = TransactionClient::new(64);
+            started
+                .send(Started {
+                    params: epoch.params.clone(),
+                    output,
+                    lanes: (normal, priority),
+                })
+                .unwrap();
+            client
+        },
+    ));
 
     let deadline = Instant::now() + TIMEOUT;
     let next = |epochs: &Receiver<Started>| match epochs.recv_timeout(Duration::from_millis(5)) {

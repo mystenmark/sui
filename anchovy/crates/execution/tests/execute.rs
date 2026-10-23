@@ -111,9 +111,12 @@ fn transfers_execute_one_after_another() {
     ));
     assert_eq!(effects.status(), &ExecutionStatus::Success, "{effects:?}");
     // Its results read back as the reference answers for an executed one.
-    let executed = execution::executed(&node.store, &effects.transaction_digest().into_inner())
-        .unwrap()
-        .unwrap();
+    let executed = execution::executed_named(
+        &node.store,
+        &messages::base::Digest::new(effects.transaction_digest().into_inner()),
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(executed.effects_digest, effects.digest().into_inner());
     assert_eq!(executed.effects, bcs::to_bytes(&effects).unwrap());
     assert!(executed.events.is_none(), "a transfer emits no events");
@@ -138,7 +141,7 @@ fn transfers_execute_one_after_another() {
     changed.sort();
     assert_eq!(decode(&executed.output_objects), changed);
     assert!(
-        execution::executed(&node.store, &[7; 32])
+        execution::executed_named(&node.store, &messages::base::Digest::new([7; 32]))
             .unwrap()
             .is_none(),
         "never executed"

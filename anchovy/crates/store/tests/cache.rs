@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use messages::Message;
-use messages::base::{Digest, ObjectId};
+use messages::base::{Digest, Hashed, ObjectId};
 use messages::checkpoint::CheckpointData;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -63,10 +63,11 @@ fn object_digest(version: u64, index: usize) -> Digest {
     Digest::new(bytes)
 }
 
-fn digest(tag: u8, n: u64) -> Digest {
+/// A made-up digest, standing in for a computed one.
+fn digest(tag: u8, n: u64) -> Hashed {
     let mut bytes = [tag; 32];
     bytes[..8].copy_from_slice(&n.to_le_bytes());
-    Digest::new(bytes)
+    Hashed::computed(Digest::new(bytes))
 }
 
 fn id(n: usize) -> ObjectId {
@@ -78,8 +79,8 @@ fn id(n: usize) -> ObjectId {
 /// A transaction as the model keeps it.
 #[derive(Clone)]
 struct Tx {
-    digest: Digest,
-    effects_digest: Digest,
+    digest: Hashed,
+    effects_digest: Hashed,
     pool: usize,
     outputs: Vec<(usize, u64, State)>,
 }
@@ -123,7 +124,7 @@ struct Model {
     /// Committed, then uncommitted.
     committed: HashMap<usize, BTreeMap<u64, State>>,
     uncommitted: HashMap<usize, BTreeMap<u64, State>>,
-    committed_txs: HashMap<Digest, Tx>,
+    committed_txs: HashMap<Hashed, Tx>,
     /// In write order.
     uncommitted_txs: Vec<Tx>,
 }
@@ -135,7 +136,7 @@ impl Model {
         all
     }
 
-    fn tx(&self, digest: &Digest) -> Option<&Tx> {
+    fn tx(&self, digest: &Hashed) -> Option<&Tx> {
         self.committed_txs
             .get(digest)
             .or_else(|| self.uncommitted_txs.iter().find(|t| &t.digest == digest))
@@ -203,13 +204,19 @@ fn run_model(seed: u64, capacity: Capacity) {
             30..40 => {
                 let n = rng.gen_range(0..=model.uncommitted_txs.len().min(5));
                 let txs: Vec<Tx> = model.uncommitted_txs.drain(..n).collect();
-                let mut digests: Vec<Digest> = txs.iter().map(|t| t.digest).collect();
+                let mut digests: Vec<Hashed> = txs.iter().map(|t| t.digest).collect();
                 if let Some(old) = model.committed_txs.keys().next()
                     && rng.gen_bool(0.2)
                 {
                     digests.insert(0, *old);
                 }
-                store.commit_checkpoint(next_checkpoint, &digests, vec![step as u8], vec![]);
+                store.commit_checkpoint(
+                    next_checkpoint,
+                    &digests,
+                    vec![step as u8],
+                    vec![],
+                    &containers::Bump::default(),
+                );
                 next_checkpoint += 1;
                 for tx in txs {
                     for &(object, version, state) in &tx.outputs {
@@ -330,7 +337,7 @@ fn check_object(store: &Store, model: &Model, pool: &Pool, object: usize, rng: &
     }
 }
 
-fn check_tx(store: &Store, model: &Model, pool: &Pool, digest: &Digest, effects: &Digest) {
+fn check_tx(store: &Store, model: &Model, pool: &Pool, digest: &Hashed, effects: &Hashed) {
     let tx = model.tx(digest);
     assert_eq!(
         store.executed_effects(digest).unwrap(),
@@ -426,7 +433,13 @@ fn racing_readers_never_see_an_older_version() {
         store.write(tx.commit(&pool));
         pending.push(tx.digest);
         if n % 3 == 2 {
-            store.commit_checkpoint(n / 3, &pending, vec![], vec![]);
+            store.commit_checkpoint(
+                n / 3,
+                &pending,
+                vec![],
+                vec![],
+                &containers::Bump::default(),
+            );
             pending.clear();
         }
     }
@@ -486,7 +499,13 @@ fn racing_readers_never_see_an_executed_transaction_unexecuted() {
         written.store(n + 1, Ordering::Release);
         pending.push(tx.digest);
         if n % 2 == 1 {
-            store.commit_checkpoint(n / 2, &pending, vec![], vec![]);
+            store.commit_checkpoint(
+                n / 2,
+                &pending,
+                vec![],
+                vec![],
+                &containers::Bump::default(),
+            );
             pending.clear();
         }
     }

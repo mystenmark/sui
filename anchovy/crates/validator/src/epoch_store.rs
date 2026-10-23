@@ -6,14 +6,20 @@
 //! (`store::epoch`), in three sections: consensus output, written only by
 //! the commit handler; checkpoint builder state; and everything else.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+
+use blake2::digest::consts::U32;
+use blake2::{Blake2b, Digest as _};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use messages::base::{Digest, ObjectId, ObjectRef};
+use containers::{HeapMessageMap, HeapMessageSet};
+use hashbrown::HashMap;
+use messages::base::{Digest, Hashed, ObjectId, ObjectRef};
 use store::Live;
 use store::epoch::{EpochDb, Space};
 
+use crate::consensus::deferral::DeferralKey;
 use crate::pipeline::keys::{StreamId, TxDigest};
 use crate::pipeline::tables::Generation;
 
@@ -36,14 +42,24 @@ impl EpochStore {
     /// If the database cannot be opened.
     pub fn open(root: &Path, epoch: u64) -> (EpochStore, ConsensusOutput, BuilderOutput) {
         let db = Arc::new(EpochDb::open(root, epoch).expect("the epoch's database opens"));
+        let deferred = db
+            .entries(Space::Deferred)
+            .expect("the epoch's database reads")
+            .into_iter()
+            .map(|(key, value)| {
+                let key = key.try_into().expect("a deferral key's length");
+                (DeferralKey::decode(&key), value)
+            })
+            .collect();
         let consensus = ConsensusOutput {
             quarantine: Arc::new(Mutex::new(Quarantine {
                 db: db.clone(),
+                deferred,
                 open: Output::default(),
                 queued: std::collections::VecDeque::new(),
-                processed: HashMap::new(),
-                locks: HashMap::new(),
-                streams: HashMap::new(),
+                processed: containers::heap_message_map(0),
+                locks: SipMap::default(),
+                streams: SipMap::default(),
                 committed_height: 0,
             })),
         };
@@ -288,6 +304,9 @@ pub struct CommittedCheckpoints {
 
 struct Quarantine {
     db: Arc<EpochDb>,
+    /// Every transaction deferred and not yet taken, as written and queued:
+    /// few, so all in memory, as the reference's `ConsensusOutputCache`.
+    deferred: BTreeMap<DeferralKey, Vec<u8>>,
     /// The commit being decided.
     open: Output,
     /// Decided commits not yet written, in commit order.
@@ -295,25 +314,55 @@ struct Quarantine {
     /// The latest queued value of each key, and how many queued outputs
     /// wrote it: a key leaves memory with the last of them, as the
     /// reference's `RefCountedHashMap`.
-    processed: HashMap<TxDigest, usize>,
-    locks: HashMap<ObjectRef, (TxDigest, usize)>,
-    streams: HashMap<StreamId, ((u32, u32), usize)>,
+    processed: HeapMessageMap<TxDigest, usize>,
+    locks: SipMap<ObjectRef, (TxDigest, usize)>,
+    streams: SipMap<StreamId, ((u32, u32), usize)>,
     /// The last chunk height of the last checkpoint committed.
     committed_height: u64,
 }
 
+/// A table keyed by object references or ids from transactions' inputs,
+/// which a client chooses: hashed whole, by `SipHash`.
+type SipMap<K, V> = HashMap<K, V, std::hash::RandomState>;
+
 /// One commit's output.
-#[derive(Default)]
 struct Output {
-    processed: std::collections::HashSet<TxDigest>,
-    locks: HashMap<ObjectRef, TxDigest>,
-    streams: HashMap<StreamId, (u32, u32)>,
+    processed: HeapMessageSet<TxDigest>,
+    locks: SipMap<ObjectRef, TxDigest>,
+    streams: SipMap<StreamId, (u32, u32)>,
+    /// The execution time observations taken: (generation, authority
+    /// index) and the encoded estimates.
+    observations: Vec<((u64, u32), Vec<u8>)>,
+    /// Transactions deferred, encoded, and the keys taken, in order.
+    deferred: Vec<(DeferralKey, Option<Vec<u8>>)>,
+    /// The JSON web key votes counted, encoded.
+    jwk_votes: Vec<Vec<u8>>,
+    /// The keys that became active, encoded, if the epoch agrees keys: the
+    /// next commit's update.
+    new_jwks: Option<Vec<u8>>,
     /// The commit stage's state after the commit, encoded.
     record: Vec<u8>,
     /// The last chunk height the commit assigned.
     height: u64,
     /// Whether no chunk waited for a checkpoint after the commit.
     drained: bool,
+}
+
+impl Default for Output {
+    fn default() -> Output {
+        Output {
+            processed: containers::heap_message_set(0),
+            locks: SipMap::default(),
+            streams: SipMap::default(),
+            observations: Vec::new(),
+            deferred: Vec::new(),
+            jwk_votes: Vec::new(),
+            new_jwks: None,
+            record: Vec::new(),
+            height: 0,
+            drained: false,
+        }
+    }
 }
 
 fn lock_quarantine(quarantine: &Mutex<Quarantine>) -> std::sync::MutexGuard<'_, Quarantine> {
@@ -332,7 +381,7 @@ impl ConsensusOutput {
         q.open.processed.contains(digest)
             || q.processed.contains_key(digest)
             || q.db
-                .exists(Space::Processed, digest)
+                .exists(Space::Processed, &digest.bytes)
                 .expect("the epoch's database reads")
     }
 
@@ -357,7 +406,8 @@ impl ConsensusOutput {
         }
         q.db.get(Space::Locks, &lock_key(object))
             .expect("the epoch's database reads")
-            .map(|v| v[..].try_into().expect("a 32-byte digest"))
+            // This handler wrote it, from a transaction's computed digest.
+            .map(|v| Hashed::computed(Digest::new(v[..].try_into().expect("a 32-byte digest"))))
     }
 
     pub fn set_lock(&mut self, object: ObjectRef, holder: TxDigest) {
@@ -396,6 +446,103 @@ impl ConsensusOutput {
             .open
             .streams
             .insert(stream, last);
+    }
+
+    /// Authority `author`'s execution time observations of `generation`,
+    /// `estimates` encoded, taken by the commit being decided.
+    pub fn put_execution_time_observations(
+        &mut self,
+        author: u32,
+        generation: u64,
+        estimates: Vec<u8>,
+    ) {
+        lock_quarantine(&self.quarantine)
+            .open
+            .observations
+            .push(((generation, author), estimates));
+    }
+
+    /// Defers transactions, `transactions` encoded, by `key`: one key per
+    /// commit, as the reference's.
+    pub fn defer(&mut self, key: DeferralKey, transactions: Vec<u8>) {
+        let mut q = lock_quarantine(&self.quarantine);
+        let previous = q.deferred.insert(key, transactions.clone());
+        assert!(previous.is_none(), "{key:?} deferred to twice");
+        q.open.deferred.push((key, Some(transactions)));
+    }
+
+    /// Takes the transactions deferred by keys in `keys`, in key order.
+    pub fn take_deferred(
+        &mut self,
+        keys: std::ops::Range<DeferralKey>,
+    ) -> Vec<(DeferralKey, Vec<u8>)> {
+        let mut q = lock_quarantine(&self.quarantine);
+        let taken: Vec<DeferralKey> = q.deferred.range(keys).map(|(key, _)| *key).collect();
+        taken
+            .into_iter()
+            .map(|key| {
+                q.open.deferred.push((key, None));
+                (key, q.deferred.remove(&key).expect("a key in range"))
+            })
+            .collect()
+    }
+
+    /// A JSON web key vote the commit being decided counted, encoded.
+    pub fn put_jwk_vote(&mut self, vote: Vec<u8>) {
+        lock_quarantine(&self.quarantine).open.jwk_votes.push(vote);
+    }
+
+    /// The JSON web keys that became active in the commit being decided,
+    /// encoded.
+    pub fn set_new_jwks(&mut self, keys: Vec<u8>) {
+        lock_quarantine(&self.quarantine).open.new_jwks = Some(keys);
+    }
+
+    /// The JSON web key votes of the commits written, in no order: for the
+    /// commit handler's start.
+    ///
+    /// # Panics
+    /// If the database cannot be read.
+    pub fn jwk_votes(&self) -> Vec<Vec<u8>> {
+        lock_quarantine(&self.quarantine)
+            .db
+            .entries(Space::JwkVotes)
+            .expect("the epoch's database reads")
+            .into_iter()
+            .map(|(_, vote)| vote)
+            .collect()
+    }
+
+    /// The JSON web keys that became active in the last commit written, as
+    /// `set_new_jwks` took them.
+    ///
+    /// # Panics
+    /// If the database cannot be read.
+    pub fn new_jwks(&self) -> Option<Vec<u8>> {
+        lock_quarantine(&self.quarantine)
+            .db
+            .get(Space::Commit, &[1])
+            .expect("the epoch's database reads")
+    }
+
+    /// The execution time observations of the commits written, by
+    /// (generation, authority index): for the commit stage's start, which
+    /// replays later commits.
+    ///
+    /// # Panics
+    /// If the database cannot be read.
+    pub fn execution_time_observations(&self) -> Vec<(u64, u32, Vec<u8>)> {
+        lock_quarantine(&self.quarantine)
+            .db
+            .entries(Space::ExecutionTimeObservations)
+            .expect("the epoch's database reads")
+            .into_iter()
+            .map(|(key, estimates)| {
+                let generation = u64::from_be_bytes(key[..8].try_into().expect("8 bytes"));
+                let author = u32::from_be_bytes(key[8..].try_into().expect("4 bytes"));
+                (generation, author, estimates)
+            })
+            .collect()
     }
 
     /// Ends the commit being decided: `record` is the commit stage's state
@@ -481,13 +628,18 @@ impl Quarantine {
         };
         let mut batch = self.db.batch();
         let mut record = Vec::new();
+        let mut new_jwks = None;
         for output in self.queued.drain(..=last) {
             for digest in output.processed {
-                batch.put(Space::Processed, digest.to_vec(), Vec::new());
+                batch.put(Space::Processed, digest.bytes.to_vec(), Vec::new());
                 release(&mut self.processed, &digest, |count| count);
             }
             for (object, holder) in output.locks {
-                batch.put(Space::Locks, lock_key(&object).to_vec(), holder.to_vec());
+                batch.put(
+                    Space::Locks,
+                    lock_key(&object).to_vec(),
+                    holder.bytes.to_vec(),
+                );
                 release(&mut self.locks, &object, |held| &mut held.1);
             }
             for (stream, (round, generation)) in output.streams {
@@ -500,17 +652,37 @@ impl Quarantine {
                 );
                 release(&mut self.streams, &stream, |last| &mut last.1);
             }
+            for (key, transactions) in output.deferred {
+                let key = key.encode().to_vec();
+                match transactions {
+                    Some(transactions) => batch.put(Space::Deferred, key, transactions),
+                    None => batch.delete(Space::Deferred, key),
+                }
+            }
+            for vote in output.jwk_votes {
+                let key = Blake2b::<U32>::digest(&vote).to_vec();
+                batch.put(Space::JwkVotes, key, vote);
+            }
+            for ((generation, author), estimates) in output.observations {
+                let mut key = generation.to_be_bytes().to_vec();
+                key.extend_from_slice(&author.to_be_bytes());
+                batch.put(Space::ExecutionTimeObservations, key, estimates);
+            }
             record = output.record;
+            new_jwks = output.new_jwks;
         }
         batch.put(Space::Commit, vec![0], record);
+        if let Some(new_jwks) = new_jwks {
+            batch.put(Space::Commit, vec![1], new_jwks);
+        }
         batch.commit().expect("the epoch's database writes");
     }
 }
 
 /// One fewer queued output holds `key`'s value; it leaves memory with the
 /// last.
-fn release<K: std::hash::Hash + Eq, V>(
-    map: &mut HashMap<K, V>,
+fn release<K: std::hash::Hash + Eq, V, S: std::hash::BuildHasher>(
+    map: &mut HashMap<K, V, S>,
     key: &K,
     count: impl Fn(&mut V) -> &mut usize,
 ) {

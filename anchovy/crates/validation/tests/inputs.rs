@@ -95,7 +95,12 @@ fn matches_the_reference() {
                 let signed = Message::<SenderSignedData>::parse(unsigned(&unhex(hex)))
                     .map_err(|(e, _)| e)
                     .unwrap();
-                let ours = match validation::inputs::check(signed.get(), &ctx, &store) {
+                let ours = match validation::inputs::check(
+                    signed.get(),
+                    &ctx,
+                    &store,
+                    &containers::Bump::default(),
+                ) {
                     Ok(()) => "ok".to_owned(),
                     Err(e) => format!("{:?}", e.kind),
                 };

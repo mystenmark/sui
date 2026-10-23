@@ -4,7 +4,8 @@
 //! An epoch's database, discarded once the epoch is over: after the
 //! reference's `AuthorityEpochTables`. Raw bytes by keyspace; the pipeline's
 //! epoch store gives them types and decides who writes which. A directory
-//! per epoch, holding one Tidehunter database.
+//! per epoch, holding the epoch store's Tidehunter database (`store`) and
+//! consensus's (`consensus`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,6 +26,9 @@ pub enum Space {
     Locks,
     Streams,
     Commit,
+    ExecutionTimeObservations,
+    Deferred,
+    JwkVotes,
     // Checkpoint builder state.
     Built,
     CheckpointHashes,
@@ -35,11 +39,14 @@ pub enum Space {
 }
 
 impl Space {
-    const ALL: [Space; 9] = [
+    const ALL: [Space; 12] = [
         Space::Processed,
         Space::Locks,
         Space::Streams,
         Space::Commit,
+        Space::ExecutionTimeObservations,
+        Space::Deferred,
+        Space::JwkVotes,
         Space::Built,
         Space::CheckpointHashes,
         Space::Roots,
@@ -53,6 +60,9 @@ impl Space {
             Space::Locks => "locks",
             Space::Streams => "streams",
             Space::Commit => "commit",
+            Space::ExecutionTimeObservations => "execution_time_observations",
+            Space::Deferred => "deferred",
+            Space::JwkVotes => "jwk_votes",
             Space::Built => "built",
             Space::CheckpointHashes => "checkpoint_hashes",
             Space::Roots => "roots",
@@ -65,12 +75,17 @@ impl Space {
     /// and sequence numbers 8.
     fn key_len(self) -> usize {
         match self {
-            Space::Processed => 32,
+            // A digest, or for a JSON web key vote, its hash.
+            Space::Processed | Space::JwkVotes => 32,
             Space::Locks => 32 + 8 + 32,
             Space::Streams | Space::StartVersions => 32 + 8,
             Space::Generations => 32 + 8 + 4 + 4,
             Space::Built | Space::CheckpointHashes | Space::Roots => 8,
             Space::Commit => 1,
+            // A generation and an authority's index.
+            Space::ExecutionTimeObservations => 8 + 4,
+            // A deferral key: its variant, then two big-endian rounds.
+            Space::Deferred => 1 + 8 + 8,
         }
     }
 }
@@ -91,7 +106,7 @@ impl EpochDb {
     /// Epoch `epoch`'s database under `root`: made at the epoch's start,
     /// reopened as it was on restart.
     pub fn open(root: &Path, epoch: u64) -> Result<EpochDb> {
-        let path = epoch_dir(root, epoch);
+        let path = epoch_dir(root, epoch).join("store");
         std::fs::create_dir_all(&path).map_err(DbError::Io)?;
         let mut shape = KeyShapeBuilder::new();
         for space in Space::ALL {
@@ -148,6 +163,18 @@ impl EpochDb {
         Ok(above)
     }
 
+    /// Every entry of `space`, in key order: for reading state back at
+    /// start-up.
+    pub fn entries(&self, space: Space) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.db
+            .iterator(self.spaces[space as usize])
+            .map(|entry| {
+                let (key, value) = entry?;
+                Ok((key.to_vec(), value.to_vec()))
+            })
+            .collect()
+    }
+
     /// Writes, committed atomically.
     pub fn batch(&self) -> EpochBatch<'_> {
         EpochBatch {
@@ -175,6 +202,12 @@ impl EpochBatch<'_> {
     pub fn commit(self) -> Result<()> {
         Ok(self.batch.commit()?)
     }
+}
+
+/// Where epoch `epoch`'s consensus keeps its data under `root`: in the
+/// epoch's directory, so it goes with the epoch's store.
+pub fn consensus_dir(root: &Path, epoch: u64) -> PathBuf {
+    epoch_dir(root, epoch).join("consensus")
 }
 
 fn epoch_dir(root: &Path, epoch: u64) -> PathBuf {

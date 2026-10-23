@@ -20,6 +20,7 @@ protocol-config.workspace = true
 prost.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
+serde.workspace = true
 store.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true

@@ -6,13 +6,10 @@
 
 use std::sync::Arc;
 
-use messages::arena::BumpAlloc;
-use messages::base::Digest;
-use messages::checkpoint::{CheckpointContents, VersionedCheckpointContents};
 use messages::fast::Bump;
-use messages::reader::Reader;
 use tokio::sync::watch;
 use validator::epoch_store::CommittedCheckpoints;
+use validator::pipeline::backpressure::Backpressure;
 use validator::pipeline::items::CertifiedCheckpoint;
 use validator::pipeline::tables::{CheckpointStore, ChunkTable, GenerationTable};
 use workqueue::Processor;
@@ -32,16 +29,17 @@ use workqueue::Processor;
 ///
 /// Reads: the checkpoint store. Prunes: the chunk table. Writes: the object
 /// store, as its only committer; the generation table's and the consensus
-/// output's committed state.
+/// output's committed state; backpressure's committed watermark, which
+/// releases the commit answers it withheld.
 pub struct CheckpointCommitter {
     store: Arc<store::Store>,
     checkpoints: Arc<CheckpointStore>,
     chunks: Arc<ChunkTable>,
     generations: Arc<GenerationTable>,
     consensus_output: CommittedCheckpoints,
+    backpressure: Arc<Backpressure>,
     /// The epoch's last checkpoint, once committed.
     ended: watch::Sender<Option<u64>>,
-    bump: Bump,
 }
 
 impl CheckpointCommitter {
@@ -51,6 +49,7 @@ impl CheckpointCommitter {
         chunks: Arc<ChunkTable>,
         generations: Arc<GenerationTable>,
         consensus_output: CommittedCheckpoints,
+        backpressure: Arc<Backpressure>,
         ended: watch::Sender<Option<u64>>,
     ) -> CheckpointCommitter {
         CheckpointCommitter {
@@ -59,51 +58,35 @@ impl CheckpointCommitter {
             chunks,
             generations,
             consensus_output,
+            backpressure,
             ended,
-            bump: Bump::with_capacity(super::ARENA),
         }
     }
 
     /// # Panics
     /// If this validator did not build `certified`, its contents do not
     /// parse, or the store's commit panics.
-    fn commit(&mut self, certified: &CertifiedCheckpoint) {
+    fn commit(&mut self, certified: &CertifiedCheckpoint, bump: &Bump) {
         let seq = certified.seq;
         let built = self
             .checkpoints
             .built(seq)
             .expect("a checkpoint is certified only once built here");
-        let transactions = transactions(&built.contents, &mut self.bump);
+        let transactions = crate::transactions(&built.contents, bump);
         self.store.commit_checkpoint(
             seq,
             &transactions,
             built.encode(),
             certified.summary.to_vec(),
+            bump,
         );
-        let digests: Vec<[u8; 32]> = transactions.iter().map(|d| d.bytes).collect();
-        self.generations.commit(&digests);
+        self.generations.commit(&transactions, bump);
         self.consensus_output.committed_through(built.last_height);
         self.chunks.prune_through(built.last_height);
         self.checkpoints.committed(seq);
+        self.backpressure.committed(seq, built.last_height);
         if built.root_state.is_some() {
             self.ended.send_replace(Some(seq));
-        }
-    }
-}
-
-/// The transactions of `contents` (`CheckpointContents` BCS), in order.
-fn transactions(contents: &[u8], bump: &mut Bump) -> Vec<Digest> {
-    bump.reset();
-    let mut r = Reader::new(contents);
-    let parsed = CheckpointContents::parse(&mut r, &mut BumpAlloc(bump))
-        .and_then(|c| r.finish().map(|()| c))
-        .expect("built contents parse");
-    match parsed.version {
-        VersionedCheckpointContents::V1 { transactions, .. } => {
-            transactions.iter().map(|t| t.transaction).collect()
-        }
-        VersionedCheckpointContents::V2(transactions) => {
-            transactions.iter().map(|t| t.digest.transaction).collect()
         }
     }
 }
@@ -112,9 +95,10 @@ impl Processor for CheckpointCommitter {
     type Input = Vec<CertifiedCheckpoint>;
     type Output = ();
 
-    fn process(&mut self, certified: Vec<CertifiedCheckpoint>) -> Option<()> {
+    fn process(&mut self, certified: Vec<CertifiedCheckpoint>, bump: &mut Bump) -> Option<()> {
         for checkpoint in &certified {
-            self.commit(checkpoint);
+            self.commit(checkpoint, bump);
+            bump.reset();
         }
         None
     }

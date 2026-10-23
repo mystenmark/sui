@@ -77,6 +77,8 @@ fn main() {
         let rounds: u32 = if size == 100 { 100 } else { 20 };
         let mut elapsed = Duration::ZERO;
         let mut allocations = 0;
+        // As a worker's arena: reset after each item, never freed.
+        let mut bump = workqueue::Bump::default();
         for seq in 0..=u64::from(rounds) {
             let item = CheckpointEffects {
                 last_of_epoch: false,
@@ -85,9 +87,10 @@ fn main() {
             };
             let before = ALLOCATIONS.load(Ordering::Relaxed);
             let start = Instant::now();
-            processor.process(item);
+            processor.process(item, &mut bump);
             let took = start.elapsed();
             let allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
+            bump.reset();
             assert!(hashes.root(seq).is_some());
             // The first round warms the parse arena.
             if seq > 0 {

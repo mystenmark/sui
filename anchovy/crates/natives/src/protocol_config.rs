@@ -39,7 +39,7 @@ pub fn is_feature_enabled(
 
     let protocol_config = &get_extension!(context, ObjectRuntime)?.protocol_config;
 
-    let is_enabled = match String::from_utf8(bytes.to_vec()) {
+    let is_enabled = match String::from_utf8(bytes) {
         Ok(s) => {
             // Use the auto-generated lookup_feature method to find the feature flag
             match protocol_config.lookup_feature(s) {

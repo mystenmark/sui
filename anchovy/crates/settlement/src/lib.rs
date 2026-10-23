@@ -8,11 +8,13 @@ pub mod causal;
 pub mod funds;
 pub mod settle;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use containers::{Bump, HeapHashMap};
+
 use messages::Message;
-use messages::base::{Digest, ObjectId};
+use messages::base::{Hashed, ObjectId};
 use messages::effects::{
     AccumulatorValue, ObjectIn, ObjectOut, TransactionEffects, VersionedEffects,
 };
@@ -47,10 +49,11 @@ fn push<W>(queue: &Queue<W>, item: W, to: &str) {
     }
 }
 
-/// The executed effects of `digest`, which its waiter released.
+/// The executed effects of `digest`, which its waiter released: this
+/// validator's own.
 fn executed(store: &store::Store, digest: &TxDigest) -> Effects {
     let effects_digest = store
-        .executed_effects(&Digest::new(*digest))
+        .executed_effects(digest)
         .expect("store read")
         .expect("a released transaction has executed");
     store
@@ -81,12 +84,13 @@ fn mutates_root(effects: &TransactionEffects<'_>) -> bool {
 fn to_executed(effects: &Effects) -> ExecutedEffects {
     let view = effects.get();
     let digest = match &view.version {
-        VersionedEffects::V1(v1) => v1.transaction_digest.bytes,
-        VersionedEffects::V2(v2) => v2.transaction_digest.bytes,
+        VersionedEffects::V1(v1) => *v1.transaction_digest,
+        VersionedEffects::V2(v2) => *v2.transaction_digest,
     };
     ExecutedEffects {
-        digest,
-        effects_digest: effects.digest().bytes,
+        // The executor that wrote the effects named the digest it computed.
+        digest: Hashed::computed(digest),
+        effects_digest: *effects.digest(),
         effects: Arc::from(effects.wire_bytes()),
     }
 }
@@ -200,7 +204,7 @@ impl SettlementScheduler {
         }
     }
 
-    fn chunk(&mut self, chunk: ChunkSettlement) {
+    fn chunk(&mut self, chunk: ChunkSettlement, bump: &Bump) {
         if !self.started {
             self.started = true;
             // Every chunk before the first one seen settled before this
@@ -229,33 +233,36 @@ impl SettlementScheduler {
             },
         );
         let mut batch = WaitBatch::with_capacity(1, chunk.digests.len());
-        let keys: Vec<EffectsKey> = chunk.digests.iter().copied().map(EffectsKey).collect();
+        let mut keys = containers::Vec::with_capacity_in(chunk.digests.len(), bump);
+        keys.extend(chunk.digests.iter().map(|d| EffectsKey(**d)));
         batch.push(EffectsWaitItem::ChunkExecuted(chunk), keys);
         push(&self.effects, Command::Wait(batch), "effects waiter");
     }
 
-    fn chunk_executed(&mut self, chunk: ChunkSettlement) {
-        let effects: Vec<Effects> = chunk
-            .digests
-            .iter()
-            .map(|d| executed(&self.store, d))
-            .collect();
+    fn chunk_executed(&mut self, chunk: ChunkSettlement, bump: &mut Bump) {
         let keep = self.epoch.config.disable_effects_tx_dependencies();
         let prologue_first = !keep && self.is_prologue(chunk.digests.first());
-        let views: Vec<&TransactionEffects<'_>> = effects.iter().map(Message::get).collect();
-        let order = causal::checkpoint_order(&views, prologue_first, keep);
-        drop(views);
-        let mut slots: Vec<Option<Effects>> = effects.into_iter().map(Some).collect();
-        let effects = order
-            .into_iter()
-            .map(|i| slots[i].take().expect("a permutation"))
-            .collect();
+        let effects = {
+            let bump = &*bump;
+            let mut effects = containers::Vec::with_capacity_in(chunk.digests.len(), bump);
+            effects.extend(chunk.digests.iter().map(|d| executed(&self.store, d)));
+            let mut views = containers::Vec::with_capacity_in(effects.len(), bump);
+            views.extend(effects.iter().map(Message::get));
+            let order = causal::checkpoint_order(&views, prologue_first, keep, bump);
+            drop(views);
+            let mut slots = containers::Vec::with_capacity_in(effects.len(), bump);
+            slots.extend(effects.into_iter().map(Some));
+            order
+                .iter()
+                .map(|&i| slots[i].take().expect("a permutation"))
+                .collect()
+        };
         let pending = self
             .pending
             .get_mut(&chunk.height)
             .expect("a chunk executes after it is seen");
         pending.stage = Stage::Ordered { chunk, effects };
-        self.advance();
+        self.advance(bump);
     }
 
     /// Whether `digest` is a consensus commit prologue, which checkpoint
@@ -266,7 +273,7 @@ impl SettlementScheduler {
         };
         let transaction = self
             .store
-            .transaction(&Digest::new(*digest))
+            .transaction(digest)
             .expect("store read")
             .expect("an executed transaction is stored");
         matches!(
@@ -279,7 +286,7 @@ impl SettlementScheduler {
     }
 
     /// Starts settling the first pending chunk, if its effects are ordered.
-    fn advance(&mut self) {
+    fn advance(&mut self, bump: &Bump) {
         let Some(mut entry) = self.pending.first_entry() else {
             return;
         };
@@ -297,7 +304,7 @@ impl SettlementScheduler {
             Some((seq, count)) if seq == chunk.checkpoint_seq => count,
             _ => 0,
         };
-        let mut builder = SettlementBuilder::new(chunk.checkpoint_seq, offset);
+        let mut builder = SettlementBuilder::new(chunk.checkpoint_seq, offset, bump);
         for (i, e) in effects.iter().enumerate() {
             builder.add(i as u64, e.get());
         }
@@ -330,13 +337,12 @@ impl SettlementScheduler {
             transactions.push(executable, [key]);
         }
         let mut waits = WaitBatch::with_capacity(1, settlements.len());
-        let keys: Vec<EffectsKey> = settlements.iter().copied().map(EffectsKey).collect();
         waits.push(
             EffectsWaitItem::SettlementExecuted {
                 height,
                 digests: settlements.clone(),
             },
-            keys,
+            settlements.iter().map(|d| EffectsKey(**d)),
         );
         push(&self.inputs, Command::Wait(transactions), "input waiter");
         push(&self.effects, Command::Wait(waits), "effects waiter");
@@ -382,7 +388,7 @@ impl SettlementScheduler {
                 height,
                 digests: vec![barrier],
             },
-            [EffectsKey(barrier)],
+            [EffectsKey(*barrier)],
         );
         push(&self.inputs, Command::Wait(transactions), "input waiter");
         push(&self.effects, Command::Wait(waits), "effects waiter");
@@ -397,7 +403,7 @@ impl SettlementScheduler {
         };
     }
 
-    fn settlement_executed(&mut self, height: u64, digests: &[TxDigest]) {
+    fn settlement_executed(&mut self, height: u64, digests: &[TxDigest], bump: &Bump) {
         let mut entry = self
             .pending
             .first_entry()
@@ -425,7 +431,7 @@ impl SettlementScheduler {
                 entry.remove();
                 let barrier = executed(&self.store, &barrier);
                 self.settled(&chunk, &effects, &settlements, &barrier);
-                self.advance();
+                self.advance(bump);
             }
             Stage::Executing | Stage::Ordered { .. } => {
                 panic!("settlement effects for a chunk not settling")
@@ -549,12 +555,12 @@ impl Processor for SettlementScheduler {
     type Input = SettlementInput;
     type Output = ();
 
-    fn process(&mut self, input: SettlementInput) -> Option<()> {
+    fn process(&mut self, input: SettlementInput, bump: &mut Bump) -> Option<()> {
         match input {
-            SettlementInput::Chunk(chunk) => self.chunk(chunk),
-            SettlementInput::ChunkExecuted(chunk) => self.chunk_executed(chunk),
+            SettlementInput::Chunk(chunk) => self.chunk(chunk, bump),
+            SettlementInput::ChunkExecuted(chunk) => self.chunk_executed(chunk, bump),
             SettlementInput::SettlementExecuted { height, digests } => {
-                self.settlement_executed(height, &digests);
+                self.settlement_executed(height, &digests, bump);
             }
         }
         None
@@ -642,8 +648,8 @@ pub struct FundsReserver {
     next_ticket: Ticket,
     /// Each unresolved reservation's transaction, by the transaction's
     /// first ticket, and its index there.
-    owners: HashMap<Ticket, (Ticket, usize)>,
-    waiting: HashMap<Ticket, Waiting>,
+    owners: HeapHashMap<Ticket, (Ticket, usize)>,
+    waiting: HeapHashMap<Ticket, Waiting>,
     resolved: Vec<(Ticket, ReservationStatus)>,
 }
 
@@ -655,8 +661,8 @@ impl FundsReserver {
             ledger: Ledger::new(),
             root_version: None,
             next_ticket: 0,
-            owners: HashMap::new(),
-            waiting: HashMap::new(),
+            owners: HeapHashMap::default(),
+            waiting: HeapHashMap::default(),
             resolved: Vec::new(),
         }
     }
@@ -664,16 +670,8 @@ impl FundsReserver {
     /// Waits `withdrawal` on its reservations.
     fn reserve(&mut self, withdrawal: Withdrawal) {
         let id = self.next_ticket;
-        let reservations = withdrawal.reservations.clone();
-        assert!(!reservations.is_empty(), "a withdrawal reserves funds");
-        self.waiting.insert(
-            id,
-            Waiting {
-                withdrawal,
-                unresolved: reservations.len(),
-                resolved: vec![None; reservations.len()],
-            },
-        );
+        let count = withdrawal.reservations.len();
+        assert!(count > 0, "a withdrawal reserves funds");
         let (store, root_version) = (&self.store, self.root_version);
         let mut base = |account: &ObjectId| {
             balance_at(
@@ -682,7 +680,7 @@ impl FundsReserver {
                 root_version.expect("read once a version settled"),
             )
         };
-        for (index, reservation) in reservations.into_iter().enumerate() {
+        for (index, reservation) in withdrawal.reservations.iter().enumerate() {
             let ticket = self.next_ticket;
             self.next_ticket += 1;
             self.owners.insert(ticket, (id, index));
@@ -695,6 +693,14 @@ impl FundsReserver {
                 &mut self.resolved,
             );
         }
+        self.waiting.insert(
+            id,
+            Waiting {
+                withdrawal,
+                unresolved: count,
+                resolved: vec![None; count],
+            },
+        );
     }
 
     fn settle(&mut self, settle: Settle) {
@@ -777,7 +783,7 @@ impl Processor for FundsReserver {
     type Input = FundsCommand;
     type Output = ();
 
-    fn process(&mut self, command: FundsCommand) -> Option<()> {
+    fn process(&mut self, command: FundsCommand, _bump: &mut Bump) -> Option<()> {
         match command {
             FundsCommand::Reserve(withdrawals) => {
                 for withdrawal in withdrawals {

@@ -10,7 +10,6 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
-use checkpoint::ProtocolKey;
 use consensus::{
     Block, BlockRef, BlockStatus, CommittedSubDag, TransactionClient, TransactionsGuard,
 };
@@ -19,8 +18,8 @@ use move_core_types::ident_str;
 mod genesis;
 
 use fastcrypto::hash::MultisetHash;
-use node::Pipeline;
 use node::epoch::{Epoch, EpochRecord, Node, Perpetual};
+use node::{ConsensusOutput, Pipeline};
 use protocol_config::Chain;
 use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
 use sui_types::crypto::{AccountKeyPair, AuthorityPublicKeyBytes, get_key_pair};
@@ -160,12 +159,15 @@ impl Network {
             &genesis.checkpoint,
             genesis.objects.iter().map(|o| o.digest().into_inner()),
         );
-        let protocol_key = Arc::new(ProtocolKey::new(genesis::protocol_key_pair()));
+        let keys = genesis::validator_keys();
         let chain_identifier = messages::base::Digest::new(genesis.chain_identifier);
 
         let sui_committee = sui_types::committee::Committee::new(
             0,
-            BTreeMap::from([(AuthorityPublicKeyBytes::new(*protocol_key.public()), 10_000)]),
+            BTreeMap::from([(
+                AuthorityPublicKeyBytes::new(*keys.protocol.public()),
+                10_000,
+            )]),
         );
         let state_sync = workqueue::queue(1024);
         let (client, normal, priority) = TransactionClient::new(64);
@@ -177,10 +179,10 @@ impl Network {
             state_sync: state_sync.0.clone(),
             chain: CHAIN,
             chain_identifier,
-            protocol_key,
+            keys,
         };
         let mut node = Node::new(perpetual);
-        node.start_epoch(|_, _| client.clone());
+        node.start_epoch(&mut |_: &Arc<EpochState>, _: ConsensusOutput| client.clone());
         Network {
             node: Some(node),
             state_sync,
@@ -243,7 +245,11 @@ impl Network {
     fn start_epoch(&mut self) {
         let client = self.client.clone();
         let node = self.node.as_mut().expect("the node is running");
-        let epoch = node.start_epoch(|_, _| client).state.params.epoch;
+        let epoch = node
+            .start_epoch(&mut |_: &Arc<EpochState>, _: ConsensusOutput| client.clone())
+            .state
+            .params
+            .epoch;
         let record = EpochRecord::load(&node.perpetual.store);
         assert_eq!(record.epoch, epoch);
         self.checkpoint_offset = record.previous_checkpoint;
@@ -268,7 +274,7 @@ impl Network {
             store,
             epochs,
             current,
-            protocol_key,
+            keys,
             chain_identifier,
             ..
         } = self.node.take().unwrap().into_perpetual();
@@ -290,7 +296,7 @@ impl Network {
             state_sync: self.state_sync.0.clone(),
             chain: CHAIN,
             chain_identifier,
-            protocol_key,
+            keys,
         }));
     }
 
@@ -316,6 +322,7 @@ impl Network {
                     .commits
                     .try_push(CommitRequest {
                         commit: commit.clone(),
+                        handled: None,
                     })
                     .is_ok()
             );
@@ -544,6 +551,7 @@ impl Network {
                 .commits
                 .try_push(CommitRequest {
                     commit: commit.clone(),
+                    handled: None,
                 })
                 .is_ok()
         );
@@ -627,21 +635,24 @@ impl Network {
     }
 
     /// The effects digest of `transaction`, if executed.
-    fn executed(&self, transaction: &Transaction) -> Option<messages::base::Digest> {
+    fn executed(&self, transaction: &Transaction) -> Option<messages::base::Hashed> {
         let digest = messages::base::Digest::new(transaction.digest().into_inner());
-        self.store().executed_effects(&digest).unwrap()
+        self.store().executed_effects_named(&digest).unwrap()
     }
 
-    fn wait_executed(&self, transaction: &Transaction) -> messages::base::Digest {
+    fn wait_executed(&self, transaction: &Transaction) -> messages::base::Hashed {
         wait_for(&format!("{} to execute", transaction.digest()), || {
             self.executed(transaction)
         })
     }
 
     fn effects(&self, digest: &TransactionDigest) -> TransactionEffects {
-        let executed = execution::executed(self.store(), &digest.into_inner())
-            .unwrap()
-            .unwrap_or_else(|| panic!("{digest} executed"));
+        let executed = execution::executed_named(
+            self.store(),
+            &messages::base::Digest::new(digest.into_inner()),
+        )
+        .unwrap()
+        .unwrap_or_else(|| panic!("{digest} executed"));
         bcs::from_bytes(&executed.effects).unwrap()
     }
 
@@ -1142,12 +1153,15 @@ async fn a_transaction_dropped_after_consensus_is_answered_rejected() {
         wait(&service, &second, Some(at_second)).await,
         RawValidatorTransactionStatus::Rejected(_)
     ));
+    // The first, its lock contested, waits a round.
+    assert!(seq > 0);
+    let next = network.commit(vec![]);
     assert!(matches!(
         wait(&service, &first, Some(at_first)).await,
         RawValidatorTransactionStatus::Executed(_)
     ));
-    network.certify(seq);
-    network.assert_checkpointed(seq, &[&first]);
+    network.certify(next);
+    network.assert_checkpointed(next, &[&first]);
     assert_no_panics();
 }
 
@@ -1202,7 +1216,11 @@ fn back_to_back_commits_execute_in_order_and_certify() {
     let share = network.share(network.coin(0));
     network.commit(vec![consensus_transaction(&share)]);
     let effects = wait_for("the share to execute", || {
-        execution::executed(network.store(), &share.digest().into_inner()).unwrap()
+        execution::executed_named(
+            network.store(),
+            &messages::base::Digest::new(share.digest().into_inner()),
+        )
+        .unwrap()
     });
     let effects: TransactionEffects = bcs::from_bytes(&effects.effects).unwrap();
     let (shared_ref, _) = effects
@@ -1274,10 +1292,8 @@ fn funds_sent_to_an_address_balance_settle_and_can_be_withdrawn() {
     // The prologue, the transfer, a settlement and the barrier.
     assert_eq!(network.contents(seq_1).len(), 4);
 
-    // This validator's input checks reject funds withdrawals (address
-    // balances are not supported there yet); the committee commits it.
     let withdraw = network.withdraw(network.coin(1), SUI);
-    let seq_2 = network.commit_outvoted(vec![consensus_transaction(&withdraw)], &[0]);
+    let seq_2 = network.commit(vec![consensus_transaction(&withdraw)]);
     network.certify(seq_2);
     network.assert_checkpointed(seq_2, &[&withdraw]);
     let created = network.effects(withdraw.digest()).created();
@@ -1341,7 +1357,7 @@ fn checkpoints_of_several_commits() {
 /// Two transactions paying with the same coin version, in one commit: the
 /// later one in consensus order is dropped.
 #[test]
-fn an_owned_conflict_in_one_commit_drops_the_later_transaction() {
+fn an_owned_conflict_in_one_commit_drops_the_later_and_defers_the_earlier() {
     let mut network = Network::new(1);
     let coin = network.coin(0);
     let first = network.transfer(coin);
@@ -1350,13 +1366,21 @@ fn an_owned_conflict_in_one_commit_drops_the_later_transaction() {
         consensus_transaction(&first),
         consensus_transaction(&second),
     ]);
-    network.certify(seq);
-    network.assert_checkpointed(seq, &[&first]);
-    assert!(!network.contents(seq).contains(second.digest()));
+    // The holder of the contested lock waits a round, as a penalty.
+    let next = network.commit(vec![]);
+    network.certify(next);
+    network.assert_checkpointed(next, &[&first]);
+    for seq in seq..=next {
+        assert!(!network.contents(seq).contains(second.digest()));
+    }
+    assert!(!network.contents(seq).contains(first.digest()));
     assert!(
-        execution::executed(network.store(), &second.digest().into_inner())
-            .unwrap()
-            .is_none()
+        execution::executed_named(
+            network.store(),
+            &messages::base::Digest::new(second.digest().into_inner()),
+        )
+        .unwrap()
+        .is_none()
     );
     assert_no_panics();
 }
@@ -1369,17 +1393,13 @@ fn a_withdrawal_exceeding_the_settled_balance_fails() {
     let send = network.send_funds(network.coin(0), SUI);
     let seq = network.commit(vec![consensus_transaction(&send)]);
     network.certify(seq);
-    // This validator's input checks reject funds withdrawals; the committee
-    // commits it.
+    // Voting does not check balances: the overdraft is committed.
     let deposit = network.send_funds(network.coin(1), 5 * SUI);
     let overdraw = network.withdraw(network.coin(2), 2 * SUI);
-    let seq = network.commit_outvoted(
-        vec![
-            consensus_transaction(&deposit),
-            consensus_transaction(&overdraw),
-        ],
-        &[1],
-    );
+    let seq = network.commit(vec![
+        consensus_transaction(&deposit),
+        consensus_transaction(&overdraw),
+    ]);
     network.certify(seq);
     network.assert_checkpointed(seq, &[&deposit]);
     let effects = network.effects(overdraw.digest());

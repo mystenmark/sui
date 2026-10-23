@@ -28,7 +28,10 @@ fn position(round: u32, index: u16) -> ConsensusPosition {
 async fn a_status_set_before_the_read_is_found() {
     let cache = ConsensusTxStatusCache::new();
     let p = position(10, 2);
-    cache.set_statuses([(p.block, p.index, ConsensusTxStatus::Dropped)]);
+    cache.set_statuses(
+        [(p.block, p.index, ConsensusTxStatus::Dropped)],
+        &containers::Bump::default(),
+    );
     assert_eq!(
         cache.notify_read(p).await,
         StatusResult::Status(ConsensusTxStatus::Dropped)
@@ -46,8 +49,14 @@ async fn a_read_waits_for_its_status() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(!read.is_finished());
     // Another position's status does not answer it.
-    cache.set_statuses([(p.block, 3, ConsensusTxStatus::Rejected)]);
-    cache.set_statuses([(p.block, p.index, ConsensusTxStatus::Finalized)]);
+    cache.set_statuses(
+        [(p.block, 3, ConsensusTxStatus::Rejected)],
+        &containers::Bump::default(),
+    );
+    cache.set_statuses(
+        [(p.block, p.index, ConsensusTxStatus::Finalized)],
+        &containers::Bump::default(),
+    );
     assert_eq!(
         read.await.unwrap(),
         StatusResult::Status(ConsensusTxStatus::Finalized)
@@ -73,7 +82,10 @@ async fn a_position_expires_against_the_previous_leader_round() {
         StatusResult::Expired(10 + RETENTION_ROUNDS)
     );
     // Its status, set too late, is ignored; a new read expires at once.
-    cache.set_statuses([(p.block, p.index, ConsensusTxStatus::Finalized)]);
+    cache.set_statuses(
+        [(p.block, p.index, ConsensusTxStatus::Finalized)],
+        &containers::Bump::default(),
+    );
     assert_eq!(
         cache.notify_read(p).await,
         StatusResult::Expired(10 + RETENTION_ROUNDS)
@@ -85,10 +97,13 @@ async fn statuses_are_kept_until_they_expire() {
     let cache = ConsensusTxStatusCache::new();
     let (old, recent) = (position(5, 0), position(500, 0));
     cache.update_leader_round(1);
-    cache.set_statuses([
-        (old.block, old.index, ConsensusTxStatus::Finalized),
-        (recent.block, recent.index, ConsensusTxStatus::Finalized),
-    ]);
+    cache.set_statuses(
+        [
+            (old.block, old.index, ConsensusTxStatus::Finalized),
+            (recent.block, recent.index, ConsensusTxStatus::Finalized),
+        ],
+        &containers::Bump::default(),
+    );
     cache.update_leader_round(5 + RETENTION_ROUNDS);
     cache.update_leader_round(6 + RETENTION_ROUNDS);
     assert_eq!(
@@ -108,8 +123,14 @@ async fn statuses_are_kept_until_they_expire() {
 fn every_handler_decides_alike() {
     let cache = ConsensusTxStatusCache::new();
     let p = position(10, 2);
-    cache.set_statuses([(p.block, p.index, ConsensusTxStatus::Finalized)]);
-    cache.set_statuses([(p.block, p.index, ConsensusTxStatus::Dropped)]);
+    cache.set_statuses(
+        [(p.block, p.index, ConsensusTxStatus::Finalized)],
+        &containers::Bump::default(),
+    );
+    cache.set_statuses(
+        [(p.block, p.index, ConsensusTxStatus::Dropped)],
+        &containers::Bump::default(),
+    );
 }
 
 #[test]

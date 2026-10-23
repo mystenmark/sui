@@ -12,6 +12,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use containers::Bump;
 use messages::Message;
 use protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
 use sui_types::base_types::{ObjectID, SequenceNumber, SuiAddress, random_object_ref};
@@ -98,13 +99,12 @@ fn transactions(count: usize, objects: u64, rng: &mut Rng) -> Vec<Vec<u8>> {
         .collect()
 }
 
-fn parse(bytes: &[Vec<u8>]) -> Vec<VerifiedTransaction> {
-    bytes
-        .iter()
-        .map(|b| {
-            checks::sequenced_by_consensus(Message::parse(b.clone()).map_err(|(e, _)| e).unwrap())
-        })
-        .collect()
+fn parse<'b>(bytes: &[Vec<u8>], bump: &'b Bump) -> containers::Vec<'b, VerifiedTransaction> {
+    let mut parsed = containers::Vec::with_capacity_in(bytes.len(), bump);
+    parsed.extend(bytes.iter().map(|b| {
+        checks::sequenced_by_consensus(Message::parse(b.clone()).map_err(|(e, _)| e).unwrap())
+    }));
+    parsed
 }
 
 fn main() {
@@ -118,21 +118,28 @@ fn main() {
             let mut elapsed = Duration::ZERO;
             let mut allocations = 0;
             let rounds = 200;
+            // As a worker's arena: reset after each commit, never freed.
+            let mut bump = Bump::default();
             for round in 0..=rounds {
-                let transactions = parse(&commit);
-                let prologue = Prologue {
-                    epoch: 0,
-                    round,
-                    commit_index: round,
-                    timestamp_ms: 0,
-                    commit_digest: [0; 32],
+                let (took, allocated) = {
+                    let transactions = parse(&commit, &bump);
+                    let prologue = Prologue {
+                        epoch: 0,
+                        round,
+                        commit_index: round,
+                        timestamp_ms: 0,
+                        commit_digest: [0; 32],
+                    };
+                    let before = ALLOCATIONS.load(Ordering::Relaxed);
+                    let start = Instant::now();
+                    let ordered = sequencer.order(&config, transactions, &bump);
+                    let schedule = sequencer.schedule(prologue, None, ordered, &bump);
+                    let took = start.elapsed();
+                    let allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
+                    assert_eq!(schedule.len(), commit_size + 1);
+                    (took, allocated)
                 };
-                let before = ALLOCATIONS.load(Ordering::Relaxed);
-                let start = Instant::now();
-                let schedule = sequencer.schedule(&config, prologue, transactions);
-                let took = start.elapsed();
-                let allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
-                assert_eq!(schedule.len(), commit_size + 1);
+                bump.reset();
                 // The first round sizes the tables.
                 if round > 0 {
                     elapsed += took;
