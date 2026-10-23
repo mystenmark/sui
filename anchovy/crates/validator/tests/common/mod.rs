@@ -176,8 +176,11 @@ impl Pipeline {
         let request = Request::new(transactions, reply);
         let Some(verified) = self
             .validator
-            .process(request)
-            .and_then(|valid| self.verifier.process(valid))
+            .process(request, &mut workqueue::Bump::default())
+            .and_then(|valid| {
+                self.verifier
+                    .process(valid, &mut workqueue::Bump::default())
+            })
         else {
             return match verdict.try_recv().unwrap() {
                 Err(Rejected::Invalid(e)) => Err(e.kind),

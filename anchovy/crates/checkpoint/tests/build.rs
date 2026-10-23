@@ -91,8 +91,8 @@ impl Mainnet {
             .transactions
             .iter()
             .map(|t| ExecutedEffects {
-                digest: t.transaction.digest().bytes,
-                effects_digest: t.effects.digest.bytes,
+                digest: *t.transaction.digest(),
+                effects_digest: t.effects.digest,
                 effects: Arc::from(t.effects.bytes),
             })
             .collect()
@@ -207,7 +207,10 @@ fn contents_match_mainnet_and_sui() {
         hasher,
         sequence,
     );
-    let (built, effects) = builder.build(pending(s.sequence_number, vec![3, 4], s.timestamp_ms));
+    let (built, effects) = builder.build(
+        pending(s.sequence_number, vec![3, 4], s.timestamp_ms),
+        &mut containers::Bump::default(),
+    );
     drop(hasher_inbox);
 
     let mainnet = &m.checkpoint.get().checkpoint_contents;
@@ -256,7 +259,10 @@ fn contents_v1_match_sui() {
         hasher,
         sequence,
     );
-    let (built, effects) = builder.build(pending(s.sequence_number, vec![0, 1], s.timestamp_ms));
+    let (built, effects) = builder.build(
+        pending(s.sequence_number, vec![0, 1], s.timestamp_ms),
+        &mut containers::Bump::default(),
+    );
 
     let sui = sui_effects(&effects);
     let contents = SuiContents::new_with_digests_and_signatures(
@@ -287,7 +293,10 @@ fn summary_matches_mainnet_and_sui() {
         hasher,
         sequence,
     );
-    let (built, effects) = builder.build(pending(s.sequence_number, vec![0, 1], s.timestamp_ms));
+    let (built, effects) = builder.build(
+        pending(s.sequence_number, vec![0, 1], s.timestamp_ms),
+        &mut containers::Bump::default(),
+    );
 
     let rolling = s.epoch_rolling_gas_cost_summary;
     let before = [
@@ -303,7 +312,7 @@ fn summary_matches_mainnet_and_sui() {
         s.network_total_transactions - 14,
         before,
     );
-    let summary = summary::build(&built, Some(&prev), &epoch, &mut Bump::with_capacity(1024));
+    let summary = summary::build(&built, Some(&prev), &epoch, &Bump::default());
     assert_eq!(summary.bytes, s.bytes);
     assert_eq!(summary.digest, s.digest.bytes);
     assert_eq!(
@@ -347,13 +356,13 @@ fn summary_matches_mainnet_and_sui() {
         prev.network_total_transactions,
         before,
     );
-    let first = summary::build(&built, Some(&prev), &epoch, &mut Bump::with_capacity(1024));
+    let first = summary::build(&built, Some(&prev), &epoch, &Bump::default());
     assert_eq!(first.epoch_rolling_gas, built.gas);
 
     // Checkpoint 0 has no previous digest, and its total is its own.
     let mut genesis = built.clone();
     genesis.pending.seq = 0;
-    let zero = summary::build(&genesis, None, &epoch, &mut Bump::with_capacity(1024));
+    let zero = summary::build(&genesis, None, &epoch, &Bump::default());
     let parsed: SuiSummary = bcs::from_bytes(&zero.bytes).unwrap();
     assert_eq!(parsed.previous_digest, None);
     assert_eq!(parsed.network_total_transactions, 14);
@@ -366,7 +375,7 @@ fn signature_transaction_verifies_in_sui() {
     let m = Mainnet::load();
     let s = m.summary();
     let key = key();
-    let bytes = summary::signature_transaction(&key, s.bytes, s.epoch);
+    let bytes = summary::signature_transaction(&key, s.bytes, s.epoch, &Bump::default());
     let transaction: ConsensusTransaction = bcs::from_bytes(&bytes).unwrap();
     let ConsensusTransactionKind::CheckpointSignatureV2(message) = transaction.kind else {
         panic!("a CheckpointSignatureV2");
@@ -440,7 +449,7 @@ fn out_of_order_checkpoints_summarize_in_order() {
             if let Command::Resolve(keys) = &command {
                 resolved.extend(keys.iter().map(|(CheckpointBuilt(seq), _)| *seq));
             }
-            if let Some(ready) = waiter.process(command) {
+            if let Some(ready) = waiter.process(command, &mut workqueue::Bump::default()) {
                 let ready: Vec<CheckpointContentsBuilt> = ready
                     .into_iter()
                     .map(|item| match item {
@@ -449,17 +458,26 @@ fn out_of_order_checkpoints_summarize_in_order() {
                     })
                     .collect();
                 summarized.extend(ready.iter().map(|b| b.pending.seq));
-                summary.process(ready);
+                summary.process(ready, &mut workqueue::Bump::default());
             }
         }
         summarized
     };
 
-    contents.process(vec![pending(13, vec![3], 30)]);
-    contents.process(vec![pending(12, vec![2], 20)]);
+    contents.process(
+        vec![pending(13, vec![3], 30)],
+        &mut workqueue::Bump::default(),
+    );
+    contents.process(
+        vec![pending(12, vec![2], 20)],
+        &mut workqueue::Bump::default(),
+    );
     assert!(settle(&mut waiter).is_empty(), "12 and 13 wait for 11");
     assert!(checkpoints.built(12).is_none());
-    contents.process(vec![pending(11, vec![0, 1], 10)]);
+    contents.process(
+        vec![pending(11, vec![0, 1], 10)],
+        &mut workqueue::Bump::default(),
+    );
     assert_eq!(settle(&mut waiter), vec![11, 12, 13]);
 
     let hashed: Vec<u64> = drain(&hasher_inbox).iter().map(|e| e.seq).collect();

@@ -144,6 +144,7 @@ fn commit(index: u32, transactions: &[Vec<u8>]) -> DecodedCommit {
         author: 0,
         digest: [0; 32],
     };
+    let bump = containers::Bump::default();
     DecodedCommit {
         commit_index: index,
         leader: block,
@@ -160,12 +161,16 @@ fn commit(index: u32, transactions: &[Vec<u8>]) -> DecodedCommit {
                         Message::parse(bytes.clone()).map_err(|(e, _)| e).unwrap(),
                     ),
                     &[],
+                    &bump,
                 )
             })
             .collect(),
+        observations: Vec::new(),
+        jwks: Vec::new(),
         rejected: Vec::new(),
         cache_hits: 0,
         cache_misses: 0,
+        handled: None,
     }
 }
 
@@ -188,9 +193,8 @@ fn main() {
             let (checkpoints, checkpoint_inbox) = workqueue::queue(1024);
             let start = EpochStart {
                 previous_checkpoint: 0,
-                previous_height: 0,
-                previous_timestamp_ms: 0,
                 accumulator_root_initial_shared_version: 1,
+                authenticator_initial_shared_version: None,
                 accumulator_root_version: 1,
                 epoch_start_timestamp_ms: 0,
                 epoch_duration_ms: u64::MAX,
@@ -204,16 +208,20 @@ fn main() {
                 settlements,
                 checkpoints,
                 Arc::new(validator::consensus::status::ConsensusTxStatusCache::new()),
+                vec![([0; 96], 1)],
             );
             let mut elapsed = Duration::ZERO;
             let mut allocations = 0;
+            // As a worker's arena: reset after each item, never freed.
+            let mut bump = workqueue::Bump::default();
             for index in 1..=rounds + 1 {
                 let request = commit(index, &transactions(commit_size, objects, &mut rng));
                 let before = ALLOCATIONS.load(Ordering::Relaxed);
                 let begin = Instant::now();
-                stage.process(request).unwrap();
+                stage.process(request, &mut bump).unwrap();
                 let took = begin.elapsed();
                 let allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
+                bump.reset();
                 let mut emitted = 0;
                 while let Some(chunk) = chunk_inbox.try_pop() {
                     emitted += chunk.entries.len();

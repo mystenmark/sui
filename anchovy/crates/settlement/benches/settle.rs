@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use messages::Message;
-use messages::base::{Digest, ObjectId};
+use messages::base::{Digest, Hashed, ObjectId};
 use messages::effects::{TransactionEffects, VersionedEffects};
 use messages::transaction::SharedObjectMutability;
 use protocol_config::{Chain, ProtocolVersion};
@@ -112,8 +112,9 @@ fn bench_build(size: usize, effects: &[Vec<u8>], max_updates: Option<u32>) {
     let rounds = 50;
     let (mut elapsed, mut allocations) = (Duration::ZERO, 0);
     for round in 0..=rounds {
+        let bump = containers::Bump::with_capacity(64 * 1024);
         let (built, took, allocated) = measure(|| {
-            let mut builder = SettlementBuilder::new(1, 0);
+            let mut builder = SettlementBuilder::new(1, 0, &bump);
             for (i, e) in parsed.iter().enumerate() {
                 builder.add(i as u64, e.get());
             }
@@ -153,7 +154,8 @@ fn commit(store: &store::Store, effects: &[u8]) {
     store
         .write_through(store::Commit {
             executed: Some(store::Executed {
-                digest: *v2.transaction_digest,
+                // The generated transaction's digest.
+                digest: Hashed::computed(*v2.transaction_digest),
                 transaction: Vec::new(),
                 effects_digest: *view.digest(),
                 effects: effects.to_vec(),
@@ -164,7 +166,7 @@ fn commit(store: &store::Store, effects: &[u8]) {
         .unwrap();
 }
 
-fn digest_of(executable: &Executable) -> [u8; 32] {
+fn digest_of(executable: &Executable) -> Hashed {
     match &executable.entry.transaction {
         ExecutableTransaction::System(system) => system.digest,
         ExecutableTransaction::User(_) => unreachable!(),
@@ -188,10 +190,11 @@ fn bench_process(size: usize, effects: &[Vec<u8>]) {
     for e in effects {
         commit(&store, e);
     }
-    let digests: Vec<[u8; 32]> = parse(effects)
+    let digests: Vec<Hashed> = parse(effects)
         .iter()
         .map(|m| match &m.get().version {
-            VersionedEffects::V2(v2) => v2.transaction_digest.bytes,
+            // The generated transactions' digests.
+            VersionedEffects::V2(v2) => Hashed::computed(*v2.transaction_digest),
             VersionedEffects::V1(_) => unreachable!(),
         })
         .collect();
@@ -239,21 +242,31 @@ fn bench_process(size: usize, effects: &[Vec<u8>]) {
                 base: None,
             },
         };
-        scheduler.process(SettlementInput::Chunk(chunk.clone()));
+        scheduler.process(
+            SettlementInput::Chunk(chunk.clone()),
+            &mut workqueue::Bump::default(),
+        );
         drain(&effects_in);
 
-        let ((), mut took, mut allocated) =
-            measure(|| _ = scheduler.process(SettlementInput::ChunkExecuted(chunk)));
-        let settlements: Vec<[u8; 32]> = drain(&inputs_in).iter().map(digest_of).collect();
+        let ((), mut took, mut allocated) = measure(|| {
+            _ = scheduler.process(
+                SettlementInput::ChunkExecuted(chunk),
+                &mut workqueue::Bump::default(),
+            );
+        });
+        let settlements: Vec<Hashed> = drain(&inputs_in).iter().map(digest_of).collect();
         drain(&effects_in);
         for d in &settlements {
-            commit(&store, &support::effects(*d, 2 * height, &[], vec![]));
+            commit(&store, &support::effects(d.bytes, 2 * height, &[], vec![]));
         }
         let ((), t, a) = measure(|| {
-            _ = scheduler.process(SettlementInput::SettlementExecuted {
-                height,
-                digests: settlements,
-            });
+            _ = scheduler.process(
+                SettlementInput::SettlementExecuted {
+                    height,
+                    digests: settlements,
+                },
+                &mut workqueue::Bump::default(),
+            );
         });
         took += t;
         allocated += a;
@@ -262,17 +275,20 @@ fn bench_process(size: usize, effects: &[Vec<u8>]) {
         commit(
             &store,
             &support::effects(
-                barrier,
+                barrier.bytes,
                 2 * height + 1,
                 &[],
                 vec![support::root_mutated(ISV, 2 * height)],
             ),
         );
         let ((), t, a) = measure(|| {
-            _ = scheduler.process(SettlementInput::SettlementExecuted {
-                height,
-                digests: vec![barrier],
-            });
+            _ = scheduler.process(
+                SettlementInput::SettlementExecuted {
+                    height,
+                    digests: vec![barrier],
+                },
+                &mut workqueue::Bump::default(),
+            );
         });
         took += t;
         allocated += a;

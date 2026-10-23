@@ -62,7 +62,7 @@ fn verdicts(
     let bump = Bump::with_capacity(1 << 16);
     let (sigs, _) = deserialization_checks(signed, &bump).unwrap();
     let at_once = verify_signatures(signed, sigs, 0, verifier, &[], &bump).is_ok();
-    let mut deferred = Vec::new();
+    let mut deferred = containers::Vec::new_in(&bump);
     let prepared =
         verify_signatures_deferring_ed25519(signed, sigs, 0, verifier, &[], &bump, &mut deferred)
             .is_ok();

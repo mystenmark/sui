@@ -3,8 +3,8 @@
 
 use crate::arena::{Alloc, Ref};
 use crate::base::{
-    Digest, EffectsAuxDataDigest, ObjectDigest, ObjectId, ObjectKey, ObjectRef, SequenceNumber,
-    SuiAddress, TransactionDigest, TransactionEffectsDigest, TransactionEventsDigest, U64Le,
+    Digest, EffectsAuxDataDigest, Hashed, ObjectDigest, ObjectId, ObjectKey, ObjectRef,
+    SequenceNumber, SuiAddress, TransactionDigest, TransactionEventsDigest, U64Le,
 };
 use crate::error::{ParseError, Result};
 use crate::execution_status::ExecutionStatus;
@@ -432,7 +432,7 @@ pub struct TransactionEffects<'a> {
     /// The exact encoding, which is what gets hashed.
     pub bytes: &'a [u8],
     /// Computed once, from `bytes`, while parsing.
-    pub digest: TransactionEffectsDigest,
+    pub digest: Hashed,
     pub version: VersionedEffects<'a>,
 }
 
@@ -461,9 +461,9 @@ impl<'a> TransactionEffects<'a> {
         Ok(TransactionEffects {
             bytes,
             digest: if A::BUILD {
-                Digest::of("TransactionEffects", bytes)
+                Hashed::of("TransactionEffects", bytes)
             } else {
-                Digest::ZERO
+                Hashed::ZERO
             },
             version,
         })
@@ -489,8 +489,8 @@ pub struct TransactionEvents<'a> {
 
 impl<'a> TransactionEvents<'a> {
     /// Hashed on demand: the reference does not treat events as a message.
-    pub fn digest(&self) -> TransactionEventsDigest {
-        Digest::of("TransactionEvents", self.bytes)
+    pub fn digest(&self) -> Hashed {
+        Hashed::of("TransactionEvents", self.bytes)
     }
 
     pub fn parse<A: Alloc<'a>>(r: &mut Reader<'a>, a: &mut A) -> Result<TransactionEvents<'a>> {
@@ -525,7 +525,7 @@ crate::impl_wire!(TransactionEvents, guess = 15);
 crate::base::assert_wire_layout!(EventCommitment = 41);
 
 impl crate::message::Digested for TransactionEffects<'_> {
-    fn digest(&self) -> &Digest {
+    fn digest(&self) -> &Hashed {
         &self.digest
     }
 }

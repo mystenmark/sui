@@ -13,6 +13,7 @@ testing = []
 
 [dependencies]
 bcs.workspace = true
+consensus-config.workspace = true
 containers.workspace = true
 exec-types.workspace = true
 executor.workspace = true

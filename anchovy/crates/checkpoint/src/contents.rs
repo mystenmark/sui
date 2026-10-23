@@ -16,7 +16,7 @@ use messages::effects::{
 use messages::fast::checkpoint::UserSignature;
 use messages::fast::{Bump, Writer};
 use messages::reader::Reader;
-use messages::transaction::{SenderSignedData, TransactionKind};
+use messages::transaction::{GenericSignature, SenderSignedData, TransactionKind};
 use protocol_config::ProtocolConfig;
 use validator::pipeline::items::ExecutedEffects;
 
@@ -39,7 +39,7 @@ pub struct Contents {
 
 /// Builds the contents of a checkpoint whose effects, in checkpoint order,
 /// are `effects`, and whose transactions, aligned with them, are
-/// `transactions`. `bump` is scratch, reset here.
+/// `transactions`, with temporaries in `bump`.
 ///
 /// Each user signature is recorded with no alias version: aliases are
 /// object state anchovy does not read yet, so every signer signs as itself
@@ -52,18 +52,15 @@ pub fn build(
     config: &ProtocolConfig,
     effects: &[ExecutedEffects],
     transactions: &[SenderSignedData<'_>],
-    bump: &mut Bump,
+    bump: &Bump,
 ) -> Contents {
     assert_eq!(
         effects.len(),
         transactions.len(),
         "a transaction per effects"
     );
-    bump.reset();
-    let bump = &*bump;
-
     let mut gas = [0u64; 4];
-    let mut written = Vec::new();
+    let mut written = containers::Vec::new_in(bump);
     for executed in effects {
         let mut r = Reader::new(&executed.effects);
         let parsed = TransactionEffects::parse(&mut r, &mut BumpAlloc(bump))
@@ -104,14 +101,13 @@ pub fn build(
         let mut contents = messages::fast::ContentsBuilder::new_in(bump, effects.len());
         // The lengths are asserted equal above.
         for (executed, transaction) in effects.iter().zip(transactions) {
-            let mut signatures = containers::Vec::<UserSignature<'_>>::with_capacity_in(
-                transaction.tx_signatures().len(),
-                bump,
-            );
-            signatures.extend(transaction.tx_signatures().iter().map(|s| (s.0, None)));
+            let listed = listed_signatures(transaction);
+            let mut signatures =
+                containers::Vec::<UserSignature<'_>>::with_capacity_in(listed.len(), bump);
+            signatures.extend(listed.iter().map(|s| (s.0, None)));
             contents.push(
-                Digest::new(executed.digest),
-                Digest::new(executed.effects_digest),
+                executed.digest.into(),
+                executed.effects_digest.into(),
                 signatures.leak(),
             );
         }
@@ -122,7 +118,7 @@ pub fn build(
 
     let artifacts_digest = config
         .include_checkpoint_artifacts_digest_in_summary()
-        .then(|| artifacts_digest(&mut written));
+        .then(|| artifacts_digest(&mut written, bump));
 
     Contents {
         bytes: Arc::from(built.bytes),
@@ -149,24 +145,35 @@ fn contents_v1<'a>(
 ) -> messages::fast::Built<'a> {
     let signatures: usize = transactions
         .iter()
-        .flat_map(SenderSignedData::tx_signatures)
+        .flat_map(listed_signatures)
         .map(|s| 3 + s.0.len())
         .sum();
     let mut w = Writer::new_in(bump, 10 + effects.len() * 69 + signatures);
     w.u8(0);
     w.len_prefix(effects.len());
     for executed in effects {
-        w.digest(&Digest::new(executed.digest));
-        w.digest(&Digest::new(executed.effects_digest));
+        w.digest(&executed.digest);
+        w.digest(&executed.effects_digest);
     }
     w.len_prefix(transactions.len());
     for transaction in transactions {
-        w.len_prefix(transaction.tx_signatures().len());
-        for signature in transaction.tx_signatures() {
+        let listed = listed_signatures(transaction);
+        w.len_prefix(listed.len());
+        for signature in listed {
             w.bytes(signature.0);
         }
     }
     w.finish("CheckpointContents")
+}
+
+/// The signatures the contents list for `transaction`: none for the epoch's
+/// last, whose signatures the reference's builder leaves out
+/// (`create_and_execute_advance_epoch_tx`), else its own.
+fn listed_signatures<'a, 's>(transaction: &'s SenderSignedData<'a>) -> &'s [GenericSignature<'a>] {
+    match transaction.data().kind() {
+        TransactionKind::EndOfEpochTransaction(_) | TransactionKind::ChangeEpoch(_) => &[],
+        _ => transaction.tx_signatures(),
+    }
 }
 
 type Blake2b256 = Blake2b<U32>;
@@ -175,12 +182,12 @@ type Blake2b256 = Blake2b<U32>;
 /// latest state of each object written, by id, committed to by a Merkle
 /// tree, the one artifact's digest then hashed as a list. `written` is
 /// in checkpoint order and is sorted here.
-pub fn artifacts_digest(written: &mut [(ObjectId, u64, Digest)]) -> [u8; 32] {
+pub fn artifacts_digest(written: &mut [(ObjectId, u64, Digest)], bump: &Bump) -> [u8; 32] {
     use blake2::Digest as _;
     // Stable, so an object's states stay in checkpoint order: the last of
     // each run is its latest.
     written.sort_by_key(|w| w.0);
-    let mut leaves: Vec<[u8; 32]> = Vec::with_capacity(written.len());
+    let mut leaves = containers::Vec::<[u8; 32]>::with_capacity_in(written.len(), bump);
     for (i, (id, version, digest)) in written.iter().enumerate() {
         if written.get(i + 1).is_some_and(|next| next.0 == *id) {
             debug_assert!(written[i + 1].1 > *version, "object versions increase");
@@ -206,20 +213,25 @@ pub fn artifacts_digest(written: &mut [(ObjectId, u64, Digest)]) -> [u8; 32] {
 /// fastcrypto's `MerkleTree::<Blake2b256>` root over leaf hashes `level`:
 /// inner nodes hash a 1 prefix and both children, an odd level is padded
 /// with the all-zero empty node, and the empty tree's root is that node.
-fn merkle_root(level: &mut Vec<[u8; 32]>) -> [u8; 32] {
+/// The root over `level`, which is overwritten; a level of odd length is
+/// padded with a zero node.
+fn merkle_root(level: &mut [[u8; 32]]) -> [u8; 32] {
     use blake2::Digest as _;
-    while level.len() > 1 {
-        if level.len() % 2 == 1 {
-            level.push([0; 32]);
-        }
-        for i in 0..level.len() / 2 {
+    let mut len = level.len();
+    while len > 1 {
+        for i in 0..len.div_ceil(2) {
+            let right = if 2 * i + 1 < len {
+                level[2 * i + 1]
+            } else {
+                [0; 32]
+            };
             let mut hasher = Blake2b256::new();
             hasher.update([1u8]);
             hasher.update(level[2 * i]);
-            hasher.update(level[2 * i + 1]);
+            hasher.update(right);
             level[i] = hasher.finalize().into();
         }
-        level.truncate(level.len() / 2);
+        len = len.div_ceil(2);
     }
     level.first().copied().unwrap_or([0; 32])
 }
@@ -232,8 +244,8 @@ mod tests {
     fn merkle_root_of_none_one_and_odd() {
         use blake2::Digest as _;
 
-        assert_eq!(merkle_root(&mut vec![]), [0; 32]);
-        assert_eq!(merkle_root(&mut vec![[7; 32]]), [7; 32]);
+        assert_eq!(merkle_root(&mut []), [0; 32]);
+        assert_eq!(merkle_root(&mut [[7; 32]]), [7; 32]);
 
         let inner = |l: [u8; 32], r: [u8; 32]| -> [u8; 32] {
             let mut h = Blake2b256::new();
@@ -243,7 +255,7 @@ mod tests {
             h.finalize().into()
         };
         let expected = inner(inner([1; 32], [2; 32]), inner([3; 32], [0; 32]));
-        assert_eq!(merkle_root(&mut vec![[1; 32], [2; 32], [3; 32]]), expected);
+        assert_eq!(merkle_root(&mut [[1; 32], [2; 32], [3; 32]]), expected);
     }
 
     #[test]
@@ -257,8 +269,8 @@ mod tests {
         ];
         let mut latest = vec![(a, 3, Digest::new([6; 32])), (b, 4, Digest::new([7; 32]))];
         assert_eq!(
-            artifacts_digest(&mut repeated),
-            artifacts_digest(&mut latest)
+            artifacts_digest(&mut repeated, &Bump::default()),
+            artifacts_digest(&mut latest, &Bump::default())
         );
     }
 }

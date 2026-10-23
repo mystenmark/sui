@@ -48,8 +48,8 @@ where
     message
 }
 
-fn expect_digest(type_name: &str, bytes: &[u8], digest: Digest) {
-    assert_eq!(digest, Digest::of(type_name, bytes), "{type_name}");
+fn expect_digest(type_name: &str, bytes: &[u8], digest: impl Into<Digest>) {
+    assert_eq!(digest.into(), Digest::of(type_name, bytes), "{type_name}");
 }
 
 fn bytes32(n: u8) -> [u8; 32] {

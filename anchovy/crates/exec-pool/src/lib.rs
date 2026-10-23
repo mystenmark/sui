@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use containers::Bump;
 use execution::{Funds, Input};
 use messages::Message;
 use messages::effects::{
@@ -93,7 +94,8 @@ pub struct Executor {
 }
 
 /// The objects a transaction wrote: id, version, object.
-type WrittenObjects = Vec<(messages::base::ObjectId, u64, Message<Object<'static>>)>;
+type WrittenObjects<'b> =
+    containers::Vec<'b, (messages::base::ObjectId, u64, Message<Object<'static>>)>;
 
 /// A written object's value: the object as the input waiter resolves it.
 fn object(bytes: Vec<u8>) -> Message<Object<'static>> {
@@ -136,12 +138,13 @@ impl Executor {
         resolved_keys: &mut Vec<(InputKey, InputValue)>,
         effects_keys: &mut Vec<EffectsKey>,
         deposits: &mut Vec<Settle>,
+        bump: &Bump,
     ) {
         let entry = &executable.entry;
         let (digest, bytes): (TxDigest, &[u8]) = match &entry.transaction {
             ExecutableTransaction::User(transaction) => {
                 let signed = &transaction.get().0;
-                (signed.digest().bytes, signed.bytes())
+                (*signed.digest(), signed.bytes())
             }
             ExecutableTransaction::System(system) => (system.digest, &system.bytes),
         };
@@ -149,10 +152,7 @@ impl Executor {
         let stored = self.stored_effects(digest);
         // Executed and committed before a restart: its checkpoint will not
         // commit again, so what it produced is written at once.
-        let committed = stored.is_some()
-            && !self
-                .store
-                .is_uncommitted(&messages::base::Digest::new(digest));
+        let committed = stored.is_some() && !self.store.is_uncommitted(&digest);
 
         // 1. Its inputs, from the values its keys resolved to: the shared
         //    accesses' first, in access order (as the resolver keys them),
@@ -162,7 +162,7 @@ impl Executor {
             .iter()
             .map(|v| v.as_ref().expect("every key resolved"));
         self.resolved.clear();
-        let mut provided: Vec<(messages::base::ObjectId, Input<'_>)> = Vec::new();
+        let mut provided = containers::Vec::new_in(bump);
         for access in &entry.shared {
             let generation = match values.next().expect("a value per shared access") {
                 InputValue::Generation(generation, object) => {
@@ -216,8 +216,15 @@ impl Executor {
 
         // 2. Its effects: stored, or from executing and committing it.
         let (effects, written) = match stored {
-            Some(effects) => (effects, Vec::new()),
-            None => self.execute_now(digest, bytes, &provided, funds, executable.root_version),
+            Some(effects) => (effects, containers::Vec::new_in(bump)),
+            None => self.execute_now(
+                digest,
+                bytes,
+                &provided,
+                funds,
+                executable.root_version,
+                bump,
+            ),
         };
         drop(provided);
         let VersionedEffects::V2(effects_v2) = &effects.get().version else {
@@ -301,14 +308,14 @@ impl Executor {
                 ObjectOut::NotExist | ObjectOut::AccumulatorWriteV1(_) => {}
             }
         }
-        effects_keys.push(EffectsKey(digest));
+        effects_keys.push(EffectsKey(digest.into()));
     }
 
     /// The effects of the transaction with `digest`, if it executed already.
     fn stored_effects(&self, digest: TxDigest) -> Option<Message<TransactionEffects<'static>>> {
         let effects_digest = self
             .store
-            .executed_effects(&messages::base::Digest::new(digest))
+            .executed_effects(&digest)
             .expect("the store reads")?;
         Some(
             self.store
@@ -324,25 +331,28 @@ impl Executor {
     /// # Panics
     /// If execution fails outside the transaction: everything it reads was
     /// waited for, so that is a bug.
-    fn execute_now(
+    fn execute_now<'b>(
         &self,
         digest: TxDigest,
         bytes: &[u8],
         provided: &[(messages::base::ObjectId, Input<'_>)],
         funds: Funds,
         root_version: u64,
-    ) -> (Message<TransactionEffects<'static>>, WrittenObjects) {
+        bump: &'b Bump,
+    ) -> (Message<TransactionEffects<'static>>, WrittenObjects<'b>) {
         let outcome = self
             .epoch
             .execution
             .execute_at(&self.store, bytes, provided, funds, Some(root_version))
             .unwrap_or_else(|e| panic!("transaction {digest:?} failed to execute: {e:?}"));
-        let written = outcome
-            .commit
-            .written
-            .iter()
-            .map(|w| (w.id, w.version, object(w.bytes.clone())))
-            .collect();
+        let mut written = containers::Vec::with_capacity_in(outcome.commit.written.len(), bump);
+        written.extend(
+            outcome
+                .commit
+                .written
+                .iter()
+                .map(|w| (w.id, w.version, object(w.bytes.clone()))),
+        );
         self.store.write(outcome.commit);
         let effects = Message::parse(outcome.effects)
             .map_err(|(e, _)| e)
@@ -485,7 +495,7 @@ fn produced(
         }
         _ => Generation::Ended {
             version: effects.lamport_version,
-            transaction: digest,
+            transaction: digest.bytes,
         },
     }
 }
@@ -502,7 +512,7 @@ impl Processor for Executor {
     type Input = Vec<Executable>;
     type Output = ();
 
-    fn process(&mut self, ready: Vec<Executable>) -> Option<()> {
+    fn process(&mut self, ready: Vec<Executable>, bump: &mut Bump) -> Option<()> {
         let mut resolved_keys = Vec::new();
         let mut effects_keys = Vec::with_capacity(ready.len());
         let mut deposits = Vec::new();
@@ -512,6 +522,7 @@ impl Processor for Executor {
                 &mut resolved_keys,
                 &mut effects_keys,
                 &mut deposits,
+                bump,
             );
         }
         // Everything is committed and recorded: now the keys are visible.
@@ -549,9 +560,10 @@ pub struct EffectsAvailability {
 impl Availability<EffectsKey> for EffectsAvailability {
     fn check(&mut self, keys: &[EffectsKey], found: &mut Vec<Option<()>>) {
         found.clear();
+        // A key may be a digest a client named.
         found.extend(keys.iter().map(|EffectsKey(digest)| {
             self.store
-                .executed_effects(&messages::base::Digest::new(*digest))
+                .executed_effects_named(digest)
                 .expect("the store reads")
                 .map(|_| ())
         }));
@@ -679,7 +691,7 @@ mod tests {
                 transaction: ExecutableTransaction::System(SystemTransaction {
                     kind: SystemKind::Barrier { height: 0 },
                     bytes: vec![],
-                    digest: [0; 32],
+                    digest: messages::base::Hashed::of("TransactionData", &[]),
                 }),
                 shared: vec![],
                 origin: None,

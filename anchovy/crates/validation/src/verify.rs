@@ -148,7 +148,7 @@ pub fn verify_signatures_deferring_ed25519(
     verifier: &Verifier,
     aliases: &[(SuiAddress, &[SuiAddress])],
     bump: &Bump,
-    deferred: &mut Vec<Ed25519Check>,
+    deferred: &mut containers::Vec<'_, Ed25519Check>,
 ) -> Result<SignerIndices, Error> {
     let Some(by_signer) = signer_mapping(tx, signatures, verifier, aliases, false, bump)? else {
         return Ok(SignerIndices::all(tx));

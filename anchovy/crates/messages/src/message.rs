@@ -9,7 +9,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::arena::{Alloc, Arena, Build, Measure};
-use crate::base::Digest;
+use crate::base::Hashed;
 use crate::error::{ParseError, Result};
 use crate::reader::Reader;
 
@@ -264,14 +264,14 @@ where
 /// A view whose identity is a digest computed while parsing: the types the
 /// reference implements `Message` for.
 pub trait Digested {
-    fn digest(&self) -> &Digest;
+    fn digest(&self) -> &Hashed;
 }
 
 impl<T: Wire> Message<T>
 where
     for<'a> T::View<'a>: Digested,
 {
-    pub fn digest(&self) -> &Digest {
+    pub fn digest(&self) -> &Hashed {
         self.get().digest()
     }
 }

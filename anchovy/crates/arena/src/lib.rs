@@ -86,12 +86,18 @@ impl Bump {
         self.used.get()
     }
 
-    /// Frees everything allocated, for reuse: overflow chunks are released
-    /// and the first chunk is bumped from its start again.
+    /// Frees everything allocated, for reuse. The largest chunk is kept as
+    /// the first, the others released: an arena reset after each item grows
+    /// to the largest item's need and then allocates no more.
     ///
     /// Taking `&mut self` is what makes this sound: every allocation borrows
     /// the arena, so none can be alive here.
     pub fn reset(&mut self) {
+        // Each overflow chunk is at least twice the one before: the last is
+        // the largest.
+        if let Some(largest) = self.extra.get_mut().pop() {
+            self.first = largest;
+        }
         self.extra.get_mut().clear();
         self.current.set((self.first.ptr, self.first.size));
         self.used.set(0);
@@ -200,25 +206,30 @@ mod tests {
     }
 
     #[test]
-    fn reset_reuses_the_first_chunk() {
+    fn reset_keeps_the_largest_chunk() {
         let mut bump = Bump::with_capacity(64);
-        let first = (&bump)
+        (&bump)
             .allocate(Layout::from_size_align(8, 8).unwrap())
+            .unwrap();
+        let large = (&bump)
+            .allocate(Layout::from_size_align(1000, 1).unwrap())
+            .unwrap()
+            .as_ptr()
+            .cast::<u8>();
+        assert_eq!(bump.chunks(), 2);
+        bump.reset();
+        assert_eq!((bump.chunks(), bump.used(), bump.allocated()), (1, 0, 0));
+        // The same item again fits the kept chunk.
+        let again = (&bump)
+            .allocate(Layout::from_size_align(1000, 1).unwrap())
             .unwrap()
             .as_ptr()
             .cast::<u8>();
         (&bump)
-            .allocate(Layout::from_size_align(1000, 1).unwrap())
-            .unwrap();
-        assert_eq!(bump.chunks(), 2);
-        bump.reset();
-        assert_eq!((bump.chunks(), bump.used(), bump.allocated()), (1, 0, 0));
-        let again = (&bump)
             .allocate(Layout::from_size_align(8, 8).unwrap())
-            .unwrap()
-            .as_ptr()
-            .cast::<u8>();
-        assert_eq!(first, again);
+            .unwrap();
+        assert_eq!(large, again);
+        assert_eq!(bump.chunks(), 1);
     }
 
     #[test]

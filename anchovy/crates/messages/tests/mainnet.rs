@@ -57,7 +57,7 @@ fn check(path: &Path, counts: &mut Counts) {
             VersionedEffects::V1(v1) => (v1.transaction_digest, v1.events_digest),
         };
         assert_eq!(*transaction_digest, *tx.transaction.data().digest());
-        assert_eq!(events_digest.copied(), tx.events.map(|e| e.digest()));
+        assert_eq!(events_digest.copied(), tx.events.map(|e| e.digest().into()));
         for object in tx.output_objects {
             let digest = object.digest();
             let written = match &tx.effects.version {

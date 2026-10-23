@@ -502,7 +502,7 @@ fn run(seed: u64, coverage: &mut Coverage) {
     let (sui_events_digest, port_events_digest) = if sui_events.data.is_empty() {
         (None, None)
     } else {
-        (Some(sui_events.digest()), Some(built_events.digest))
+        (Some(sui_events.digest()), Some(built_events.digest.into()))
     };
 
     // Dependencies, with duplicates, as the store collects them in a set.

@@ -12,7 +12,7 @@ pub mod epoch;
 pub use cache::{Capacity, Store};
 
 use messages::ParseError;
-use messages::base::{Digest, ObjectId};
+use messages::base::{Digest, Hashed, ObjectId};
 use tidehunter::db::DbError;
 
 #[derive(Debug)]
@@ -53,10 +53,10 @@ pub struct Written {
 
 /// A transaction that executed, and its results, as BCS.
 pub struct Executed {
-    pub digest: Digest,
+    pub digest: Hashed,
     /// `SenderSignedData`.
     pub transaction: Vec<u8>,
-    pub effects_digest: Digest,
+    pub effects_digest: Hashed,
     /// `TransactionEffects`.
     pub effects: Vec<u8>,
     /// `TransactionEvents`, if there are any.

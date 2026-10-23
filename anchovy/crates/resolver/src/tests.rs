@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use messages::Message;
-use messages::base::{Digest, ObjectId};
+use messages::base::{Digest, Hashed, ObjectId};
 use messages::transaction::SharedObjectMutability;
 use protocol_config::{Chain, ProtocolVersion};
 use sui_types::Identifier;
@@ -42,6 +42,11 @@ const CHAIN: [u8; 32] = [0x5a; 32];
 
 /// An empty generation table, over an epoch store in a directory kept alive
 /// with it.
+/// A transaction digest, as computed.
+fn hashed(n: u8) -> Hashed {
+    Hashed::of("TransactionData", &[n])
+}
+
 fn generation_table() -> (Arc<GenerationTable>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let (store, _, _) = validator::epoch_store::EpochStore::open(dir.path(), 0);
@@ -107,7 +112,7 @@ fn system(shared: Vec<SharedAccess>) -> ScheduledEntry {
         transaction: ExecutableTransaction::System(SystemTransaction {
             kind: SystemKind::Prologue { round: 0 },
             bytes: vec![],
-            digest: [0; 32],
+            digest: hashed(0),
         }),
         shared,
         origin: None,
@@ -162,7 +167,8 @@ fn generation(stream: StreamId, round: u32, generation: u32) -> InputKey {
 fn handler() -> (CommitHandler, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let (_, output, _) = EpochStore::open(dir.path(), 0);
-    (CommitHandler::new(output, 0), dir)
+    let handler = CommitHandler::new(output, 0, vec![([0; 96], 10_000)], &epoch().config, None);
+    (handler, dir)
 }
 
 /// `entry`'s keys and resolved bases, its accesses linked by `handler`.
@@ -172,7 +178,7 @@ fn resolve(
     mut entry: ScheduledEntry,
 ) -> (Vec<InputKey>, Vec<(StreamId, u32, u32)>) {
     handler.link(&mut entry.shared);
-    let base = resolver.resolve(&entry, &Digest::new(CHAIN));
+    let base = resolver.resolve(&entry, &Digest::new(CHAIN), &containers::Bump::default());
     (resolver.keys.clone(), base)
 }
 
@@ -471,7 +477,7 @@ fn availability_reads_the_store_and_the_generation_table() {
             version: 4,
             digest: [0; 32],
         },
-        [0; 32],
+        hashed(0),
         true,
     );
     generations.record(
@@ -482,7 +488,7 @@ fn availability_reads_the_store_and_the_generation_table() {
             version: 5,
             transaction: [0; 32],
         },
-        [0; 32],
+        hashed(0),
         true,
     );
     let mut availability = InputAvailability { store, generations };
@@ -521,7 +527,7 @@ fn availability_reads_the_store_and_the_generation_table() {
     ));
     assert!(matches!(&found[9], Some(InputValue::Live)));
     // `Reserved` resolves only when `FundsReserver` resolves it.
-    availability.check(&[InputKey::Reserved([1; 32])], &mut found);
+    availability.check(&[InputKey::Reserved(hashed(1))], &mut found);
     assert!(found[0].is_none());
 }
 
@@ -562,7 +568,11 @@ fn a_resolved_chunk_waits_in_the_input_waiter_until_its_keys_are_available() {
             spend,
         ],
     };
-    assert!(resolver.process(link(chunk)).is_none());
+    assert!(
+        resolver
+            .process(link(chunk), &mut workqueue::Bump::default())
+            .is_none()
+    );
     let Some(Command::Wait(mut batch)) = inbox.try_pop() else {
         panic!("a wait");
     };
@@ -591,7 +601,7 @@ fn a_resolved_chunk_waits_in_the_input_waiter_until_its_keys_are_available() {
             version: 2,
             digest: [0; 32],
         },
-        [0; 32],
+        hashed(0),
         true,
     );
     waiter.resolve([(
@@ -640,7 +650,7 @@ fn a_resolved_chunk_waits_in_the_input_waiter_until_its_keys_are_available() {
         checkpoint_seq: 2,
         entries: vec![system(vec![access(clock, Mutable, 2, 0)])],
     };
-    resolver.process(link(next));
+    resolver.process(link(next), &mut workqueue::Bump::default());
     let Some(Command::Wait(mut batch)) = inbox.try_pop() else {
         panic!("a wait");
     };
@@ -662,7 +672,7 @@ fn an_empty_chunk_waits_for_nothing() {
         checkpoint_seq: 0,
         entries: vec![],
     };
-    resolver.process(chunk);
+    resolver.process(chunk, &mut workqueue::Bump::default());
     assert!(inbox.try_pop().is_none());
 }
 
@@ -805,7 +815,7 @@ fn a_withdrawing_transaction_waits_on_its_reservations_instead_of_its_inputs() {
     let ExecutableTransaction::User(transaction) = &spend.transaction else {
         unreachable!()
     };
-    let digest = transaction.get().0.digest().bytes;
+    let digest = *transaction.get().0.digest();
     let chunk = Chunk {
         version: AccumulatorVersion(7),
         root_version: 1,
@@ -818,7 +828,7 @@ fn a_withdrawing_transaction_waits_on_its_reservations_instead_of_its_inputs() {
             user(vec![], vec![], gas),
         ],
     };
-    resolver.process(chunk);
+    resolver.process(chunk, &mut workqueue::Bump::default());
     let expected: Vec<Reservation> = amounts
         .iter()
         .map(|&(account, amount)| Reservation {

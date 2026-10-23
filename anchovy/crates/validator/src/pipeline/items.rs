@@ -5,6 +5,7 @@
 //! waiters. Each names its producer and consumer.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use ::consensus::{BlockRef, TransactionIndex};
 use messages::Message;
@@ -12,6 +13,7 @@ use messages::base::ObjectId;
 use messages::object::Object;
 
 use crate::checks::VerifiedTransaction;
+use crate::consensus::execution_time::Key;
 use crate::consensus::sequence::SharedAccess;
 use crate::pipeline::keys::{AccumulatorVersion, Reservation, StreamId, TxDigest};
 use crate::pipeline::tables::{BuiltCheckpoint, Generation};
@@ -40,6 +42,8 @@ pub struct SystemTransaction {
 pub enum SystemKind {
     /// The consensus commit prologue of the commit in `round`.
     Prologue { round: u32 },
+    /// The authenticator state's update in the commit in `round`.
+    AuthenticatorStateUpdate { round: u32 },
     /// The `index`th settlement transaction of the chunk at `height`.
     Settlement { height: u64, index: u32 },
     /// The accumulator barrier of the chunk at `height`.
@@ -131,6 +135,11 @@ pub struct EpochClose {
     pub root_version: u64,
     /// Its shared accesses, after every other access of the epoch.
     pub shared: Vec<SharedAccess>,
+    /// The epoch's first checkpoint.
+    pub first_checkpoint: u64,
+    /// The execution time observations as of the last commit, by key and
+    /// authority name, sorted by key: the next epoch's, once filtered.
+    pub observations: Vec<(Key, Vec<([u8; 96], Duration)>)>,
 }
 
 /// A transaction with its inputs as keys. `VersionResolver` or

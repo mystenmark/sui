@@ -28,6 +28,7 @@ use workqueue::{Processor, Refusal, Refuse};
 use crate::checks::{self, SignatureChecks, VerifiedTransaction};
 use crate::consensus::cache::{BlockEntries, CachedTransaction, ConsensusTxCache};
 use crate::consensus::decode::{checkpoint_signature, claimed_immutable};
+use crate::consensus::execution_time::duration;
 use crate::epoch::EpochState;
 use crate::pipeline::items::{BuiltWaitItem, BuiltWaits};
 use crate::pipeline::keys::CheckpointBuilt;
@@ -96,11 +97,7 @@ pub struct BlockVoter {
     cache: Arc<ConsensusTxCache>,
     signatures: SignatureChecks,
     checkpoint_signatures: Option<BuiltWaits>,
-    bump: Bump,
 }
-
-/// Enough for the temporaries of nearly every transaction.
-const ARENA_BYTES: usize = 64 * 1024;
 
 impl BlockVoter {
     pub fn new(
@@ -114,7 +111,6 @@ impl BlockVoter {
             store,
             cache,
             checkpoint_signatures: None,
-            bump: Bump::with_capacity(ARENA_BYTES),
         }
     }
 
@@ -128,7 +124,7 @@ impl BlockVoter {
 
     /// Votes on `block`: `verify_and_vote_batch`. A valid block's decoded
     /// transactions are cached.
-    pub fn vote(&mut self, block: Block) -> Verdict {
+    pub fn vote(&mut self, block: Block, bump: &Bump) -> Verdict {
         let epoch = &self.epoch.clone();
         let Block {
             reference,
@@ -137,7 +133,7 @@ impl BlockVoter {
 
         // 1. Decode every transaction, as sui decodes it; one that does not
         //    decode invalidates the block.
-        let mut decoded = Vec::with_capacity(transactions.len());
+        let mut decoded = containers::Vec::with_capacity_in(transactions.len(), bump);
         for (index, bytes) in transactions.into_iter().enumerate() {
             let undecodable = |reason: String| InvalidBlock {
                 index,
@@ -145,14 +141,13 @@ impl BlockVoter {
             };
             let transaction = Message::<ConsensusTransaction<'static>>::parse(bytes)
                 .map_err(|(e, _)| undecodable(format!("{e:?}")))?;
-            self.bump.reset();
-            validation::consensus::decode_checks(transaction.get(), &self.bump)
+            validation::consensus::decode_checks(transaction.get(), bump)
                 .map_err(|e| undecodable(format!("{e:?}")))?;
             decoded.push(transaction);
         }
 
         // 2. The rules every honest validator applies to the block alike.
-        validate_transactions(epoch, &reference, &decoded, &self.bump)?;
+        validate_transactions(epoch, &reference, &decoded, bump)?;
         self.route_signatures(&decoded);
 
         // 3. A vote on each user transaction; other kinds are accepted.
@@ -160,17 +155,17 @@ impl BlockVoter {
         //    one batch, then the rest of `vote_transaction`.
         let mut rejects = Vec::new();
         let mut entries: BlockEntries = (0..decoded.len()).map(|_| None).collect();
-        let mut valid = Vec::new();
-        let mut pending = Vec::new();
+        let mut valid = containers::Vec::new_in(bump);
+        let mut pending = containers::Vec::new_in(bump);
         for (index, transaction) in decoded.into_iter().enumerate() {
             let ConsensusTransactionKind::UserTransactionV2(user) = transaction.get().kind() else {
                 continue;
             };
-            let claims = Claims::of(user).copied();
+            let claims = Claims::of(user).copied(bump);
             let transaction = transaction
                 .into_user_transaction()
                 .expect("a user transaction");
-            match checks::validate_one(transaction, &epoch.context(), &mut self.bump) {
+            match checks::validate_one(transaction, &epoch.context(), bump) {
                 Ok(transaction) => {
                     valid.push(transaction);
                     pending.push((index, claims));
@@ -178,18 +173,19 @@ impl BlockVoter {
                 Err(_) => rejects.push(index as TransactionIndex),
             }
         }
-        let verified = self.signatures.verify_batch(valid);
+        let verified = self.signatures.verify_batch(valid, bump);
         for (i, verified) in verified.into_iter().enumerate() {
             let (index, claims) = &pending[i];
             match verified {
                 Ok((transaction, indices)) => {
                     if self
-                        .vote_verified(epoch, &transaction, indices, claims)
+                        .vote_verified(epoch, &transaction, indices, claims, bump)
                         .is_err()
                     {
                         rejects.push(*index as TransactionIndex);
                     }
-                    entries[*index] = Some(CachedTransaction::new(transaction, &claims.immutable));
+                    entries[*index] =
+                        Some(CachedTransaction::new(transaction, &claims.immutable, bump));
                 }
                 Err(_) => rejects.push(*index as TransactionIndex),
             }
@@ -227,7 +223,8 @@ impl BlockVoter {
         epoch: &EpochState,
         transaction: &VerifiedTransaction,
         indices: SignerIndices,
-        claims: &CopiedClaims,
+        claims: &CopiedClaims<'_>,
+        bump: &Bump,
     ) -> Result<(), RejectReason> {
         if epoch.params.config.address_aliases() {
             let indices = indices.as_slice();
@@ -262,15 +259,16 @@ impl BlockVoter {
         // `handle_vote_transaction`: an executed transaction's inputs are
         // not checked. Its immutable claim still is, as the reference's: the
         // claim decides what the commit handler locks.
-        let digest = transaction.get().0.digest().bytes;
-        if execution::executed(&self.store, &digest)
+        if self
+            .store
+            .executed_effects(transaction.get().0.digest())
             .expect("the store reads")
             .is_none()
         {
-            checks::inputs_pass(epoch, &self.store, transaction)?;
+            checks::inputs_pass(epoch, &self.store, transaction, bump)?;
         }
         if !claims.immutable.is_empty() {
-            verify_immutable_object_claims(&self.store, transaction, &claims.immutable)?;
+            verify_immutable_object_claims(&self.store, transaction, &claims.immutable, bump)?;
         }
         Ok(())
     }
@@ -280,9 +278,9 @@ impl Processor for BlockVoter {
     type Input = VoteRequest;
     type Output = ();
 
-    fn process(&mut self, request: VoteRequest) -> Option<()> {
+    fn process(&mut self, request: VoteRequest, bump: &mut Bump) -> Option<()> {
         let VoteRequest { block, reply } = request;
-        let verdict = self.vote(block);
+        let verdict = self.vote(block, bump);
         // Consensus may have stopped waiting; nothing to do then.
         let _ = reply.send(verdict);
         None
@@ -317,22 +315,24 @@ impl<'a> Claims<'a> {
 impl Claims<'_> {
     /// The claims voting reads, copied out of the consensus transaction so
     /// that its transaction can take over its buffers.
-    fn copied(&self) -> CopiedClaims {
+    fn copied<'b>(&self, bump: &'b Bump) -> CopiedClaims<'b> {
+        let mut immutable = containers::Vec::with_capacity_in(self.immutable.len(), bump);
+        immutable.extend_from_slice(self.immutable);
         CopiedClaims {
             aliases_v2: self.aliases_v2.map(|a| ShortList::of(a.iter().copied())),
             aliases_v1: self
                 .aliases_v1
                 .map(|a| ShortList::of(a.iter().map(|(s, v)| (**s, *v)))),
-            immutable: self.immutable.to_vec(),
+            immutable,
         }
     }
 }
 
 /// `Claims`, owned.
-struct CopiedClaims {
+struct CopiedClaims<'b> {
     aliases_v2: Option<ShortList<(u8, Option<u64>)>>,
     aliases_v1: Option<ShortList<(SuiAddress, Option<u64>)>>,
-    immutable: Vec<ObjectId>,
+    immutable: containers::Vec<'b, ObjectId>,
 }
 
 /// A list kept only as far as it can match a transaction's signers (a
@@ -444,6 +444,14 @@ fn validate_transactions(
                 if observation.estimate_count() > config.max_programmable_tx_commands() as usize {
                     return invalid("ExecutionTimeObservation contains too many estimates");
                 }
+                // The reference cannot deserialize such a duration.
+                if observation
+                    .estimates
+                    .iter()
+                    .any(|(_, d)| duration(*d).is_none())
+                {
+                    return invalid("ExecutionTimeObservation duration overflows");
+                }
             }
             ConsensusTransactionKind::UpdateTransactionDenyConfig(update) => {
                 if !config.share_transaction_deny_config_in_consensus() {
@@ -536,17 +544,16 @@ fn check_share_limits(rules: &TransactionDenyRules<'_>, bump: &Bump) -> Result<(
 fn verify_immutable_object_claims(
     store: &store::Store,
     transaction: &VerifiedTransaction,
-    claimed: &[ObjectId],
+    claimed_ids: &[ObjectId],
+    bump: &Bump,
 ) -> Result<(), RejectReason> {
-    let inputs = input_objects(transaction.get().0.data())?;
-    let owned: Vec<_> = inputs
-        .iter()
-        .filter_map(|kind| match kind {
-            InputKind::ImmOrOwned(r) => Some(*r),
-            _ => None,
-        })
-        .collect();
-    if let Some(id) = claimed
+    let inputs = input_objects(transaction.get().0.data(), bump)?;
+    let mut owned: containers::Vec<'_, messages::base::ObjectRef> = containers::Vec::new_in(bump);
+    owned.extend(inputs.iter().filter_map(|kind| match kind {
+        InputKind::ImmOrOwned(r) => Some(*r),
+        _ => None,
+    }));
+    if let Some(id) = claimed_ids
         .iter()
         .find(|id| !owned.iter().any(|r| r.id == **id))
     {
@@ -554,7 +561,7 @@ fn verify_immutable_object_claims(
             "{id:?} is not an owned input"
         )));
     }
-    let mut immutable = Vec::new();
+    let mut immutable = containers::Vec::new_in(bump);
     for input in &owned {
         let Some(object) = store.live_object(&input.id).expect("the store reads") else {
             return Err(RejectReason::ImmutableClaim(format!(
@@ -573,7 +580,8 @@ fn verify_immutable_object_claims(
             immutable.push(input.id);
         }
     }
-    let mut claimed: Vec<_> = claimed.to_vec();
+    let mut claimed = containers::Vec::with_capacity_in(claimed_ids.len(), bump);
+    claimed.extend_from_slice(claimed_ids);
     claimed.sort_unstable();
     claimed.dedup();
     immutable.sort_unstable();

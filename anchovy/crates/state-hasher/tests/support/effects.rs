@@ -144,8 +144,8 @@ pub fn transaction(
     }
     let built = builder.finish();
     ExecutedEffects {
-        digest: rng.bytes(),
-        effects_digest: built.digest.bytes,
+        digest: messages::base::Hashed::of("TransactionData", &rng.bytes()),
+        effects_digest: messages::base::Hashed::of("TransactionEffects", built.bytes),
         effects: Arc::from(built.bytes),
     }
 }

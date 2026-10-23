@@ -371,36 +371,37 @@ impl Db {
     /// The object's latest version, live or a tombstone; none if it never
     /// existed.
     pub fn latest(&self, id: &ObjectId) -> Result<Option<(u64, Latest)>> {
-        if let Some(live) = self.live(id)? {
-            let object = self.object(id, live.version)?.ok_or(Error::Inconsistent(
-                "a live row names a version with no object",
-            ))?;
-            return Ok(Some((live.version, Latest::Object(object, live.digest))));
-        }
-        let mut versions = self.tidehunter.iterator(self.objects);
-        versions.reverse();
-        versions.set_lower_bound(object_key(id, 0).to_vec());
-        versions.set_upper_bound(object_key(id, u64::MAX).to_vec());
-        match versions.next() {
-            Some(entry) => {
-                let (key, value) = entry?;
-                if key[..ID] != id.0 {
-                    return Ok(None);
-                }
-                let version = u64::from_be_bytes(key[ID..].try_into().expect("eight bytes"));
-                let latest = match value.as_ref() {
-                    DELETED => Latest::Deleted,
-                    WRAPPED => Latest::Wrapped,
-                    // Without a live row, the latest version is a tombstone.
-                    _ => {
-                        return Err(Error::Inconsistent(
-                            "an object's latest version is live, but it has no live row",
-                        ));
-                    }
-                };
-                Ok(Some((version, latest)))
+        loop {
+            if let Some(live) = self.live(id)? {
+                let object = self.object(id, live.version)?.ok_or(Error::Inconsistent(
+                    "a live row names a version with no object",
+                ))?;
+                return Ok(Some((live.version, Latest::Object(object, live.digest))));
             }
-            None => Ok(None),
+            let mut versions = self.tidehunter.iterator(self.objects);
+            versions.reverse();
+            versions.set_lower_bound(object_key(id, 0).to_vec());
+            versions.set_upper_bound(object_key(id, u64::MAX).to_vec());
+            let Some(entry) = versions.next() else {
+                return Ok(None);
+            };
+            let (key, value) = entry?;
+            if key[..ID] != id.0 {
+                return Ok(None);
+            }
+            let version = u64::from_be_bytes(key[ID..].try_into().expect("eight bytes"));
+            let latest = match value.as_ref() {
+                DELETED => Latest::Deleted,
+                WRAPPED => Latest::Wrapped,
+                // A live version without a live row: a commit wrote both
+                // since the row was read. Tidehunter makes a batch's keys
+                // visible one at a time, so its live row is about to appear.
+                _ => {
+                    std::thread::yield_now();
+                    continue;
+                }
+            };
+            return Ok(Some((version, latest)));
         }
     }
 

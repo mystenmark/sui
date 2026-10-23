@@ -12,6 +12,7 @@ mod support;
 use std::collections::{BTreeMap, HashMap};
 
 use messages::Message;
+use messages::base::{Digest, Hashed};
 use messages::effects::TransactionEffects as EffectsView;
 use move_core_types::u256::U256;
 use settlement::settle::{self, SettlementBuilder};
@@ -278,7 +279,8 @@ fn reference_transaction(kind: TransactionKind) -> settle::Built {
     let tx = VerifiedTransaction::new_system_transaction(kind);
     settle::Built {
         bytes: bcs::to_bytes(tx.inner()).unwrap(),
-        digest: tx.digest().into_inner(),
+        // Computed by the reference.
+        digest: Hashed::computed(Digest::new(tx.digest().into_inner())),
     }
 }
 
@@ -291,7 +293,8 @@ fn ours(
         .iter()
         .map(|b| Message::parse(b.clone()).map_err(|(e, _)| e).unwrap())
         .collect();
-    let mut builder = SettlementBuilder::new(seq, offset);
+    let bump = containers::Bump::default();
+    let mut builder = SettlementBuilder::new(seq, offset, &bump);
     for (i, e) in parsed.iter().enumerate() {
         builder.add(i as u64, e.get());
     }

@@ -21,6 +21,7 @@ use aggregator::Committee;
 use checkpoint::ProtocolKey;
 use consensus::TransactionClient;
 use epoch::EpochRecord;
+use execution::epoch_start::SystemObjects;
 use messages::transaction::DigestPending;
 use state_hasher::StateHashes;
 use tokio::sync::watch;
@@ -32,6 +33,7 @@ use validator::consensus::vote::VoteRequest;
 use validator::current::EpochHandle;
 use validator::epoch::EpochState;
 use validator::epoch_store::{BuilderOutput, ConsensusOutput as OutputWriter, EpochStore};
+use validator::pipeline::backpressure::{Backpressure, Limits};
 use validator::pipeline::items::{CertifiedCheckpoint, EffectsWaitItem};
 use validator::pipeline::keys::EffectsKey;
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable, GenerationTable};
@@ -43,6 +45,15 @@ use workqueue::{Activity, Queue, WorkerHandle};
 
 /// Each queue's capacity.
 pub const QUEUE: usize = 4096;
+
+/// How far consensus may run ahead of committed checkpoints. The queues
+/// ahead of the executor hold about one item per chunk in flight, so the
+/// chunk limit keeps them under `QUEUE`; the transaction limit is the
+/// reference's default `backpressure_threshold`.
+pub const BACKPRESSURE: Limits = Limits {
+    chunks: QUEUE / 4,
+    transactions: 100_000,
+};
 
 /// The running pipeline: where the black boxes hand it work, where it hands
 /// them work, and the tables its processors share.
@@ -86,6 +97,9 @@ pub struct ConsensusOutput {
     pub commits: Queue<CommitRequest>,
     /// The first commit to deliver: consensus-core's replay point.
     pub replay_from: u32,
+    /// The last commit the pipeline handled before it started: the commit
+    /// record's, or 0 at the epoch's start.
+    pub last_processed: u32,
 }
 
 /// What the commit handler starts the epoch from.
@@ -93,7 +107,12 @@ pub struct ConsensusOutput {
 /// # Panics
 /// If the store cannot be read or written, lacks `previous`, or has no
 /// shared accumulator root.
-fn epoch_start(store: &store::Store, epoch_store: &EpochStore, record: &EpochRecord) -> EpochStart {
+fn epoch_start(
+    store: &store::Store,
+    epoch_store: &EpochStore,
+    record: &EpochRecord,
+    objects: &SystemObjects,
+) -> EpochStart {
     let checkpoint = BuiltCheckpoint::decode(
         &store
             .checkpoint(record.previous_checkpoint)
@@ -121,10 +140,9 @@ fn epoch_start(store: &store::Store, epoch_store: &EpochStore, record: &EpochRec
         .version;
     EpochStart {
         previous_checkpoint: checkpoint.seq,
-        previous_height: checkpoint.last_height,
-        previous_timestamp_ms: checkpoint.timestamp_ms,
         accumulator_root_version,
         accumulator_root_initial_shared_version: initial_shared_version,
+        authenticator_initial_shared_version: objects.authenticator_state,
         epoch_start_timestamp_ms: record.epoch_start_timestamp_ms,
         epoch_duration_ms: record.epoch_duration_ms,
     }
@@ -156,7 +174,11 @@ impl Pipeline {
         state_sync: Queue<CertifiedCheckpoint>,
         record: &EpochRecord,
     ) -> Pipeline {
-        let start = epoch_start(store, epoch_store, record);
+        // Created only by an epoch's last transaction, so as the epoch
+        // started, whatever of it a restart finds committed.
+        let system_objects =
+            execution::epoch_start::system_objects(store).expect("the store reads");
+        let start = epoch_start(store, epoch_store, record, &system_objects);
         let committed_seq = store
             .committed_checkpoint()
             .expect("the store reads")
@@ -170,14 +192,19 @@ impl Pipeline {
         let next_to_certify = committed_seq + 1;
 
         // Where the epoch resumes: after the last commit its consensus
-        // output was written through, else from its start.
-        let committed_height = BuiltCheckpoint::decode(
-            &store
-                .checkpoint(committed_seq)
-                .expect("the store reads")
-                .expect("the committed checkpoint is stored"),
-        )
-        .last_height;
+        // output was written through, else from its start, before any of its
+        // chunks: heights count from 1 each epoch.
+        let committed_height = if committed_seq > record.previous_checkpoint {
+            BuiltCheckpoint::decode(
+                &store
+                    .checkpoint(committed_seq)
+                    .expect("the store reads")
+                    .expect("the committed checkpoint is stored"),
+            )
+            .last_height
+        } else {
+            0
+        };
         consensus_output
             .committed_checkpoints()
             .committed_through(committed_height);
@@ -211,6 +238,7 @@ impl Pipeline {
             votes: queues.votes.clone(),
             commits: queues.commits.clone(),
             replay_from,
+            last_processed: resumed.map_or(0, |r| r.commit_index),
         });
         let parts = Arc::new(Parts {
             store: store.clone(),
@@ -218,6 +246,8 @@ impl Pipeline {
             epoch_store: epoch_store.clone(),
             key: protocol_key.clone(),
             committee: committee.clone(),
+            stakes: record.stakes().collect(),
+            system_objects,
             consensus: consensus.clone(),
             cache: Arc::new(ConsensusTxCache::new()),
             generations: Arc::new(GenerationTable::new(epoch_store.clone())),
@@ -225,6 +255,7 @@ impl Pipeline {
             checkpoints,
             statuses: Arc::new(ConsensusTxStatusCache::new()),
             state_hashes,
+            backpressure: Arc::new(Backpressure::new(BACKPRESSURE, committed_seq)),
             start,
             next_to_certify,
             first_hashed,

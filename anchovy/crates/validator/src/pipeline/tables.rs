@@ -125,9 +125,9 @@ impl GenerationTable {
 
     /// Writes the generations `transactions`, which have committed,
     /// produced.
-    pub fn commit(&self, transactions: &[TxDigest]) {
+    pub fn commit(&self, transactions: &[TxDigest], bump: &containers::Bump) {
         let mut uncommitted = lock(&self.uncommitted);
-        let mut written = Vec::new();
+        let mut written = containers::Vec::new_in(bump);
         for digest in transactions {
             for key in uncommitted.by_producer.remove(digest).unwrap_or_default() {
                 let value = uncommitted.generations[&key];

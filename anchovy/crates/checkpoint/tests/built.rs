@@ -141,7 +141,10 @@ impl Setup {
     }
 
     fn process(&mut self, command: Command<CheckpointBuilt, BuiltWaitItem, Arc<BuiltCheckpoint>>) {
-        if let Some(ready) = self.waiter.process(command) {
+        if let Some(ready) = self
+            .waiter
+            .process(command, &mut workqueue::Bump::default())
+        {
             self.router.send(ready);
         }
     }

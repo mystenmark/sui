@@ -80,13 +80,13 @@ pub struct ConsensusCommitPrologueV4 {
     pub additional_state_digest: AdditionalConsensusStateDigest,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct JwkId {
     pub iss: String,
     pub kid: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
 #[serde(rename = "JWK")]
 pub struct Jwk {
     pub kty: String,

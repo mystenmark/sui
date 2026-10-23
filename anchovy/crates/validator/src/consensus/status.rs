@@ -123,9 +123,10 @@ impl ConsensusTxStatusCache {
     pub fn set_statuses(
         &self,
         updates: impl IntoIterator<Item = (BlockRef, TransactionIndex, ConsensusTxStatus)>,
+        bump: &containers::Bump,
     ) {
         let leader_round = *self.leader_round.borrow();
-        let mut woken = Vec::new();
+        let mut woken = containers::Vec::new_in(bump);
         {
             let mut inner = self.lock();
             for (block, index, status) in updates {

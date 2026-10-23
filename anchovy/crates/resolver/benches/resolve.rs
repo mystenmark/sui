@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use messages::Message;
-use messages::base::{Digest, ObjectId};
+use messages::base::{Digest, Hashed, ObjectId};
 use messages::transaction::SharedObjectMutability;
 use protocol_config::{Chain, ProtocolVersion};
 use resolver::{InputAvailability, VersionResolver};
@@ -99,6 +99,11 @@ impl Rng {
 
 /// An empty generation table, over an epoch store in a directory kept alive
 /// with it.
+/// A transaction digest, as computed.
+fn hashed(n: u8) -> Hashed {
+    Hashed::of("TransactionData", &[n])
+}
+
 fn generation_table() -> (Arc<GenerationTable>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let (store, _, _) = validator::epoch_store::EpochStore::open(dir.path(), 0);
@@ -215,13 +220,16 @@ fn resolve(epoch: &Arc<EpochParams>, rng: &mut Rng) {
             let mut elapsed = Duration::ZERO;
             let mut allocations = 0;
             let rounds = 200;
+            // As a worker's arena: reset after each item, never freed.
+            let mut bump = workqueue::Bump::default();
             for round in 0..=rounds {
                 let chunk = chunk(round, &transactions);
                 let before = ALLOCATIONS.load(Ordering::Relaxed);
                 let start = Instant::now();
-                resolver.process(chunk);
+                resolver.process(chunk, &mut bump);
                 let took = start.elapsed();
                 let allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
+                bump.reset();
                 let Some(Command::Wait(batch)) = inbox.try_pop() else {
                     panic!("a wait");
                 };
@@ -284,7 +292,7 @@ fn availability(rng: &mut Rng) {
                 version: 2,
                 digest: [0; 32],
             },
-            [0; 32],
+            hashed(0),
             true,
         );
     }

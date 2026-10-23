@@ -12,6 +12,7 @@ use checkpoint::{
 };
 use consensus::TransactionClient;
 use exec_pool::{EffectsAvailability, EffectsRouter, Executor};
+use execution::epoch_start::SystemObjects;
 use messages::transaction::DigestPending;
 use resolver::{InputAvailability, VersionResolver};
 use settlement::{FundsReserver, SettlementScheduler};
@@ -25,6 +26,7 @@ use validator::consensus::status::ConsensusTxStatusCache;
 use validator::consensus::vote::{BlockVoter, VoteRequest};
 use validator::epoch::EpochState;
 use validator::epoch_store::{CommittedCheckpoints, ConsensusOutput as OutputWriter, EpochStore};
+use validator::pipeline::backpressure::Backpressure;
 use validator::pipeline::items::{
     BuiltCommand, BuiltWaits, CertifiedCheckpoint, CheckpointContentsBuilt, CheckpointEffects,
     CheckpointSignature, Chunk, EffectsWaitItem, EpochCloserInput, Executable, FundsCommand,
@@ -142,6 +144,10 @@ pub(crate) struct Parts {
     pub epoch_store: EpochStore,
     pub key: Arc<ProtocolKey>,
     pub committee: Arc<Committee>,
+    /// Each member's name and stake, by committee index.
+    pub stakes: Vec<([u8; 96], u64)>,
+    /// The system objects as the epoch started.
+    pub system_objects: SystemObjects,
     pub consensus: TransactionClient,
     pub cache: Arc<ConsensusTxCache>,
     pub generations: Arc<GenerationTable>,
@@ -149,6 +155,7 @@ pub(crate) struct Parts {
     pub checkpoints: Arc<CheckpointStore>,
     pub statuses: Arc<ConsensusTxStatusCache>,
     pub state_hashes: Arc<StateHashes>,
+    pub backpressure: Arc<Backpressure>,
     pub start: EpochStart,
     /// The first checkpoint the aggregator certifies.
     pub next_to_certify: u64,
@@ -183,7 +190,9 @@ impl Parts {
             settlement,
             checkpoint_waits,
             self.statuses.clone(),
+            self.stakes.clone(),
         )
+        .with_backpressure(self.backpressure.clone())
     }
 
     fn resolver(&self, inputs: Queue<InputCommand>, funds: Queue<FundsCommand>) -> VersionResolver {
@@ -279,6 +288,7 @@ impl Parts {
     ) -> EpochCloser {
         EpochCloser::new(
             self.epoch.params.clone(),
+            self.system_objects,
             self.store.clone(),
             self.checkpoints.clone(),
             resolver,
@@ -310,6 +320,7 @@ impl Parts {
             state_sync,
         )
         .with_fork_checks(built)
+        .with_backpressure(self.backpressure.clone())
     }
 
     fn committer(
@@ -323,6 +334,7 @@ impl Parts {
             self.chunks.clone(),
             self.generations.clone(),
             committed,
+            self.backpressure.clone(),
             ended,
         )
     }

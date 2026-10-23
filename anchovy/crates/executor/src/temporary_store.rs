@@ -585,7 +585,10 @@ impl<'a> TemporaryStore<'a> {
 
         inner.encoded_events =
             (!inner.events.is_empty()).then(|| effects::build_events(bump, &inner.events));
-        let events_digest = inner.encoded_events.as_ref().map(|built| built.digest);
+        let events_digest = inner
+            .encoded_events
+            .as_ref()
+            .map(|built| built.digest.into());
         let effects = effects::new_from_execution_v2(
             bump,
             status,

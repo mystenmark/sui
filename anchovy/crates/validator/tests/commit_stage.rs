@@ -7,23 +7,26 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest as _};
 use consensus::BlockRef;
 use messages::Message;
+use messages::base::Hashed;
 use protocol_config::{Chain, ProtocolVersion};
 use sui_types::base_types::{ObjectID, SequenceNumber, SuiAddress, random_object_ref};
 use sui_types::crypto::{AccountKeyPair, get_key_pair};
 use sui_types::digests::{AdditionalConsensusStateDigest, ConsensusCommitDigest};
 use sui_types::messages_consensus::ConsensusDeterminedVersionAssignments;
 use sui_types::transaction::{
-    CallArg, ObjectArg, ProgrammableTransaction, SharedObjectMutability, Transaction,
-    TransactionData, TransactionKind, VerifiedTransaction,
+    Argument, CallArg, Command, ObjectArg, ProgrammableTransaction, SharedObjectMutability,
+    Transaction, TransactionData, TransactionKind, VerifiedTransaction,
 };
 use validator::checks;
 use validator::consensus::commit::{CommitStage, Decided, EpochStart};
 use validator::consensus::decode::{CommittedTransaction, DecodedCommit};
+use validator::consensus::execution_time::{Key, SharedObservations};
 use validator::epoch::EpochParams;
 use validator::epoch_store::{ConsensusOutput, EpochStore};
 use validator::pipeline::items::{
@@ -60,24 +63,30 @@ struct Outputs {
     chunks: Inbox<Chunk>,
     settlements: Inbox<SettlementInput>,
     checkpoints: Inbox<waiter::Command<ChunkSettled, PendingCheckpoint>>,
-    /// The epoch store the stage writes.
-    _dir: tempfile::TempDir,
+    /// The epoch store the stage writes, unless the test keeps it.
+    dir: Option<tempfile::TempDir>,
 }
 
 fn stage(epoch: &Arc<EpochParams>) -> (CommitStage, Outputs) {
+    let (output, dir) = consensus_output();
+    let (stage, mut outputs) = stage_over(epoch, output);
+    outputs.dir = Some(dir);
+    (stage, outputs)
+}
+
+/// A stage of a committee of one, over `output`.
+fn stage_over(epoch: &Arc<EpochParams>, output: ConsensusOutput) -> (CommitStage, Outputs) {
     let (chunks, chunk_inbox) = workqueue::queue(1024);
     let (settlements, settlement_inbox) = workqueue::queue(1024);
     let (checkpoints, checkpoint_inbox) = workqueue::queue(1024);
     let start = EpochStart {
         previous_checkpoint: 10,
-        previous_height: 0,
-        previous_timestamp_ms: 0,
         accumulator_root_initial_shared_version: ROOT_VERSION,
+        authenticator_initial_shared_version: None,
         accumulator_root_version: ROOT_VERSION,
         epoch_start_timestamp_ms: 0,
         epoch_duration_ms: u64::MAX,
     };
-    let (output, dir) = consensus_output();
     (
         CommitStage::new(
             epoch.clone(),
@@ -87,12 +96,13 @@ fn stage(epoch: &Arc<EpochParams>) -> (CommitStage, Outputs) {
             settlements,
             checkpoints,
             Arc::new(validator::consensus::status::ConsensusTxStatusCache::new()),
+            vec![([0; 96], 10_000)],
         ),
         Outputs {
             chunks: chunk_inbox,
             settlements: settlement_inbox,
             checkpoints: checkpoint_inbox,
-            _dir: dir,
+            dir: None,
         },
     )
 }
@@ -133,7 +143,28 @@ fn transactions(count: usize, seed: u64) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// A signed transaction splitting its gas coin, as `Transaction` BCS.
+fn split_transaction() -> Vec<u8> {
+    let (sender, key): (SuiAddress, AccountKeyPair) = get_key_pair();
+    let pt = ProgrammableTransaction {
+        inputs: vec![CallArg::Pure(bcs::to_bytes(&1u64).unwrap())],
+        commands: vec![Command::SplitCoins(
+            Argument::GasCoin,
+            vec![Argument::Input(0)],
+        )],
+    };
+    let data = TransactionData::new(
+        TransactionKind::ProgrammableTransaction(pt),
+        sender,
+        random_object_ref(),
+        1_000_000,
+        1000,
+    );
+    bcs::to_bytes(&Transaction::from_data_and_signer(data, vec![&key])).unwrap()
+}
+
 fn commit(index: u32, round: u32, timestamp_ms: u64, transactions: &[Vec<u8>]) -> DecodedCommit {
+    let bump = containers::Bump::default();
     let block = BlockRef {
         round,
         author: 1,
@@ -155,18 +186,22 @@ fn commit(index: u32, round: u32, timestamp_ms: u64, transactions: &[Vec<u8>]) -
                         Message::parse(bytes.clone()).map_err(|(e, _)| e).unwrap(),
                     ),
                     &[],
+                    &bump,
                 )
             })
             .collect(),
+        observations: Vec::new(),
+        jwks: Vec::new(),
         rejected: Vec::new(),
         cache_hits: 0,
         cache_misses: transactions.len(),
+        handled: None,
     }
 }
 
-fn digest_of(transaction: &ExecutableTransaction) -> [u8; 32] {
+fn digest_of(transaction: &ExecutableTransaction) -> Hashed {
     match transaction {
-        ExecutableTransaction::User(t) => t.get().0.digest().bytes,
+        ExecutableTransaction::User(t) => *t.get().0.digest(),
         ExecutableTransaction::System(t) => t.digest,
     }
 }
@@ -219,8 +254,54 @@ fn reference_state_digest(timestamps: &VecDeque<u64>) -> AdditionalConsensusStat
     AdditionalConsensusStateDigest::new(fold.finalize().into())
 }
 
+/// The prologue digest of a commit splitting a coin, after a commit carrying
+/// an observation of splits if `observed`, with the stage restarted between
+/// them if `restart`, as consensus replays the window of earlier commits.
+fn prologue_after(observed: bool, restart: bool, split: &[u8]) -> Hashed {
+    let mut bump = containers::Bump::default();
+    let epoch = epoch(10_000, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (_, output, _) = EpochStore::open(dir.path(), 0);
+    let committed = output.committed_checkpoints();
+    let (mut stage, _outputs) = stage_over(&epoch, output);
+    let mut first = commit(1, 2, 1_000, &[]);
+    if observed {
+        first.observations = vec![SharedObservations {
+            author: 0,
+            authority: [0; 96],
+            generation: 1,
+            estimates: vec![(Key::SplitCoins, Duration::from_millis(50))],
+        }];
+    }
+    stage.process(first, &mut bump);
+    // The first commit's checkpoint commits: its output is written.
+    committed.committed_through(u64::MAX);
+    if restart {
+        drop((stage, committed));
+        let (_, output, _) = EpochStore::open(dir.path(), 0);
+        stage = stage_over(&epoch, output).0;
+        assert!(
+            stage.decide(commit(1, 2, 1_000, &[]), &bump).is_none(),
+            "replayed"
+        );
+    }
+    let decided = stage
+        .decide(commit(2, 4, 2_000, &[split.to_vec()]), &bump)
+        .unwrap();
+    digest_of(&decided.chunks[0].entries[0].transaction)
+}
+
+#[test]
+fn execution_time_observations_outlive_a_restart() {
+    let split = split_transaction();
+    let observed = prologue_after(true, false, &split);
+    assert_ne!(observed, prologue_after(false, false, &split));
+    assert_eq!(observed, prologue_after(true, true, &split));
+}
+
 #[test]
 fn the_prologue_is_sui_s_byte_for_byte() {
+    let bump = containers::Bump::default();
     let epoch = epoch(10_000, 0);
     let (mut stage, _outputs) = stage(&epoch);
     let mut window = VecDeque::new();
@@ -228,7 +309,9 @@ fn the_prologue_is_sui_s_byte_for_byte() {
     for i in 1..=13u32 {
         let timestamp = 1_000 * u64::from(i) + u64::from(i * i);
         let round = 2 * i;
-        let decided = stage.decide(commit(i, round, timestamp, &[])).unwrap();
+        let decided = stage
+            .decide(commit(i, round, timestamp, &[]), &bump)
+            .unwrap();
         if window.len() == 10 {
             window.pop_front();
         }
@@ -247,17 +330,18 @@ fn the_prologue_is_sui_s_byte_for_byte() {
             ConsensusDeterminedVersionAssignments::CancelledTransactionsV2(vec![]),
             reference_state_digest(&window),
         );
-        assert_eq!(prologue.digest, expected.digest().into_inner());
+        assert_eq!(prologue.digest.bytes, expected.digest().into_inner());
         assert_eq!(prologue.bytes, bcs::to_bytes(expected.inner()).unwrap());
     }
 }
 
 #[test]
 fn chunks_split_at_the_limit_and_checkpoints_follow_the_previous_epoch() {
+    let bump = containers::Bump::default();
     let epoch = epoch(3, 0);
     let (mut stage, _outputs) = stage(&epoch);
     let users = transactions(7, 0);
-    let decided = stage.decide(commit(1, 4, 100, &users)).unwrap();
+    let decided = stage.decide(commit(1, 4, 100, &users), &bump).unwrap();
 
     // The prologue and 7 transactions: chunks of 3, 3 and 2.
     let sizes: Vec<_> = decided.chunks.iter().map(|c| c.entries.len()).collect();
@@ -312,7 +396,7 @@ fn chunks_split_at_the_limit_and_checkpoints_follow_the_previous_epoch() {
     assert_eq!(origins.len(), 8);
 
     // Heights and sequence numbers carry on into the next commit.
-    let decided = stage.decide(commit(2, 6, 200, &[])).unwrap();
+    let decided = stage.decide(commit(2, 6, 200, &[]), &bump).unwrap();
     assert_eq!(
         (decided.chunks[0].height, decided.chunks[0].checkpoint_seq),
         (4, 14)
@@ -322,12 +406,15 @@ fn chunks_split_at_the_limit_and_checkpoints_follow_the_previous_epoch() {
 
 #[test]
 fn commits_share_a_checkpoint_until_the_interval_passes() {
+    let bump = containers::Bump::default();
     let epoch = epoch(100, 200);
     let (mut stage, _outputs) = stage(&epoch);
     let mut cut = Vec::new();
     for (i, timestamp) in [(1, 100), (2, 150), (3, 250), (4, 300)] {
         let users = transactions(2, i.into());
-        let decided = stage.decide(commit(i, 2 * i, timestamp, &users)).unwrap();
+        let decided = stage
+            .decide(commit(i, 2 * i, timestamp, &users), &bump)
+            .unwrap();
         assert_eq!(decided.chunks.len(), 1);
         assert_eq!(
             decided.chunks[0].checkpoint_seq,
@@ -347,6 +434,7 @@ fn commits_share_a_checkpoint_until_the_interval_passes() {
 /// here commits consensus replayed and transactions included twice.
 #[test]
 fn stages_decide_alike() {
+    let bump = containers::Bump::default();
     let epoch = epoch(4, 100);
     let batches: Vec<_> = (0..4).map(|i| transactions(5, i)).collect();
     let commits = |batch: usize| -> Vec<Vec<u8>> {
@@ -362,24 +450,25 @@ fn stages_decide_alike() {
 
     let (mut first, _a) = stage(&epoch);
     let once: Vec<_> = (0..4)
-        .map(|i| summary(&first.decide(nth(i)).unwrap()))
+        .map(|i| summary(&first.decide(nth(i), &bump).unwrap()))
         .collect();
 
     let (mut second, _b) = stage(&epoch);
     let mut replayed = Vec::new();
     for i in 0..4 {
-        replayed.push(summary(&second.decide(nth(i)).unwrap()));
-        assert!(second.decide(nth(i)).is_none());
+        replayed.push(summary(&second.decide(nth(i), &bump).unwrap()));
+        assert!(second.decide(nth(i), &bump).is_none());
     }
     assert_eq!(once, replayed);
 }
 
 #[test]
 fn the_stage_emits_chunks_settlements_and_checkpoint_waits() {
+    let mut bump = containers::Bump::default();
     let epoch = epoch(4, 0);
     let (mut stage, outputs) = stage(&epoch);
     let users = transactions(5, 0);
-    assert_eq!(stage.process(commit(1, 2, 50, &users)), Some(()));
+    assert_eq!(stage.process(commit(1, 2, 50, &users), &mut bump), Some(()));
 
     let mut chunks = Vec::new();
     while let Some(chunk) = outputs.chunks.try_pop() {
@@ -399,22 +488,22 @@ fn the_stage_emits_chunks_settlements_and_checkpoint_waits() {
     let mut waiter = waiter::WaiterProcessor::new(|_: &ChunkSettled| false);
     let command = outputs.checkpoints.try_pop().unwrap();
     assert!(outputs.checkpoints.try_pop().is_none());
-    assert!(waiter.process(command).is_none());
+    assert!(waiter.process(command, &mut bump).is_none());
     assert!(
         waiter
-            .process(waiter::Command::notify(vec![ChunkSettled(2)]))
+            .process(waiter::Command::notify(vec![ChunkSettled(2)]), &mut bump)
             .unwrap()
             .iter()
             .map(|c| (c.seq, c.heights.clone()))
             .eq([(12, vec![2])])
     );
     let ready = waiter
-        .process(waiter::Command::notify(vec![ChunkSettled(1)]))
+        .process(waiter::Command::notify(vec![ChunkSettled(1)]), &mut bump)
         .unwrap();
     assert_eq!(ready.len(), 1);
     assert_eq!((ready[0].seq, ready[0].timestamp_ms), (11, 50));
 
     // A commit handled before emits nothing.
-    assert_eq!(stage.process(commit(1, 2, 50, &users)), None);
+    assert_eq!(stage.process(commit(1, 2, 50, &users), &mut bump), None);
     assert!(outputs.chunks.try_pop().is_none());
 }

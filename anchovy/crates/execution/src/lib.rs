@@ -7,6 +7,7 @@
 //! go out, as the reference's BCS, which the rest of anchovy reads with its
 //! own views.
 
+pub mod epoch_start;
 pub mod genesis;
 pub mod native;
 pub mod reads;
@@ -14,6 +15,8 @@ mod store_view;
 pub mod system_state;
 
 use std::sync::Arc;
+
+use messages::base::{Digest, Hashed};
 
 use sui_execution::Executor;
 use sui_protocol_config::{ProtocolConfig, ProtocolVersion};
@@ -356,10 +359,11 @@ impl Reference {
             commit: store::Commit {
                 written,
                 removed,
+                // Both computed by the reference's types, in this process.
                 executed: Some(store::Executed {
-                    digest: digest_of(digest),
+                    digest: Hashed::computed(digest_of(digest)),
                     transaction: transaction.to_vec(),
-                    effects_digest: messages::base::Digest::new(effects_digest.into_inner()),
+                    effects_digest: Hashed::computed(Digest::new(effects_digest.into_inner())),
                     effects: effects_bytes,
                     events,
                 }),
@@ -403,15 +407,29 @@ pub fn assert_same(reference: &Outcome, native: &Outcome) {
 
 /// The transaction with digest `transaction`, if it executed: read back
 /// from the store as the reference's `complete_executed_data` reads it.
-pub fn executed(store: &store::Store, transaction: &[u8; 32]) -> Result<Option<Executed>> {
-    let Some(effects_digest) =
-        store.executed_effects(&messages::base::Digest::new(*transaction))?
-    else {
+pub fn executed(store: &store::Store, transaction: &Hashed) -> Result<Option<Executed>> {
+    let effects_digest = store.executed_effects(transaction)?;
+    complete(store, transaction, effects_digest)
+}
+
+/// `executed` of a digest a request names, which a client chooses (see
+/// `store::Store::executed_effects_named`).
+pub fn executed_named(store: &store::Store, transaction: &Digest) -> Result<Option<Executed>> {
+    let effects_digest = store.executed_effects_named(transaction)?;
+    complete(store, transaction, effects_digest)
+}
+
+fn complete(
+    store: &store::Store,
+    transaction: &Digest,
+    effects_digest: Option<Hashed>,
+) -> Result<Option<Executed>> {
+    let Some(effects_digest) = effects_digest else {
         return Ok(None);
     };
     let bytes = store
         .effects(&effects_digest)?
-        .ok_or(Error::MissingEffects(effects_digest))?
+        .ok_or(Error::MissingEffects(effects_digest.into()))?
         .get()
         .bytes
         .to_vec();
@@ -419,8 +437,8 @@ pub fn executed(store: &store::Store, transaction: &[u8; 32]) -> Result<Option<E
     let events = match effects.events_digest() {
         Some(_) => Some(
             store
-                .events(&messages::base::Digest::new(*transaction))?
-                .ok_or(Error::MissingEffects(effects_digest))?
+                .events(transaction)?
+                .ok_or(Error::MissingEffects(effects_digest.into()))?
                 .get()
                 .bytes
                 .to_vec(),

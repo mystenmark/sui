@@ -11,12 +11,9 @@
 //! crate read; `tests/fast.rs` rebuilds every mainnet message from its
 //! parsed view and checks bytes and digest.
 
-use blake2::Blake2b;
-use blake2::digest::consts::U32;
-
 pub use containers::Bump;
 
-use crate::base::{AccountAddress, Digest, SuiAddress};
+use crate::base::{AccountAddress, Digest, Hashed, SuiAddress};
 use crate::execution_status::{
     CommandArgumentError, ExecutionErrorKind, ExecutionStatus, MoveLocation, PackageUpgradeError,
     TypeArgumentError,
@@ -37,7 +34,7 @@ pub use events::{EventsBuilder, event_digest};
 #[derive(Clone, Copy, Debug)]
 pub struct Built<'a> {
     pub bytes: &'a [u8],
-    pub digest: Digest,
+    pub digest: Hashed,
 }
 
 /// Writes BCS into an arena, the mirror of `Reader`.
@@ -62,14 +59,9 @@ impl<'a> Writer<'a> {
 
     /// The bytes written, and the digest of `type_name`, `::`, and them.
     pub fn finish(self, type_name: &str) -> Built<'a> {
-        use blake2::Digest as _;
-        let mut hasher = Blake2b::<U32>::new();
-        hasher.update(type_name.as_bytes());
-        hasher.update(b"::");
-        hasher.update(&self.out);
         Built {
+            digest: Hashed::of(type_name, &self.out),
             bytes: self.out.leak(),
-            digest: Digest::new(hasher.finalize().into()),
         }
     }
 

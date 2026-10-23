@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use exec_pool::{EffectsAvailability, Executor};
 use messages::Message;
-use messages::base::ObjectId;
+use messages::base::{Hashed, ObjectId};
 use messages::transaction::SharedObjectMutability;
 use move_core_types::ident_str;
 use protocol_config::{Chain, ProtocolVersion};
@@ -283,7 +283,7 @@ impl Node {
     }
 
     /// The effects of the transaction with `digest`, if it executed.
-    pub fn effects(&self, digest: [u8; 32]) -> Option<TransactionEffects> {
+    pub fn effects(&self, digest: Hashed) -> Option<TransactionEffects> {
         execution::executed(&self.store, &digest)
             .unwrap()
             .map(|e| bcs::from_bytes(&e.effects).unwrap())
@@ -294,7 +294,8 @@ impl Node {
     pub fn execute_owned(&mut self, transaction: VerifiedTransaction) -> TransactionEffects {
         let digest = digest(&transaction);
         let executable = self.executable(transaction, vec![], vec![]);
-        self.executor.process(vec![executable]);
+        self.executor
+            .process(vec![executable], &mut workqueue::Bump::default());
         self.drain_checked();
         self.effects(digest).unwrap()
     }
@@ -365,8 +366,8 @@ impl Node {
     }
 }
 
-pub fn digest(transaction: &VerifiedTransaction) -> [u8; 32] {
-    transaction.get().0.digest().bytes
+pub fn digest(transaction: &VerifiedTransaction) -> Hashed {
+    *transaction.get().0.digest()
 }
 
 /// The input waiter's keys for `executable`, as the resolver gives them: its
@@ -450,7 +451,8 @@ impl InputWaiter {
                 return batches;
             }
             batches += 1;
-            node.executor.process(ready);
+            node.executor
+                .process(ready, &mut workqueue::Bump::default());
             let (inputs, _) = node.drain_checked();
             self.waiter.resolve(inputs);
         }

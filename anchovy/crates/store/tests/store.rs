@@ -6,7 +6,7 @@
 //! mainnet checkpoint.
 
 use messages::Message;
-use messages::base::Digest;
+use messages::base::{Digest, Hashed};
 use messages::checkpoint::CheckpointData;
 use store::{Commit, Executed, Live, Removal, Removed, Store, Written};
 
@@ -138,7 +138,8 @@ fn executed_transactions_round_trip_and_survive_reopening() {
     let checkpoint = checkpoint();
     let tx = &checkpoint.get().transactions[1];
     let digest = *tx.transaction.digest();
-    let effects_digest = Digest::new([7; 32]);
+    // A stand-in: the store does not check it against the effects.
+    let effects_digest = Hashed::computed(Digest::new([7; 32]));
     let events = tx.events.map(|e| e.bytes.to_vec());
     {
         let store = Store::open(dir.path()).unwrap();
@@ -262,7 +263,13 @@ fn committed_checkpoints_and_the_watermark_survive_reopening() {
         store.commit_genesis_checkpoint(b"genesis".to_vec(), b"start".to_vec());
         // Past 255, where little-endian keys would sort wrongly.
         for seq in 1..=300u64 {
-            store.commit_checkpoint(seq, &[], seq.to_le_bytes().to_vec(), vec![seq as u8]);
+            store.commit_checkpoint(
+                seq,
+                &[],
+                seq.to_le_bytes().to_vec(),
+                vec![seq as u8],
+                &containers::Bump::default(),
+            );
         }
     }
     let store = Store::open(dir.path()).unwrap();
@@ -279,7 +286,7 @@ fn committed_checkpoints_and_the_watermark_survive_reopening() {
     assert_eq!(store.certified(0).unwrap(), None);
     assert_eq!(store.certified(2).unwrap(), Some(vec![2]));
     assert_eq!(store.checkpoint(301).unwrap(), None);
-    store.commit_checkpoint(301, &[], vec![], vec![]);
+    store.commit_checkpoint(301, &[], vec![], vec![], &containers::Bump::default());
 }
 
 #[test]
@@ -288,5 +295,36 @@ fn checkpoints_commit_in_order() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
     store.commit_genesis_checkpoint(vec![], vec![]);
-    store.commit_checkpoint(2, &[], vec![], vec![]);
+    store.commit_checkpoint(2, &[], vec![], vec![], &containers::Bump::default());
+}
+
+/// A digest a request names, not executed, is answered from its own
+/// negative cache, which the transaction's later execution clears.
+#[test]
+fn a_named_digest_s_absence_is_cached_until_it_executes() {
+    let dir = tempfile::tempdir().unwrap();
+    let checkpoint = checkpoint();
+    let tx = &checkpoint.get().transactions[1];
+    let digest = *tx.transaction.digest();
+    let named = Digest::from(digest);
+    let store = Store::open(dir.path()).unwrap();
+    assert_eq!(store.executed_effects_named(&named).unwrap(), None);
+    assert_eq!(store.executed_effects_named(&named).unwrap(), None);
+    store
+        .write_through(Commit {
+            written: written(checkpoint.get()),
+            removed: vec![],
+            executed: Some(Executed {
+                digest,
+                transaction: tx.transaction.bytes().to_vec(),
+                effects_digest: tx.effects.digest,
+                effects: tx.effects.bytes.to_vec(),
+                events: tx.events.map(|e| e.bytes.to_vec()),
+            }),
+        })
+        .unwrap();
+    assert_eq!(
+        store.executed_effects_named(&named).unwrap(),
+        Some(tx.effects.digest)
+    );
 }

@@ -49,13 +49,12 @@ pub fn rolling_gas(
 
 /// The summary of `built`, in epoch `params`, after `previous` (`None` only
 /// for checkpoint 0), as the reference's `CheckpointSummary::new`, with its
-/// end-of-epoch data if it is the epoch's last. `bump` is scratch, reset
-/// here.
+/// end-of-epoch data if it is the epoch's last, with temporaries in `bump`.
 pub fn build(
     built: &CheckpointContentsBuilt,
     previous: Option<&BuiltCheckpoint>,
     params: &EpochParams,
-    bump: &mut Bump,
+    bump: &Bump,
 ) -> Summary {
     let epoch = params.epoch;
     let network_total_transactions =
@@ -63,22 +62,18 @@ pub fn build(
     let epoch_rolling_gas = rolling_gas(built, previous, epoch);
 
     let version_specific_data = match params.config.checkpoint_summary_version_specific_data {
-        None | Some(0) => Vec::new(),
-        Some(1) => version_specific_data_v1(&built.randomness_rounds),
+        None | Some(0) => containers::Vec::new_in(bump),
+        Some(1) => version_specific_data_v1(&built.randomness_rounds, bump),
         Some(v) => panic!("unknown checkpoint summary version-specific data version {v}"),
     };
-    let commitments: Vec<(CheckpointCommitmentKind, Digest)> = built
-        .artifacts_digest
-        .iter()
-        .map(|d| {
-            (
-                CheckpointCommitmentKind::CheckpointArtifactsDigest,
-                Digest::new(*d),
-            )
-        })
-        .collect();
+    let mut commitments = containers::Vec::new_in(bump);
+    commitments.extend(built.artifacts_digest.iter().map(|d| {
+        (
+            CheckpointCommitmentKind::CheckpointArtifactsDigest,
+            Digest::new(*d),
+        )
+    }));
 
-    bump.reset();
     let mut summary = SummaryBuilder::new_in(
         bump,
         epoch,
@@ -141,8 +136,11 @@ fn summary_epoch(summary: &[u8]) -> u64 {
 }
 
 /// `CheckpointVersionSpecificData::V1 { randomness_rounds }` BCS.
-fn version_specific_data_v1(randomness_rounds: &[u64]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(6 + 8 * randomness_rounds.len());
+fn version_specific_data_v1<'b>(
+    randomness_rounds: &[u64],
+    bump: &'b Bump,
+) -> containers::Vec<'b, u8> {
+    let mut out = containers::Vec::with_capacity_in(6 + 8 * randomness_rounds.len(), bump);
     out.push(0);
     let mut n = randomness_rounds.len();
     loop {
@@ -162,8 +160,8 @@ fn version_specific_data_v1(randomness_rounds: &[u64]) -> Vec<u8> {
 
 /// `key`'s signature over `summary` in `epoch`, as the reference's
 /// `AuthoritySignInfo::new`: the intent message's BCS, then the epoch.
-pub fn sign(key: &ProtocolKey, summary: &[u8], epoch: u64) -> [u8; 48] {
-    let mut message = Vec::with_capacity(3 + summary.len() + 8);
+pub fn sign(key: &ProtocolKey, summary: &[u8], epoch: u64, bump: &Bump) -> [u8; 48] {
+    let mut message = containers::Vec::with_capacity_in(3 + summary.len() + 8, bump);
     message.extend_from_slice(&CHECKPOINT_SUMMARY_INTENT);
     message.extend_from_slice(summary);
     message.extend_from_slice(&epoch.to_le_bytes());
@@ -172,8 +170,13 @@ pub fn sign(key: &ProtocolKey, summary: &[u8], epoch: u64) -> [u8; 48] {
 
 /// The `ConsensusTransaction` BCS submitting `key`'s signature over
 /// `summary`: a `CheckpointSignatureV2` of a `SignedCheckpointSummary`.
-pub fn signature_transaction(key: &ProtocolKey, summary: &[u8], epoch: u64) -> Vec<u8> {
-    let signature = sign(key, summary, epoch);
+pub fn signature_transaction(
+    key: &ProtocolKey,
+    summary: &[u8],
+    epoch: u64,
+    bump: &Bump,
+) -> Vec<u8> {
+    let signature = sign(key, summary, epoch, bump);
     let mut out = Vec::with_capacity(8 + 1 + summary.len() + 8 + 97 + 48);
     // The tracking id is local bookkeeping; the reference hashes the
     // signature into it.
@@ -193,9 +196,10 @@ mod tests {
 
     #[test]
     fn version_specific_data_lengths() {
-        assert_eq!(version_specific_data_v1(&[]), vec![0, 0]);
+        let bump = Bump::default();
+        assert_eq!(*version_specific_data_v1(&[], &bump), [0, 0]);
         let rounds: Vec<u64> = (0..130).collect();
-        let bytes = version_specific_data_v1(&rounds);
+        let bytes = version_specific_data_v1(&rounds, &bump);
         assert_eq!(&bytes[..3], &[0, 0x82, 0x01]);
         assert_eq!(bytes.len(), 3 + 8 * 130);
     }

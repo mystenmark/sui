@@ -1,0 +1,40 @@
+[package]
+name = "consensus-glue"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# consensus-core under the node: glue only. The pipeline's side of each
+# interface (the voter, the commit handler) is in the validator crate.
+[dependencies]
+consensus.workspace = true
+consensus-config.workspace = true
+consensus-core.workspace = true
+consensus-types.workspace = true
+execution.workspace = true
+fastcrypto.workspace = true
+futures.workspace = true
+mysten-metrics.workspace = true
+node.workspace = true
+prometheus.workspace = true
+sui-protocol-config.workspace = true
+tokio.workspace = true
+validator.workspace = true
+workqueue.workspace = true
+
+[dev-dependencies]
+bcs.workspace = true
+checkpoint.workspace = true
+messages.workspace = true
+protocol-config.workspace = true
+rand.workspace = true
+store.workspace = true
+sui-config.workspace = true
+sui-genesis-builder.workspace = true
+sui-types.workspace = true
+tempfile.workspace = true
+tonic.workspace = true
+
+[lints]
+workspace = true

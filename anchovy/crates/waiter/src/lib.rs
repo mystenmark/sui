@@ -381,7 +381,11 @@ where
     type Input = Command<K, T, V>;
     type Output = Vec<T>;
 
-    fn process(&mut self, command: Command<K, T, V>) -> Option<Vec<T>> {
+    fn process(
+        &mut self,
+        command: Command<K, T, V>,
+        _bump: &mut workqueue::Bump,
+    ) -> Option<Vec<T>> {
         match command {
             Command::Wait(mut batch) => self.waiter.wait_for(&mut batch),
             Command::Resolve(resolved) => self.waiter.resolve(resolved),

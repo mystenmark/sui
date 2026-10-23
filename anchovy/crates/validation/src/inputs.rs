@@ -9,21 +9,22 @@
 //! [`Objects`] source, the node's store.
 //!
 //! Not checked, and refused as unsupported instead where they matter:
-//! address balances (fund withdrawals, coin reservations, gasless
-//! transactions). Not checked: the operator's deny config and the coin
+//! address balances beyond withdrawals from the sender's or sponsor's
+//! (withdrawals from allowances, coin reservations, gas from a balance,
+//! gasless transactions). Not checked: the operator's deny config and the coin
 //! deny list, the bytecode verification of packages to be published
 //! (execution verifies them), and previously received objects (the
 //! reference's markers).
 
-use std::collections::BTreeSet;
-
+use containers::Bump;
 use messages::Message;
 use messages::base::{ObjectDigest, ObjectId, ObjectRef, SuiAddress};
 use messages::object::{Data, MoveObjectType, Object, Owner};
 use messages::system_transaction::EndOfEpochTransactionKind;
 use messages::transaction::{
-    CallArg, Command, ObjectArg, SenderSignedData, SharedObjectArg, SharedObjectMutability,
-    TransactionData, TransactionKind, TxState,
+    CallArg, Command, ObjectArg, Reservation, SenderSignedData, SharedObjectArg,
+    SharedObjectMutability, TransactionData, TransactionKind, TxState, WithdrawFrom,
+    WithdrawalTypeArg,
 };
 use messages::type_tag::TypeTag;
 
@@ -79,11 +80,16 @@ fn not_found(id: &ObjectId, version: Option<u64>) -> Error {
 /// receiving objects are not inputs.
 ///
 /// A system transaction's inputs are the shared objects it updates.
-pub fn input_objects<'a>(
+pub fn input_objects<'a, 'b>(
     data: &TransactionData<'a, impl TxState>,
-) -> Result<Vec<InputKind<'a>>, Error> {
-    let system =
-        |id: u16, initial_shared_version: u64| Ok(vec![shared_mut(id, initial_shared_version)]);
+    bump: &'b Bump,
+) -> Result<containers::Vec<'b, InputKind<'a>>, Error> {
+    let system = |id: u16, initial_shared_version: u64| {
+        let mut inputs = containers::Vec::with_capacity_in(1, bump);
+        inputs.push(shared_mut(id, initial_shared_version));
+        Ok(inputs)
+    };
+    let mut inputs = containers::Vec::new_in(bump);
     let (pt, is_system) = match data.kind() {
         TransactionKind::ProgrammableTransaction(pt) => (pt, false),
         TransactionKind::ProgrammableSystemTransaction(pt) => (pt, true),
@@ -104,17 +110,15 @@ pub fn input_objects<'a>(
             );
         }
         TransactionKind::ChangeEpoch(_) => return system(SYSTEM_STATE, 1),
-        TransactionKind::Genesis(_) => return Ok(vec![]),
+        TransactionKind::Genesis(_) => return Ok(inputs),
         TransactionKind::EndOfEpochTransaction(txns) => {
             // Deduplicated, as transactions may share inputs, in a deterministic order.
-            let mut inputs: Vec<InputKind<'a>> = Vec::new();
-            for input in txns.iter().flat_map(end_of_epoch_inputs) {
+            for input in txns.iter().flat_map(end_of_epoch_inputs).flatten() {
                 if !inputs.contains(&input) {
                     inputs.push(input);
                 }
             }
-            let mut used = BTreeSet::new();
-            if !inputs.iter().all(|i| used.insert(i.id().0)) {
+            if !distinct(&inputs, bump) {
                 return Err(error(
                     ErrorKind::DuplicateObjectRefInput,
                     "an object is input twice",
@@ -123,7 +127,6 @@ pub fn input_objects<'a>(
             return Ok(inputs);
         }
     };
-    let mut inputs = Vec::new();
     for arg in pt.inputs {
         match arg {
             CallArg::Object(ObjectArg::ImmOrOwnedObject(r)) if !r.is_coin_reservation() => {
@@ -133,18 +136,17 @@ pub fn input_objects<'a>(
             _ => {}
         }
     }
-    let mut used = BTreeSet::new();
-    if !inputs.iter().all(|i| used.insert(i.id().0)) {
+    if !distinct(&inputs, bump) {
         return Err(error(
             ErrorKind::DuplicateObjectRefInput,
             "an object is input twice",
         ));
     }
-    let mut packages: BTreeSet<ObjectId> = BTreeSet::new();
+    let mut packages = containers::Vec::new_in(bump);
     for command in pt.commands {
         match command {
             Command::MoveCall(call) => {
-                packages.insert(*call.package);
+                packages.push(*call.package);
                 for t in call.type_arguments {
                     type_packages(t, &mut packages);
                 }
@@ -152,12 +154,14 @@ pub fn input_objects<'a>(
             Command::Publish(_, deps) => packages.extend(deps.iter().copied()),
             Command::Upgrade(_, deps, package, _) => {
                 packages.extend(deps.iter().copied());
-                packages.insert(**package);
+                packages.push(**package);
             }
             Command::MakeMoveVec(Some(t), _) => type_packages(t, &mut packages),
             _ => {}
         }
     }
+    packages.sort_unstable();
+    packages.dedup();
     inputs.extend(packages.into_iter().map(InputKind::Package));
     if !is_system {
         inputs.extend(
@@ -171,24 +175,33 @@ pub fn input_objects<'a>(
     Ok(inputs)
 }
 
+/// Whether no object is input twice.
+fn distinct(inputs: &[InputKind<'_>], bump: &Bump) -> bool {
+    let mut used = containers::hash_set(bump, inputs.len());
+    inputs.iter().all(|i| used.insert(i.id().0))
+}
+
 /// The reference's `EndOfEpochTransactionKind::input_objects`.
-fn end_of_epoch_inputs<'a>(kind: &EndOfEpochTransactionKind<'_>) -> Vec<InputKind<'a>> {
+fn end_of_epoch_inputs<'a>(kind: &EndOfEpochTransactionKind<'_>) -> [Option<InputKind<'a>>; 2] {
     match *kind {
         EndOfEpochTransactionKind::ChangeEpoch(_)
         | EndOfEpochTransactionKind::StoreExecutionTimeObservations(_)
         | EndOfEpochTransactionKind::WriteAccumulatorStorageCost { .. } => {
-            vec![shared_mut(SYSTEM_STATE, 1)]
+            [Some(shared_mut(SYSTEM_STATE, 1)), None]
         }
         EndOfEpochTransactionKind::AuthenticatorStateExpire {
             authenticator_obj_initial_shared_version,
             ..
-        } => vec![shared_mut(
-            AUTHENTICATOR_STATE,
-            authenticator_obj_initial_shared_version,
-        )],
-        EndOfEpochTransactionKind::BridgeCommitteeInit(bridge_version) => vec![
-            shared_mut(BRIDGE, bridge_version),
-            shared_mut(SYSTEM_STATE, 1),
+        } => [
+            Some(shared_mut(
+                AUTHENTICATOR_STATE,
+                authenticator_obj_initial_shared_version,
+            )),
+            None,
+        ],
+        EndOfEpochTransactionKind::BridgeCommitteeInit(bridge_version) => [
+            Some(shared_mut(BRIDGE, bridge_version)),
+            Some(shared_mut(SYSTEM_STATE, 1)),
         ],
         EndOfEpochTransactionKind::AuthenticatorStateCreate
         | EndOfEpochTransactionKind::RandomnessStateCreate
@@ -198,7 +211,7 @@ fn end_of_epoch_inputs<'a>(kind: &EndOfEpochTransactionKind<'_>) -> Vec<InputKin
         | EndOfEpochTransactionKind::CoinRegistryCreate
         | EndOfEpochTransactionKind::DisplayRegistryCreate
         | EndOfEpochTransactionKind::AddressAliasStateCreate
-        | EndOfEpochTransactionKind::ForwardingAddressRegistryCreate => vec![],
+        | EndOfEpochTransactionKind::ForwardingAddressRegistryCreate => [None, None],
     }
 }
 
@@ -219,12 +232,12 @@ const RANDOMNESS_STATE: u16 = 0x8;
 const BRIDGE: u16 = 0x9;
 
 /// Every package a type names.
-fn type_packages(t: &TypeTag<'_>, packages: &mut BTreeSet<ObjectId>) {
+fn type_packages(t: &TypeTag<'_>, packages: &mut containers::Vec<'_, ObjectId>) {
     match t {
         TypeTag::Vector(inner) => type_packages(inner, packages),
         TypeTag::Struct(s) => {
             // An address and an object id are the same 32 bytes.
-            packages.insert(ObjectId(s.address.0));
+            packages.push(ObjectId(s.address.0));
             for p in s.type_params {
                 type_packages(p, packages);
             }
@@ -234,17 +247,18 @@ fn type_packages(t: &TypeTag<'_>, packages: &mut BTreeSet<ObjectId>) {
 }
 
 /// The objects the transaction receives.
-pub fn receiving_objects<'a>(data: &TransactionData<'a, impl TxState>) -> Vec<&'a ObjectRef> {
-    let TransactionKind::ProgrammableTransaction(pt) = data.kind() else {
-        return vec![];
-    };
-    pt.inputs
-        .iter()
-        .filter_map(|arg| match arg {
+pub fn receiving_objects<'a, 'b>(
+    data: &TransactionData<'a, impl TxState>,
+    bump: &'b Bump,
+) -> containers::Vec<'b, &'a ObjectRef> {
+    let mut receiving = containers::Vec::new_in(bump);
+    if let TransactionKind::ProgrammableTransaction(pt) = data.kind() {
+        receiving.extend(pt.inputs.iter().filter_map(|arg| match arg {
             CallArg::Object(ObjectArg::Receiving(r)) => Some(*r),
             _ => None,
-        })
-        .collect()
+        }));
+    }
+    receiving
 }
 
 /// A loaded input.
@@ -288,24 +302,68 @@ impl Input<'_> {
 }
 
 /// Everything above, for one transaction that passed validation and
-/// signature verification.
+/// signature verification, with temporaries in `bump`.
 pub fn check(
     signed: &SenderSignedData<'_, impl TxState>,
     ctx: &Context<'_>,
     objects: &impl Objects,
+    bump: &Bump,
 ) -> Result<(), Error> {
     let data = signed.data();
     refuse_address_balances(data, ctx)?;
-    let kinds = input_objects(data)?;
-    let receiving = receiving_objects(data);
-    let inputs = load(&kinds, objects)?;
-    let received = load_receiving(&receiving, objects)?;
+    let kinds = input_objects(data, bump)?;
+    let receiving = receiving_objects(data, bump);
+    let inputs = load(&kinds, objects, bump)?;
+    let received = load_receiving(&receiving, objects, bump)?;
 
-    check_gas(data, ctx, &inputs)?;
-    check_objects(data, &inputs)?;
+    check_gas(data, ctx, &inputs, bump)?;
+    check_objects(data, &inputs, bump)?;
     check_replay_protection(data, &inputs)?;
-    check_receiving_objects(&inputs, &receiving, &received)?;
-    check_owned_objects_live(&inputs)
+    check_receiving_objects(&inputs, &receiving, &received, bump)?;
+    check_owned_objects_live(&inputs)?;
+    check_funds_withdrawals(data)
+}
+
+/// The reference's `process_funds_withdrawals_for_signing`, for the
+/// withdrawals `refuse_address_balances` lets through: each reserves a
+/// non-zero amount, and the amounts drawn on one balance do not overflow.
+fn check_funds_withdrawals(data: &TransactionData<'_, impl TxState>) -> Result<(), Error> {
+    let TransactionKind::ProgrammableTransaction(pt) = data.kind() else {
+        return Ok(());
+    };
+    let invalid = |message: &str| Err(error(ErrorKind::InvalidWithdrawReservation, message));
+    // Each withdrawal's balance (its owner and type) and amount.
+    let withdrawals = || {
+        pt.inputs.iter().filter_map(|arg| {
+            let CallArg::FundsWithdrawal(w) = arg else {
+                return None;
+            };
+            let w = w.get();
+            let owner = match w.withdraw_from {
+                WithdrawFrom::Sender => data.sender(),
+                WithdrawFrom::Sponsor => data.gas_data().owner,
+                WithdrawFrom::SenderAllowance { funder, .. } => funder,
+            };
+            let WithdrawalTypeArg::Balance(ty) = w.type_arg;
+            let Reservation::MaxAmountU64(amount) = w.reservation;
+            Some(((owner, ty), amount))
+        })
+    };
+    // In order, as the reference accumulates them: each balance's running
+    // total, without a table.
+    for (i, (balance, amount)) in withdrawals().enumerate() {
+        if amount == 0 {
+            return invalid("Balance withdraw reservation amount must be non-zero");
+        }
+        let total = withdrawals()
+            .take(i + 1)
+            .filter(|(b, _)| *b == balance)
+            .try_fold(0u64, |total, (_, amount)| total.checked_add(amount));
+        if total.is_none() {
+            return invalid("Balance withdraw reservation overflow");
+        }
+    }
+    Ok(())
 }
 
 /// Address balances are not kept yet, so nothing that draws on them can be
@@ -335,7 +393,11 @@ fn refuse_address_balances(
     if let TransactionKind::ProgrammableTransaction(pt) = data.kind() {
         for arg in pt.inputs {
             match arg {
-                CallArg::FundsWithdrawal(_) => return unsupported("a funds withdrawal"),
+                CallArg::FundsWithdrawal(w)
+                    if matches!(w.get().withdraw_from, WithdrawFrom::SenderAllowance { .. }) =>
+                {
+                    return unsupported("a withdrawal from an allowance");
+                }
                 CallArg::Object(ObjectArg::ImmOrOwnedObject(r)) if r.is_coin_reservation() => {
                     return unsupported("a coin reservation");
                 }
@@ -348,8 +410,13 @@ fn refuse_address_balances(
 
 /// `read_objects_for_signing`: packages and shared objects one at a time,
 /// in order; then the owned objects, whose errors say more.
-fn load<'a>(kinds: &[InputKind<'a>], objects: &impl Objects) -> Result<Vec<Input<'a>>, Error> {
-    let mut loaded: Vec<Option<Input<'a>>> = kinds.iter().map(|_| None).collect();
+fn load<'a, 'b>(
+    kinds: &[InputKind<'a>],
+    objects: &impl Objects,
+    bump: &'b Bump,
+) -> Result<containers::Vec<'b, Input<'a>>, Error> {
+    let mut loaded = containers::Vec::with_capacity_in(kinds.len(), bump);
+    loaded.extend(kinds.iter().map(|_| None::<Input<'a>>));
     for (i, kind) in kinds.iter().enumerate() {
         let object = match kind {
             InputKind::Package(id) => {
@@ -411,10 +478,9 @@ fn load<'a>(kinds: &[InputKind<'a>], objects: &impl Objects) -> Result<Vec<Input
             live,
         });
     }
-    Ok(loaded
-        .into_iter()
-        .map(|i| i.expect("every input loaded"))
-        .collect())
+    let mut inputs = containers::Vec::with_capacity_in(kinds.len(), bump);
+    inputs.extend(loaded.into_iter().map(|i| i.expect("every input loaded")));
+    Ok(inputs)
 }
 
 /// The version a consensus object's stream starts at; none for other owners.
@@ -430,18 +496,19 @@ fn start_version(owner: &Owner<'_>) -> Option<u64> {
 }
 
 /// `read_receiving_objects_for_signing`: each live object, or none.
-fn load_receiving(
+fn load_receiving<'b>(
     receiving: &[&ObjectRef],
     objects: &impl Objects,
-) -> Result<Vec<Message<Object<'static>>>, Error> {
-    receiving
-        .iter()
-        .map(|r| {
-            objects
-                .live(&r.id)
-                .ok_or_else(|| not_found(&r.id, Some(r.version.get())))
-        })
-        .collect()
+    bump: &'b Bump,
+) -> Result<containers::Vec<'b, Message<Object<'static>>>, Error> {
+    let mut received = containers::Vec::with_capacity_in(receiving.len(), bump);
+    for r in receiving {
+        let object = objects
+            .live(&r.id)
+            .ok_or_else(|| not_found(&r.id, Some(r.version.get())))?;
+        received.push(object);
+    }
+    Ok(received)
 }
 
 /// `check_gas`: the price, then the gas coins' owners and balance. (The
@@ -450,19 +517,17 @@ fn check_gas(
     data: &TransactionData<'_, impl TxState>,
     ctx: &Context<'_>,
     inputs: &[Input<'_>],
+    bump: &Bump,
 ) -> Result<(), Error> {
     let gas = data.gas_data();
     transaction_data::check_gas_price(gas.price, ctx)?;
-    let coins: Vec<&Input<'_>> = gas
-        .payment
-        .iter()
-        .map(|r| {
-            inputs
-                .iter()
-                .find(|i| i.kind.id() == &r.id)
-                .expect("gas coins are inputs")
-        })
-        .collect();
+    let mut coins = containers::Vec::with_capacity_in(gas.payment.len(), bump);
+    coins.extend(gas.payment.iter().map(|r| {
+        inputs
+            .iter()
+            .find(|i| i.kind.id() == &r.id)
+            .expect("gas coins are inputs")
+    }));
     // `check_gas_objects`, which `check_gas_balance` repeats.
     for coin in &coins {
         if !matches!(coin.object().owner, Owner::AddressOwner(_)) {
@@ -502,8 +567,9 @@ fn check_gas(
 fn check_objects(
     data: &TransactionData<'_, impl TxState>,
     inputs: &[Input<'_>],
+    bump: &Bump,
 ) -> Result<(), Error> {
-    let mut mutable = BTreeSet::new();
+    let mut mutable = containers::hash_set(bump, inputs.len());
     for input in inputs {
         if input.is_mutable() && !mutable.insert(input.kind.id().0) {
             return Err(error(
@@ -708,8 +774,10 @@ fn check_receiving_objects(
     inputs: &[Input<'_>],
     receiving: &[&ObjectRef],
     received: &[Message<Object<'static>>],
+    bump: &Bump,
 ) -> Result<(), Error> {
-    let mut seen: BTreeSet<[u8; 32]> = inputs.iter().map(|i| i.kind.id().0).collect();
+    let mut seen = containers::hash_set(bump, inputs.len() + receiving.len());
+    seen.extend(inputs.iter().map(|i| i.kind.id().0));
     for (i, r) in receiving.iter().enumerate() {
         let version = r.version.get();
         if version == u64::MAX {

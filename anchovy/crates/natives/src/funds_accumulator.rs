@@ -75,8 +75,8 @@ pub fn add_to_accumulator_address(
     ));
 
     // TODO this will need to look at the layout of T when this is not guaranteed to be a Balance
-    let Some([amount]): Option<[Value; 1]> = value.unpack().collect::<Vec<_>>().try_into().ok()
-    else {
+    let mut fields = value.unpack();
+    let (Some(amount), None) = (fields.next(), fields.next()) else {
         debug_assert!(false);
         return Err(
             PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR).with_message(

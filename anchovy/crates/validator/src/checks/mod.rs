@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use containers::Bump;
 use messages::Message;
-use messages::base::{Digest, ObjectId};
+use messages::base::{Hashed, ObjectId};
 use messages::object::Object;
 use messages::transaction::{Attested, DigestPending, HasDigest, Transaction, TxState};
 use validation::{sender_signed, verify};
@@ -96,13 +96,12 @@ pub type InputsCheckedTransaction = Message<Transaction<'static, InputsChecked>>
 pub fn validate(
     mut transactions: Vec<Unchecked>,
     context: &validation::Context<'_>,
-    bump: &mut Bump,
+    bump: &Bump,
 ) -> (Vec<ValidTransaction>, Option<validation::Error>) {
     let failed = transactions
         .iter()
         .enumerate()
         .find_map(|(i, transaction)| {
-            bump.reset();
             sender_signed::validity_check(&transaction.get().0, context, bump)
                 .err()
                 .map(|e| (i, e))
@@ -119,9 +118,8 @@ pub fn validate(
 pub fn validate_one(
     transaction: Unchecked,
     context: &validation::Context<'_>,
-    bump: &mut Bump,
+    bump: &Bump,
 ) -> Result<ValidTransaction, validation::Error> {
-    bump.reset();
     sender_signed::validity_check(&transaction.get().0, context, bump)?;
     Ok(transaction.with_digest().relabel(&Witness(PhantomData)))
 }
@@ -130,11 +128,7 @@ pub fn validate_one(
 pub struct SignatureChecks {
     epoch: Arc<EpochState>,
     cache: SignatureCache,
-    bump: Bump,
 }
-
-/// Enough for the temporaries of nearly every transaction.
-const ARENA_BYTES: usize = 64 * 1024;
 
 impl SignatureChecks {
     /// In `epoch`, with a cache of `2 * generation` entries.
@@ -142,7 +136,6 @@ impl SignatureChecks {
         SignatureChecks {
             cache: SignatureCache::new(epoch.params.epoch, generation),
             epoch,
-            bump: Bump::with_capacity(ARENA_BYTES),
         }
     }
 
@@ -157,9 +150,10 @@ impl SignatureChecks {
     pub fn verify(
         &mut self,
         transactions: Vec<ValidTransaction>,
+        bump: &Bump,
     ) -> Result<Vec<VerifiedTransaction>, validation::Error> {
         for transaction in &transactions {
-            self.verify_signatures(transaction)?;
+            self.verify_signatures(transaction, bump)?;
         }
         Ok(Message::relabel_all(transactions, &Witness(PhantomData)))
     }
@@ -170,8 +164,9 @@ impl SignatureChecks {
     pub fn verify_one(
         &mut self,
         transaction: ValidTransaction,
+        bump: &Bump,
     ) -> Result<(VerifiedTransaction, SignerIndices), validation::Error> {
-        let indices = self.verify_signatures(&transaction)?;
+        let indices = self.verify_signatures(&transaction, bump)?;
         Ok((transaction.relabel(&Witness(PhantomData)), indices))
     }
 
@@ -179,15 +174,16 @@ impl SignatureChecks {
     /// signatures in one batch, which costs less than verifying each. Each
     /// transaction verifies exactly when it would alone: if the batch fails,
     /// each transaction's Ed25519 signatures are verified on their own.
-    pub fn verify_batch(
+    pub fn verify_batch<'b>(
         &mut self,
-        transactions: Vec<ValidTransaction>,
-    ) -> Vec<Result<(VerifiedTransaction, SignerIndices), validation::Error>> {
+        transactions: containers::Vec<'b, ValidTransaction>,
+        bump: &'b Bump,
+    ) -> containers::Vec<'b, Result<(VerifiedTransaction, SignerIndices), validation::Error>> {
         enum Prepared {
             Cached(SignerIndices),
             /// Verified but for its Ed25519 checks, `deferred[checks]`.
             Pending {
-                key: Digest,
+                key: Hashed,
                 indices: SignerIndices,
                 checks: std::ops::Range<usize>,
             },
@@ -196,85 +192,84 @@ impl SignatureChecks {
         let epoch = self.epoch.clone();
         // 1. Cache hits stand; the rest are checked, but for their Ed25519
         //    signatures' verification.
-        let mut deferred = Vec::new();
-        let prepared: Vec<Prepared> = transactions
-            .iter()
-            .map(|transaction| {
-                let (key, cached) = self.cache.lookup(transaction);
-                if let Some(indices) = cached {
-                    return Prepared::Cached(indices);
+        let mut deferred = containers::Vec::new_in(bump);
+        let mut prepared = containers::Vec::with_capacity_in(transactions.len(), bump);
+        prepared.extend(transactions.iter().map(|transaction| {
+            let (key, cached) = self.cache.lookup(transaction);
+            if let Some(indices) = cached {
+                return Prepared::Cached(indices);
+            }
+            let signed = &transaction.get().0;
+            let start = deferred.len();
+            let prepared =
+                sender_signed::deserialization_checks(signed, bump).and_then(|(signatures, _)| {
+                    verify::verify_signatures_deferring_ed25519(
+                        signed,
+                        signatures,
+                        epoch.params.epoch,
+                        &epoch.verifier,
+                        &[],
+                        bump,
+                        &mut deferred,
+                    )
+                });
+            match prepared {
+                Ok(indices) => Prepared::Pending {
+                    key,
+                    indices,
+                    checks: start..deferred.len(),
+                },
+                Err(e) => {
+                    deferred.truncate(start);
+                    Prepared::Failed(e)
                 }
-                self.bump.reset();
-                let signed = &transaction.get().0;
-                let start = deferred.len();
-                let prepared = sender_signed::deserialization_checks(signed, &self.bump).and_then(
-                    |(signatures, _)| {
-                        verify::verify_signatures_deferring_ed25519(
-                            signed,
-                            signatures,
-                            epoch.params.epoch,
-                            &epoch.verifier,
-                            &[],
-                            &self.bump,
-                            &mut deferred,
-                        )
-                    },
-                );
-                match prepared {
-                    Ok(indices) => Prepared::Pending {
-                        key,
-                        indices,
-                        checks: start..deferred.len(),
-                    },
-                    Err(e) => {
-                        deferred.truncate(start);
-                        Prepared::Failed(e)
-                    }
-                }
-            })
-            .collect();
+            }
+        }));
 
         // 2. One batch; if it fails, each transaction's checks alone.
         let batch_verified = verify::verify_ed25519_batch(&deferred);
 
         // 3. The verified enter the cache. `prepared` has an entry per
         // transaction.
-        transactions
-            .into_iter()
-            .zip(prepared)
-            .map(|(transaction, prepared)| {
-                let indices = match prepared {
-                    Prepared::Cached(indices) => indices,
-                    Prepared::Pending {
-                        key,
-                        indices,
-                        checks,
-                    } => {
-                        let verified =
-                            batch_verified || deferred[checks].iter().all(verify::verify_ed25519);
-                        if !verified {
-                            return Err(validation::Error::new(
-                                validation::ErrorKind::InvalidSignature,
-                                "signature does not verify",
-                            ));
+        let mut verified = containers::Vec::with_capacity_in(transactions.len(), bump);
+        verified.extend(
+            transactions
+                .into_iter()
+                .zip(prepared)
+                .map(|(transaction, prepared)| {
+                    let indices = match prepared {
+                        Prepared::Cached(indices) => indices,
+                        Prepared::Pending {
+                            key,
+                            indices,
+                            checks,
+                        } => {
+                            let verified = batch_verified
+                                || deferred[checks].iter().all(verify::verify_ed25519);
+                            if !verified {
+                                return Err(validation::Error::new(
+                                    validation::ErrorKind::InvalidSignature,
+                                    "signature does not verify",
+                                ));
+                            }
+                            self.cache.insert(key, indices);
+                            indices
                         }
-                        self.cache.insert(key, indices);
-                        indices
-                    }
-                    Prepared::Failed(e) => return Err(e),
-                };
-                Ok((transaction.relabel(&Witness(PhantomData)), indices))
-            })
-            .collect()
+                        Prepared::Failed(e) => return Err(e),
+                    };
+                    Ok((transaction.relabel(&Witness(PhantomData)), indices))
+                }),
+        );
+        verified
     }
 
     fn verify_signatures(
         &mut self,
         transaction: &ValidTransaction,
+        bump: &Bump,
     ) -> Result<SignerIndices, validation::Error> {
-        let (epoch, bump) = (&self.epoch, &mut self.bump);
+        let epoch = &self.epoch;
         self.cache.verify(transaction, |signed| {
-            bump.reset();
             let (signatures, _) = sender_signed::deserialization_checks(signed, bump)?;
             // No aliases: they are object state, which does not exist yet.
             verify::verify_signatures(
@@ -296,8 +291,14 @@ pub fn check_inputs(
     epoch: &EpochState,
     store: &store::Store,
     transaction: VerifiedTransaction,
+    bump: &Bump,
 ) -> Result<InputsCheckedTransaction, validation::Error> {
-    validation::inputs::check(&transaction.get().0, &epoch.context(), &StoreObjects(store))?;
+    validation::inputs::check(
+        &transaction.get().0,
+        &epoch.context(),
+        &StoreObjects(store),
+        bump,
+    )?;
     Ok(transaction.relabel(&Witness(PhantomData)))
 }
 
@@ -316,8 +317,14 @@ pub fn inputs_pass(
     epoch: &EpochState,
     store: &store::Store,
     transaction: &VerifiedTransaction,
+    bump: &Bump,
 ) -> Result<(), validation::Error> {
-    validation::inputs::check(&transaction.get().0, &epoch.context(), &StoreObjects(store))
+    validation::inputs::check(
+        &transaction.get().0,
+        &epoch.context(),
+        &StoreObjects(store),
+        bump,
+    )
 }
 
 struct StoreObjects<'a>(&'a store::Store);

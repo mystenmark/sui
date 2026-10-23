@@ -73,6 +73,7 @@ impl VersionResolver {
         &mut self,
         entry: &ScheduledEntry,
         chain_identifier: &ChainIdentifier,
+        bump: &Bump,
     ) -> Vec<(StreamId, u32, u32)> {
         self.keys.clear();
         self.amounts.clear();
@@ -81,7 +82,7 @@ impl VersionResolver {
         if let ExecutableTransaction::User(transaction) = &entry.transaction {
             let data = transaction.get().0.data();
             self.object_keys(data);
-            funds_withdrawals(data, chain_identifier, &mut self.amounts);
+            funds_withdrawals(data, chain_identifier, &mut self.amounts, bump);
         }
         resolved_base
     }
@@ -188,6 +189,7 @@ fn funds_withdrawals(
     data: &TransactionData<'_, impl TxState>,
     chain_identifier: &ChainIdentifier,
     amounts: &mut Vec<(ObjectId, u64)>,
+    bump: &Bump,
 ) {
     let index = data.index();
     let gas = data.gas_data();
@@ -198,7 +200,6 @@ fn funds_withdrawals(
     {
         return;
     }
-    let bump = Bump::with_capacity(256);
     for withdrawal in index.funds_withdrawals {
         let withdrawal = withdrawal.get();
         let Reservation::MaxAmountU64(amount) = withdrawal.reservation;
@@ -210,13 +211,13 @@ fn funds_withdrawals(
         };
         let WithdrawalTypeArg::Balance(inner) = withdrawal.type_arg;
         let account =
-            get_field_id(owner, &balance_type(&bump, inner)).expect("checked at signing time");
+            get_field_id(owner, &balance_type(bump, inner)).expect("checked at signing time");
         amounts.push((account, amount));
     }
     if gas_from_balance {
         // Sponsor or sender: either way the gas owner.
         let account =
-            get_field_id(gas.owner, &sui_balance_type(&bump)).expect("checked at signing time");
+            get_field_id(gas.owner, &sui_balance_type(bump)).expect("checked at signing time");
         amounts.push((account, gas.budget));
     }
     for reservation in index.coin_reservations {
@@ -254,7 +255,7 @@ impl Processor for VersionResolver {
     type Input = Chunk;
     type Output = ();
 
-    fn process(&mut self, chunk: Chunk) -> Option<()> {
+    fn process(&mut self, chunk: Chunk, bump: &mut Bump) -> Option<()> {
         let Chunk {
             version,
             root_version,
@@ -266,7 +267,7 @@ impl Processor for VersionResolver {
         let mut withdrawals = Vec::new();
         for entry in entries {
             let chain_identifier = self.epoch.chain_identifier;
-            let resolved_base = self.resolve(&entry, &chain_identifier);
+            let resolved_base = self.resolve(&entry, &chain_identifier, bump);
             let reserved: Vec<keys::Reservation> = self
                 .amounts
                 .drain(..)
@@ -280,7 +281,7 @@ impl Processor for VersionResolver {
                 let ExecutableTransaction::User(transaction) = &entry.transaction else {
                     unreachable!("only user transactions withdraw funds");
                 };
-                let digest = transaction.get().0.digest().bytes;
+                let digest = *transaction.get().0.digest();
                 self.keys.push(InputKey::Reserved(digest));
                 withdrawals.push(Withdrawal {
                     digest,

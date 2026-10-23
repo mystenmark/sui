@@ -116,11 +116,14 @@ fn roots_fold_in_order() {
         let seq = seq as u64;
         assert!(
             processor
-                .process(CheckpointEffects {
-                    last_of_epoch: false,
-                    seq,
-                    effects: effects.clone()
-                })
+                .process(
+                    CheckpointEffects {
+                        last_of_epoch: false,
+                        seq,
+                        effects: effects.clone()
+                    },
+                    &mut workqueue::Bump::default()
+                )
                 .is_none()
         );
         assert_eq!(hashes.checkpoint(seq), Some(reference(effects)));
@@ -154,11 +157,14 @@ fn roots_fold_in_order_whatever_the_arrival_order() {
     let mut arrived = vec![false; checkpoints.len()];
     for i in order {
         let seq = first + i as u64;
-        processor.process(CheckpointEffects {
-            last_of_epoch: false,
-            seq,
-            effects: checkpoints[i].clone(),
-        });
+        processor.process(
+            CheckpointEffects {
+                last_of_epoch: false,
+                seq,
+                effects: checkpoints[i].clone(),
+            },
+            &mut workqueue::Bump::default(),
+        );
         arrived[i] = true;
         assert_eq!(hashes.checkpoint(seq), Some(reference(&checkpoints[i])));
         let folded = arrived.iter().take_while(|a| **a).count();
@@ -184,10 +190,13 @@ fn a_checkpoint_hashed_twice_panics() {
     let (hashes, _dir) = state_hashes();
     let mut processor = StateHasher::new(hashes, 0, StateHash::default());
     for _ in 0..2 {
-        processor.process(CheckpointEffects {
-            last_of_epoch: false,
-            seq: 3,
-            effects: vec![],
-        });
+        processor.process(
+            CheckpointEffects {
+                last_of_epoch: false,
+                seq: 3,
+                effects: vec![],
+            },
+            &mut workqueue::Bump::default(),
+        );
     }
 }

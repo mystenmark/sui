@@ -11,7 +11,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 use messages::Message;
-use messages::base::{Digest, ObjectId};
+use messages::base::{Digest, Hashed, ObjectId};
 use messages::effects::TransactionEffects;
 use messages::transaction::SharedObjectMutability;
 use protocol_config::{Chain, ProtocolVersion};
@@ -230,7 +230,8 @@ impl Harness {
             .map_err(|(e, _)| e)
             .unwrap();
         let digest = match &view.get().version {
-            messages::effects::VersionedEffects::V2(v2) => *v2.transaction_digest,
+            // The built transaction's digest.
+            messages::effects::VersionedEffects::V2(v2) => Hashed::computed(*v2.transaction_digest),
             messages::effects::VersionedEffects::V1(_) => unreachable!(),
         };
         self.store
@@ -248,7 +249,8 @@ impl Harness {
     }
 
     fn process(&mut self, input: SettlementInput) {
-        self.scheduler.process(input);
+        self.scheduler
+            .process(input, &mut workqueue::Bump::default());
     }
 
     /// Settles the chunk the scheduler is settling: executes its
@@ -268,7 +270,7 @@ impl Harness {
         let (waits, _, _) = drain(&self.effects);
         let settlements = if matches!(system(&sent[0]).kind, SystemKind::Settlement { .. }) {
             for s in &sent {
-                self.execute(&support::effects(system(s).digest, 20, &[], vec![]));
+                self.execute(&support::effects(system(s).digest.bytes, 20, &[], vec![]));
             }
             let digests: Vec<TxDigest> = sent.iter().map(|s| system(s).digest).collect();
             assert!(
@@ -288,7 +290,7 @@ impl Harness {
         assert!(sent.is_empty());
         let digest = system(&barrier).digest;
         self.execute(&support::effects(
-            digest,
+            digest.bytes,
             21,
             &[],
             vec![support::root_mutated(ISV, 20)],
@@ -307,7 +309,8 @@ fn expected_settlements(effects: &[Vec<u8>], height: u64, offset: u64) -> Vec<se
         .iter()
         .map(|b| Message::parse(b.clone()).map_err(|(e, _)| e).unwrap())
         .collect();
-    let mut builder = SettlementBuilder::new(SEQ, offset);
+    let bump = containers::Bump::default();
+    let mut builder = SettlementBuilder::new(SEQ, offset, &bump);
     for (i, e) in parsed.iter().enumerate() {
         builder.add(i as u64, e.get());
     }
@@ -331,7 +334,10 @@ fn digests_of(effects: &[Vec<u8>]) -> Vec<TxDigest> {
                 .map_err(|(e, _)| e)
                 .unwrap();
             match &view.get().version {
-                messages::effects::VersionedEffects::V2(v2) => v2.transaction_digest.bytes,
+                // The built system transactions' digests.
+                messages::effects::VersionedEffects::V2(v2) => {
+                    Hashed::computed(*v2.transaction_digest)
+                }
                 messages::effects::VersionedEffects::V1(_) => unreachable!(),
             }
         })
@@ -352,7 +358,7 @@ fn settles_a_chunk_end_to_end() {
     assert!(matches!(&waits[..], [EffectsWaitItem::ChunkExecuted(w)] if w.height == 10));
     assert_eq!(
         keys,
-        digests.iter().copied().map(EffectsKey).collect::<Vec<_>>()
+        digests.iter().map(|d| EffectsKey(**d)).collect::<Vec<_>>()
     );
 
     for e in &effects {
@@ -392,7 +398,7 @@ fn settles_a_chunk_end_to_end() {
 
     // The settlements created two accumulator objects.
     let settlement_effects = support::effects(
-        expected[0].digest,
+        expected[0].digest.bytes,
         20,
         &[],
         vec![
@@ -422,11 +428,11 @@ fn settles_a_chunk_end_to_end() {
         matches!(&waits[..], [EffectsWaitItem::SettlementExecuted { height: 10, digests }]
         if digests == &[expected_barrier.digest])
     );
-    assert_eq!(keys, vec![EffectsKey(expected_barrier.digest)]);
+    assert_eq!(keys, vec![EffectsKey(*expected_barrier.digest)]);
     assert!(h.chunks.get(10).is_none());
 
     h.execute(&support::effects(
-        expected_barrier.digest,
+        expected_barrier.digest.bytes,
         21,
         &[],
         vec![support::root_mutated(ISV, 20)],
@@ -536,7 +542,7 @@ fn chunks_settle_in_height_order_with_offsets_and_root_generations() {
     );
     assert_eq!(barrier.resolved_base, vec![(stream(), 3, 2)]);
     h.execute(&support::effects(
-        system(barrier).digest,
+        system(barrier).digest.bytes,
         30,
         &[],
         vec![support::root_mutated(ISV, 29)],
@@ -629,7 +635,8 @@ fn settled_balances_are_read_at_the_barriers_version() {
 fn withdrawal(n: u8, version: u64, amounts: &[(u16, u64)]) -> Withdrawal {
     let version = AccumulatorVersion(version);
     Withdrawal {
-        digest: [n; 32],
+        // A stand-in: a withdrawal without a transaction.
+        digest: Hashed::computed(Digest::new([n; 32])),
         reservations: amounts
             .iter()
             .map(|&(account, amount)| Reservation {
@@ -659,7 +666,7 @@ fn released(inputs: &Inbox<InputCommand>) -> Vec<(u8, ReservationStatus)> {
             let (InputKey::Reserved(digest), InputValue::Reserved(status)) = (key, value) else {
                 panic!("only `Reserved` keys");
             };
-            released.push((digest[0], status));
+            released.push((digest.bytes[0], status));
         }
     }
     released
@@ -676,20 +683,26 @@ fn reservations_resolve_in_consensus_order_against_the_settled_balance() {
     write(&store, ObjectId(support::id(b)), 3, account_object(50));
     write(&store, ObjectId(support::id(a)), 4, account_object(1));
     let (mut reserver, inputs) = reserver(store);
-    reserver.process(FundsCommand::Settle(vec![settled(10, 3, &[], 0)]));
+    reserver.process(
+        FundsCommand::Settle(vec![settled(10, 3, &[], 0)]),
+        &mut workqueue::Bump::default(),
+    );
 
-    reserver.process(FundsCommand::Reserve(vec![
-        withdrawal(1, 10, &[(a, 60)]),
-        // 40 left in `a`.
-        withdrawal(2, 10, &[(a, 50)]),
-        // `b` falls short, but `a` is charged anyway, as in the reference.
-        withdrawal(3, 10, &[(a, 40), (b, 60)]),
-        withdrawal(4, 10, &[(a, 1)]),
-        withdrawal(5, 10, &[(b, 50)]),
-        // An account never funded holds nothing.
-        withdrawal(6, 10, &[(c, 0)]),
-        withdrawal(7, 10, &[(c, 1)]),
-    ]));
+    reserver.process(
+        FundsCommand::Reserve(vec![
+            withdrawal(1, 10, &[(a, 60)]),
+            // 40 left in `a`.
+            withdrawal(2, 10, &[(a, 50)]),
+            // `b` falls short, but `a` is charged anyway, as in the reference.
+            withdrawal(3, 10, &[(a, 40), (b, 60)]),
+            withdrawal(4, 10, &[(a, 1)]),
+            withdrawal(5, 10, &[(b, 50)]),
+            // An account never funded holds nothing.
+            withdrawal(6, 10, &[(c, 0)]),
+            withdrawal(7, 10, &[(c, 1)]),
+        ]),
+        &mut workqueue::Bump::default(),
+    );
     assert_eq!(
         released(&inputs),
         [
@@ -712,33 +725,51 @@ fn a_transaction_waits_for_all_its_reservations() {
     let (a, b) = (0x3001, 0x3002);
     write(&store, ObjectId(support::id(a)), 3, account_object(100));
     let (mut reserver, inputs) = reserver(store);
-    reserver.process(FundsCommand::Settle(vec![settled(10, 3, &[], 0)]));
+    reserver.process(
+        FundsCommand::Settle(vec![settled(10, 3, &[], 0)]),
+        &mut workqueue::Bump::default(),
+    );
 
     // Version 11 is unsettled: `a` is certain, `b` (empty) is not.
-    reserver.process(FundsCommand::Reserve(vec![
-        withdrawal(1, 11, &[(a, 30), (b, 5)]),
-        withdrawal(2, 11, &[(a, 30)]),
-    ]));
+    reserver.process(
+        FundsCommand::Reserve(vec![
+            withdrawal(1, 11, &[(a, 30), (b, 5)]),
+            withdrawal(2, 11, &[(a, 30)]),
+        ]),
+        &mut workqueue::Bump::default(),
+    );
     assert_eq!(released(&inputs), [(2, Fulfilled)]);
     // A deposit commit 10 made into `b` settles the doubt early.
-    reserver.process(FundsCommand::Settle(vec![Settle::Deposit(
-        ObjectId(support::id(b)),
-        5,
-        AccumulatorVersion(11),
-    )]));
+    reserver.process(
+        FundsCommand::Settle(vec![Settle::Deposit(
+            ObjectId(support::id(b)),
+            5,
+            AccumulatorVersion(11),
+        )]),
+        &mut workqueue::Bump::default(),
+    );
     assert_eq!(released(&inputs), [(1, Fulfilled)]);
 
     // Version 12: `b` will hold at least 5 − 5; this waits for settlement.
-    reserver.process(FundsCommand::Reserve(vec![withdrawal(3, 12, &[(b, 1)])]));
+    reserver.process(
+        FundsCommand::Reserve(vec![withdrawal(3, 12, &[(b, 1)])]),
+        &mut workqueue::Bump::default(),
+    );
     assert!(released(&inputs).is_empty());
-    reserver.process(FundsCommand::Settle(vec![settled(11, 4, &[], 0)]));
+    reserver.process(
+        FundsCommand::Settle(vec![settled(11, 4, &[], 0)]),
+        &mut workqueue::Bump::default(),
+    );
     assert!(released(&inputs).is_empty());
     let b_id = ObjectId(support::id(b));
-    reserver.process(FundsCommand::Settle(vec![Settle::Settled {
-        balances: vec![(b_id, 0)],
-        version: AccumulatorVersion(12),
-        root_version: 5,
-    }]));
+    reserver.process(
+        FundsCommand::Settle(vec![Settle::Settled {
+            balances: vec![(b_id, 0)],
+            version: AccumulatorVersion(12),
+            root_version: 5,
+        }]),
+        &mut workqueue::Bump::default(),
+    );
     assert_eq!(released(&inputs), [(3, Cancelled)]);
 }
 
@@ -750,27 +781,42 @@ fn unwithdrawn_reservations_are_credited_to_later_versions() {
     let (a, b) = (0x3001, 0x3002);
     write(&store, ObjectId(support::id(a)), 3, account_object(100));
     let (mut reserver, inputs) = reserver(store);
-    reserver.process(FundsCommand::Settle(vec![settled(10, 3, &[], 0)]));
+    reserver.process(
+        FundsCommand::Settle(vec![settled(10, 3, &[], 0)]),
+        &mut workqueue::Bump::default(),
+    );
 
     // `a` is certain at 11, `b` (empty) is not; 12 has nothing left of `a`.
-    reserver.process(FundsCommand::Reserve(vec![
-        withdrawal(1, 11, &[(a, 100), (b, 5)]),
-        withdrawal(2, 12, &[(a, 50)]),
-    ]));
+    reserver.process(
+        FundsCommand::Reserve(vec![
+            withdrawal(1, 11, &[(a, 100), (b, 5)]),
+            withdrawal(2, 12, &[(a, 50)]),
+        ]),
+        &mut workqueue::Bump::default(),
+    );
     assert!(released(&inputs).is_empty());
     // 11 settles: `b` cancels the first, which withdraws nothing, so its 100
     // from `a` is credited back and the second is certain.
-    reserver.process(FundsCommand::Settle(vec![settled(11, 4, &[], 0)]));
+    reserver.process(
+        FundsCommand::Settle(vec![settled(11, 4, &[], 0)]),
+        &mut workqueue::Bump::default(),
+    );
     assert_eq!(released(&inputs), [(1, Cancelled), (2, Fulfilled)]);
 
     // L(13) = 100 − 50: a reservation of 90 waits until the second's
     // transaction turns out to have withdrawn only 10.
-    reserver.process(FundsCommand::Reserve(vec![withdrawal(3, 13, &[(a, 90)])]));
+    reserver.process(
+        FundsCommand::Reserve(vec![withdrawal(3, 13, &[(a, 90)])]),
+        &mut workqueue::Bump::default(),
+    );
     assert!(released(&inputs).is_empty());
-    reserver.process(FundsCommand::Settle(vec![Settle::Credit(
-        ObjectId(support::id(a)),
-        40,
-        AccumulatorVersion(12),
-    )]));
+    reserver.process(
+        FundsCommand::Settle(vec![Settle::Credit(
+            ObjectId(support::id(a)),
+            40,
+            AccumulatorVersion(12),
+        )]),
+        &mut workqueue::Bump::default(),
+    );
     assert_eq!(released(&inputs), [(3, Fulfilled)]);
 }
