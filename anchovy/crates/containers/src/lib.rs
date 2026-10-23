@@ -90,8 +90,10 @@ pub fn hash_set<K>(bump: &Bump, capacity: usize) -> HashSet<'_, K> {
 pub type MessageMap<'a, K, V> = hashbrown::HashMap<K, V, DigestHasher, &'a Bump>;
 pub type MessageSet<'a, K> = hashbrown::HashSet<K, DigestHasher, &'a Bump>;
 
-/// [`MessageMap`] on the heap, for tables that outlive an arena.
+/// [`MessageMap`] and [`MessageSet`] on the heap, for tables that outlive
+/// an arena.
 pub type HeapMessageMap<K, V> = hashbrown::HashMap<K, V, DigestHasher>;
+pub type HeapMessageSet<K> = hashbrown::HashSet<K, DigestHasher>;
 
 pub fn message_map<K: DigestKey, V>(bump: &Bump, capacity: usize) -> MessageMap<'_, K, V> {
     MessageMap::with_capacity_and_hasher_in(capacity, DigestHasher::new(), bump)
@@ -103,6 +105,10 @@ pub fn message_set<K: DigestKey>(bump: &Bump, capacity: usize) -> MessageSet<'_,
 
 pub fn heap_message_map<K: DigestKey, V>(capacity: usize) -> HeapMessageMap<K, V> {
     HeapMessageMap::with_capacity_and_hasher(capacity, DigestHasher::new())
+}
+
+pub fn heap_message_set<K: DigestKey>(capacity: usize) -> HeapMessageSet<K> {
+    HeapMessageSet::with_capacity_and_hasher(capacity, DigestHasher::new())
 }
 
 /// A key a [`DigestHasher`] may hash: its `Hash` calls `write_u64` once,

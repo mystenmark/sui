@@ -6,13 +6,15 @@
 //! (`store::epoch`), in three sections: consensus output, written only by
 //! the commit handler; checkpoint builder state; and everything else.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest as _};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use containers::{HeapMessageMap, HeapMessageSet};
+use hashbrown::HashMap;
 use messages::base::{Digest, Hashed, ObjectId, ObjectRef};
 use store::Live;
 use store::epoch::{EpochDb, Space};
@@ -55,9 +57,9 @@ impl EpochStore {
                 deferred,
                 open: Output::default(),
                 queued: std::collections::VecDeque::new(),
-                processed: HashMap::new(),
-                locks: HashMap::new(),
-                streams: HashMap::new(),
+                processed: containers::heap_message_map(0),
+                locks: SipMap::default(),
+                streams: SipMap::default(),
                 committed_height: 0,
             })),
         };
@@ -312,19 +314,22 @@ struct Quarantine {
     /// The latest queued value of each key, and how many queued outputs
     /// wrote it: a key leaves memory with the last of them, as the
     /// reference's `RefCountedHashMap`.
-    processed: HashMap<TxDigest, usize>,
-    locks: HashMap<ObjectRef, (TxDigest, usize)>,
-    streams: HashMap<StreamId, ((u32, u32), usize)>,
+    processed: HeapMessageMap<TxDigest, usize>,
+    locks: SipMap<ObjectRef, (TxDigest, usize)>,
+    streams: SipMap<StreamId, ((u32, u32), usize)>,
     /// The last chunk height of the last checkpoint committed.
     committed_height: u64,
 }
 
+/// A table keyed by object references or ids from transactions' inputs,
+/// which a client chooses: hashed whole, by `SipHash`.
+type SipMap<K, V> = HashMap<K, V, std::hash::RandomState>;
+
 /// One commit's output.
-#[derive(Default)]
 struct Output {
-    processed: std::collections::HashSet<TxDigest>,
-    locks: HashMap<ObjectRef, TxDigest>,
-    streams: HashMap<StreamId, (u32, u32)>,
+    processed: HeapMessageSet<TxDigest>,
+    locks: SipMap<ObjectRef, TxDigest>,
+    streams: SipMap<StreamId, (u32, u32)>,
     /// The execution time observations taken: (generation, authority
     /// index) and the encoded estimates.
     observations: Vec<((u64, u32), Vec<u8>)>,
@@ -341,6 +346,23 @@ struct Output {
     height: u64,
     /// Whether no chunk waited for a checkpoint after the commit.
     drained: bool,
+}
+
+impl Default for Output {
+    fn default() -> Output {
+        Output {
+            processed: containers::heap_message_set(0),
+            locks: SipMap::default(),
+            streams: SipMap::default(),
+            observations: Vec::new(),
+            deferred: Vec::new(),
+            jwk_votes: Vec::new(),
+            new_jwks: None,
+            record: Vec::new(),
+            height: 0,
+            drained: false,
+        }
+    }
 }
 
 fn lock_quarantine(quarantine: &Mutex<Quarantine>) -> std::sync::MutexGuard<'_, Quarantine> {
@@ -659,8 +681,8 @@ impl Quarantine {
 
 /// One fewer queued output holds `key`'s value; it leaves memory with the
 /// last.
-fn release<K: std::hash::Hash + Eq, V>(
-    map: &mut HashMap<K, V>,
+fn release<K: std::hash::Hash + Eq, V, S: std::hash::BuildHasher>(
+    map: &mut HashMap<K, V, S>,
     key: &K,
     count: impl Fn(&mut V) -> &mut usize,
 ) {
