@@ -122,14 +122,15 @@ claim); a plain `Digest` hashes all its bytes. `MessageMap` takes only
 and cache a miss only for a computed digest (`executed_effects_uncached` for
 a digest a request names).
 
+Shards and ticket counters are picked with per-instance secrets
+(`containers::Sharder`), and a digest a request names is cached absent in a
+separate `SipHash` set. The epoch store's processed digests are a
+`MessageMap`.
+
 Deliberately left:
-- SipHash tables whose keys clients choose: the store cache's object slots
-  (misses cached for any id an input names) and the status cache's waiters
-  (keyed by the client's position). The effects waiter's key is a plain
-  digest, hashed whole. The store cache picks shards by an unkeyed hash:
-  keys can be ground into one shard (contention, not a flood).
-- Epoch store consensus-output maps (std SipHash): their keys are now
-  `Hashed`, so they could move to `MessageMap`.
+- `SipHash` tables whose keys clients choose: the store cache's object slots,
+  the status cache's waiters, the epoch store's locks and streams, and the
+  request-named absences. The effects waiter's key is a plain digest.
 - The causal sort: needed while `disable_effects_tx_dependencies` is off
   (mainnet, and before protocol 138).
 - Execution: `Kept`'s heap Vec, `StoreReads::parse` copies, and written
