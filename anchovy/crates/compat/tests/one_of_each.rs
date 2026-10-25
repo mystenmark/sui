@@ -27,7 +27,7 @@ use rand::rngs::OsRng;
 use sui_config::NodeConfig;
 use sui_core::authority::AuthorityState;
 use sui_core::authority_client::{AuthorityAPI as _, NetworkAuthorityClient};
-use sui_protocol_config::Chain;
+use sui_protocol_config::{Chain, OverrideGuard, ProtocolConfig, ProtocolVersion};
 use sui_swarm_config::genesis_config::ValidatorGenesisConfigBuilder;
 use sui_swarm_config::network_config_builder::ConfigBuilder;
 use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
@@ -42,6 +42,7 @@ use sui_types::messages_checkpoint::{CheckpointContents, CheckpointSummary};
 use sui_types::messages_grpc::SubmitTxRequest;
 use sui_types::object::{Object, Owner};
 use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
+use sui_types::supported_protocol_versions::SupportedProtocolVersions;
 use sui_types::transaction::{
     Argument, CallArg, Command, FundsWithdrawalArg, ObjectArg, SharedObjectMutability,
 };
@@ -244,6 +245,14 @@ impl Network {
 
     /// As `new`, its epochs lasting `epoch_duration_ms`, if given.
     fn with_epoch_duration(epoch_duration_ms: Option<u64>) -> Network {
+        Network::configured(|builder| match epoch_duration_ms {
+            Some(duration) => builder.with_epoch_duration(duration),
+            None => builder,
+        })
+    }
+
+    /// As `new`, its genesis and sui validators configured by `configure`.
+    fn configured(configure: impl FnOnce(ConfigBuilder) -> ConfigBuilder) -> Network {
         telemetry_subscribers::init_for_testing();
         let validators = [3 * STAKE, 3 * STAKE, STAKE]
             .into_iter()
@@ -253,11 +262,8 @@ impl Network {
                     .build(&mut OsRng)
             })
             .collect();
-        let mut builder = ConfigBuilder::new_with_temp_dir().with_validators(validators);
-        if let Some(duration) = epoch_duration_ms {
-            builder = builder.with_epoch_duration(duration);
-        }
-        let config = builder.build();
+        let config =
+            configure(ConfigBuilder::new_with_temp_dir().with_validators(validators)).build();
         let (sui_configs, [anchovy_config]) = config.validator_configs.split_at(2) else {
             unreachable!("three validators");
         };
@@ -677,6 +683,22 @@ impl Network {
             .state()
     }
 
+    /// The protocol version of anchovy's current epoch, and of the first sui
+    /// validator's.
+    fn protocol_versions(&self) -> (u64, u64) {
+        let anchovy = self
+            .anchovy
+            .node()
+            .running()
+            .unwrap()
+            .state
+            .params
+            .config
+            .version;
+        let sui = self.sui().epoch_store_for_testing().protocol_version();
+        (anchovy.as_u64(), sui.as_u64())
+    }
+
     /// Waits until anchovy has certified checkpoint `seq`, as sui did.
     fn wait_for_certified(&mut self, seq: u64) {
         self.wait_for(&format!("checkpoint {seq} to certify"), |network| {
@@ -1016,5 +1038,81 @@ fn a_sui_validator_resumes_alike_after_a_crash() {
 fn an_idle_network_certifies_checkpoints() {
     let mut network = Network::new();
     network.wait_for_certified(3);
+    drop(network.runtime);
+}
+
+/// Gives the version below the highest the highest's gas model, the only
+/// one anchovy's executor runs, alike for sui and anchovy (one process, one
+/// override): before any config is read, held for the test.
+fn runnable_below_max() -> OverrideGuard {
+    let below = ProtocolVersion::MAX.prev();
+    let gas_model = ProtocolConfig::get_for_max_version_UNSAFE().gas_model_version();
+    ProtocolConfig::apply_overrides_for_testing(move |version, mut config| {
+        if version == below {
+            config.set_gas_model_version_for_testing(gas_model);
+        }
+        config
+    })
+}
+
+/// A genesis one protocol version below the highest: the first epoch's end
+/// upgrades to it only with anchovy's capabilities, as sui's stake alone
+/// falls short of the threshold (a quorum and half the rest), and anchovy's
+/// change-epoch transaction must then name it.
+#[test]
+fn the_network_upgrades_with_anchovy_s_support() {
+    let _runnable = runnable_below_max();
+    let max = ProtocolVersion::MAX;
+    let mut network = Network::configured(|builder| {
+        builder
+            .with_epoch_duration(5_000)
+            .with_protocol_version(max.prev())
+    });
+    assert_eq!(
+        network.protocol_versions(),
+        (max.as_u64() - 1, max.as_u64() - 1)
+    );
+    let first = network.transfer(0);
+    network.execute(&first);
+    network.wait_for("the upgrade", |network| {
+        (network.protocol_versions() == (max.as_u64(), max.as_u64())).then_some(())
+    });
+    let later = network.transfer(0);
+    network.execute(&later);
+    drop(network.runtime);
+}
+
+/// One sui validator lacks the highest version: no group reaches the
+/// threshold, and every validator keeps the version.
+#[test]
+fn a_split_vote_keeps_the_version() {
+    let _runnable = runnable_below_max();
+    let max = ProtocolVersion::MAX;
+    let mut network = Network::configured(|builder| {
+        builder
+            .with_epoch_duration(5_000)
+            .with_protocol_version(max.prev())
+            .with_supported_protocol_version_callback(Arc::new(move |index, _| {
+                if index == 0 {
+                    SupportedProtocolVersions::new_for_testing(
+                        ProtocolVersion::MIN.as_u64(),
+                        max.as_u64() - 1,
+                    )
+                } else {
+                    SupportedProtocolVersions::SYSTEM_DEFAULT
+                }
+            }))
+    });
+    let first = network.transfer(0);
+    network.execute(&first);
+    network.wait_for("epoch 1", |network| {
+        (network.anchovy.epoch() >= 1).then_some(())
+    });
+    assert_eq!(
+        network.protocol_versions(),
+        (max.as_u64() - 1, max.as_u64() - 1)
+    );
+    let later = network.transfer(0);
+    network.execute(&later);
     drop(network.runtime);
 }
