@@ -13,7 +13,7 @@ use messages::build::system_transaction::{Jwk, JwkId};
 use messages::transaction::{
     CallArg, ObjectArg, SharedObjectArg, SharedObjectMutability, TransactionKind,
 };
-use protocol_config::{ConsensusTransactionOrdering, ProtocolConfig};
+use sui_protocol_config::{ConsensusTransactionOrdering, ProtocolConfig};
 
 use crate::checks::VerifiedTransaction;
 

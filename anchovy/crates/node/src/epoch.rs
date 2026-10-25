@@ -14,7 +14,7 @@ use checkpoint::ProtocolKey;
 use consensus::TransactionClient;
 use execution::system_state::Member;
 use messages::base::Digest;
-use protocol_config::Chain;
+use sui_protocol_config::Chain;
 use validator::current::CurrentEpoch;
 use validator::epoch::EpochState;
 use validator::epoch_store::EpochStore;

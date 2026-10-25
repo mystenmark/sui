@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use consensus::BlockRef;
 use messages::Message;
-use protocol_config::{Chain, ProtocolVersion};
+use sui_protocol_config::{Chain, ProtocolVersion};
 use sui_types::base_types::{ObjectID, SequenceNumber, SuiAddress, random_object_ref};
 use sui_types::crypto::{AccountKeyPair, get_key_pair};
 use sui_types::transaction::{

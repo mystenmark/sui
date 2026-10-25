@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use messages::base::Digest;
-use protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
+use sui_protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
 use validation::verify::{JWK, JwkId, Verifier};
 
 /// What every validator agrees on about the epoch: all the consensus

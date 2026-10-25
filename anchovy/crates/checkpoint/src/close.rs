@@ -16,7 +16,7 @@ use messages::build::system_transaction::{
 };
 use messages::fast::Bump;
 use messages::transaction::TransactionKind;
-use protocol_config::{ExecutionTimeEstimateParams, PerObjectCongestionControlMode};
+use sui_protocol_config::{ExecutionTimeEstimateParams, PerObjectCongestionControlMode};
 use validator::consensus::commit::end_of_epoch_transaction;
 use validator::consensus::execution_time::{Key, KeyRef};
 use validator::epoch::EpochParams;

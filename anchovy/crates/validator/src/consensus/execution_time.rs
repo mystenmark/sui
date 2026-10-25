@@ -16,10 +16,10 @@ use hashbrown::{Equivalent, HashMap};
 use messages::build::type_tag::TypeInput;
 use messages::system_transaction::ExecutionTimeObservationKey;
 use messages::transaction::{Command, TransactionKind};
-use protocol_config::{
+use serde::{Deserialize, Serialize};
+use sui_protocol_config::{
     ExecutionTimeEstimateParams, PerObjectCongestionControlMode, ProtocolConfig,
 };
-use serde::{Deserialize, Serialize};
 
 use crate::checks::VerifiedTransaction;
 
@@ -392,7 +392,7 @@ impl Observations {
 #[cfg(test)]
 mod tests {
     use messages::transaction::Argument;
-    use protocol_config::ProtocolVersion;
+    use sui_protocol_config::ProtocolVersion;
 
     use super::*;
 
@@ -402,7 +402,10 @@ mod tests {
         let committee = (0u8..).zip(stakes).map(|(i, s)| ([i; 96], *s)).collect();
         ExecutionTimeEstimator::new(
             committee,
-            &ProtocolConfig::get_for_version(ProtocolVersion::MAX, protocol_config::Chain::Unknown),
+            &ProtocolConfig::get_for_version(
+                ProtocolVersion::MAX,
+                sui_protocol_config::Chain::Unknown,
+            ),
         )
     }
 

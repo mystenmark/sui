@@ -309,7 +309,7 @@ impl SettlementScheduler {
             builder.add(i as u64, e.get());
         }
         let kinds = builder.build(
-            self.epoch.config.max_updates_per_settlement_txn,
+            self.epoch.config.max_updates_per_settlement_txn_as_option(),
             self.epoch.epoch,
             chunk.root.initial_shared_version,
             height,

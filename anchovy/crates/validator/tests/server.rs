@@ -14,7 +14,7 @@ use messages::grpc::{
     CheckpointRequest, CheckpointRequestV2, ObjectInfoRequest, ObjectInfoRequestKind,
     SystemStateRequest, TransactionInfoRequest,
 };
-use protocol_config::{Chain, ProtocolVersion};
+use sui_protocol_config::{Chain, ProtocolVersion};
 use tonic::Code;
 use tonic::transport::Channel;
 use tonic::transport::server::TcpIncoming;

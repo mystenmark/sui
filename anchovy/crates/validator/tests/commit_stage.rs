@@ -14,7 +14,7 @@ use blake2::{Blake2b, Digest as _};
 use consensus::BlockRef;
 use messages::Message;
 use messages::base::Hashed;
-use protocol_config::{Chain, ProtocolVersion};
+use sui_protocol_config::{Chain, ProtocolVersion};
 use sui_types::base_types::{ObjectID, SequenceNumber, SuiAddress, random_object_ref};
 use sui_types::crypto::{AccountKeyPair, get_key_pair};
 use sui_types::digests::{AdditionalConsensusStateDigest, ConsensusCommitDigest};
@@ -54,8 +54,12 @@ fn epoch(max_transactions: u64, min_interval_ms: u64) -> Arc<EpochParams> {
         1000,
         4,
     );
-    epoch.config.max_transactions_per_checkpoint = Some(max_transactions);
-    epoch.config.min_checkpoint_interval_ms = Some(min_interval_ms);
+    epoch
+        .config
+        .set_max_transactions_per_checkpoint_for_testing(max_transactions);
+    epoch
+        .config
+        .set_min_checkpoint_interval_ms_for_testing(min_interval_ms);
     Arc::new(epoch)
 }
 

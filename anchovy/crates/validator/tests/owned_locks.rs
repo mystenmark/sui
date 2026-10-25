@@ -11,7 +11,7 @@ use std::sync::Arc;
 use consensus::{Block, BlockRef, CommittedSubDag};
 use messages::Message;
 use messages::base::Hashed;
-use protocol_config::{Chain, ProtocolVersion};
+use sui_protocol_config::{Chain, ProtocolVersion};
 use sui_types::base_types::{ObjectRef, SequenceNumber, SuiAddress, random_object_ref};
 use sui_types::crypto::{AccountKeyPair, get_key_pair};
 use sui_types::transaction::{
@@ -251,9 +251,9 @@ fn wire(r: &ObjectRef) -> messages::base::ObjectRef {
 
 /// A handler of a committee of one, that has handled no commit.
 fn new_handler(output: validator::epoch_store::ConsensusOutput) -> CommitHandler {
-    let config = protocol_config::ProtocolConfig::get_for_version(
-        protocol_config::ProtocolVersion::MAX,
-        protocol_config::Chain::Unknown,
+    let config = sui_protocol_config::ProtocolConfig::get_for_version(
+        sui_protocol_config::ProtocolVersion::MAX,
+        sui_protocol_config::Chain::Unknown,
     );
     CommitHandler::new(output, 0, vec![([0; 96], 10_000)], &config, None)
 }

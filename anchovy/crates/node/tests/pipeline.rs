@@ -20,7 +20,7 @@ mod genesis;
 use fastcrypto::hash::MultisetHash;
 use node::epoch::{Epoch, EpochRecord, Node, Perpetual};
 use node::{ConsensusOutput, Pipeline};
-use protocol_config::Chain;
+use sui_protocol_config::Chain;
 use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
 use sui_types::crypto::{AccountKeyPair, AuthorityPublicKeyBytes, get_key_pair};
 use sui_types::digests::TransactionDigest;

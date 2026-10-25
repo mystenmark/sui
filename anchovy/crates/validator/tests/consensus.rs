@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use consensus::{Block, BlockRef, CommittedSubDag, TransactionIndex};
 use messages::base::Digest;
-use protocol_config::{Chain, ProtocolVersion};
+use sui_protocol_config::{Chain, ProtocolVersion};
 use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
 use sui_types::crypto::{AccountKeyPair, AuthorityPublicKeyBytes, get_key_pair};
 use sui_types::digests::TransactionDigest;
@@ -156,9 +156,9 @@ fn block(round: u32, transactions: Vec<Vec<u8>>) -> Block {
 
 /// A handler of a committee of one, that has handled no commit.
 fn new_handler(output: validator::epoch_store::ConsensusOutput) -> CommitHandler {
-    let config = protocol_config::ProtocolConfig::get_for_version(
-        protocol_config::ProtocolVersion::MAX,
-        protocol_config::Chain::Unknown,
+    let config = sui_protocol_config::ProtocolConfig::get_for_version(
+        sui_protocol_config::ProtocolVersion::MAX,
+        sui_protocol_config::Chain::Unknown,
     );
     CommitHandler::new(output, 0, vec![([0; 96], 10_000)], &config, None)
 }

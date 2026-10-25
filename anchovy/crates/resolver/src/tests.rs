@@ -6,7 +6,7 @@ use std::sync::Arc;
 use messages::Message;
 use messages::base::{Digest, Hashed, ObjectId};
 use messages::transaction::SharedObjectMutability;
-use protocol_config::{Chain, ProtocolVersion};
+use sui_protocol_config::{Chain, ProtocolVersion};
 use sui_types::Identifier;
 use sui_types::base_types::{ObjectID, ObjectRef, SequenceNumber, SuiAddress, random_object_ref};
 use sui_types::coin_reservation::ParsedObjectRefWithdrawal;

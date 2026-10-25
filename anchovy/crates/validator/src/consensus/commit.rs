@@ -24,7 +24,7 @@ use blake2::{Blake2b, Digest as _};
 use containers::Bump;
 use messages::base::{Hashed, ObjectRef};
 use messages::build::system_transaction::{Jwk, JwkId};
-use protocol_config::ProtocolConfig;
+use sui_protocol_config::ProtocolConfig;
 use workqueue::Processor;
 
 use crate::consensus::decode::{CommittedTransaction, DecodedCommit};
@@ -812,7 +812,7 @@ impl CommitStage {
                 entries,
             });
         }
-        let min_interval = config.min_checkpoint_interval_ms.unwrap_or(0);
+        let min_interval = config.min_checkpoint_interval_ms_as_option().unwrap_or(0);
         flushed.extend(self.queue.flush(prologue.timestamp_ms, min_interval));
         if close.is_some() {
             flushed.extend(self.queue.flush_forced());
