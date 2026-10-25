@@ -192,6 +192,10 @@ impl Parts {
             self.statuses.clone(),
             self.stakes.clone(),
         )
+        .with_stored_observations(&execution::epoch_start::stored_execution_time_observations(
+            &self.store,
+            &self.epoch.params.config,
+        ))
         .with_backpressure(self.backpressure.clone())
     }
 

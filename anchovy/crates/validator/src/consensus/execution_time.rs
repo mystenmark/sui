@@ -158,6 +158,32 @@ impl Key {
         }
     }
 
+    /// A key as the end-of-epoch transaction stored it.
+    pub fn of_stored(
+        stored: &messages::build::system_transaction::ExecutionTimeObservationKey,
+    ) -> Key {
+        use messages::build::system_transaction::ExecutionTimeObservationKey as Stored;
+        match stored {
+            Stored::MoveEntryPoint {
+                package,
+                module,
+                function,
+                type_arguments,
+            } => Key::MoveEntryPoint {
+                package: package.0.0,
+                module: module.as_str().into(),
+                function: function.as_str().into(),
+                type_arguments: type_arguments.clone(),
+            },
+            Stored::TransferObjects => Key::TransferObjects,
+            Stored::SplitCoins => Key::SplitCoins,
+            Stored::MergeCoins => Key::MergeCoins,
+            Stored::Publish => Key::Publish,
+            Stored::MakeMoveVec => Key::MakeMoveVec,
+            Stored::Upgrade => Key::Upgrade,
+        }
+    }
+
     /// As the end-of-epoch transaction stores it.
     pub fn to_stored(&self) -> messages::build::system_transaction::ExecutionTimeObservationKey {
         use messages::build::base::{AccountAddress, ObjectId};
@@ -279,11 +305,41 @@ impl ExecutionTimeEstimator {
     /// Takes observations `observe` took before a restart.
     pub fn restore(&mut self, author: u32, generation: u64, estimates: &[(Key, Duration)]) {
         for (key, duration) in estimates {
-            self.observe_one(author, generation, key, *duration);
+            self.observe_one(author, Some(generation), key, *duration);
         }
     }
 
-    fn observe_one(&mut self, source: u32, generation: u64, key: &Key, duration: Duration) {
+    /// Takes the observations the previous epoch stored, before any of this
+    /// epoch's, as the reference's `get_stored_execution_time_observations`
+    /// gives them to its estimator: with no generation, so any of this
+    /// epoch's replaces them. Unless new keys start unobserved
+    /// (`default_none_duration_for_new_keys`), the reference gives them
+    /// generation 0, which every member's starts at: they are then ignored.
+    pub fn restore_stored(
+        &mut self,
+        stored: &messages::build::system_transaction::StoredExecutionTimeObservations,
+    ) {
+        if !self.params.default_none_duration_for_new_keys {
+            return;
+        }
+        let messages::build::system_transaction::StoredExecutionTimeObservations::V1(stored) =
+            stored;
+        for (key, by_authority) in stored {
+            let key = Key::of_stored(key);
+            for (name, duration) in by_authority {
+                let Some(member) = self.committee.iter().position(|(n, _)| *n == name.0) else {
+                    continue;
+                };
+                let member = u32::try_from(member).expect("fewer than 2^32 members");
+                let duration = Duration::new(duration.secs, duration.nanos);
+                self.observe_one(member, None, &key, duration);
+            }
+        }
+    }
+
+    /// The reference's `process_observation_from_consensus`: none for
+    /// `generation` takes the observation whatever came before.
+    fn observe_one(&mut self, source: u32, generation: Option<u64>, key: &Key, duration: Duration) {
         // The reference uses only the default for publishing.
         if *key == Key::Publish {
             return;
@@ -298,10 +354,10 @@ impl ExecutionTimeEstimator {
                 stake_weighted_median: (!default_none).then_some(Duration::ZERO),
             });
         let (latest, observed) = &mut observations.by_authority[source as usize];
-        if *latest >= generation {
+        if generation.is_some_and(|generation| *latest >= generation) {
             return;
         }
-        *latest = generation;
+        *latest = generation.unwrap_or(0);
         *observed = Some(duration);
         observations.update_median(&self.committee, &self.params, &mut self.observed);
     }
