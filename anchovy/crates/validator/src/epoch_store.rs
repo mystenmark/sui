@@ -487,6 +487,32 @@ impl ConsensusOutput {
             .collect()
     }
 
+    /// Whether any deferred transaction is still waiting, the commit being
+    /// decided's included.
+    pub fn has_deferred(&self) -> bool {
+        !lock_quarantine(&self.quarantine).deferred.is_empty()
+    }
+
+    /// Drops every deferred transaction still waiting: the commit being
+    /// decided's are not written, earlier ones are deleted.
+    pub fn abandon_deferred(&mut self) {
+        let mut q = lock_quarantine(&self.quarantine);
+        let keys: Vec<DeferralKey> = std::mem::take(&mut q.deferred).into_keys().collect();
+        for key in keys {
+            match q
+                .open
+                .deferred
+                .iter()
+                .position(|(k, put)| *k == key && put.is_some())
+            {
+                Some(i) => {
+                    q.open.deferred.remove(i);
+                }
+                None => q.open.deferred.push((key, None)),
+            }
+        }
+    }
+
     /// A JSON web key vote the commit being decided counted, encoded.
     pub fn put_jwk_vote(&mut self, vote: Vec<u8>) {
         lock_quarantine(&self.quarantine).open.jwk_votes.push(vote);

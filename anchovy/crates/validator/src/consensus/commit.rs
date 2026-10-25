@@ -54,6 +54,8 @@ pub enum DropReason {
     LockConflict { object: ObjectRef, holder: TxDigest },
     /// Its input objects are invalid.
     Inputs(validation::Error),
+    /// It came after the epoch's certificates closed.
+    EpochClosed,
 }
 
 /// A commit the handler decided: its schedule, where each scheduled
@@ -75,6 +77,9 @@ pub struct HandledCommit<'b> {
     /// microseconds, in schedule order: what the reference's
     /// `IndirectStateObserver` sees.
     pub estimates_us: containers::Vec<'b, u64>,
+    /// The epoch's last commit: its time is up and no deferred transaction
+    /// remains, or the close deadline passed.
+    pub final_commit: bool,
     pub cache_hits: usize,
     pub cache_misses: usize,
 }
@@ -106,6 +111,11 @@ pub struct CommitHandler {
     /// The authenticator state's initial shared version, if the epoch
     /// agrees keys: the reference's `authenticator_state_enabled`.
     authenticator: Option<u64>,
+    /// When the epoch's time is up, by commit timestamp.
+    epoch_end_ms: u64,
+    /// A commit at or past `epoch_end_ms` was handled: later commits' user
+    /// transactions, observations and votes are dropped.
+    certs_closed: bool,
 }
 
 impl CommitHandler {
@@ -142,7 +152,22 @@ impl CommitHandler {
             jwks,
             new_jwks,
             authenticator: authenticator.filter(|_| config.enable_jwk_consensus_updates()),
+            epoch_end_ms: u64::MAX,
+            certs_closed: false,
         }
+    }
+
+    /// Ends the epoch at `epoch_end_ms` (its start plus its duration),
+    /// certificates closed already if `certs_closed`.
+    #[must_use]
+    pub fn with_end(mut self, epoch_end_ms: u64, certs_closed: bool) -> CommitHandler {
+        self.epoch_end_ms = epoch_end_ms;
+        self.certs_closed = certs_closed;
+        self
+    }
+
+    pub fn certs_closed(&self) -> bool {
+        self.certs_closed
     }
 
     /// Ends the commit just handled, with what `CommitStage` decided of it:
@@ -175,6 +200,8 @@ impl CommitHandler {
 
         let round = u64::from(commit.leader.round);
         let config = &epoch.config;
+        // As of the commits before this one, so every validator drops alike.
+        let certs_closed = self.certs_closed;
 
         // 2. Lock owned inputs in consensus order, as the reference's
         //    `filter_consensus_txns`: a transaction an input of which another
@@ -193,6 +220,10 @@ impl CommitHandler {
         } in commit.transactions
         {
             let digest = *transaction.get().0.digest();
+            if certs_closed {
+                dropped.push((block, index, digest, DropReason::EpochClosed));
+                continue;
+            }
             let owned = match owned {
                 Ok(owned) => owned,
                 Err(e) => {
@@ -229,7 +260,12 @@ impl CommitHandler {
 
         // 4. The commit's execution time observations, before its
         //    transactions are estimated.
-        for shared in &commit.observations {
+        let observations = if certs_closed {
+            &[][..]
+        } else {
+            &commit.observations[..]
+        };
+        for shared in observations {
             if self.execution_times.observe(shared) {
                 self.output.put_execution_time_observations(
                     shared.author,
@@ -242,7 +278,7 @@ impl CommitHandler {
         // 5. The keys voted for (`process_jwks`), and the update adding those
         //    that became active in the last commit
         //    (`create_authenticator_state_update`).
-        let update = self.jwk_update(&commit.jwks);
+        let update = self.jwk_update(if certs_closed { &[] } else { &commit.jwks });
 
         // 6. The transactions deferred to this round, then the commit's, in
         //    protocol order: `merge_and_reorder_transactions`.
@@ -290,6 +326,7 @@ impl CommitHandler {
             estimates_us.push(self.execution_times.estimate_us(&transaction));
             admitted.push(transaction);
         }
+        let final_commit = self.close_epoch(config, commit.timestamp_ms, &mut deferred);
         for (key, transactions) in deferred {
             self.output.defer(key, encode_deferred(&transactions));
         }
@@ -307,9 +344,36 @@ impl CommitHandler {
             deferred: deferred_here,
             dropped,
             estimates_us,
+            final_commit,
             cache_hits: commit.cache_hits,
             cache_misses: commit.cache_misses,
         })
+    }
+
+    /// The reference's `handle_close_epoch`: once the epoch's time is up,
+    /// certificates close, and the epoch ends at the first commit after
+    /// which no deferred transaction remains, `deferred` (this commit's)
+    /// included; past the close deadline it ends regardless, abandoning
+    /// them. Whether this commit is the epoch's last.
+    fn close_epoch<T>(
+        &mut self,
+        config: &ProtocolConfig,
+        timestamp_ms: u64,
+        deferred: &mut containers::BTreeMap<'_, DeferralKey, T>,
+    ) -> bool {
+        if timestamp_ms < self.epoch_end_ms {
+            return false;
+        }
+        self.certs_closed = true;
+        let deadline_reached = config
+            .epoch_close_deadline_ms_as_option()
+            .is_some_and(|deadline| timestamp_ms >= self.epoch_end_ms.saturating_add(deadline));
+        let has_deferred = !deferred.is_empty() || self.output.has_deferred();
+        if has_deferred && deadline_reached {
+            deferred.clear();
+            self.output.abandon_deferred();
+        }
+        !has_deferred || deadline_reached
     }
 
     /// The execution time observations so far, as the epoch's last commit
@@ -427,7 +491,10 @@ pub struct CommitRecord {
     /// The timestamp of the last checkpoint cut, for the interval cuts.
     pub last_built_timestamp: u64,
     pub root_version: u64,
+    /// The epoch's last commit is decided.
     pub closed: bool,
+    /// The epoch's certificates have closed (`CommitHandler::with_end`).
+    pub certs_closed: bool,
 }
 
 impl CommitRecord {
@@ -440,6 +507,7 @@ impl CommitRecord {
             self.last_built_timestamp,
             self.root_version,
             self.closed,
+            self.certs_closed,
         ))
         .expect("a record encodes")
     }
@@ -455,6 +523,7 @@ impl CommitRecord {
             last_built_timestamp,
             root_version,
             closed,
+            certs_closed,
         ) = bcs::from_bytes(bytes).expect("a stored record decodes");
         CommitRecord {
             commit_index,
@@ -464,6 +533,7 @@ impl CommitRecord {
             last_built_timestamp,
             root_version,
             closed,
+            certs_closed,
         }
     }
 }
@@ -586,6 +656,12 @@ impl CommitStage {
             committee,
             &epoch.config,
             start.authenticator_initial_shared_version,
+        )
+        .with_end(
+            start
+                .epoch_start_timestamp_ms
+                .saturating_add(start.epoch_duration_ms),
+            record.is_some_and(|r| r.certs_closed),
         );
         CommitStage {
             epoch,
@@ -633,6 +709,7 @@ impl CommitStage {
             origins,
             dropped,
             estimates_us,
+            final_commit,
             ..
         } = self.handler.handle(epoch, commit, bump)?;
         let config = &epoch.config;
@@ -702,11 +779,7 @@ impl CommitStage {
 
         // 3. The epoch's last commit reserves the change-epoch transaction's
         //    write of the system state, after every other.
-        let end = self
-            .start
-            .epoch_start_timestamp_ms
-            .saturating_add(self.start.epoch_duration_ms);
-        let close = (prologue.timestamp_ms >= end).then(|| {
+        let close = final_commit.then(|| {
             self.closed = true;
             let writes_before = entries
                 .iter()
@@ -926,6 +999,7 @@ impl CommitStage {
             last_built_timestamp: self.queue.last_built_timestamp,
             root_version: self.root_version,
             closed: self.closed,
+            certs_closed: self.handler.certs_closed(),
         };
         self.handler
             .finish(&record, self.queue.height, self.queue.pending.is_empty());
