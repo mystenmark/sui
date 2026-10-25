@@ -6,6 +6,7 @@
 pub mod cache;
 pub mod capabilities;
 pub mod commit;
+pub mod congestion;
 pub mod decode;
 pub mod deferral;
 pub mod execution_time;

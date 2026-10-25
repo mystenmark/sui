@@ -60,6 +60,9 @@ pub struct ScheduledEntry {
     pub transaction: ExecutableTransaction,
     pub shared: Vec<SharedAccess>,
     pub origin: Option<(BlockRef, TransactionIndex)>,
+    /// A transaction cancelled for congestion: each consensus object input
+    /// and the marker version it reads as instead (then `shared` is empty).
+    pub cancelled: Vec<(ObjectId, u64)>,
 }
 
 /// A checkpoint chunk's transactions, in schedule order.

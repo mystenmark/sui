@@ -72,6 +72,20 @@ pub enum Scheduled {
     /// The JSON web keys that became active in the last commit.
     AuthenticatorStateUpdate(Vec<(JwkId, Jwk)>),
     User(VerifiedTransaction),
+    /// A user transaction cancelled for congestion, scheduled in place with
+    /// its consensus object inputs, which it does not read: they take no
+    /// ordinal and write nothing.
+    Cancelled(VerifiedTransaction, Vec<CancelledInput>),
+}
+
+/// A consensus object input of a cancelled transaction, with the
+/// reference's marker version in place of a version
+/// (`SequenceNumber::CONGESTED` or `CANCELLED_READ`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CancelledInput {
+    pub id: ObjectId,
+    pub initial_shared_version: u64,
+    pub marker: u64,
 }
 
 /// An `AuthenticatorStateUpdate` to schedule: the authenticator state's
@@ -174,20 +188,24 @@ impl Sequencer {
     }
 
     /// The commit's schedule: the prologue, the authenticator state's
-    /// update if any, then `transactions`, in order, each with its shared
-    /// inputs' ordinals: the reference's `assign_versions_from_consensus`,
-    /// with ordinals for versions.
+    /// update if any, then `transactions` (each `User` or `Cancelled`), in
+    /// order, each user transaction with its shared inputs' ordinals: the
+    /// reference's `assign_versions_from_consensus`, with ordinals for
+    /// versions.
     pub fn schedule<'b>(
         &mut self,
         prologue: Prologue,
         update: Option<AuthenticatorUpdate>,
-        transactions: containers::Vec<'b, VerifiedTransaction>,
+        transactions: containers::Vec<'b, Scheduled>,
         bump: &'b Bump,
     ) -> Schedule<'b> {
         let round = prologue.round;
         let accesses = 2 + transactions
             .iter()
-            .map(|t| shared_inputs(t).count())
+            .map(|t| match t {
+                Scheduled::User(t) => shared_inputs(t).count(),
+                _ => 0,
+            })
             .sum::<usize>();
         let mut schedule = Schedule {
             transactions: containers::Vec::with_capacity_in(transactions.len() + 2, bump),
@@ -234,7 +252,20 @@ impl Sequencer {
         // 3. Each transaction's shared inputs: every access reads the
         //    generation before the transaction's own writes.
         let first = schedule.transactions.len();
-        for (offset, transaction) in transactions.into_iter().enumerate() {
+        for (offset, scheduled) in transactions.into_iter().enumerate() {
+            let transaction = match scheduled {
+                Scheduled::User(transaction) => transaction,
+                cancelled @ Scheduled::Cancelled(..) => {
+                    schedule.ends.push(
+                        u32::try_from(schedule.accesses.len()).expect("fewer than 2^32 accesses"),
+                    );
+                    schedule.transactions.push(cancelled);
+                    continue;
+                }
+                Scheduled::Prologue(_) | Scheduled::AuthenticatorStateUpdate(_) => {
+                    unreachable!("only user transactions are given")
+                }
+            };
             let start = schedule.accesses.len();
             for shared in shared_inputs(&transaction) {
                 let stream = (shared.id, shared.initial_shared_version.get());
@@ -294,7 +325,9 @@ pub fn uses_randomness(transaction: &VerifiedTransaction) -> bool {
 
 /// A user transaction's shared inputs, in input order: the reference's
 /// `shared_input_objects`.
-fn shared_inputs(transaction: &VerifiedTransaction) -> impl Iterator<Item = &SharedObjectArg> + '_ {
+pub(crate) fn shared_inputs(
+    transaction: &VerifiedTransaction,
+) -> impl Iterator<Item = &SharedObjectArg> + '_ {
     let inputs = match transaction.get().0.data().kind() {
         TransactionKind::ProgrammableTransaction(pt) => pt.inputs,
         _ => &[],

@@ -326,6 +326,7 @@ fn load<'a>(
             version,
             transaction,
         }) => InputState::ConsensusStreamEnded(version, TransactionDigest::new(transaction)),
+        Some(Input::Cancelled(marker)) => InputState::Cancelled(marker),
     };
     Ok(LoadedInput::new(object_kind, state))
 }

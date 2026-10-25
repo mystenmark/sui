@@ -544,6 +544,7 @@ fn executable(
             }),
             shared: vec![SharedAccess { mutability, ..root }],
             origin: None,
+            cancelled: Vec::new(),
         },
         resolved_base,
         inputs: Vec::new(),

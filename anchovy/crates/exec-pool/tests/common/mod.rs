@@ -266,6 +266,7 @@ impl Node {
                 transaction: ExecutableTransaction::User(transaction),
                 shared,
                 origin: None,
+                cancelled: Vec::new(),
             },
             resolved_base,
             inputs: Vec::new(),

@@ -145,6 +145,7 @@ impl EpochCloser {
                     transaction: ExecutableTransaction::System(transaction),
                     shared: close.shared,
                     origin: None,
+                    cancelled: Vec::new(),
                 }],
             },
             "resolver",

@@ -215,7 +215,9 @@ fn scheduled(handled: &HandledCommit) -> Vec<Hashed> {
         .iter()
         .filter_map(|t| match t {
             Scheduled::User(t) => Some(digest_of(t)),
-            Scheduled::Prologue(_) | Scheduled::AuthenticatorStateUpdate(_) => None,
+            Scheduled::Prologue(_)
+            | Scheduled::AuthenticatorStateUpdate(_)
+            | Scheduled::Cancelled(..) => None,
         })
         .collect()
 }

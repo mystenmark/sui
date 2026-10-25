@@ -205,6 +205,9 @@ pub enum Input<'a> {
     /// The object's stream ended at `version`, in `transaction`: the input
     /// reads as the reference's stream-ended marker.
     Ended { version: u64, transaction: [u8; 32] },
+    /// A consensus object of a cancelled transaction, which reads none: the
+    /// reference's marker version (`SequenceNumber::CONGESTED`, ...).
+    Cancelled(u64),
 }
 
 /// An executed transaction as the reference answers for it
@@ -491,6 +494,11 @@ fn load_at(
                 sui_types::base_types::SequenceNumber::from_u64(version),
                 TransactionDigest::new(transaction),
             ),
+            Some(Input::Cancelled(marker)) => {
+                ObjectReadResultKind::CancelledTransactionSharedObject(
+                    sui_types::base_types::SequenceNumber::from_u64(marker),
+                )
+            }
         };
         inputs.push(ObjectReadResult::new(kind, result));
     }

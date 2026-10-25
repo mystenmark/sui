@@ -60,6 +60,7 @@ impl EpochStore {
                 processed: containers::heap_message_map(0),
                 locks: SipMap::default(),
                 streams: SipMap::default(),
+                debts: SipMap::default(),
                 committed_height: 0,
             })),
         };
@@ -317,6 +318,7 @@ struct Quarantine {
     processed: HeapMessageMap<TxDigest, usize>,
     locks: SipMap<ObjectRef, (TxDigest, usize)>,
     streams: SipMap<StreamId, ((u32, u32), usize)>,
+    debts: SipMap<ObjectId, ((u64, u64), usize)>,
     /// The last chunk height of the last checkpoint committed.
     committed_height: u64,
 }
@@ -330,6 +332,8 @@ struct Output {
     processed: HeapMessageSet<TxDigest>,
     locks: SipMap<ObjectRef, TxDigest>,
     streams: SipMap<StreamId, (u32, u32)>,
+    /// Congestion debts recorded, each as (round, debt).
+    debts: SipMap<ObjectId, (u64, u64)>,
     /// The execution time observations taken: (generation, authority
     /// index) and the encoded estimates.
     observations: Vec<((u64, u32), Vec<u8>)>,
@@ -356,6 +360,7 @@ impl Default for Output {
             processed: containers::heap_message_set(0),
             locks: SipMap::default(),
             streams: SipMap::default(),
+            debts: SipMap::default(),
             observations: Vec::new(),
             deferred: Vec::new(),
             jwk_votes: Vec::new(),
@@ -418,6 +423,34 @@ impl ConsensusOutput {
             .open
             .locks
             .insert(object, holder);
+    }
+
+    /// The congestion debt last recorded for `object`, and the round it was
+    /// recorded in, as (round, debt), if any this epoch.
+    ///
+    /// # Panics
+    /// If the database cannot be read.
+    pub fn congestion_debt(&self, object: &ObjectId) -> Option<(u64, u64)> {
+        let q = lock_quarantine(&self.quarantine);
+        if let Some(debt) = q.open.debts.get(object) {
+            return Some(*debt);
+        }
+        if let Some((debt, _)) = q.debts.get(object) {
+            return Some(*debt);
+        }
+        q.db.get(Space::CongestionDebts, &object.0)
+            .expect("the epoch's database reads")
+            .map(|v| bcs::from_bytes(&v).expect("a debt as written"))
+    }
+
+    /// Records `object`'s congestion debt `debt` in `round`. Debts are never
+    /// deleted: a later commit decays a stale one (the reference's
+    /// `load_initial_object_debts`).
+    pub fn set_congestion_debt(&mut self, object: ObjectId, round: u64, debt: u64) {
+        lock_quarantine(&self.quarantine)
+            .open
+            .debts
+            .insert(object, (round, debt));
     }
 
     /// The stream's last scheduled generation, (round, generation), if a
@@ -662,6 +695,10 @@ impl Quarantine {
             let entry = self.streams.entry(*stream).or_insert((*last, 0));
             *entry = (*last, entry.1 + 1);
         }
+        for (object, debt) in &output.debts {
+            let entry = self.debts.entry(*object).or_insert((*debt, 0));
+            *entry = (*debt, entry.1 + 1);
+        }
         self.queued.push_back(output);
     }
 
@@ -704,6 +741,14 @@ impl Quarantine {
                     value,
                 );
                 release(&mut self.streams, &stream, |last| &mut last.1);
+            }
+            for (object, debt) in output.debts {
+                batch.put(
+                    Space::CongestionDebts,
+                    object.0.to_vec(),
+                    bcs::to_bytes(&debt).expect("a debt serializes"),
+                );
+                release(&mut self.debts, &object, |held| &mut held.1);
             }
             for (key, transactions) in output.deferred {
                 let key = key.encode().to_vec();
