@@ -273,8 +273,9 @@ the change-epoch transaction. Confirmed by the reads above: the only consumer of
   (`executor/src/execution_engine.rs:1331`, `:1400`), so it would apply packages it was given.
 - **Supported range.** None: no check that the epoch's version is supported. `get_for_version`'s
   assertion would panic on a version above 138.
-- **Two `ProtocolConfig`s.** The validator uses anchovy's copy (`crates/protocol-config`, `MAX`
-  138); execution uses the reference's `sui-protocol-config`.
+- **Two `ProtocolConfig`s** (since resolved: anchovy now uses `sui-protocol-config` throughout).
+  The validator used anchovy's copy (`crates/protocol-config`, `MAX` 138); execution used the
+  reference's `sui-protocol-config`.
 
 ### Gaps, by consequence in a mixed network
 

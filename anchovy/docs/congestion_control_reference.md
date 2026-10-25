@@ -316,10 +316,9 @@ deferral path, the double spend, returns before the estimate, as the reference's
    proper. Randomness-using transactions are the only ones whose schedule can still differ, and only
    in a network where randomness is enabled.
 
-**Forcing congestion in a compat test.** Both protocol-config crates (sui's and anchovy's
-`protocol-config`) keep a process-global override (`apply_overrides_for_testing`, PC:4956; anchovy
-`protocol-config/src/lib.rs:4792`). Apply the same override to both before any config is read; each
-nextest test is its own process. Useful settings:
+**Forcing congestion in a compat test.** `sui-protocol-config` keeps a process-global override
+(`apply_overrides_for_testing`, PC:4956), which anchovy, now on the same crate, sees too. Apply it
+before any config is read; each nextest test is its own process. Useful settings:
 - `per_object_congestion_control_mode = ExecutionTimeEstimate { target_utilization: 0,
   allowed_txn_cost_overage_burst_limit_us: 0, .. }` (setter
   `set_per_object_congestion_control_mode_for_testing`, PC:5002). The budget is then 0. Of several

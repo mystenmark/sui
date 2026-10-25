@@ -59,11 +59,10 @@ the committee submits a `CapabilityNotificationV2` through its consensus
 - the available system packages come from `compare_system_package` over
   anchovy's store.
 
-The execution crate already links `sui-protocol-config` and
-`sui-framework`, so both digests and packages come from sui's own code
-(`supported_versions_with_digests`, `available_system_packages` in
-`execution`). Anchovy's own `protocol-config` copy is never hashed, so it
-cannot drift from sui's digest (decision 1).
+Anchovy uses sui's `sui-protocol-config` throughout (its own copy is
+gone), and the execution crate links `sui-framework`, so digests and
+packages come from sui's own code (`supported_versions_with_digests`,
+`available_system_packages` in `execution`) (decision 1).
 
 ### Recording them (PU R1.5, R1.6)
 
@@ -145,8 +144,8 @@ Debts are epoch state in the epoch store (`anchovy-store-placement`).
   first epoch end only if anchovy's count. Anchovy must then write `MAX`.
 - **Split vote:** one sui validator supports only `MAX - 1`, so there is no
   upgrade, and anchovy agrees.
-- **Congestion:** the same override applied to both protocol-config crates
-  before any config is read. With target utilization 0 and burst 0, several
+- **Congestion:** a `sui-protocol-config` override, applied before any
+  config is read, which sui and anchovy in one process both see. With target utilization 0 and burst 0, several
   transactions on one shared object in one block defer all but the first.
   With `max_deferral_rounds_for_congestion_control = 0` they are cancelled.
   With a small limit they re-defer, then cancel. With decay 0, debts carry.
@@ -166,9 +165,9 @@ machine against `consensus_handler`'s deadline tests.
 
 ## Decisions
 
-1. Digests and packages come from sui's `sui-protocol-config` and
-   `sui-framework`, through the execution crate, rather than from anchovy's
-   copy. The copy can't make the same digest by accident.
+1. Anchovy switches to sui's `sui-protocol-config`, dropping its copy, and
+   takes packages from `sui-framework`: digests match sui's by
+   construction.
 2. Randomness is out of scope (above).
 3. Framework upgrades: the package rule is ported, but compat tests only
    version upgrades. A framework upgrade needs other framework bytes, which
