@@ -179,6 +179,24 @@ impl CommitHandler {
         }
     }
 
+    /// Starts the estimator from the execution time observations the
+    /// previous epoch `stored`, then those of this epoch's commits written,
+    /// in the reference's order (`ExecutionTimeEstimator::new`).
+    #[must_use]
+    pub fn with_stored_observations(
+        mut self,
+        config: &ProtocolConfig,
+        stored: &messages::build::system_transaction::StoredExecutionTimeObservations,
+    ) -> CommitHandler {
+        let mut execution_times = ExecutionTimeEstimator::new(self.committee.clone(), config);
+        execution_times.restore_stored(stored);
+        for (generation, author, estimates) in self.output.execution_time_observations() {
+            execution_times.restore(author, generation, &decode_estimates(&estimates));
+        }
+        self.execution_times = execution_times;
+        self
+    }
+
     /// Ends the epoch at `epoch_end_ms` (its start plus its duration),
     /// certificates closed already if `certs_closed`.
     #[must_use]
@@ -328,7 +346,9 @@ impl CommitHandler {
         //    protocol order: `merge_and_reorder_transactions`.
         let mut previously_deferred = containers::message_map(bump, 0);
         let mut transactions = containers::Vec::with_capacity_in(accepted.len(), bump);
-        for (key, deferred) in self.output.take_deferred(DeferralKey::due_by(round)) {
+        let due = self.output.take_deferred(DeferralKey::due_by(round));
+        let loaded_deferred = !due.is_empty();
+        for (key, deferred) in due {
             for deferred in decode_deferred(&deferred) {
                 let hashed = *deferred.transaction.get().0.digest();
                 previously_deferred.insert(hashed, key);
@@ -394,7 +414,8 @@ impl CommitHandler {
         for (object, debt) in tracker.debts() {
             self.output.set_congestion_debt(object, round, debt);
         }
-        let final_commit = self.close_epoch(config, commit.timestamp_ms, &mut deferred);
+        let final_commit =
+            self.close_epoch(config, commit.timestamp_ms, loaded_deferred, &mut deferred);
         let upgrade = final_commit.then(|| {
             capabilities::choose(
                 config.version.as_u64(),
@@ -475,10 +496,15 @@ impl CommitHandler {
     /// which no deferred transaction remains, `deferred` (this commit's)
     /// included; past the close deadline it ends regardless, abandoning
     /// them. Whether this commit is the epoch's last.
+    ///
+    /// A commit that `loaded_deferred` transactions is not the last either,
+    /// even if it scheduled them all: the reference drops the keys it loaded
+    /// from its cache only after this check (`record_deferral_deletion`).
     fn close_epoch<T>(
         &mut self,
         config: &ProtocolConfig,
         timestamp_ms: u64,
+        loaded_deferred: bool,
         deferred: &mut containers::BTreeMap<'_, DeferralKey, T>,
     ) -> bool {
         if timestamp_ms < self.epoch_end_ms {
@@ -488,7 +514,7 @@ impl CommitHandler {
         let deadline_reached = config
             .epoch_close_deadline_ms_as_option()
             .is_some_and(|deadline| timestamp_ms >= self.epoch_end_ms.saturating_add(deadline));
-        let has_deferred = !deferred.is_empty() || self.output.has_deferred();
+        let has_deferred = loaded_deferred || !deferred.is_empty() || self.output.has_deferred();
         if has_deferred && deadline_reached {
             deferred.clear();
             self.output.abandon_deferred();
@@ -819,6 +845,19 @@ impl CommitStage {
             statuses,
             backpressure: None,
         }
+    }
+
+    /// Starts the commit handler's estimator from the observations the
+    /// previous epoch `stored` (`CommitHandler::with_stored_observations`).
+    #[must_use]
+    pub fn with_stored_observations(
+        mut self,
+        stored: &messages::build::system_transaction::StoredExecutionTimeObservations,
+    ) -> CommitStage {
+        self.handler = self
+            .handler
+            .with_stored_observations(&self.epoch.config, stored);
+        self
     }
 
     /// Answers each commit through `backpressure`, which may withhold it.

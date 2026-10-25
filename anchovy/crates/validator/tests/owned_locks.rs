@@ -696,7 +696,8 @@ fn the_stage_leaves_dropped_transactions_out_of_its_chunks() {
 
 /// Once its time is up, the epoch waits for its deferred transactions:
 /// the commit at the end time defers one and is not the last; the next
-/// schedules it, drops its own user transactions, and is.
+/// schedules it and drops its own user transactions, but having loaded a
+/// deferral is not the last either, as the reference's; the one after is.
 #[test]
 fn the_epoch_ends_once_its_deferred_transactions_are_scheduled() {
     let bump = containers::Bump::default();
@@ -723,6 +724,8 @@ fn the_epoch_ends_once_its_deferred_transactions_are_scheduled() {
         &decided.dropped[..],
         [(_, _, dropped, DropReason::EpochClosed)] if *dropped == digest(&third)
     ));
+    assert!(!decided.final_commit);
+    let decided = handler.handle(&epoch, commit(3, &[]), &bump).unwrap();
     assert!(decided.final_commit);
 }
 
