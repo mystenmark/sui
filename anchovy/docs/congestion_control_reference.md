@@ -200,7 +200,10 @@ epoch's `deferred_transactions` cache (CH:1467-1479); loading deletes the loaded
 
 **R2.7 [E] Epoch close waits on deferrals.** `advance_end_of_epoch_state_machine`
 (CH:2366-2413): once the epoch's time is up, the final round is the first commit with no
-deferred transactions, from this commit or earlier ones. Until then the epoch stays open, with
+deferred transactions, from this commit or earlier ones. The keys a commit loaded are removed from the
+deferred-transactions cache only after this check (`record_deferral_deletion`, CH:1252, after
+`handle_close_epoch`, CH:1189), so a commit that loads any deferred transaction is never the final
+one, even if it schedules them all. Until then the epoch stays open, with
 user certificates closed. Past `epoch_close_deadline_ms` (120 s, from v130) it closes regardless,
 and `abandon_deferred_transactions` (CH:2420-2460) drops the remainder. Anchovy's stand-in ends
 the epoch at the first commit past its end time (TASKS_PHASE16 "Not here yet"). That is already
