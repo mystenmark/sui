@@ -27,7 +27,10 @@ use rand::rngs::OsRng;
 use sui_config::NodeConfig;
 use sui_core::authority::AuthorityState;
 use sui_core::authority_client::{AuthorityAPI as _, NetworkAuthorityClient};
-use sui_protocol_config::{Chain, OverrideGuard, ProtocolConfig, ProtocolVersion};
+use sui_protocol_config::{
+    Chain, ExecutionTimeEstimateParams, OverrideGuard, PerObjectCongestionControlMode,
+    ProtocolConfig, ProtocolVersion,
+};
 use sui_swarm_config::genesis_config::ValidatorGenesisConfigBuilder;
 use sui_swarm_config::network_config_builder::ConfigBuilder;
 use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
@@ -36,6 +39,7 @@ use sui_types::crypto::{AccountKeyPair, NetworkKeyPair};
 use sui_types::digests::TransactionDigest;
 use sui_types::effects::TransactionEffects;
 use sui_types::effects::TransactionEffectsAPI as _;
+use sui_types::execution_status::{ExecutionErrorKind, ExecutionFailure, ExecutionStatus};
 use sui_types::gas_coin::{GAS, GasCoin};
 use sui_types::message_envelope::Message as _;
 use sui_types::messages_checkpoint::{CheckpointContents, CheckpointSummary};
@@ -512,12 +516,26 @@ impl Network {
     /// `execute` for `transactions` submitted in one request, so in one
     /// block; submitted again while an epoch ends before they execute.
     fn execute_together(&mut self, transactions: &[&Transaction]) -> Vec<TransactionEffects> {
+        self.submit_together(transactions);
+        self.agree_on(transactions)
+    }
+
+    /// `execute_together`, whatever becomes of each: what anchovy's
+    /// effects, certified alike, say.
+    fn outcomes_together(&mut self, transactions: &[&Transaction]) -> Vec<TransactionEffects> {
+        self.submit_together(transactions);
+        self.effects_of(transactions)
+    }
+
+    /// Submits `transactions` through anchovy's RPC service in one request,
+    /// waiting for each one's effects, submitting again while an epoch ends
+    /// first.
+    fn submit_together(&mut self, transactions: &[&Transaction]) {
         let owned: Vec<Transaction> = transactions.iter().map(|t| (*t).clone()).collect();
         loop {
             let service = Validator::over(self.anchovy.node().perpetual.current.clone());
-            let executed = self.run("effects", Self::submit_and_wait(service, owned.clone()));
-            if executed {
-                return self.agree_on(transactions);
+            if self.run("effects", Self::submit_and_wait(service, owned.clone())) {
+                return;
             }
         }
     }
@@ -636,6 +654,15 @@ impl Network {
     /// Waits until anchovy has certified the checkpoints of `transactions`,
     /// each of which succeeded; their effects.
     fn agree_on(&mut self, transactions: &[&Transaction]) -> Vec<TransactionEffects> {
+        let effects = self.effects_of(transactions);
+        for effects in &effects {
+            assert!(effects.status().is_ok(), "{:?}", effects.status());
+        }
+        effects
+    }
+
+    /// Each transaction's effects, once in a checkpoint sui certified alike.
+    fn effects_of(&mut self, transactions: &[&Transaction]) -> Vec<TransactionEffects> {
         transactions
             .iter()
             .map(|transaction| {
@@ -643,12 +670,9 @@ impl Network {
                     network.anchovy.checkpoint_of(transaction.digest())
                 });
                 self.wait_for_certified(seq);
-                let effects = self
-                    .anchovy
+                self.anchovy
                     .effects(transaction.digest())
-                    .expect("executed");
-                assert!(effects.status().is_ok(), "{:?}", effects.status());
-                effects
+                    .expect("executed")
             })
             .collect()
     }
@@ -1113,6 +1137,109 @@ fn a_split_vote_keeps_the_version() {
         (max.as_u64() - 1, max.as_u64() - 1)
     );
     let later = network.transfer(0);
+    network.execute(&later);
+    drop(network.runtime);
+}
+
+/// Congestion control with no budget, alike for sui and anchovy (one
+/// process, one override): of the transactions writing a consensus object
+/// in a commit, only the first runs; the rest are deferred, for at most
+/// `max_rounds` rounds, then cancelled. Before any config is read, held for
+/// the test.
+fn no_congestion_budget(max_rounds: u64) -> OverrideGuard {
+    ProtocolConfig::apply_overrides_for_testing(move |_, mut config| {
+        if let PerObjectCongestionControlMode::ExecutionTimeEstimate(params) =
+            config.per_object_congestion_control_mode()
+        {
+            config.set_per_object_congestion_control_mode_for_testing(
+                PerObjectCongestionControlMode::ExecutionTimeEstimate(
+                    ExecutionTimeEstimateParams {
+                        target_utilization: 0,
+                        allowed_txn_cost_overage_burst_limit_us: 0,
+                        ..params
+                    },
+                ),
+            );
+        }
+        config.set_max_deferral_rounds_for_congestion_control_for_testing(max_rounds);
+        config
+    })
+}
+
+/// A shared coin, created by a transaction paid with coin `gas`.
+fn shared_coin(network: &mut Network, gas: usize) -> ObjectID {
+    let share = network.share(gas);
+    let created = network.execute(&share).created();
+    let (shared, _) = created
+        .iter()
+        .find(|(_, owner)| matches!(owner, Owner::Shared { .. }))
+        .expect("a shared coin");
+    shared.0
+}
+
+/// Writes of one shared coin in one commit: the first runs, the others are
+/// deferred, round after round while its debt carries, alike.
+#[test]
+fn congested_writes_are_deferred_alike() {
+    let _budget = no_congestion_budget(10);
+    let mut network = Network::new();
+    let shared = shared_coin(&mut network, 0);
+    let writes: Vec<_> = (0..3)
+        .map(|gas| network.split_shared(gas, shared))
+        .collect();
+    let outcomes = network.outcomes_together(&writes.iter().collect::<Vec<_>>());
+    assert!(outcomes[0].status().is_ok(), "{:?}", outcomes[0].status());
+    let later = network.transfer(3);
+    network.execute(&later);
+    drop(network.runtime);
+}
+
+/// With no deferral allowed, the later writes are cancelled at once: they
+/// run nothing, and their effects name the congested coin, alike.
+#[test]
+fn congested_writes_are_cancelled_alike() {
+    let _budget = no_congestion_budget(0);
+    let mut network = Network::new();
+    let shared = shared_coin(&mut network, 0);
+    let writes: Vec<_> = (0..3)
+        .map(|gas| network.split_shared(gas, shared))
+        .collect();
+    let outcomes = network.outcomes_together(&writes.iter().collect::<Vec<_>>());
+    assert!(outcomes[0].status().is_ok(), "{:?}", outcomes[0].status());
+    for cancelled in &outcomes[1..] {
+        assert!(
+            matches!(
+                cancelled.status(),
+                ExecutionStatus::Failure(ExecutionFailure {
+                    error: ExecutionErrorKind::ExecutionCancelledDueToSharedObjectCongestion { .. },
+                    ..
+                })
+            ),
+            "{:?}",
+            cancelled.status()
+        );
+    }
+    // The coin, never written by the cancelled, is written again.
+    let again = network.split_shared(3, shared);
+    network.execute(&again);
+    drop(network.runtime);
+}
+
+/// Deferred writes pending as an epoch's time is up keep it open until they
+/// are scheduled, alike: short epochs, writes submitted until one spans an
+/// epoch's end.
+#[test]
+fn deferrals_hold_the_epoch_open_alike() {
+    let _budget = no_congestion_budget(10);
+    let mut network = Network::with_epoch_duration(Some(5_000));
+    let shared = shared_coin(&mut network, 0);
+    while network.anchovy.epoch() < 2 {
+        let writes: Vec<_> = (0..3)
+            .map(|gas| network.split_shared(gas, shared))
+            .collect();
+        network.outcomes_together(&writes.iter().collect::<Vec<_>>());
+    }
+    let later = network.transfer(3);
     network.execute(&later);
     drop(network.runtime);
 }
