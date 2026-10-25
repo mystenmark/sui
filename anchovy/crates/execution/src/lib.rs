@@ -13,6 +13,7 @@ pub mod native;
 pub mod reads;
 mod store_view;
 pub mod system_state;
+pub mod upgrade;
 
 use std::sync::Arc;
 

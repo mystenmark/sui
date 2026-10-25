@@ -27,6 +27,7 @@ use messages::build::system_transaction::{Jwk, JwkId};
 use sui_protocol_config::ProtocolConfig;
 use workqueue::Processor;
 
+use crate::consensus::capabilities::{self, CapabilitySet};
 use crate::consensus::decode::{CommittedTransaction, DecodedCommit};
 use crate::consensus::deferral::{DeferralKey, Deferred, decode_deferred, encode_deferred};
 use crate::consensus::execution_time::{
@@ -80,6 +81,9 @@ pub struct HandledCommit<'b> {
     /// The epoch's last commit: its time is up and no deferred transaction
     /// remains, or the close deadline passed.
     pub final_commit: bool,
+    /// For the epoch's last commit, the next epoch's protocol version and
+    /// the system packages to go with it (`capabilities::choose`).
+    pub upgrade: Option<(u64, Vec<messages::build::base::ObjectRef>)>,
     pub cache_hits: usize,
     pub cache_misses: usize,
 }
@@ -105,6 +109,9 @@ pub struct CommitHandler {
     sequencer: Sequencer,
     execution_times: ExecutionTimeEstimator,
     jwks: JwkAggregator,
+    /// Each member's name and stake, by committee index.
+    committee: Vec<([u8; 96], u64)>,
+    capabilities: CapabilitySet,
     /// The JSON web keys that became active in the last commit handled,
     /// which the next adds to the authenticator state.
     new_jwks: Vec<(JwkId, Jwk)>,
@@ -134,8 +141,14 @@ impl CommitHandler {
         for (generation, author, estimates) in output.execution_time_observations() {
             execution_times.restore(author, generation, &decode_estimates(&estimates));
         }
-        let mut jwks =
-            JwkAggregator::new(committee, config.max_jwk_votes_per_validator_per_epoch());
+        let mut capabilities = CapabilitySet::new(&committee);
+        for announced in output.capabilities() {
+            capabilities.record(capabilities::decode(&announced));
+        }
+        let mut jwks = JwkAggregator::new(
+            committee.clone(),
+            config.max_jwk_votes_per_validator_per_epoch(),
+        );
         for vote in output.jwk_votes() {
             let (author, key) = decode_vote(&vote);
             jwks.restore(author, key);
@@ -150,6 +163,8 @@ impl CommitHandler {
             sequencer: Sequencer::new(),
             execution_times,
             jwks,
+            committee,
+            capabilities,
             new_jwks,
             authenticator: authenticator.filter(|_| config.enable_jwk_consensus_updates()),
             epoch_end_ms: u64::MAX,
@@ -280,6 +295,17 @@ impl CommitHandler {
         //    (`create_authenticator_state_update`).
         let update = self.jwk_update(if certs_closed { &[] } else { &commit.jwks });
 
+        // The capabilities announced (`process_capability_notifications`).
+        if !certs_closed {
+            for announced in commit.capabilities {
+                let encoded = capabilities::encode(&announced);
+                let author = announced.author;
+                if self.capabilities.record(announced) {
+                    self.output.put_capabilities(author, encoded);
+                }
+            }
+        }
+
         // 6. The transactions deferred to this round, then the commit's, in
         //    protocol order: `merge_and_reorder_transactions`.
         let mut previously_deferred = containers::message_map(bump, 0);
@@ -327,6 +353,15 @@ impl CommitHandler {
             admitted.push(transaction);
         }
         let final_commit = self.close_epoch(config, commit.timestamp_ms, &mut deferred);
+        let upgrade = final_commit.then(|| {
+            capabilities::choose(
+                config.version.as_u64(),
+                config,
+                &self.committee,
+                &self.capabilities,
+                config.buffer_stake_for_protocol_upgrade_bps(),
+            )
+        });
         for (key, transactions) in deferred {
             self.output.defer(key, encode_deferred(&transactions));
         }
@@ -345,6 +380,7 @@ impl CommitHandler {
             dropped,
             estimates_us,
             final_commit,
+            upgrade,
             cache_hits: commit.cache_hits,
             cache_misses: commit.cache_misses,
         })
@@ -710,6 +746,7 @@ impl CommitStage {
             dropped,
             estimates_us,
             final_commit,
+            upgrade,
             ..
         } = self.handler.handle(epoch, commit, bump)?;
         let config = &epoch.config;
@@ -803,7 +840,9 @@ impl CommitStage {
                 base: None,
             }];
             self.handler.link(&mut close);
-            close
+            let (protocol_version, system_packages) =
+                upgrade.expect("the last commit chooses the next version");
+            (close, protocol_version, system_packages)
         });
 
         // 4. Chunks and checkpoints.
@@ -821,7 +860,11 @@ impl CommitStage {
         prologue: &Prologue,
         entries: containers::Vec<'b, ScheduledEntry>,
         digests: containers::Vec<'b, TxDigest>,
-        close: Option<Vec<SharedAccess>>,
+        close: Option<(
+            Vec<SharedAccess>,
+            u64,
+            Vec<messages::build::base::ObjectRef>,
+        )>,
         bump: &'b Bump,
     ) -> Decided<'b> {
         let config = &epoch.config;
@@ -898,7 +941,7 @@ impl CommitStage {
                 timestamp_ms: f.timestamp_ms,
                 close: None,
             }));
-        if let Some(shared) = close {
+        if let Some((shared, protocol_version, system_packages)) = close {
             let last = decided
                 .checkpoints
                 .last_mut()
@@ -910,6 +953,8 @@ impl CommitStage {
                 shared,
                 first_checkpoint: self.start.previous_checkpoint + 1,
                 observations: self.handler.execution_time_observations(),
+                protocol_version,
+                system_packages,
             });
         }
         decided
@@ -1249,6 +1294,11 @@ pub fn end_of_epoch_transaction(
     epoch: u64,
     mut kinds: Vec<messages::build::system_transaction::EndOfEpochTransactionKind>,
     protocol_version: u64,
+    system_packages: Vec<(
+        messages::build::base::SequenceNumber,
+        Vec<Vec<u8>>,
+        Vec<messages::build::base::ObjectId>,
+    )>,
     gas: [u64; 4],
     epoch_start_timestamp_ms: u64,
 ) -> SystemTransaction {
@@ -1265,7 +1315,7 @@ pub fn end_of_epoch_transaction(
         storage_rebate: rebate,
         non_refundable_storage_fee: non_refundable,
         epoch_start_timestamp_ms,
-        system_packages: Vec::new(),
+        system_packages,
     }));
     system_transaction(
         TransactionKind::EndOfEpochTransaction(kinds),

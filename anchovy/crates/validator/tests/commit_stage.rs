@@ -196,6 +196,7 @@ fn commit(index: u32, round: u32, timestamp_ms: u64, transactions: &[Vec<u8>]) -
             .collect(),
         observations: Vec::new(),
         jwks: Vec::new(),
+        capabilities: Vec::new(),
         rejected: Vec::new(),
         cache_hits: 0,
         cache_misses: transactions.len(),

@@ -18,6 +18,7 @@ containers.workspace = true
 exec-types.workspace = true
 executor.workspace = true
 messages.workspace = true
+move-binary-format.workspace = true
 move-core-types.workspace = true
 move-vm-runtime.workspace = true
 natives.workspace = true

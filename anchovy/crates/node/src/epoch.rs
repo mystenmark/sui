@@ -257,6 +257,16 @@ impl Epoch {
     /// If the store cannot be read, or the record's committee is invalid.
     pub fn start(perpetual: &Perpetual, consensus: &mut impl Consensus) -> Epoch {
         let record = EpochRecord::load(&perpetual.store);
+        // As the reference's `check_protocol_version`: a binary that cannot
+        // run the epoch's version stops rather than diverge.
+        let supported = execution::upgrade::supported_protocol_versions();
+        if !execution::upgrade::is_supported(supported, record.protocol_version) {
+            eprintln!(
+                "epoch {} runs protocol version {}, outside this binary's {supported:?}",
+                record.epoch, record.protocol_version,
+            );
+            std::process::exit(1);
+        }
         let state = Arc::new(EpochState::starting_at(
             perpetual.chain,
             record.protocol_version,

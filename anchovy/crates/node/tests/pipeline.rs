@@ -124,6 +124,9 @@ struct Network {
     client: TransactionClient,
     /// Submissions taken and not yet in a block: each goes in the next.
     pending: Vec<TransactionsGuard>,
+    /// The pipeline's own capability notifications, kept apart from the
+    /// submissions tests make: each also goes in the next block.
+    announced: Vec<TransactionsGuard>,
     /// What became of each block with submissions, once committed.
     blocks: Vec<(BlockRef, oneshot::Sender<BlockStatus>)>,
     certified: BTreeMap<u64, CertifiedCheckpointSummary>,
@@ -196,6 +199,7 @@ impl Network {
             lanes,
             client,
             pending: Vec::new(),
+            announced: Vec::new(),
             blocks: Vec::new(),
             certified: BTreeMap::new(),
             delivered: Vec::new(),
@@ -236,6 +240,7 @@ impl Network {
         self.client = client;
         self.lanes = (normal, priority);
         self.pending.clear();
+        self.announced.clear();
         self.blocks.clear();
         self.delivered.clear();
         self.commit_index = 0;
@@ -467,7 +472,11 @@ impl Network {
             self.pending.push(guard);
         }
         while let Ok(guard) = self.lanes.0.try_recv() {
-            self.pending.push(guard);
+            if is_capability_notification(&guard) {
+                self.announced.push(guard);
+            } else {
+                self.pending.push(guard);
+            }
         }
         while let Some(certified) = self.state_sync.1.try_pop() {
             let summary: CertifiedCheckpointSummary = bcs::from_bytes(&certified.summary).unwrap();
@@ -509,7 +518,11 @@ impl Network {
         };
         // Each submission is included in this block, where it is told.
         let mut transactions = transactions;
-        for guard in std::mem::take(&mut self.pending) {
+        let announced = std::mem::take(&mut self.announced);
+        for guard in std::mem::take(&mut self.pending)
+            .into_iter()
+            .chain(announced)
+        {
             let first = transactions.len() as u16;
             let indices = (first..first + guard.transactions.len() as u16).collect();
             transactions.extend(guard.transactions);
@@ -1054,6 +1067,21 @@ async fn wait(
     .expect("answered")
     .unwrap();
     response.into_inner().inner.unwrap()
+}
+
+/// Whether `guard` is the pipeline's capability notification.
+fn is_capability_notification(guard: &TransactionsGuard) -> bool {
+    guard.transactions.iter().all(|bytes| {
+        messages::Message::<messages::consensus::ConsensusTransaction<'static>>::parse(
+            bytes.clone(),
+        )
+        .is_ok_and(|t| {
+            matches!(
+                t.get().kind(),
+                messages::consensus::ConsensusTransactionKind::CapabilityNotificationV2(_)
+            )
+        })
+    })
 }
 
 /// Plays consensus for submissions made on another task: once something is
