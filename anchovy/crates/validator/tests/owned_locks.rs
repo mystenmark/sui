@@ -11,7 +11,7 @@ use std::sync::Arc;
 use consensus::{Block, BlockRef, CommittedSubDag};
 use messages::Message;
 use messages::base::Hashed;
-use protocol_config::{Chain, ProtocolVersion};
+use sui_protocol_config::{Chain, ProtocolVersion};
 use sui_types::base_types::{ObjectRef, SequenceNumber, SuiAddress, random_object_ref};
 use sui_types::crypto::{AccountKeyPair, get_key_pair};
 use sui_types::transaction::{
@@ -199,6 +199,7 @@ fn commit(index: u32, transactions: &[Claimed<'_>]) -> DecodedCommit {
             .collect(),
         observations: Vec::new(),
         jwks: Vec::new(),
+        capabilities: Vec::new(),
         rejected: Vec::new(),
         cache_hits: 0,
         cache_misses: transactions.len(),
@@ -214,7 +215,9 @@ fn scheduled(handled: &HandledCommit) -> Vec<Hashed> {
         .iter()
         .filter_map(|t| match t {
             Scheduled::User(t) => Some(digest_of(t)),
-            Scheduled::Prologue(_) | Scheduled::AuthenticatorStateUpdate(_) => None,
+            Scheduled::Prologue(_)
+            | Scheduled::AuthenticatorStateUpdate(_)
+            | Scheduled::Cancelled(..) => None,
         })
         .collect()
 }
@@ -237,6 +240,7 @@ fn conflicts(handled: &HandledCommit) -> Vec<(Hashed, messages::base::ObjectRef,
         .map(|(_, _, digest, reason)| match reason {
             DropReason::LockConflict { object, holder } => (*digest, *object, *holder),
             DropReason::Inputs(e) => panic!("dropped for its inputs: {e:?}"),
+            DropReason::EpochClosed => panic!("dropped after the epoch closed"),
         })
         .collect()
 }
@@ -251,9 +255,9 @@ fn wire(r: &ObjectRef) -> messages::base::ObjectRef {
 
 /// A handler of a committee of one, that has handled no commit.
 fn new_handler(output: validator::epoch_store::ConsensusOutput) -> CommitHandler {
-    let config = protocol_config::ProtocolConfig::get_for_version(
-        protocol_config::ProtocolVersion::MAX,
-        protocol_config::Chain::Unknown,
+    let config = sui_protocol_config::ProtocolConfig::get_for_version(
+        sui_protocol_config::ProtocolVersion::MAX,
+        sui_protocol_config::Chain::Unknown,
     );
     CommitHandler::new(output, 0, vec![([0; 96], 10_000)], &config, None)
 }
@@ -316,6 +320,7 @@ fn a_deferred_transaction_outlives_a_restart() {
         last_built_timestamp: 0,
         root_version: 1,
         closed: false,
+        certs_closed: false,
     };
     handler.finish(&record, 1, true);
     committed.committed_through(1);
@@ -395,6 +400,7 @@ fn a_key_a_quorum_voted_for_is_added_by_the_next_commit_across_a_restart() {
         last_built_timestamp: 0,
         root_version: 1,
         closed: false,
+        certs_closed: false,
     };
     first.finish(&record, 1, true);
     committed.committed_through(1);
@@ -686,4 +692,65 @@ fn the_stage_leaves_dropped_transactions_out_of_its_chunks() {
     );
     assert_eq!(decided.dropped.len(), 1);
     assert_eq!(decided.dropped[0].2, digest(&second));
+}
+
+/// Once its time is up, the epoch waits for its deferred transactions:
+/// the commit at the end time defers one and is not the last; the next
+/// schedules it and drops its own user transactions, but having loaded a
+/// deferral is not the last either, as the reference's; the one after is.
+#[test]
+fn the_epoch_ends_once_its_deferred_transactions_are_scheduled() {
+    let bump = containers::Bump::default();
+    let epoch = epoch();
+    let sender = Sender::new();
+    let object = random_object_ref();
+    let first = sender.transaction(random_object_ref(), &[object]);
+    let second = sender.transaction(random_object_ref(), &[object]);
+    let third = sender.transaction(random_object_ref(), &[]);
+    let (output, _dir) = consensus_output();
+    let mut handler = new_handler(output).with_end(1000, false);
+    let decided = handler
+        .handle(&epoch, commit(1, &[(&first, &[]), (&second, &[])]), &bump)
+        .unwrap();
+    assert_eq!(deferred(&decided), vec![digest(&first)]);
+    assert!(!decided.final_commit);
+    assert!(handler.certs_closed());
+
+    let decided = handler
+        .handle(&epoch, commit(2, &[(&third, &[])]), &bump)
+        .unwrap();
+    assert_eq!(scheduled(&decided), vec![digest(&first)]);
+    assert!(matches!(
+        &decided.dropped[..],
+        [(_, _, dropped, DropReason::EpochClosed)] if *dropped == digest(&third)
+    ));
+    assert!(!decided.final_commit);
+    let decided = handler.handle(&epoch, commit(3, &[]), &bump).unwrap();
+    assert!(decided.final_commit);
+}
+
+/// A commit past the close deadline is the epoch's last even with
+/// deferred transactions, which are abandoned.
+#[test]
+fn the_close_deadline_abandons_deferred_transactions() {
+    let bump = containers::Bump::default();
+    let epoch = epoch();
+    let deadline = epoch.config.epoch_close_deadline_ms();
+    let sender = Sender::new();
+    let object = random_object_ref();
+    let first = sender.transaction(random_object_ref(), &[object]);
+    let second = sender.transaction(random_object_ref(), &[object]);
+    let (output, _dir) = consensus_output();
+    let mut handler = new_handler(output).with_end(1000, false);
+    // Commit `n` is at `1000 * n` ms.
+    let past_deadline = u32::try_from((1000 + deadline).div_ceil(1000)).unwrap();
+    let decided = handler
+        .handle(
+            &epoch,
+            commit(past_deadline, &[(&first, &[]), (&second, &[])]),
+            &bump,
+        )
+        .unwrap();
+    assert_eq!(deferred(&decided), vec![digest(&first)]);
+    assert!(decided.final_commit);
 }

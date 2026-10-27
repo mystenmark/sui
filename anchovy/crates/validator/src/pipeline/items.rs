@@ -60,6 +60,9 @@ pub struct ScheduledEntry {
     pub transaction: ExecutableTransaction,
     pub shared: Vec<SharedAccess>,
     pub origin: Option<(BlockRef, TransactionIndex)>,
+    /// A transaction cancelled for congestion: each consensus object input
+    /// and the marker version it reads as instead (then `shared` is empty).
+    pub cancelled: Vec<(ObjectId, u64)>,
 }
 
 /// A checkpoint chunk's transactions, in schedule order.
@@ -140,6 +143,10 @@ pub struct EpochClose {
     /// The execution time observations as of the last commit, by key and
     /// authority name, sorted by key: the next epoch's, once filtered.
     pub observations: Vec<(Key, Vec<([u8; 96], Duration)>)>,
+    /// The next epoch's protocol version, and the system packages to go
+    /// with it, as the last commit chose them (`capabilities::choose`).
+    pub protocol_version: u64,
+    pub system_packages: Vec<messages::build::base::ObjectRef>,
 }
 
 /// A transaction with its inputs as keys. `VersionResolver` or

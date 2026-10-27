@@ -25,7 +25,7 @@ use messages::Message;
 use messages::base::Digest;
 use messages::checkpoint::CheckpointData;
 use messages::transaction::{DigestPending, DigestReady, Transaction, TransactionKind};
-use protocol_config::{Chain, ProtocolVersion};
+use sui_protocol_config::{Chain, ProtocolVersion};
 use tokio::sync::oneshot;
 use tonic::transport::Channel;
 use tonic::transport::server::TcpIncoming;

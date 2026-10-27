@@ -201,6 +201,10 @@ impl Executor {
             };
             self.resolved.push(generation);
         }
+        // A cancelled transaction's consensus objects read as their markers.
+        for &(id, marker) in &entry.cancelled {
+            provided.push((id, Input::Cancelled(marker)));
+        }
         let mut funds = Funds::MaybeSufficient;
         for value in values {
             match value {
@@ -695,6 +699,7 @@ mod tests {
                 }),
                 shared: vec![],
                 origin: None,
+                cancelled: Vec::new(),
             },
             resolved_base: vec![],
             inputs: vec![],

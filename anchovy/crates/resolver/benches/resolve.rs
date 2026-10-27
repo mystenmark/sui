@@ -40,8 +40,8 @@ use std::time::{Duration, Instant};
 use messages::Message;
 use messages::base::{Digest, Hashed, ObjectId};
 use messages::transaction::SharedObjectMutability;
-use protocol_config::{Chain, ProtocolVersion};
 use resolver::{InputAvailability, VersionResolver};
+use sui_protocol_config::{Chain, ProtocolVersion};
 use sui_types::Identifier;
 use sui_types::base_types::{ObjectID, SequenceNumber, SuiAddress, random_object_ref};
 use sui_types::crypto::{AccountKeyPair, get_key_pair};
@@ -196,6 +196,7 @@ fn chunk(round: u32, transactions: &[Planned]) -> Chunk {
                 transaction: ExecutableTransaction::User(transaction),
                 shared,
                 origin: None,
+                cancelled: Vec::new(),
             }
         })
         .collect();

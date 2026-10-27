@@ -17,7 +17,7 @@ use messages::fast::checkpoint::UserSignature;
 use messages::fast::{Bump, Writer};
 use messages::reader::Reader;
 use messages::transaction::{GenericSignature, SenderSignedData, TransactionKind};
-use protocol_config::ProtocolConfig;
+use sui_protocol_config::ProtocolConfig;
 use validator::pipeline::items::ExecutedEffects;
 
 /// The reference's `ObjectDigest::OBJECT_DIGEST_DELETED` and `_WRAPPED`.

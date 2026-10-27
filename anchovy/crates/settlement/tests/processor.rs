@@ -14,9 +14,9 @@ use messages::Message;
 use messages::base::{Digest, Hashed, ObjectId};
 use messages::effects::TransactionEffects;
 use messages::transaction::SharedObjectMutability;
-use protocol_config::{Chain, ProtocolVersion};
 use settlement::settle::{self, SettlementBuilder};
 use settlement::{FundsReserver, SettlementScheduler};
+use sui_protocol_config::{Chain, ProtocolVersion};
 use validator::consensus::sequence::{SharedAccess, SharedOrdinal};
 use validator::epoch::EpochParams;
 use validator::pipeline::items::{
@@ -316,7 +316,7 @@ fn expected_settlements(effects: &[Vec<u8>], height: u64, offset: u64) -> Vec<se
     }
     builder
         .build(
-            epoch().config.max_updates_per_settlement_txn,
+            epoch().config.max_updates_per_settlement_txn_as_option(),
             7,
             ISV,
             height,

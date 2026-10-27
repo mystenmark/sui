@@ -98,8 +98,8 @@ async fn serve(key: NetworkKey) -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let epoch = std::sync::Arc::new(validator::epoch::EpochState::new(
-            protocol_config::Chain::Unknown,
-            protocol_config::ProtocolVersion::MAX.as_u64(),
+            sui_protocol_config::Chain::Unknown,
+            sui_protocol_config::ProtocolVersion::MAX.as_u64(),
             0,
             messages::base::Digest::new([0; 32]),
             1000,

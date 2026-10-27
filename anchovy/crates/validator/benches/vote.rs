@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use consensus::{Block, BlockRef};
 use messages::base::{Digest, ObjectId};
-use protocol_config::{Chain, ProtocolVersion};
+use sui_protocol_config::{Chain, ProtocolVersion};
 use sui_types::base_types::{ObjectID, SuiAddress};
 use sui_types::crypto::{AccountKeyPair, get_key_pair};
 use sui_types::digests::TransactionDigest;

@@ -148,6 +148,33 @@ fn epoch_start(
     }
 }
 
+/// Submits this validator's capabilities for the epoch, as the reference's
+/// `SuiNode::monitor_reconfiguration` does at each epoch's start: the
+/// protocol versions and system packages it supports, which the epoch's last
+/// commit chooses the next version from. On its own thread: a full
+/// submission lane blocks it, and the pipeline may be started in a runtime.
+fn announce_capabilities(
+    store: &store::Store,
+    epoch: &EpochState,
+    protocol_key: &ProtocolKey,
+    system_objects: &SystemObjects,
+    consensus: &TransactionClient,
+) {
+    let notification = execution::upgrade::capability_notification(
+        store,
+        *protocol_key.public(),
+        epoch.params.chain,
+        &epoch.params.config,
+        execution::upgrade::supported_protocol_versions(),
+        system_objects.accumulator_root.is_some(),
+    );
+    let consensus = consensus.clone();
+    std::thread::spawn(move || {
+        // Failing only as consensus shuts down, when the epoch is over.
+        let _ = consensus.submit_blocking(vec![notification], consensus::Priority::Normal);
+    });
+}
+
 impl Pipeline {
     /// The pipeline over `store`, in `epoch`, signing checkpoints with
     /// `protocol_key`, certifying them with `committee`'s signatures and
@@ -261,6 +288,18 @@ impl Pipeline {
             first_hashed,
             root_state,
         });
+        if record
+            .stakes()
+            .any(|(name, _)| name == *protocol_key.public())
+        {
+            announce_capabilities(
+                store,
+                epoch,
+                protocol_key,
+                &parts.system_objects,
+                &consensus,
+            );
+        }
         let (ended_sender, ended) = watch::channel(None);
         let workers = wiring::spawn(
             parts.clone(),

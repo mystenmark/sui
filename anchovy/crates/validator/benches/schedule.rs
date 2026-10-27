@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use containers::Bump;
 use messages::Message;
-use protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
+use sui_protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
 use sui_types::base_types::{ObjectID, SequenceNumber, SuiAddress, random_object_ref};
 use sui_types::crypto::{AccountKeyPair, get_key_pair};
 use sui_types::transaction::{
@@ -22,7 +22,7 @@ use sui_types::transaction::{
     TransactionData, TransactionKind,
 };
 use validator::checks::{self, VerifiedTransaction};
-use validator::consensus::sequence::{Prologue, Sequencer};
+use validator::consensus::sequence::{Prologue, Scheduled, Sequencer};
 
 struct Counting;
 
@@ -133,7 +133,9 @@ fn main() {
                     let before = ALLOCATIONS.load(Ordering::Relaxed);
                     let start = Instant::now();
                     let ordered = sequencer.order(&config, transactions, &bump);
-                    let schedule = sequencer.schedule(prologue, None, ordered, &bump);
+                    let mut scheduled = containers::Vec::with_capacity_in(ordered.len(), &bump);
+                    scheduled.extend(ordered.into_iter().map(Scheduled::User));
+                    let schedule = sequencer.schedule(prologue, None, scheduled, &bump);
                     let took = start.elapsed();
                     let allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
                     assert_eq!(schedule.len(), commit_size + 1);

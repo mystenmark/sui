@@ -60,6 +60,7 @@ impl EpochStore {
                 processed: containers::heap_message_map(0),
                 locks: SipMap::default(),
                 streams: SipMap::default(),
+                debts: SipMap::default(),
                 committed_height: 0,
             })),
         };
@@ -317,6 +318,7 @@ struct Quarantine {
     processed: HeapMessageMap<TxDigest, usize>,
     locks: SipMap<ObjectRef, (TxDigest, usize)>,
     streams: SipMap<StreamId, ((u32, u32), usize)>,
+    debts: SipMap<ObjectId, ((u64, u64), usize)>,
     /// The last chunk height of the last checkpoint committed.
     committed_height: u64,
 }
@@ -330,6 +332,8 @@ struct Output {
     processed: HeapMessageSet<TxDigest>,
     locks: SipMap<ObjectRef, TxDigest>,
     streams: SipMap<StreamId, (u32, u32)>,
+    /// Congestion debts recorded, each as (round, debt).
+    debts: SipMap<ObjectId, (u64, u64)>,
     /// The execution time observations taken: (generation, authority
     /// index) and the encoded estimates.
     observations: Vec<((u64, u32), Vec<u8>)>,
@@ -340,6 +344,8 @@ struct Output {
     /// The keys that became active, encoded, if the epoch agrees keys: the
     /// next commit's update.
     new_jwks: Option<Vec<u8>>,
+    /// Capabilities recorded, by authority index, encoded.
+    capabilities: Vec<(u32, Vec<u8>)>,
     /// The commit stage's state after the commit, encoded.
     record: Vec<u8>,
     /// The last chunk height the commit assigned.
@@ -354,10 +360,12 @@ impl Default for Output {
             processed: containers::heap_message_set(0),
             locks: SipMap::default(),
             streams: SipMap::default(),
+            debts: SipMap::default(),
             observations: Vec::new(),
             deferred: Vec::new(),
             jwk_votes: Vec::new(),
             new_jwks: None,
+            capabilities: Vec::new(),
             record: Vec::new(),
             height: 0,
             drained: false,
@@ -415,6 +423,34 @@ impl ConsensusOutput {
             .open
             .locks
             .insert(object, holder);
+    }
+
+    /// The congestion debt last recorded for `object`, and the round it was
+    /// recorded in, as (round, debt), if any this epoch.
+    ///
+    /// # Panics
+    /// If the database cannot be read.
+    pub fn congestion_debt(&self, object: &ObjectId) -> Option<(u64, u64)> {
+        let q = lock_quarantine(&self.quarantine);
+        if let Some(debt) = q.open.debts.get(object) {
+            return Some(*debt);
+        }
+        if let Some((debt, _)) = q.debts.get(object) {
+            return Some(*debt);
+        }
+        q.db.get(Space::CongestionDebts, &object.0)
+            .expect("the epoch's database reads")
+            .map(|v| bcs::from_bytes(&v).expect("a debt as written"))
+    }
+
+    /// Records `object`'s congestion debt `debt` in `round`. Debts are never
+    /// deleted: a later commit decays a stale one (the reference's
+    /// `load_initial_object_debts`).
+    pub fn set_congestion_debt(&mut self, object: ObjectId, round: u64, debt: u64) {
+        lock_quarantine(&self.quarantine)
+            .open
+            .debts
+            .insert(object, (round, debt));
     }
 
     /// The stream's last scheduled generation, (round, generation), if a
@@ -487,9 +523,59 @@ impl ConsensusOutput {
             .collect()
     }
 
+    /// Whether any deferred transaction is still waiting, the commit being
+    /// decided's included.
+    pub fn has_deferred(&self) -> bool {
+        !lock_quarantine(&self.quarantine).deferred.is_empty()
+    }
+
+    /// Drops every deferred transaction still waiting: the commit being
+    /// decided's are not written, earlier ones are deleted.
+    pub fn abandon_deferred(&mut self) {
+        let mut q = lock_quarantine(&self.quarantine);
+        let keys: Vec<DeferralKey> = std::mem::take(&mut q.deferred).into_keys().collect();
+        for key in keys {
+            match q
+                .open
+                .deferred
+                .iter()
+                .position(|(k, put)| *k == key && put.is_some())
+            {
+                Some(i) => {
+                    q.open.deferred.remove(i);
+                }
+                None => q.open.deferred.push((key, None)),
+            }
+        }
+    }
+
     /// A JSON web key vote the commit being decided counted, encoded.
     pub fn put_jwk_vote(&mut self, vote: Vec<u8>) {
         lock_quarantine(&self.quarantine).open.jwk_votes.push(vote);
+    }
+
+    /// Capabilities the commit being decided recorded for the authority at
+    /// committee index `author`, encoded: they replace any kept.
+    pub fn put_capabilities(&mut self, author: u32, capabilities: Vec<u8>) {
+        lock_quarantine(&self.quarantine)
+            .open
+            .capabilities
+            .push((author, capabilities));
+    }
+
+    /// The capabilities kept of the commits written, by authority index:
+    /// for the commit handler's start.
+    ///
+    /// # Panics
+    /// If the database cannot be read.
+    pub fn capabilities(&self) -> Vec<Vec<u8>> {
+        lock_quarantine(&self.quarantine)
+            .db
+            .entries(Space::Capabilities)
+            .expect("the epoch's database reads")
+            .into_iter()
+            .map(|(_, capabilities)| capabilities)
+            .collect()
     }
 
     /// The JSON web keys that became active in the commit being decided,
@@ -609,6 +695,10 @@ impl Quarantine {
             let entry = self.streams.entry(*stream).or_insert((*last, 0));
             *entry = (*last, entry.1 + 1);
         }
+        for (object, debt) in &output.debts {
+            let entry = self.debts.entry(*object).or_insert((*debt, 0));
+            *entry = (*debt, entry.1 + 1);
+        }
         self.queued.push_back(output);
     }
 
@@ -652,12 +742,27 @@ impl Quarantine {
                 );
                 release(&mut self.streams, &stream, |last| &mut last.1);
             }
+            for (object, debt) in output.debts {
+                batch.put(
+                    Space::CongestionDebts,
+                    object.0.to_vec(),
+                    bcs::to_bytes(&debt).expect("a debt serializes"),
+                );
+                release(&mut self.debts, &object, |held| &mut held.1);
+            }
             for (key, transactions) in output.deferred {
                 let key = key.encode().to_vec();
                 match transactions {
                     Some(transactions) => batch.put(Space::Deferred, key, transactions),
                     None => batch.delete(Space::Deferred, key),
                 }
+            }
+            for (author, capabilities) in output.capabilities {
+                batch.put(
+                    Space::Capabilities,
+                    author.to_be_bytes().to_vec(),
+                    capabilities,
+                );
             }
             for vote in output.jwk_votes {
                 let key = Blake2b::<U32>::digest(&vote).to_vec();

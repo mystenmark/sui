@@ -18,7 +18,7 @@ pub mod transaction_data;
 pub mod verify;
 
 use messages::base::ChainIdentifier;
-use protocol_config::ProtocolConfig;
+use sui_protocol_config::ProtocolConfig;
 
 pub use error::{Error, ErrorKind};
 

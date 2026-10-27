@@ -6,7 +6,7 @@ use std::sync::Arc;
 use messages::Message;
 use messages::base::{Digest, Hashed, ObjectId};
 use messages::transaction::SharedObjectMutability;
-use protocol_config::{Chain, ProtocolVersion};
+use sui_protocol_config::{Chain, ProtocolVersion};
 use sui_types::Identifier;
 use sui_types::base_types::{ObjectID, ObjectRef, SequenceNumber, SuiAddress, random_object_ref};
 use sui_types::coin_reservation::ParsedObjectRefWithdrawal;
@@ -116,6 +116,7 @@ fn system(shared: Vec<SharedAccess>) -> ScheduledEntry {
         }),
         shared,
         origin: None,
+        cancelled: Vec::new(),
     }
 }
 
@@ -140,6 +141,7 @@ fn signed(data: TransactionData, key: &AccountKeyPair) -> ScheduledEntry {
         transaction: ExecutableTransaction::User(transaction),
         shared: vec![],
         origin: None,
+        cancelled: Vec::new(),
     }
 }
 

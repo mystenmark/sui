@@ -11,7 +11,7 @@ use messages::transaction::{
     Argument, CallArg, Command, ObjectArg, ProgrammableMoveCall, ProgrammableTransaction,
 };
 use messages::type_tag::TypeTag;
-use protocol_config::ProtocolConfig;
+use sui_protocol_config::ProtocolConfig;
 
 use crate::kind::is_valid_identifier;
 use crate::transaction_data::command_arguments;

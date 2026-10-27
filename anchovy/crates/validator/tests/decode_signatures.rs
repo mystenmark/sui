@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use consensus::{Block, BlockRef, CommittedSubDag};
 use messages::base::Digest;
-use protocol_config::{Chain, ProtocolVersion};
+use sui_protocol_config::{Chain, ProtocolVersion};
 use sui_types::committee::Committee;
 use sui_types::crypto::{AuthorityPublicKeyBytes, KeypairTraits};
 use sui_types::digests::CheckpointContentsDigest;

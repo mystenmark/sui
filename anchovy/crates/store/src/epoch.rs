@@ -29,6 +29,8 @@ pub enum Space {
     ExecutionTimeObservations,
     Deferred,
     JwkVotes,
+    Capabilities,
+    CongestionDebts,
     // Checkpoint builder state.
     Built,
     CheckpointHashes,
@@ -39,7 +41,7 @@ pub enum Space {
 }
 
 impl Space {
-    const ALL: [Space; 12] = [
+    const ALL: [Space; 14] = [
         Space::Processed,
         Space::Locks,
         Space::Streams,
@@ -47,6 +49,8 @@ impl Space {
         Space::ExecutionTimeObservations,
         Space::Deferred,
         Space::JwkVotes,
+        Space::Capabilities,
+        Space::CongestionDebts,
         Space::Built,
         Space::CheckpointHashes,
         Space::Roots,
@@ -63,6 +67,8 @@ impl Space {
             Space::ExecutionTimeObservations => "execution_time_observations",
             Space::Deferred => "deferred",
             Space::JwkVotes => "jwk_votes",
+            Space::Capabilities => "capabilities",
+            Space::CongestionDebts => "congestion_debts",
             Space::Built => "built",
             Space::CheckpointHashes => "checkpoint_hashes",
             Space::Roots => "roots",
@@ -75,10 +81,12 @@ impl Space {
     /// and sequence numbers 8.
     fn key_len(self) -> usize {
         match self {
-            // A digest, or for a JSON web key vote, its hash.
-            Space::Processed | Space::JwkVotes => 32,
+            // A digest, or for a JSON web key vote, its hash; or an object id.
+            Space::Processed | Space::JwkVotes | Space::CongestionDebts => 32,
             Space::Locks => 32 + 8 + 32,
             Space::Streams | Space::StartVersions => 32 + 8,
+            // An authority's index.
+            Space::Capabilities => 4,
             Space::Generations => 32 + 8 + 4 + 4,
             Space::Built | Space::CheckpointHashes | Space::Roots => 8,
             Space::Commit => 1,

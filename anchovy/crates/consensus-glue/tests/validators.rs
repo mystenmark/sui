@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use consensus_glue::{Parameters, Runner};
 use messages::base::{Digest, ObjectId};
 use node::epoch::{EpochRecord, Node, Perpetual};
-use protocol_config::Chain;
+use sui_protocol_config::Chain;
 use sui_types::base_types::{AuthorityName, ObjectID, ObjectRef, SuiAddress};
 use sui_types::crypto::{AccountKeyPair, get_key_pair};
 use sui_types::effects::{TransactionEffects, TransactionEffectsAPI};

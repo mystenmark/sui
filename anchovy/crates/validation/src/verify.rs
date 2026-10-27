@@ -24,7 +24,7 @@ use fastcrypto_zkp::bn254::zk_login_api::{ZkLoginCircuitMode, ZkLoginEnv};
 use messages::base::SuiAddress;
 use messages::signature::{CompressedSignature, MultiSig, PublicKey};
 use messages::transaction::{SenderSignedData, TransactionKind, TxState};
-use protocol_config::{Chain, ProtocolConfig};
+use sui_protocol_config::{Chain, ProtocolConfig};
 
 use crate::signature::{ParsedSignature, Passkey, ZkLoginAuthenticator, zklogin};
 use crate::{Error, ErrorKind};

@@ -15,7 +15,7 @@ use consensus::{Block, BlockRef, CommittedSubDag, TransactionClient, Transaction
 use messages::base::Digest;
 use node::ConsensusOutput;
 use node::epoch::{EpochRecord, Node, Perpetual};
-use protocol_config::Chain;
+use sui_protocol_config::Chain;
 use sui_types::crypto::{AccountKeyPair, get_key_pair};
 use tokio::sync::mpsc;
 use validator::consensus::decode::CommitRequest;

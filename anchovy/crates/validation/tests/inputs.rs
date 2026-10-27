@@ -11,7 +11,7 @@ use messages::Message;
 use messages::base::{Digest, ObjectId};
 use messages::object::Object;
 use messages::transaction::SenderSignedData;
-use protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
+use sui_protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
 use validation::Context;
 use validation::inputs::Objects;
 

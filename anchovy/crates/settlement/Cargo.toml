@@ -20,7 +20,7 @@ workqueue.workspace = true
 
 [dev-dependencies]
 move-core-types.workspace = true
-protocol-config.workspace = true
+sui-protocol-config.workspace = true
 rand.workspace = true
 sui-types.workspace = true
 tempfile.workspace = true

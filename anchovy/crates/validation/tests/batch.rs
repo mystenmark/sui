@@ -13,7 +13,7 @@ use fastcrypto::traits::ToFromBytes;
 use messages::Message;
 use messages::build;
 use messages::transaction::{DigestPending, Transaction, TransactionKind};
-use protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
+use sui_protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
 use validation::sender_signed::deserialization_checks;
 use validation::verify::{
     Verifier, verify_ed25519, verify_ed25519_batch, verify_signatures,
