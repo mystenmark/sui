@@ -19,7 +19,7 @@ serde_json.workspace = true
 blake2.workspace = true
 containers.workspace = true
 messages.workspace = true
-protocol-config.workspace = true
+sui-protocol-config.workspace = true
 
 [dev-dependencies]
 flate2 = "1"

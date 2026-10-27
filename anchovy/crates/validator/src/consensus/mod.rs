@@ -4,7 +4,9 @@
 //! The processors consensus feeds: voting on blocks, and handling commits.
 
 pub mod cache;
+pub mod capabilities;
 pub mod commit;
+pub mod congestion;
 pub mod decode;
 pub mod deferral;
 pub mod execution_time;

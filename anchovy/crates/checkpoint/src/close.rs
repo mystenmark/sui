@@ -16,7 +16,7 @@ use messages::build::system_transaction::{
 };
 use messages::fast::Bump;
 use messages::transaction::TransactionKind;
-use protocol_config::{ExecutionTimeEstimateParams, PerObjectCongestionControlMode};
+use sui_protocol_config::{ExecutionTimeEstimateParams, PerObjectCongestionControlMode};
 use validator::consensus::commit::end_of_epoch_transaction;
 use validator::consensus::execution_time::{Key, KeyRef};
 use validator::epoch::EpochParams;
@@ -123,7 +123,8 @@ impl EpochCloser {
         let transaction = end_of_epoch_transaction(
             epoch.epoch,
             kinds,
-            epoch.config.version.as_u64(),
+            close.protocol_version,
+            self.system_packages(&close.system_packages),
             summary::rolling_gas(&built, Some(&previous), epoch.epoch),
             built.pending.timestamp_ms,
         );
@@ -144,6 +145,7 @@ impl EpochCloser {
                     transaction: ExecutableTransaction::System(transaction),
                     shared: close.shared,
                     origin: None,
+                    cancelled: Vec::new(),
                 }],
             },
             "resolver",
@@ -341,6 +343,20 @@ impl EpochCloser {
                 }
             }
         }
+    }
+
+    /// The bytes of the system packages of `chosen` that change.
+    ///
+    /// # Panics
+    /// If this binary cannot make them: the reference's checkpoint builder
+    /// retries then, and its validator gets the last checkpoint by state
+    /// sync, which anchovy has not.
+    fn system_packages(
+        &self,
+        chosen: &[messages::build::base::ObjectRef],
+    ) -> Vec<execution::upgrade::SystemPackageBytes> {
+        execution::upgrade::system_package_bytes(&self.store, chosen, &self.epoch.config)
+            .expect("this binary makes the system packages the network chose")
     }
 
     /// Step 3.

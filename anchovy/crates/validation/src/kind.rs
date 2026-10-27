@@ -12,7 +12,7 @@ use messages::transaction::{
     SharedObjectMutability, TransactionData, TransactionKind, TxState,
 };
 use messages::type_tag::{TypeInput, TypeTag};
-use protocol_config::{PerObjectCongestionControlMode, ProtocolConfig};
+use sui_protocol_config::{PerObjectCongestionControlMode, ProtocolConfig};
 
 use crate::{Error, ErrorKind};
 
@@ -157,7 +157,7 @@ fn programmable_transaction(
         call_arg(input, config)?;
     }
 
-    if let Some(max) = config.max_publish_or_upgrade_per_ptb {
+    if let Some(max) = config.max_publish_or_upgrade_per_ptb_as_option() {
         let publishes = pt
             .commands
             .iter()
@@ -257,7 +257,7 @@ fn call_arg(arg: &CallArg<'_>, config: &ProtocolConfig) -> Result<(), Error> {
         }
         CallArg::FundsWithdrawal(w) => {
             let messages::transaction::WithdrawalTypeArg::Balance(ty) = w.get().type_arg;
-            if let Some(max) = config.max_accumulator_type_nodes {
+            if let Some(max) = config.max_accumulator_type_nodes_as_option() {
                 // The type is `Balance<ty>`: one node more than `ty`.
                 if node_count(&ty).saturating_add(1) > max {
                     return Err(size_limit("type nodes in a funds accumulator type", max));
@@ -318,7 +318,7 @@ fn command_check(command: &Command<'_>, config: &ProtocolConfig) -> Result<(), E
                     config.max_modules_in_publish(),
                 ));
             }
-            if let Some(max) = config.max_package_dependencies
+            if let Some(max) = config.max_package_dependencies_as_option()
                 && deps.len() >= max as usize
             {
                 return Err(size_limit("package dependencies", max));

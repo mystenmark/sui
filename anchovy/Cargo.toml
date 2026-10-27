@@ -15,7 +15,6 @@ members = [
     "crates/messages",
     "crates/natives",
     "crates/node",
-    "crates/protocol-config",
     "crates/resolver",
     "crates/settlement",
     "crates/state-hasher",
@@ -86,7 +85,6 @@ exec-types = { path = "crates/exec-types" }
 natives = { path = "crates/natives" }
 node = { path = "crates/node" }
 messages = { path = "crates/messages" }
-protocol-config = { path = "crates/protocol-config" }
 resolver = { path = "crates/resolver" }
 settlement = { path = "crates/settlement" }
 state-hasher = { path = "crates/state-hasher" }

@@ -59,3 +59,60 @@ pub fn system_objects(store: &store::Store) -> Result<SystemObjects> {
 pub fn accumulator_object_count(store: &store::Store) -> Result<Option<u64>> {
     get_accumulator_object_count(&StoreView::new(store)).map_err(Error::Sui)
 }
+
+/// The reference's `EXTRA_FIELD_EXECUTION_TIME_ESTIMATES_CHUNK_COUNT_KEY`
+/// (in `sui-core`): the system state's extra field counting the chunks of
+/// stored execution time observations.
+const EXECUTION_TIME_ESTIMATES_CHUNK_COUNT_KEY: u64 = 1;
+
+/// The execution time observations the previous epoch's last transaction
+/// stored in the system state, merged, as the reference's
+/// `get_stored_execution_time_observations` reads them for an epoch's
+/// estimator: none if `config` stores none, or the store has none.
+pub fn stored_execution_time_observations(
+    store: &store::Store,
+    config: &sui_protocol_config::ProtocolConfig,
+) -> messages::build::system_transaction::StoredExecutionTimeObservations {
+    use sui_protocol_config::PerObjectCongestionControlMode;
+    use sui_types::dynamic_field::get_dynamic_field_from_store;
+    use sui_types::execution::ExecutionTimeObservationChunkKey;
+    use sui_types::sui_system_state::{SuiSystemState, get_sui_system_state};
+    use sui_types::transaction::StoredExecutionTimeObservations;
+
+    let none =
+        || messages::build::system_transaction::StoredExecutionTimeObservations::V1(Vec::new());
+    let PerObjectCongestionControlMode::ExecutionTimeEstimate(params) =
+        config.per_object_congestion_control_mode()
+    else {
+        return none();
+    };
+    if params.observations_chunk_size.is_none() {
+        return none();
+    }
+    let view = StoreView::new(store);
+    let Ok(SuiSystemState::V2(system_state)) = get_sui_system_state(&view) else {
+        return none();
+    };
+    let fields = system_state.extra_fields.id.id.bytes;
+    let Ok::<u64, _>(count) =
+        get_dynamic_field_from_store(&view, fields, &EXECUTION_TIME_ESTIMATES_CHUNK_COUNT_KEY)
+    else {
+        return none();
+    };
+    let mut chunks = Vec::new();
+    for chunk_index in 0..count {
+        let key = ExecutionTimeObservationChunkKey { chunk_index };
+        let Ok::<Vec<u8>, _>(bytes) = get_dynamic_field_from_store(&view, fields, &key) else {
+            return none();
+        };
+        let chunk: StoredExecutionTimeObservations =
+            bcs::from_bytes(&bytes).expect("stored execution time observations deserialize");
+        chunks.push(chunk);
+    }
+    // The same BCS in anchovy's types.
+    let merged = bcs::to_bytes(&StoredExecutionTimeObservations::merge_sorted_chunks(
+        chunks,
+    ))
+    .expect("observations serialize");
+    bcs::from_bytes(&merged).expect("observations as the reference serializes them")
+}

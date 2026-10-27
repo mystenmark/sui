@@ -24,9 +24,12 @@ use blake2::{Blake2b, Digest as _};
 use containers::Bump;
 use messages::base::{Hashed, ObjectRef};
 use messages::build::system_transaction::{Jwk, JwkId};
-use protocol_config::ProtocolConfig;
+use sui_protocol_config::{PerObjectCongestionControlMode, ProtocolConfig};
 use workqueue::Processor;
 
+use crate::checks::VerifiedTransaction;
+use crate::consensus::capabilities::{self, CapabilitySet};
+use crate::consensus::congestion::{self, CongestionTracker};
 use crate::consensus::decode::{CommittedTransaction, DecodedCommit};
 use crate::consensus::deferral::{DeferralKey, Deferred, decode_deferred, encode_deferred};
 use crate::consensus::execution_time::{
@@ -34,7 +37,8 @@ use crate::consensus::execution_time::{
 };
 use crate::consensus::jwk::{JwkAggregator, JwkVote, decode_vote, encode_vote, jwk_order};
 use crate::consensus::sequence::{
-    AuthenticatorUpdate, Prologue, Schedule, Scheduled, Sequencer, SharedAccess, SharedOrdinal,
+    AuthenticatorUpdate, CancelledInput, Prologue, Schedule, Scheduled, Sequencer, SharedAccess,
+    SharedOrdinal, shared_inputs, uses_randomness,
 };
 use crate::consensus::status::{ConsensusTxStatus, ConsensusTxStatusCache};
 use crate::epoch::EpochParams;
@@ -54,6 +58,8 @@ pub enum DropReason {
     LockConflict { object: ObjectRef, holder: TxDigest },
     /// Its input objects are invalid.
     Inputs(validation::Error),
+    /// It came after the epoch's certificates closed.
+    EpochClosed,
 }
 
 /// A commit the handler decided: its schedule, where each scheduled
@@ -71,10 +77,16 @@ pub struct HandledCommit<'b> {
     /// Transactions dropped before scheduling, in consensus order. Like the
     /// reference's, they are processed: a later inclusion is a duplicate.
     pub dropped: containers::Vec<'b, (BlockRef, TransactionIndex, TxDigest, DropReason)>,
-    /// Each scheduled user transaction's execution time estimate, in
-    /// microseconds, in schedule order: what the reference's
-    /// `IndirectStateObserver` sees.
-    pub estimates_us: containers::Vec<'b, u64>,
+    /// The prologue's additional state digest: the commit interval
+    /// observer's, folded with the estimates the commit observed (the
+    /// reference's `IndirectStateObserver`).
+    pub state_digest: [u8; 32],
+    /// The epoch's last commit: its time is up and no deferred transaction
+    /// remains, or the close deadline passed.
+    pub final_commit: bool,
+    /// For the epoch's last commit, the next epoch's protocol version and
+    /// the system packages to go with it (`capabilities::choose`).
+    pub upgrade: Option<(u64, Vec<messages::build::base::ObjectRef>)>,
     pub cache_hits: usize,
     pub cache_misses: usize,
 }
@@ -100,12 +112,23 @@ pub struct CommitHandler {
     sequencer: Sequencer,
     execution_times: ExecutionTimeEstimator,
     jwks: JwkAggregator,
+    /// Each member's name and stake, by committee index.
+    committee: Vec<([u8; 96], u64)>,
+    capabilities: CapabilitySet,
+    /// The commit timestamps congestion control's budget and the prologue's
+    /// state digest are taken from.
+    commit_times: CommitIntervalObserver,
     /// The JSON web keys that became active in the last commit handled,
     /// which the next adds to the authenticator state.
     new_jwks: Vec<(JwkId, Jwk)>,
     /// The authenticator state's initial shared version, if the epoch
     /// agrees keys: the reference's `authenticator_state_enabled`.
     authenticator: Option<u64>,
+    /// When the epoch's time is up, by commit timestamp.
+    epoch_end_ms: u64,
+    /// A commit at or past `epoch_end_ms` was handled: later commits' user
+    /// transactions, observations and votes are dropped.
+    certs_closed: bool,
 }
 
 impl CommitHandler {
@@ -124,8 +147,14 @@ impl CommitHandler {
         for (generation, author, estimates) in output.execution_time_observations() {
             execution_times.restore(author, generation, &decode_estimates(&estimates));
         }
-        let mut jwks =
-            JwkAggregator::new(committee, config.max_jwk_votes_per_validator_per_epoch());
+        let mut capabilities = CapabilitySet::new(&committee);
+        for announced in output.capabilities() {
+            capabilities.record(capabilities::decode(&announced));
+        }
+        let mut jwks = JwkAggregator::new(
+            committee.clone(),
+            config.max_jwk_votes_per_validator_per_epoch(),
+        );
         for vote in output.jwk_votes() {
             let (author, key) = decode_vote(&vote);
             jwks.restore(author, key);
@@ -140,9 +169,54 @@ impl CommitHandler {
             sequencer: Sequencer::new(),
             execution_times,
             jwks,
+            committee,
+            capabilities,
+            commit_times: CommitIntervalObserver::default(),
             new_jwks,
             authenticator: authenticator.filter(|_| config.enable_jwk_consensus_updates()),
+            epoch_end_ms: u64::MAX,
+            certs_closed: false,
         }
+    }
+
+    /// Starts the estimator from the execution time observations the
+    /// previous epoch `stored`, then those of this epoch's commits written,
+    /// in the reference's order (`ExecutionTimeEstimator::new`).
+    #[must_use]
+    pub fn with_stored_observations(
+        mut self,
+        config: &ProtocolConfig,
+        stored: &messages::build::system_transaction::StoredExecutionTimeObservations,
+    ) -> CommitHandler {
+        let mut execution_times = ExecutionTimeEstimator::new(self.committee.clone(), config);
+        execution_times.restore_stored(stored);
+        for (generation, author, estimates) in self.output.execution_time_observations() {
+            execution_times.restore(author, generation, &decode_estimates(&estimates));
+        }
+        self.execution_times = execution_times;
+        self
+    }
+
+    /// Ends the epoch at `epoch_end_ms` (its start plus its duration),
+    /// certificates closed already if `certs_closed`.
+    #[must_use]
+    pub fn with_end(mut self, epoch_end_ms: u64, certs_closed: bool) -> CommitHandler {
+        self.epoch_end_ms = epoch_end_ms;
+        self.certs_closed = certs_closed;
+        self
+    }
+
+    pub fn certs_closed(&self) -> bool {
+        self.certs_closed
+    }
+
+    /// Observes the timestamp of a commit handled before a restart, which
+    /// the commit interval observer keeps in memory only.
+    pub fn observe_prior(&mut self, config: &ProtocolConfig, timestamp_ms: u64) {
+        self.commit_times.observe(
+            config.get_consensus_commit_rate_estimation_window_size(),
+            timestamp_ms,
+        );
     }
 
     /// Ends the commit just handled, with what `CommitStage` decided of it:
@@ -175,6 +249,10 @@ impl CommitHandler {
 
         let round = u64::from(commit.leader.round);
         let config = &epoch.config;
+        // As of the commits before this one, so every validator drops alike.
+        let certs_closed = self.certs_closed;
+        // The reference's `observe_commit`, before anything is estimated.
+        self.observe_prior(config, commit.timestamp_ms);
 
         // 2. Lock owned inputs in consensus order, as the reference's
         //    `filter_consensus_txns`: a transaction an input of which another
@@ -193,6 +271,10 @@ impl CommitHandler {
         } in commit.transactions
         {
             let digest = *transaction.get().0.digest();
+            if certs_closed {
+                dropped.push((block, index, digest, DropReason::EpochClosed));
+                continue;
+            }
             let owned = match owned {
                 Ok(owned) => owned,
                 Err(e) => {
@@ -229,7 +311,12 @@ impl CommitHandler {
 
         // 4. The commit's execution time observations, before its
         //    transactions are estimated.
-        for shared in &commit.observations {
+        let observations = if certs_closed {
+            &[][..]
+        } else {
+            &commit.observations[..]
+        };
+        for shared in observations {
             if self.execution_times.observe(shared) {
                 self.output.put_execution_time_observations(
                     shared.author,
@@ -242,13 +329,26 @@ impl CommitHandler {
         // 5. The keys voted for (`process_jwks`), and the update adding those
         //    that became active in the last commit
         //    (`create_authenticator_state_update`).
-        let update = self.jwk_update(&commit.jwks);
+        let update = self.jwk_update(if certs_closed { &[] } else { &commit.jwks });
+
+        // The capabilities announced (`process_capability_notifications`).
+        if !certs_closed {
+            for announced in commit.capabilities {
+                let encoded = capabilities::encode(&announced);
+                let author = announced.author;
+                if self.capabilities.record(announced) {
+                    self.output.put_capabilities(author, encoded);
+                }
+            }
+        }
 
         // 6. The transactions deferred to this round, then the commit's, in
         //    protocol order: `merge_and_reorder_transactions`.
         let mut previously_deferred = containers::message_map(bump, 0);
         let mut transactions = containers::Vec::with_capacity_in(accepted.len(), bump);
-        for (key, deferred) in self.output.take_deferred(DeferralKey::due_by(round)) {
+        let due = self.output.take_deferred(DeferralKey::due_by(round));
+        let loaded_deferred = !due.is_empty();
+        for (key, deferred) in due {
             for deferred in decode_deferred(&deferred) {
                 let hashed = *deferred.transaction.get().0.digest();
                 previously_deferred.insert(hashed, key);
@@ -259,37 +359,72 @@ impl CommitHandler {
         transactions.extend(accepted);
         let ordered = self.sequencer.order(config, transactions, bump);
 
-        // 7. Each, in order, deferred or estimated and scheduled:
+        // 7. Each, in order, deferred, cancelled, or estimated and scheduled:
         //    `handle_deferral_and_cancellation`. A contested holder is
-        //    deferred a round, as a penalty for the double spend.
+        //    deferred a round, as a penalty for the double spend; past the
+        //    deferral limit it goes on to congestion control, which defers a
+        //    transaction starting past the commit's budget, and cancels it
+        //    past the limit. Randomness-using transactions skip congestion
+        //    control (`docs/upgrades_and_congestion_design.md`).
+        let mut tracker = self.congestion_tracker(config, round, &ordered, bump);
+        let max_rounds = config.max_deferral_rounds_for_congestion_control();
         let mut deferred: containers::BTreeMap<DeferralKey, containers::Vec<Deferred>> =
             containers::BTreeMap::new_in(bump);
         let mut deferred_here = containers::Vec::new_in(bump);
         let mut admitted = containers::Vec::with_capacity_in(ordered.len(), bump);
-        let mut estimates_us = containers::Vec::with_capacity_in(ordered.len(), bump);
+        let mut observed = containers::Vec::with_capacity_in(ordered.len(), bump);
         for transaction in ordered {
             let hashed = *transaction.get().0.digest();
-            if contested.contains(&hashed) && config.defer_owned_object_double_spend() {
-                let from = previously_deferred
+            let key = DeferralKey::next_round(
+                round,
+                previously_deferred
                     .get(&hashed)
-                    .map_or(round, DeferralKey::deferred_from_round);
-                let key = DeferralKey::next_round(round, from);
-                if key.within_limit(config.max_deferral_rounds_for_congestion_control()) {
-                    let origin = origins.remove(&hashed).expect("each transaction's origin");
-                    deferred_here.push((origin.0, origin.1, hashed));
-                    deferred
-                        .entry(key)
-                        .or_insert_with(|| containers::Vec::new_in(bump))
-                        .push(Deferred {
-                            origin,
-                            transaction,
-                        });
+                    .map_or(round, DeferralKey::deferred_from_round),
+            );
+            let double_spend =
+                contested.contains(&hashed) && config.defer_owned_object_double_spend();
+            if !(double_spend && key.within_limit(max_rounds)) {
+                let estimate = self.execution_times.estimate_us(&transaction);
+                observed.push(estimate);
+                if uses_randomness(&transaction) {
+                    admitted.push(Scheduled::User(transaction));
+                    continue;
+                }
+                let Some(congested_objects) = tracker.congested(&transaction) else {
+                    tracker.charge(&transaction, estimate);
+                    admitted.push(Scheduled::User(transaction));
+                    continue;
+                };
+                if !key.within_limit(max_rounds) {
+                    let inputs = cancelled_inputs(&transaction, &congested_objects);
+                    admitted.push(Scheduled::Cancelled(transaction, inputs));
                     continue;
                 }
             }
-            estimates_us.push(self.execution_times.estimate_us(&transaction));
-            admitted.push(transaction);
+            let origin = origins.remove(&hashed).expect("each transaction's origin");
+            deferred_here.push((origin.0, origin.1, hashed));
+            deferred
+                .entry(key)
+                .or_insert_with(|| containers::Vec::new_in(bump))
+                .push(Deferred {
+                    origin,
+                    transaction,
+                });
         }
+        for (object, debt) in tracker.debts() {
+            self.output.set_congestion_debt(object, round, debt);
+        }
+        let final_commit =
+            self.close_epoch(config, commit.timestamp_ms, loaded_deferred, &mut deferred);
+        let upgrade = final_commit.then(|| {
+            capabilities::choose(
+                config.version.as_u64(),
+                config,
+                &self.committee,
+                &self.capabilities,
+                config.buffer_stake_for_protocol_upgrade_bps(),
+            )
+        });
         for (key, transactions) in deferred {
             self.output.defer(key, encode_deferred(&transactions));
         }
@@ -306,10 +441,85 @@ impl CommitHandler {
             duplicates,
             deferred: deferred_here,
             dropped,
-            estimates_us,
+            state_digest: self.commit_times.digest(&indirect_state_digest(observed)),
+            final_commit,
+            upgrade,
             cache_hits: commit.cache_hits,
             cache_misses: commit.cache_misses,
         })
+    }
+
+    /// The commit's congestion tracker (the reference's
+    /// `init_congestion_tracker`): its budget from the estimated commit
+    /// period, and its objects' debts as recorded in earlier rounds, decayed
+    /// to `round`, for the objects of `ordered`'s regular transactions.
+    fn congestion_tracker<'b>(
+        &self,
+        config: &ProtocolConfig,
+        round: u64,
+        ordered: &[VerifiedTransaction],
+        bump: &'b Bump,
+    ) -> CongestionTracker<'b> {
+        let PerObjectCongestionControlMode::ExecutionTimeEstimate(params) =
+            config.per_object_congestion_control_mode()
+        else {
+            unreachable!("the estimator requires execution time estimate congestion control");
+        };
+        let period_ms = self
+            .commit_times
+            .interval_estimate_ms()
+            .unwrap_or_else(|| config.min_checkpoint_interval_ms_as_option().unwrap_or(0));
+        let per_round = config
+            .max_accumulated_txn_cost_per_object_in_mysticeti_commit_as_option()
+            .unwrap_or(0);
+        let mut objects = containers::Vec::new_in(bump);
+        objects.extend(
+            ordered
+                .iter()
+                .filter(|t| !uses_randomness(t))
+                .flat_map(|t| shared_inputs(t).map(|input| input.id)),
+        );
+        objects.sort_unstable();
+        objects.dedup();
+        let debts = objects.into_iter().filter_map(|object| {
+            let (recorded, debt) = self.output.congestion_debt(&object)?;
+            Some((
+                object,
+                congestion::decayed(debt, recorded, round, per_round),
+            ))
+        });
+        CongestionTracker::new(&params, period_ms, debts, bump)
+    }
+
+    /// The reference's `handle_close_epoch`: once the epoch's time is up,
+    /// certificates close, and the epoch ends at the first commit after
+    /// which no deferred transaction remains, `deferred` (this commit's)
+    /// included; past the close deadline it ends regardless, abandoning
+    /// them. Whether this commit is the epoch's last.
+    ///
+    /// A commit that `loaded_deferred` transactions is not the last either,
+    /// even if it scheduled them all: the reference drops the keys it loaded
+    /// from its cache only after this check (`record_deferral_deletion`).
+    fn close_epoch<T>(
+        &mut self,
+        config: &ProtocolConfig,
+        timestamp_ms: u64,
+        loaded_deferred: bool,
+        deferred: &mut containers::BTreeMap<'_, DeferralKey, T>,
+    ) -> bool {
+        if timestamp_ms < self.epoch_end_ms {
+            return false;
+        }
+        self.certs_closed = true;
+        let deadline_reached = config
+            .epoch_close_deadline_ms_as_option()
+            .is_some_and(|deadline| timestamp_ms >= self.epoch_end_ms.saturating_add(deadline));
+        let has_deferred = loaded_deferred || !deferred.is_empty() || self.output.has_deferred();
+        if has_deferred && deadline_reached {
+            deferred.clear();
+            self.output.abandon_deferred();
+        }
+        !has_deferred || deadline_reached
     }
 
     /// The execution time observations so far, as the epoch's last commit
@@ -403,6 +613,28 @@ impl CommitHandler {
     }
 }
 
+/// A transaction cancelled for congestion on `congested`: each of its
+/// consensus object inputs, in input order, marked `CONGESTED` if congested
+/// and `CANCELLED_READ` otherwise (the reference's
+/// `assign_versions_for_certificate`).
+fn cancelled_inputs(
+    transaction: &VerifiedTransaction,
+    congested: &[messages::base::ObjectId],
+) -> Vec<CancelledInput> {
+    use sui_types::base_types::SequenceNumber;
+    shared_inputs(transaction)
+        .map(|input| CancelledInput {
+            id: input.id,
+            initial_shared_version: input.initial_shared_version.get(),
+            marker: if congested.contains(&input.id) {
+                SequenceNumber::CONGESTED.value()
+            } else {
+                SequenceNumber::CANCELLED_READ.value()
+            },
+        })
+        .collect()
+}
+
 /// The accumulator root (`SUI_ACCUMULATOR_ROOT_OBJECT_ID`), which each
 /// chunk's settlement writes.
 const ACCUMULATOR_ROOT: messages::base::ObjectId = messages::base::ObjectId::from_u16(0xacc);
@@ -427,7 +659,10 @@ pub struct CommitRecord {
     /// The timestamp of the last checkpoint cut, for the interval cuts.
     pub last_built_timestamp: u64,
     pub root_version: u64,
+    /// The epoch's last commit is decided.
     pub closed: bool,
+    /// The epoch's certificates have closed (`CommitHandler::with_end`).
+    pub certs_closed: bool,
 }
 
 impl CommitRecord {
@@ -440,6 +675,7 @@ impl CommitRecord {
             self.last_built_timestamp,
             self.root_version,
             self.closed,
+            self.certs_closed,
         ))
         .expect("a record encodes")
     }
@@ -455,6 +691,7 @@ impl CommitRecord {
             last_built_timestamp,
             root_version,
             closed,
+            certs_closed,
         ) = bcs::from_bytes(bytes).expect("a stored record decodes");
         CommitRecord {
             commit_index,
@@ -464,6 +701,7 @@ impl CommitRecord {
             last_built_timestamp,
             root_version,
             closed,
+            certs_closed,
         }
     }
 }
@@ -541,7 +779,6 @@ pub struct CommitStage {
     handler: CommitHandler,
     start: EpochStart,
     queue: CheckpointQueue,
-    commit_times: CommitIntervalObserver,
     /// Commits through this one were decided before a restart: replayed,
     /// they only rebuild the commit interval observer, which is in memory,
     /// as the reference's prior commits do.
@@ -586,13 +823,18 @@ impl CommitStage {
             committee,
             &epoch.config,
             start.authenticator_initial_shared_version,
+        )
+        .with_end(
+            start
+                .epoch_start_timestamp_ms
+                .saturating_add(start.epoch_duration_ms),
+            record.is_some_and(|r| r.certs_closed),
         );
         CommitStage {
             epoch,
             handler,
             start,
             queue,
-            commit_times: CommitIntervalObserver::default(),
             prior_through,
             last_commit: record.map(|r| r.commit_index),
             closed: record.is_some_and(|r| r.closed),
@@ -603,6 +845,19 @@ impl CommitStage {
             statuses,
             backpressure: None,
         }
+    }
+
+    /// Starts the commit handler's estimator from the observations the
+    /// previous epoch `stored` (`CommitHandler::with_stored_observations`).
+    #[must_use]
+    pub fn with_stored_observations(
+        mut self,
+        stored: &messages::build::system_transaction::StoredExecutionTimeObservations,
+    ) -> CommitStage {
+        self.handler = self
+            .handler
+            .with_stored_observations(&self.epoch.config, stored);
+        self
     }
 
     /// Answers each commit through `backpressure`, which may withhold it.
@@ -617,12 +872,8 @@ impl CommitStage {
     pub fn decide<'b>(&mut self, commit: DecodedCommit, bump: &'b Bump) -> Option<Decided<'b>> {
         let epoch = &self.epoch.clone();
         if commit.commit_index <= self.prior_through {
-            self.commit_times.observe(
-                epoch
-                    .config
-                    .get_consensus_commit_rate_estimation_window_size(),
-                commit.timestamp_ms,
-            );
+            self.handler
+                .observe_prior(&epoch.config, commit.timestamp_ms);
             return None;
         }
         if self.closed {
@@ -632,10 +883,11 @@ impl CommitStage {
             mut schedule,
             origins,
             dropped,
-            estimates_us,
+            state_digest,
+            final_commit,
+            upgrade,
             ..
         } = self.handler.handle(epoch, commit, bump)?;
-        let config = &epoch.config;
         let Some(&Scheduled::Prologue(prologue)) = schedule.transactions.first() else {
             unreachable!("a schedule starts with its prologue");
         };
@@ -648,16 +900,20 @@ impl CommitStage {
         }
         self.last_commit = Some(prologue.commit_index);
 
-        // 1. The prologue, with the state digest of the commits through
-        //    this one and the estimates of the transactions it schedules.
-        self.commit_times.observe(
-            config.get_consensus_commit_rate_estimation_window_size(),
-            prologue.timestamp_ms,
-        );
-        let digest = self
-            .commit_times
-            .digest(&indirect_state_digest(estimates_us));
-        let mut prologue_transaction = Some(prologue_transaction(&prologue, &digest));
+        // 1. The prologue, with the commit's state digest and its cancelled
+        //    transactions, in schedule order.
+        let cancelled = schedule
+            .transactions
+            .iter()
+            .filter_map(|scheduled| match scheduled {
+                Scheduled::Cancelled(transaction, inputs) => {
+                    Some((transaction.get().0.digest().bytes, inputs.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        let mut prologue_transaction =
+            Some(prologue_transaction(&prologue, &state_digest, cancelled));
 
         // 2. Each transaction with its shared accesses, in schedule order.
         let transactions =
@@ -691,22 +947,34 @@ impl CommitStage {
                         Some(origin),
                     )
                 }
+                Scheduled::Cancelled(transaction, inputs) => {
+                    let digest = *transaction.get().0.digest();
+                    let origin = origins[&digest];
+                    digests.push(digest);
+                    entries.push(ScheduledEntry {
+                        transaction: ExecutableTransaction::User(transaction),
+                        shared: Vec::new(),
+                        origin: Some(origin),
+                        cancelled: inputs
+                            .iter()
+                            .map(|input| (input.id, input.marker))
+                            .collect(),
+                    });
+                    continue;
+                }
             };
             digests.push(digest);
             entries.push(ScheduledEntry {
                 transaction,
                 shared: schedule.accesses(i).to_vec(),
                 origin,
+                cancelled: Vec::new(),
             });
         }
 
         // 3. The epoch's last commit reserves the change-epoch transaction's
         //    write of the system state, after every other.
-        let end = self
-            .start
-            .epoch_start_timestamp_ms
-            .saturating_add(self.start.epoch_duration_ms);
-        let close = (prologue.timestamp_ms >= end).then(|| {
+        let close = final_commit.then(|| {
             self.closed = true;
             let writes_before = entries
                 .iter()
@@ -730,7 +998,9 @@ impl CommitStage {
                 base: None,
             }];
             self.handler.link(&mut close);
-            close
+            let (protocol_version, system_packages) =
+                upgrade.expect("the last commit chooses the next version");
+            (close, protocol_version, system_packages)
         });
 
         // 4. Chunks and checkpoints.
@@ -748,7 +1018,11 @@ impl CommitStage {
         prologue: &Prologue,
         entries: containers::Vec<'b, ScheduledEntry>,
         digests: containers::Vec<'b, TxDigest>,
-        close: Option<Vec<SharedAccess>>,
+        close: Option<(
+            Vec<SharedAccess>,
+            u64,
+            Vec<messages::build::base::ObjectRef>,
+        )>,
         bump: &'b Bump,
     ) -> Decided<'b> {
         let config = &epoch.config;
@@ -812,7 +1086,7 @@ impl CommitStage {
                 entries,
             });
         }
-        let min_interval = config.min_checkpoint_interval_ms.unwrap_or(0);
+        let min_interval = config.min_checkpoint_interval_ms_as_option().unwrap_or(0);
         flushed.extend(self.queue.flush(prologue.timestamp_ms, min_interval));
         if close.is_some() {
             flushed.extend(self.queue.flush_forced());
@@ -825,7 +1099,7 @@ impl CommitStage {
                 timestamp_ms: f.timestamp_ms,
                 close: None,
             }));
-        if let Some(shared) = close {
+        if let Some((shared, protocol_version, system_packages)) = close {
             let last = decided
                 .checkpoints
                 .last_mut()
@@ -837,6 +1111,8 @@ impl CommitStage {
                 shared,
                 first_checkpoint: self.start.previous_checkpoint + 1,
                 observations: self.handler.execution_time_observations(),
+                protocol_version,
+                system_packages,
             });
         }
         decided
@@ -926,6 +1202,7 @@ impl CommitStage {
             last_built_timestamp: self.queue.last_built_timestamp,
             root_version: self.root_version,
             closed: self.closed,
+            certs_closed: self.handler.certs_closed(),
         };
         self.handler
             .finish(&record, self.queue.height, self.queue.pending.is_empty());
@@ -1071,6 +1348,16 @@ impl CommitIntervalObserver {
         self.timestamps.push_back(timestamp_ms);
     }
 
+    /// `commit_interval_estimate`: the span of the timestamps kept, divided
+    /// by how many there are, rounded up; none with fewer than two.
+    fn interval_estimate_ms(&self) -> Option<u64> {
+        let (first, last) = (self.timestamps.front()?, self.timestamps.back()?);
+        (self.timestamps.len() > 1).then(|| {
+            last.saturating_sub(*first)
+                .div_ceil(self.timestamps.len() as u64)
+        })
+    }
+
     /// The reference's `AdditionalConsensusState::digest`, folded with the
     /// commit's `indirect` state digest by `IndirectStateObserver::fold_with`.
     fn digest(&self, indirect: &[u8; 32]) -> [u8; 32] {
@@ -1105,8 +1392,12 @@ fn indirect_state_digest(estimates_us: impl IntoIterator<Item = u64>) -> [u8; 32
 pub fn prologue_transaction(
     prologue: &Prologue,
     additional_state_digest: &[u8; 32],
+    cancelled: Vec<([u8; 32], Vec<CancelledInput>)>,
 ) -> SystemTransaction {
-    use messages::build::base::{AdditionalConsensusStateDigest, ConsensusCommitDigest, Digest};
+    use messages::build::base::{
+        AdditionalConsensusStateDigest, ConsensusCommitDigest, Digest, ObjectId, SequenceNumber,
+        TransactionDigest,
+    };
     use messages::build::system_transaction::{
         ConsensusCommitPrologueV4, ConsensusDeterminedVersionAssignments,
     };
@@ -1119,7 +1410,26 @@ pub fn prologue_transaction(
         commit_timestamp_ms: prologue.timestamp_ms,
         consensus_commit_digest: ConsensusCommitDigest(Digest(prologue.commit_digest)),
         consensus_determined_version_assignments:
-            ConsensusDeterminedVersionAssignments::CancelledTransactionsV2(Vec::new()),
+            ConsensusDeterminedVersionAssignments::CancelledTransactionsV2(
+                cancelled
+                    .into_iter()
+                    .map(|(digest, inputs)| {
+                        let assigned = inputs
+                            .iter()
+                            .map(|input| {
+                                (
+                                    (
+                                        ObjectId(messages::build::base::AccountAddress(input.id.0)),
+                                        SequenceNumber(input.initial_shared_version),
+                                    ),
+                                    SequenceNumber(input.marker),
+                                )
+                            })
+                            .collect();
+                        (TransactionDigest(Digest(digest)), assigned)
+                    })
+                    .collect(),
+            ),
         additional_state_digest: AdditionalConsensusStateDigest(Digest(*additional_state_digest)),
     });
     system_transaction(
@@ -1175,6 +1485,11 @@ pub fn end_of_epoch_transaction(
     epoch: u64,
     mut kinds: Vec<messages::build::system_transaction::EndOfEpochTransactionKind>,
     protocol_version: u64,
+    system_packages: Vec<(
+        messages::build::base::SequenceNumber,
+        Vec<Vec<u8>>,
+        Vec<messages::build::base::ObjectId>,
+    )>,
     gas: [u64; 4],
     epoch_start_timestamp_ms: u64,
 ) -> SystemTransaction {
@@ -1191,7 +1506,7 @@ pub fn end_of_epoch_transaction(
         storage_rebate: rebate,
         non_refundable_storage_fee: non_refundable,
         epoch_start_timestamp_ms,
-        system_packages: Vec::new(),
+        system_packages,
     }));
     system_transaction(
         TransactionKind::EndOfEpochTransaction(kinds),

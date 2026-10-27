@@ -40,9 +40,9 @@ use messages::Message;
 use messages::base::{Digest, Hashed, ObjectId};
 use messages::effects::{TransactionEffects, VersionedEffects};
 use messages::transaction::SharedObjectMutability;
-use protocol_config::{Chain, ProtocolVersion};
 use settlement::SettlementScheduler;
 use settlement::settle::{self, SettlementBuilder};
+use sui_protocol_config::{Chain, ProtocolVersion};
 use validator::consensus::sequence::{SharedAccess, SharedOrdinal};
 use validator::epoch::EpochParams;
 use validator::pipeline::items::{
@@ -308,8 +308,8 @@ fn bench_process(size: usize, effects: &[Vec<u8>]) {
 
 fn main() {
     let max_updates =
-        protocol_config::ProtocolConfig::get_for_version(ProtocolVersion::MAX, Chain::Unknown)
-            .max_updates_per_settlement_txn;
+        sui_protocol_config::ProtocolConfig::get_for_version(ProtocolVersion::MAX, Chain::Unknown)
+            .max_updates_per_settlement_txn_as_option();
     println!("span     chunk    ns/tx  allocs/tx");
     for size in [100, 1000] {
         let effects = support::transfers(size as u64, size as u64);

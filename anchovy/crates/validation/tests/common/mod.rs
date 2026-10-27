@@ -10,7 +10,7 @@ use fastcrypto_zkp::bn254::zk_login::{JWK, JwkId};
 use messages::Message;
 use messages::base::Digest;
 use messages::transaction::{SenderSignedData, TransactionData};
-use protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
+use sui_protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
 use validation::Context;
 use validation::verify::Verifier;
 

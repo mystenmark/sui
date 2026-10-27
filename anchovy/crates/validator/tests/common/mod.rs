@@ -16,7 +16,7 @@ use messages::Message;
 use messages::base::Digest;
 use messages::checkpoint::CheckpointData;
 use messages::transaction::{DigestPending, Transaction};
-use protocol_config::{Chain, ProtocolVersion};
+use sui_protocol_config::{Chain, ProtocolVersion};
 use validation::ErrorKind;
 use validation::verify::{JWK, JwkId};
 use validator::epoch::EpochState;

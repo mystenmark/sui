@@ -8,7 +8,7 @@ use containers::Bump;
 use messages::Message;
 use messages::base::ObjectId;
 use messages::transaction::SharedObjectMutability as Mutability;
-use protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
+use sui_protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
 use sui_types::base_types::{ObjectID, SequenceNumber, SuiAddress, random_object_ref};
 use sui_types::crypto::{AccountKeyPair, get_key_pair};
 use sui_types::transaction::{
@@ -83,7 +83,9 @@ fn order_and_schedule(
     let mut arena = containers::Vec::with_capacity_in(transactions.len(), bump);
     arena.extend(transactions);
     let ordered = sequencer.order(&config(), arena, bump);
-    sequencer.schedule(prologue(round), None, ordered, bump)
+    let mut scheduled = containers::Vec::with_capacity_in(ordered.len(), bump);
+    scheduled.extend(ordered.into_iter().map(Scheduled::User));
+    sequencer.schedule(prologue(round), None, scheduled, bump)
 }
 
 /// The generation each access reads, by transaction, prologue first.
@@ -106,7 +108,9 @@ fn order(schedule: &Schedule<'_>) -> Vec<[u8; 32]> {
         .iter()
         .filter_map(|t| match t {
             Scheduled::User(t) => Some(t.get().0.digest().bytes),
-            Scheduled::Prologue(_) | Scheduled::AuthenticatorStateUpdate(_) => None,
+            Scheduled::Prologue(_)
+            | Scheduled::AuthenticatorStateUpdate(_)
+            | Scheduled::Cancelled(..) => None,
         })
         .collect()
 }

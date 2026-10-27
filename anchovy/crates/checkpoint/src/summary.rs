@@ -61,7 +61,10 @@ pub fn build(
         previous.map_or(0, |p| p.network_total_transactions) + built.transaction_count;
     let epoch_rolling_gas = rolling_gas(built, previous, epoch);
 
-    let version_specific_data = match params.config.checkpoint_summary_version_specific_data {
+    let version_specific_data = match params
+        .config
+        .checkpoint_summary_version_specific_data_as_option()
+    {
         None | Some(0) => containers::Vec::new_in(bump),
         Some(1) => version_specific_data_v1(&built.randomness_rounds, bump),
         Some(v) => panic!("unknown checkpoint summary version-specific data version {v}"),

@@ -1511,7 +1511,6 @@ dependencies = [
  "execution",
  "fastcrypto",
  "messages",
- "protocol-config",
  "state-hasher",
  "store",
  "sui-protocol-config",
@@ -1715,7 +1714,6 @@ dependencies = [
  "messages",
  "move-core-types",
  "node",
- "protocol-config",
  "rand 0.8.8",
  "store",
  "sui-config",
@@ -1723,6 +1721,7 @@ dependencies = [
  "sui-genesis-builder",
  "sui-move-build",
  "sui-node",
+ "sui-protocol-config",
  "sui-swarm",
  "sui-swarm-config",
  "sui-types",
@@ -1842,7 +1841,6 @@ dependencies = [
  "mysten-metrics",
  "node",
  "prometheus",
- "protocol-config",
  "rand 0.8.8",
  "store",
  "sui-config",
@@ -3029,9 +3027,9 @@ dependencies = [
  "execution",
  "messages",
  "move-core-types",
- "protocol-config",
  "resolver",
  "store",
+ "sui-protocol-config",
  "sui-types",
  "tempfile",
  "tokio",
@@ -3064,6 +3062,7 @@ dependencies = [
  "exec-types",
  "executor",
  "messages",
+ "move-binary-format",
  "move-core-types",
  "move-vm-runtime",
  "natives",
@@ -6318,7 +6317,6 @@ dependencies = [
  "messages",
  "move-core-types",
  "prometheus",
- "protocol-config",
  "rand 0.8.8",
  "resolver",
  "settlement",
@@ -7567,17 +7565,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "protocol-config"
-version = "0.1.0"
-dependencies = [
- "bs58 0.5.1",
- "insta",
- "serde",
- "serde_json",
- "tracing",
-]
-
-[[package]]
 name = "protox"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8123,8 +8110,8 @@ dependencies = [
  "containers",
  "executor",
  "messages",
- "protocol-config",
  "store",
+ "sui-protocol-config",
  "sui-types",
  "tempfile",
  "validator",
@@ -8841,10 +8828,10 @@ dependencies = [
  "hashbrown 0.17.1",
  "messages",
  "move-core-types",
- "protocol-config",
  "rand 0.8.8",
  "serde",
  "store",
+ "sui-protocol-config",
  "sui-types",
  "tempfile",
  "validator",
@@ -12371,11 +12358,11 @@ dependencies = [
  "flate2",
  "imbl",
  "messages",
- "protocol-config",
  "rand 0.8.8",
  "roaring",
  "serde",
  "serde_json",
+ "sui-protocol-config",
 ]
 
 [[package]]
@@ -12394,12 +12381,12 @@ dependencies = [
  "hyper-util",
  "messages",
  "prost 0.14.4",
- "protocol-config",
  "rcgen",
  "rustls",
  "serde",
  "serde_json",
  "store",
+ "sui-protocol-config",
  "sui-types",
  "tempfile",
  "tokio",
