@@ -263,6 +263,7 @@ pub fn current(
         },
         beacon,
         network_keys: Vec::new(),
+        p2p_addresses: Vec::new(),
         randomness_gate,
     }));
     (

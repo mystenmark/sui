@@ -78,6 +78,7 @@ impl EpochRecord {
                     m.network_key,
                     &m.address,
                     &m.hostname,
+                    &m.p2p_address,
                 )
             })
             .collect();
@@ -104,7 +105,7 @@ impl EpochRecord {
             u64,
             u64,
             u64,
-            Vec<(Vec<u8>, u64, [u8; 32], [u8; 32], String, String)>,
+            Vec<(Vec<u8>, u64, [u8; 32], [u8; 32], String, String, String)>,
             Vec<u8>,
         );
         let (
@@ -127,13 +128,16 @@ impl EpochRecord {
             committee: committee
                 .into_iter()
                 .map(
-                    |(name, stake, consensus_key, network_key, address, hostname)| Member {
-                        name: name.try_into().expect("a 96-byte protocol key"),
-                        stake,
-                        consensus_key,
-                        network_key,
-                        address,
-                        hostname,
+                    |(name, stake, consensus_key, network_key, address, hostname, p2p_address)| {
+                        Member {
+                            name: name.try_into().expect("a 96-byte protocol key"),
+                            stake,
+                            consensus_key,
+                            network_key,
+                            address,
+                            hostname,
+                            p2p_address,
+                        }
                     },
                 )
                 .collect(),

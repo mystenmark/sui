@@ -35,6 +35,9 @@ pub struct Member {
     /// Consensus's address (the primary address), a multiaddr.
     pub address: String,
     pub hostname: String,
+    /// The p2p network's address, a multiaddr: where peers push the random
+    /// beacon's signatures.
+    pub p2p_address: String,
 }
 
 impl SystemState {
@@ -57,9 +60,15 @@ pub fn read(store: &store::Store) -> Result<SystemState> {
         state.epoch_start_timestamp_ms(),
         state.epoch_duration_ms(),
     );
+    let start = state.into_epoch_start_state();
+    // Every member's, by network key: none is excluded as the zero name.
+    let p2p: std::collections::BTreeMap<[u8; 32], String> = start
+        .get_validator_as_p2p_peers(sui_types::base_types::AuthorityName::ZERO)
+        .into_iter()
+        .map(|(peer, address)| (peer.0, address.to_string()))
+        .collect();
     // Sorted by protocol key, as the checkpoint committee is.
-    let committee = state
-        .into_epoch_start_state()
+    let committee = start
         .get_consensus_committee()
         .authorities()
         .map(|(_, authority)| Member {
@@ -77,6 +86,10 @@ pub fn read(store: &store::Store) -> Result<SystemState> {
             network_key: authority.network_key.to_bytes(),
             address: authority.address.to_string(),
             hostname: authority.hostname.clone(),
+            p2p_address: p2p
+                .get(&authority.network_key.to_bytes())
+                .cloned()
+                .unwrap_or_default(),
         })
         .collect();
     Ok(SystemState {
