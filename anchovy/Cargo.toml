@@ -142,6 +142,10 @@ rcgen = { version = "0.13", default-features = false, features = ["crypto", "rin
 base64 = "0.22"
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower = { version = "0.5", features = ["util"] }
+# sui's p2p network (approved for the random beacon), at sui's revision, and
+# its codec's framing.
+anemo = { git = "https://github.com/mystenlabs/anemo.git", rev = "68adc31d4ea1f4573f08c2c75317fcb205b823de" }
+snap = "1.1.0"
 clap = { version = "4.5", features = ["derive"] }
 
 [workspace.lints.rust]

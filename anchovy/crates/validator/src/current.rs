@@ -12,6 +12,7 @@ use workqueue::Queue;
 
 use crate::epoch::EpochState;
 use crate::processors;
+use crate::randomness::BeaconInput;
 use crate::server::Consensus;
 
 /// What perpetual components use of a running epoch. Dropped with it: its
@@ -22,6 +23,10 @@ pub struct EpochHandle {
     pub transactions: Queue<processors::Request<DigestPending>>,
     /// Submission to consensus and waiting for effects.
     pub consensus: Consensus,
+    /// The random beacon's signature collector, and each member's network
+    /// key, by committee index: who may push it signatures.
+    pub beacon: Queue<BeaconInput>,
+    pub network_keys: Vec<[u8; 32]>,
 }
 
 /// The running epoch, if any. Cloned handles see the same epoch.
@@ -55,6 +60,11 @@ impl CurrentEpoch {
             .await
             .expect("the sender lives as long as self");
         current.clone().expect("waited for an epoch")
+    }
+
+    /// The running epoch, if any, without waiting.
+    pub fn now(&self) -> Option<Arc<EpochHandle>> {
+        self.sender.borrow().clone()
     }
 
     /// Resolves once `handle`'s epoch is no longer the running one.

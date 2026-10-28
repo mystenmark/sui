@@ -6307,7 +6307,9 @@ name = "node"
 version = "0.1.0"
 dependencies = [
  "aggregator",
+ "anemo",
  "bcs",
+ "bytes",
  "checkpoint",
  "consensus",
  "exec-pool",
@@ -6319,7 +6321,9 @@ dependencies = [
  "prometheus",
  "rand 0.8.8",
  "resolver",
+ "serde",
  "settlement",
+ "snap",
  "state-hasher",
  "store",
  "sui-config",
@@ -6330,6 +6334,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tonic 0.14.6",
+ "tower 0.5.3",
  "validator",
  "waiter",
  "workqueue",

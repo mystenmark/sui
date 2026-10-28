@@ -10,7 +10,8 @@ use fastcrypto_tbls::nodes::Nodes;
 use fastcrypto_tbls::tbls::{PartialSignature, ThresholdBls};
 use fastcrypto_tbls::types::ThresholdBls12381MinSig;
 use serde::{Deserialize, Serialize};
-use workqueue::Processor;
+use tokio::sync::oneshot;
+use workqueue::{Processor, Refusal, Refuse};
 
 use crate::consensus::dkg::{DkgSetup, GroupKey};
 use crate::epoch_store::EpochStore;
@@ -38,12 +39,19 @@ pub struct SendSignaturesRequest {
 pub enum BeaconInput {
     /// The epoch's group key, once DKG completed. `CommitStage` → collector.
     GroupKey(GroupKey),
-    /// Signatures the member at committee index `party` pushed. Randomness
-    /// service → collector.
+    /// Signatures the member at committee index `party` pushed, answered
+    /// once taken. Randomness service → collector.
     Signatures {
         party: u16,
         request: SendSignaturesRequest,
+        taken: oneshot::Sender<()>,
     },
+}
+
+/// A full queue drops the push; peers push again until the round is
+/// certified.
+impl Refuse for BeaconInput {
+    fn refuse(self, _: Refusal) {}
 }
 
 /// Turns the signatures peers push into each randomness round's random
@@ -224,7 +232,14 @@ impl Processor for SignatureCollector {
                     self.receive(party, request);
                 }
             }
-            BeaconInput::Signatures { party, request } => self.receive(party, request),
+            BeaconInput::Signatures {
+                party,
+                request,
+                taken,
+            } => {
+                self.receive(party, request);
+                let _ = taken.send(());
+            }
         }
         None
     }

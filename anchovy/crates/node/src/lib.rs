@@ -13,6 +13,7 @@
 //! The pipeline lives for one epoch (`epoch`).
 
 pub mod epoch;
+pub mod p2p;
 mod wiring;
 
 use std::sync::Arc;
@@ -28,6 +29,7 @@ use tokio::sync::watch;
 use validator::consensus::cache::ConsensusTxCache;
 use validator::consensus::commit::{CommitRecord, EpochStart};
 use validator::consensus::decode::CommitRequest;
+use validator::consensus::dkg::DkgSetup;
 use validator::consensus::status::ConsensusTxStatusCache;
 use validator::consensus::vote::VoteRequest;
 use validator::current::EpochHandle;
@@ -38,6 +40,7 @@ use validator::pipeline::items::{CertifiedCheckpoint, EffectsWaitItem};
 use validator::pipeline::keys::EffectsKey;
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable, GenerationTable};
 use validator::processors::Request;
+use validator::randomness::BeaconInput;
 use validator::server::Consensus;
 use waiter::Command;
 use wiring::Parts;
@@ -69,6 +72,10 @@ pub struct Pipeline {
     pub commits: Queue<CommitRequest>,
     /// Into the effects waiter, for `wait_for_effects`.
     pub effects: Queue<Command<EffectsKey, EffectsWaitItem>>,
+    /// From peers: the random beacon's signatures.
+    pub beacon: Queue<BeaconInput>,
+    /// Each member's network key, by committee index.
+    network_keys: Vec<[u8; 32]>,
     /// What became of each committed transaction, by position.
     pub statuses: Arc<ConsensusTxStatusCache>,
     consensus: TransactionClient,
@@ -268,13 +275,21 @@ impl Pipeline {
             replay_from,
             last_processed: resumed.map_or(0, |r| r.commit_index),
         });
+        let stakes: Vec<([u8; 96], u64)> = record.stakes().collect();
+        let dkg = Arc::new(DkgSetup::new(
+            &stakes,
+            &epoch.params.config,
+            &epoch.params.chain_identifier.bytes,
+            epoch.params.epoch,
+        ));
         let parts = Arc::new(Parts {
+            dkg,
             store: store.clone(),
             epoch: epoch.clone(),
             epoch_store: epoch_store.clone(),
             key: protocol_key.clone(),
             committee: committee.clone(),
-            stakes: record.stakes().collect(),
+            stakes,
             system_objects,
             consensus: consensus.clone(),
             cache: Arc::new(ConsensusTxCache::new()),
@@ -316,6 +331,8 @@ impl Pipeline {
             votes: queues.votes,
             commits: queues.commits,
             effects: queues.effects_waits,
+            beacon: queues.beacon,
+            network_keys: record.committee.iter().map(|m| m.network_key).collect(),
             statuses: parts.statuses.clone(),
             consensus,
             store: store.clone(),
@@ -352,6 +369,8 @@ impl Pipeline {
                 effects: self.effects.clone(),
                 store: self.store.clone(),
             },
+            beacon: self.beacon.clone(),
+            network_keys: self.network_keys.clone(),
         })
     }
 }
