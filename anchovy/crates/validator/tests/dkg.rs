@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The DKG observer against real parties: it merges, completes, and finds
-//! the parties' group key at the commits the reference would.
+//! the parties' group key at the commits the reference would; and the
+//! signature collector with a party's shares.
 
 use std::sync::Arc;
 
@@ -222,4 +223,113 @@ fn a_restored_observer_completes_as_the_original() {
         original.handle(&network.config, confirm_all(), 2).status,
         Some(key)
     );
+}
+
+/// Each party's DKG output, its shares included, merging the messages of
+/// `dealers` and completing with every party's confirmation.
+fn outputs(
+    network: &Network,
+    encoded: &[Vec<u8>],
+    dealers: &[usize],
+) -> Vec<fastcrypto_tbls::dkg_v1::Output<G2Element, G2Element>> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(10);
+    let merged: Vec<_> = network
+        .parties
+        .iter()
+        .map(|party| {
+            let processed: Vec<_> = dealers
+                .iter()
+                .map(|&d| {
+                    let VersionedDkgMessage::V1(m) = bcs::from_bytes(&encoded[d]).unwrap() else {
+                        unreachable!()
+                    };
+                    party.process_message(m, &mut rng).unwrap()
+                })
+                .collect();
+            party.merge(&processed).unwrap()
+        })
+        .collect();
+    let confirmations: Vec<_> = merged.iter().map(|(c, _)| c.clone()).collect();
+    network
+        .parties
+        .iter()
+        .zip(&merged)
+        .map(|(party, (_, used))| party.complete(used, &confirmations, &mut rng).unwrap())
+        .collect()
+}
+
+/// The signature collector signs a reserved round with this member's
+/// shares, aggregates them with a peer's partial signatures into the
+/// group's signature, and then pushes that instead of its partials.
+#[test]
+fn the_collector_signs_and_aggregates_with_its_shares() {
+    use fastcrypto_tbls::tbls::ThresholdBls;
+    use fastcrypto_tbls::types::ThresholdBls12381MinSig;
+    use validator::pipeline::items::GateInput;
+    use validator::randomness::{
+        BeaconInput, SendSignaturesRequest, SignatureCollector, signature_message,
+    };
+    use workqueue::Processor;
+
+    let network = network(&[2500, 2500, 2500, 2500]);
+    let encoded = messages(&network);
+    let outputs = outputs(&network, &encoded, &[0, 1, 2]);
+    let key = outputs[0].vss_pk.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _, _) = validator::epoch_store::EpochStore::open(dir.path(), 1);
+    let (gate, gate_inbox) = workqueue::queue(16);
+    let mut collector = SignatureCollector::new(1, network.setup.clone(), Some(0), store, gate);
+    let mut bump = containers::Bump::default();
+    let mut process = |collector: &mut SignatureCollector, input| {
+        collector.process(input, &mut bump);
+    };
+    let outgoing = |collector: &mut SignatureCollector| {
+        let (answer, receiver) = tokio::sync::oneshot::channel();
+        collector.process(
+            BeaconInput::Outgoing(answer),
+            &mut containers::Bump::default(),
+        );
+        receiver.blocking_recv().unwrap()
+    };
+
+    process(&mut collector, BeaconInput::GroupKey(key.clone()));
+    process(
+        &mut collector,
+        BeaconInput::Shares(outputs[0].shares.clone().unwrap()),
+    );
+    process(&mut collector, BeaconInput::Round(0));
+    // Its own shares weigh 125 of the 167 needed.
+    assert!(gate_inbox.try_pop().is_none());
+    let pushed = outgoing(&mut collector);
+    assert_eq!(pushed.len(), 1);
+    assert_eq!((pushed[0].round, pushed[0].sig), (0, None));
+    assert_eq!(pushed[0].partial_sigs.len(), 125);
+
+    let message = signature_message(0);
+    let peer = ThresholdBls12381MinSig::partial_sign_batch(
+        outputs[1].shares.as_ref().unwrap().iter(),
+        &message,
+    );
+    let (taken, _) = tokio::sync::oneshot::channel();
+    process(
+        &mut collector,
+        BeaconInput::Signatures {
+            party: 1,
+            request: SendSignaturesRequest {
+                epoch: 1,
+                round: 0,
+                partial_sigs: peer.iter().map(|p| bcs::to_bytes(p).unwrap()).collect(),
+                sig: None,
+            },
+            taken,
+        },
+    );
+    let Some(GateInput::Bytes { round: 0, bytes }) = gate_inbox.try_pop() else {
+        panic!("round 0's bytes");
+    };
+    let sig: fastcrypto::groups::bls12381::G1Element = bcs::from_bytes(&bytes).unwrap();
+    ThresholdBls12381MinSig::verify(&key.c0(), &message, &sig).unwrap();
+    let pushed = outgoing(&mut collector);
+    assert_eq!(pushed[0].sig, Some(sig));
+    assert!(pushed[0].partial_sigs.is_empty());
 }

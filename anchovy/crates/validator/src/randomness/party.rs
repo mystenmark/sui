@@ -117,7 +117,7 @@ impl DkgParty {
 
     fn confirm(&self) {
         if let Some((confirmation, _)) = &self.merged {
-            self.submit(ConsensusTransaction::new_randomness_dkg_confirmation(
+            self.submit(&ConsensusTransaction::new_randomness_dkg_confirmation(
                 self.name,
                 &VersionedDkgConfirmation::V1(confirmation.clone()),
             ));
@@ -125,8 +125,8 @@ impl DkgParty {
     }
 
     /// On its own thread: a full submission lane blocks.
-    fn submit(&self, transaction: ConsensusTransaction) {
-        let bytes = bcs::to_bytes(&transaction).expect("a transaction serializes");
+    fn submit(&self, transaction: &ConsensusTransaction) {
+        let bytes = bcs::to_bytes(transaction).expect("a transaction serializes");
         let consensus = self.consensus.clone();
         std::thread::spawn(move || {
             // Failing only as consensus shuts down, when the epoch is over.
@@ -184,7 +184,7 @@ impl Processor for DkgParty {
                     }
                 } else if !message_seen {
                     let message = self.party.create_message(&mut rng).expect("a party deals");
-                    self.submit(ConsensusTransaction::new_randomness_dkg_message(
+                    self.submit(&ConsensusTransaction::new_randomness_dkg_message(
                         self.name,
                         &VersionedDkgMessage::V1(message),
                     ));

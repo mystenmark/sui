@@ -1180,7 +1180,7 @@ impl CommitStage {
         {
             self.key_sent = true;
             push(
-                &beacon,
+                beacon,
                 BeaconInput::GroupKey(key.clone()),
                 "signature collector",
             );
