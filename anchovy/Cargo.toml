@@ -118,6 +118,8 @@ fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "076bf5ad
 # our choosing.
 ed25519-consensus = "=2.1.0"
 base64ct = { version = "=1.8.0", features = ["alloc"] }
+# The random beacon's DKG and threshold signatures.
+fastcrypto-tbls = { git = "https://github.com/MystenLabs/fastcrypto", rev = "076bf5ad8cea140dc7cf5c5861c24a36acdf64ce" }
 fastcrypto-zkp = { git = "https://github.com/MystenLabs/fastcrypto", rev = "076bf5ad8cea140dc7cf5c5861c24a36acdf64ce", package = "fastcrypto-zkp" }
 roaring = "=0.11.4"
 # The map type fastcrypto-zkp takes JWKs in.

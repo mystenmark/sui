@@ -13,6 +13,8 @@ bytes.workspace = true
 consensus.workspace = true
 containers.workspace = true
 execution.workspace = true
+fastcrypto.workspace = true
+fastcrypto-tbls.workspace = true
 foldhash.workspace = true
 hashbrown.workspace = true
 messages.workspace = true
@@ -33,6 +35,7 @@ waiter.workspace = true
 workqueue.workspace = true
 
 [dev-dependencies]
+rand.workspace = true
 execution = { workspace = true, features = ["testing"] }
 base64.workspace = true
 bcs.workspace = true
