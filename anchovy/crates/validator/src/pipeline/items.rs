@@ -12,6 +12,8 @@ use messages::Message;
 use messages::base::ObjectId;
 use messages::object::Object;
 
+use tokio::sync::oneshot;
+
 use crate::checks::VerifiedTransaction;
 use crate::consensus::execution_time::Key;
 use crate::consensus::sequence::SharedAccess;
@@ -112,6 +114,15 @@ pub enum GateInput {
     /// A randomness round's random bytes (its signature's BCS), verified.
     /// Signature processor → gate.
     Bytes { round: u64, bytes: Vec<u8> },
+    /// Which round the gate waits for, if any, and the checkpoint its update
+    /// goes into. The p2p endpoint → gate, to fetch rounds peers stopped
+    /// pushing.
+    Waiting(oneshot::Sender<Option<(u64, u64)>>),
+}
+
+/// A full queue drops the question: the asker asks again.
+impl workqueue::Refuse for GateInput {
+    fn refuse(self, _: workqueue::Refusal) {}
 }
 
 /// What settling a chunk takes. `CommitHandler` → `SettlementScheduler`.

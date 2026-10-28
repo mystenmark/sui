@@ -250,6 +250,7 @@ pub fn current(
     let (client, normal, priority) = consensus::TransactionClient::new(16);
     let (effects, effects_inbox) = workqueue::queue(16);
     let (beacon, beacon_inbox) = workqueue::queue(16);
+    let (randomness_gate, gate_inbox) = workqueue::queue(16);
     let current = CurrentEpoch::new();
     current.set(Arc::new(EpochHandle {
         epoch: epoch.clone(),
@@ -262,6 +263,10 @@ pub fn current(
         },
         beacon,
         network_keys: Vec::new(),
+        randomness_gate,
     }));
-    (current, (normal, priority, effects_inbox, beacon_inbox))
+    (
+        current,
+        (normal, priority, effects_inbox, beacon_inbox, gate_inbox),
+    )
 }

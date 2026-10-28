@@ -36,7 +36,7 @@ use validator::current::EpochHandle;
 use validator::epoch::EpochState;
 use validator::epoch_store::{BuilderOutput, ConsensusOutput as OutputWriter, EpochStore};
 use validator::pipeline::backpressure::{Backpressure, Limits};
-use validator::pipeline::items::{CertifiedCheckpoint, EffectsWaitItem};
+use validator::pipeline::items::{CertifiedCheckpoint, EffectsWaitItem, GateInput};
 use validator::pipeline::keys::EffectsKey;
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable, GenerationTable};
 use validator::processors::Request;
@@ -74,6 +74,7 @@ pub struct Pipeline {
     pub effects: Queue<Command<EffectsKey, EffectsWaitItem>>,
     /// From peers: the random beacon's signatures.
     pub beacon: Queue<BeaconInput>,
+    randomness_gate: Queue<GateInput>,
     /// Each member's network key, by committee index.
     network_keys: Vec<[u8; 32]>,
     /// What became of each committed transaction, by position.
@@ -332,6 +333,7 @@ impl Pipeline {
             commits: queues.commits,
             effects: queues.effects_waits,
             beacon: queues.beacon,
+            randomness_gate: queues.gate,
             network_keys: record.committee.iter().map(|m| m.network_key).collect(),
             statuses: parts.statuses.clone(),
             consensus,
@@ -371,6 +373,7 @@ impl Pipeline {
             },
             beacon: self.beacon.clone(),
             network_keys: self.network_keys.clone(),
+            randomness_gate: self.randomness_gate.clone(),
         })
     }
 }

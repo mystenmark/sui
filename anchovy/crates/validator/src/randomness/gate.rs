@@ -20,7 +20,8 @@ use crate::pipeline::items::{
 /// Inward:
 /// - `CommitStage`: each chunk (`GateInput::Chunk`), in height order;
 /// - `SignatureCollector`: each round's bytes (`GateInput::Bytes`), durable
-///   in the epoch store first.
+///   in the epoch store first;
+/// - p2p endpoint: which round it waits for (`GateInput::Waiting`).
 ///
 /// Outward:
 /// - `VersionResolver`: each chunk's transactions (`Chunk`);
@@ -108,6 +109,14 @@ impl Processor for RandomnessGate {
             GateInput::Chunk(chunk) => self.held.push_back(chunk),
             GateInput::Bytes { round, bytes } => {
                 self.bytes.insert(round, bytes);
+            }
+            GateInput::Waiting(answer) => {
+                let waiting = self.held.front().and_then(|front| {
+                    let update = front.update.as_ref()?;
+                    Some((update.round, front.chunk.checkpoint_seq))
+                });
+                let _ = answer.send(waiting);
+                return None;
             }
         }
         self.release();

@@ -11,6 +11,7 @@ use tokio::sync::watch;
 use workqueue::Queue;
 
 use crate::epoch::EpochState;
+use crate::pipeline::items::GateInput;
 use crate::processors;
 use crate::randomness::BeaconInput;
 use crate::server::Consensus;
@@ -27,6 +28,8 @@ pub struct EpochHandle {
     /// key, by committee index: who may push it signatures.
     pub beacon: Queue<BeaconInput>,
     pub network_keys: Vec<[u8; 32]>,
+    /// The randomness gate, asked which round it waits for.
+    pub randomness_gate: Queue<GateInput>,
 }
 
 /// The running epoch, if any. Cloned handles see the same epoch.
