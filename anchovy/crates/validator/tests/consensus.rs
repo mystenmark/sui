@@ -433,6 +433,7 @@ fn scheduled(handled: &HandledCommit<'_>) -> Vec<TransactionIndex> {
             }
             validator::consensus::sequence::Scheduled::Prologue(_)
             | validator::consensus::sequence::Scheduled::AuthenticatorStateUpdate(_)
+            | validator::consensus::sequence::Scheduled::RandomnessStateUpdate(_)
             | validator::consensus::sequence::Scheduled::Cancelled(..) => None,
         })
         .collect()
@@ -672,6 +673,7 @@ fn handlers_decide_alike_whatever_has_executed() {
                         }
                         validator::consensus::sequence::Scheduled::Prologue(_)
                         | validator::consensus::sequence::Scheduled::AuthenticatorStateUpdate(_)
+                        | validator::consensus::sequence::Scheduled::RandomnessStateUpdate(_)
                         | validator::consensus::sequence::Scheduled::Cancelled(..) => None,
                     })
                     .collect();

@@ -72,15 +72,27 @@ pub enum Scheduled {
     /// The JSON web keys that became active in the last commit.
     AuthenticatorStateUpdate(Vec<(JwkId, Jwk)>),
     User(VerifiedTransaction),
-    /// A user transaction cancelled for congestion, scheduled in place with
-    /// its consensus object inputs, which it does not read: they take no
-    /// ordinal and write nothing.
+    /// A user transaction cancelled for congestion, or because DKG failed,
+    /// scheduled in place with its consensus object inputs, which it does
+    /// not read: they take no ordinal and write nothing.
     Cancelled(VerifiedTransaction, Vec<CancelledInput>),
+    /// The randomness state's update for the commit's randomness round,
+    /// which heads the schedule's randomness part.
+    RandomnessStateUpdate(RandomnessUpdate),
+}
+
+/// A `RandomnessStateUpdate` to schedule: the round, and the randomness
+/// state's initial shared version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RandomnessUpdate {
+    pub round: u64,
+    pub initial_shared_version: u64,
 }
 
 /// A consensus object input of a cancelled transaction, with the
 /// reference's marker version in place of a version
-/// (`SequenceNumber::CONGESTED` or `CANCELLED_READ`).
+/// (`SequenceNumber::CONGESTED`, `CANCELLED_READ` or
+/// `RANDOMNESS_UNAVAILABLE`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CancelledInput {
     pub id: ObjectId,
@@ -100,6 +112,10 @@ pub struct AuthenticatorUpdate {
 #[derive(Debug)]
 pub struct Schedule<'b> {
     pub transactions: containers::Vec<'b, Scheduled>,
+    /// Where the randomness part starts, if the commit has one: its
+    /// randomness state update, if any, then the randomness-using
+    /// transactions. Checkpoints take it apart from the rest.
+    pub randomness_start: Option<usize>,
     accesses: containers::Vec<'b, SharedAccess>,
     /// Where each transaction's accesses end in `accesses`.
     ends: containers::Vec<'b, u32>,
@@ -188,19 +204,20 @@ impl Sequencer {
     }
 
     /// The commit's schedule: the prologue, the authenticator state's
-    /// update if any, then `transactions` (each `User` or `Cancelled`), in
-    /// order, each user transaction with its shared inputs' ordinals: the
-    /// reference's `assign_versions_from_consensus`, with ordinals for
-    /// versions.
+    /// update if any, then `transactions` (each `User` or `Cancelled`, those
+    /// using randomness last), in order, `randomness` heading those using
+    /// randomness; each with its shared inputs' ordinals: the reference's
+    /// `assign_versions_from_consensus`, with ordinals for versions.
     pub fn schedule<'b>(
         &mut self,
         prologue: Prologue,
         update: Option<AuthenticatorUpdate>,
+        randomness: Option<RandomnessUpdate>,
         transactions: containers::Vec<'b, Scheduled>,
         bump: &'b Bump,
     ) -> Schedule<'b> {
         let round = prologue.round;
-        let accesses = 2 + transactions
+        let accesses = 3 + transactions
             .iter()
             .map(|t| match t {
                 Scheduled::User(t) => shared_inputs(t).count(),
@@ -208,9 +225,10 @@ impl Sequencer {
             })
             .sum::<usize>();
         let mut schedule = Schedule {
-            transactions: containers::Vec::with_capacity_in(transactions.len() + 2, bump),
+            transactions: containers::Vec::with_capacity_in(transactions.len() + 3, bump),
+            randomness_start: None,
             accesses: containers::Vec::with_capacity_in(accesses, bump),
-            ends: containers::Vec::with_capacity_in(transactions.len() + 2, bump),
+            ends: containers::Vec::with_capacity_in(transactions.len() + 3, bump),
         };
 
         // 1. The prologue writes the clock, first.
@@ -250,9 +268,47 @@ impl Sequencer {
         }
 
         // 3. Each transaction's shared inputs: every access reads the
-        //    generation before the transaction's own writes.
-        let first = schedule.transactions.len();
-        for (offset, scheduled) in transactions.into_iter().enumerate() {
+        //    generation before the transaction's own writes. The randomness
+        //    state's update writes it before the first transaction using
+        //    randomness.
+        let mut randomness = randomness;
+        let mut transactions = transactions.into_iter().peekable();
+        loop {
+            let next = transactions.peek();
+            let randomness_next = next.is_none_or(|t| match t {
+                Scheduled::User(t) | Scheduled::Cancelled(t, _) => uses_randomness(t),
+                _ => unreachable!("only user transactions are given"),
+            });
+            if randomness_next && schedule.randomness_start.is_none() {
+                if let Some(update) = randomness.take() {
+                    schedule.randomness_start = Some(schedule.transactions.len());
+                    let state = SharedAccess {
+                        id: RANDOMNESS_STATE,
+                        initial_shared_version: update.initial_shared_version,
+                        mutability: SharedObjectMutability::Mutable,
+                        ordinal: SharedOrdinal {
+                            round,
+                            writes_before: 0,
+                        },
+                        base: None,
+                    };
+                    let index = u32::try_from(schedule.transactions.len())
+                        .expect("fewer than 2^32 transactions");
+                    Self::count(&mut self.writes, index, std::iter::once(&state));
+                    schedule.accesses.push(state);
+                    schedule.ends.push(
+                        u32::try_from(schedule.accesses.len()).expect("fewer than 2^32 accesses"),
+                    );
+                    schedule
+                        .transactions
+                        .push(Scheduled::RandomnessStateUpdate(update));
+                } else if next.is_some() {
+                    schedule.randomness_start = Some(schedule.transactions.len());
+                }
+            }
+            let Some(scheduled) = transactions.next() else {
+                break;
+            };
             let transaction = match scheduled {
                 Scheduled::User(transaction) => transaction,
                 cancelled @ Scheduled::Cancelled(..) => {
@@ -262,9 +318,7 @@ impl Sequencer {
                     schedule.transactions.push(cancelled);
                     continue;
                 }
-                Scheduled::Prologue(_) | Scheduled::AuthenticatorStateUpdate(_) => {
-                    unreachable!("only user transactions are given")
-                }
+                _ => unreachable!("only user transactions are given"),
             };
             let start = schedule.accesses.len();
             for shared in shared_inputs(&transaction) {
@@ -280,7 +334,8 @@ impl Sequencer {
                     base: None,
                 });
             }
-            let index = u32::try_from(first + offset).expect("fewer than 2^32 transactions");
+            let index =
+                u32::try_from(schedule.transactions.len()).expect("fewer than 2^32 transactions");
             let accesses = &schedule.accesses[start..];
             Self::count(&mut self.writes, index, accesses.iter());
             schedule

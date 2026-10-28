@@ -9,6 +9,7 @@ pub mod commit;
 pub mod congestion;
 pub mod decode;
 pub mod deferral;
+pub mod dkg;
 pub mod execution_time;
 pub mod jwk;
 pub mod sequence;

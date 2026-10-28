@@ -22,6 +22,7 @@ use validator::checks::{Valid, Verified};
 use validator::consensus::cache::ConsensusTxCache;
 use validator::consensus::commit::{CommitStage, EpochStart};
 use validator::consensus::decode::{CommitDecoder, CommitRequest, DecodedCommit};
+use validator::consensus::dkg::DkgSetup;
 use validator::consensus::status::ConsensusTxStatusCache;
 use validator::consensus::vote::{BlockVoter, VoteRequest};
 use validator::epoch::EpochState;
@@ -30,11 +31,12 @@ use validator::pipeline::backpressure::Backpressure;
 use validator::pipeline::items::{
     BuiltCommand, BuiltWaits, CertifiedCheckpoint, CheckpointContentsBuilt, CheckpointEffects,
     CheckpointSignature, Chunk, EffectsWaitItem, EpochCloserInput, Executable, FundsCommand,
-    InputCommand, PendingCheckpoint, SettlementInput,
+    GateInput, InputCommand, PendingCheckpoint, SettlementInput,
 };
 use validator::pipeline::keys::{ChunkSettled, EffectsKey};
 use validator::pipeline::tables::{CheckpointStore, ChunkTable, GenerationTable};
 use validator::processors::{Request, SignatureVerifier, TransactionValidator};
+use validator::randomness::{BeaconInput, RandomnessGate, SignatureCollector};
 use validator::submit::SubmitChecker;
 use waiter::{Command, WaiterProcessor};
 use workqueue::{Activity, Inbox, Processor, Queue, Sink, Worker, WorkerHandle};
@@ -66,7 +68,10 @@ pub(crate) fn spawn(
         // Consensus.
         w.one("voting",            i.votes,            |p, q| p.voter(q.built_waits),                                  drop),
         w.one("commit-decode",     i.commits,          |p, q| p.decoder(q.built_waits),                                into(&q.handler, "handler")),
-        w.one("commit-handler",    i.handler,          move |p, q| p.commit_stage(output, q.resolver, q.settlement, q.checkpoint_waits), drop),
+        w.one("commit-handler",    i.handler,          move |p, q| p.commit_stage(output, q.gate, q.beacon, q.checkpoint_waits), drop),
+        // The random beacon.
+        w.one("randomness-gate",   i.gate,             |p, q| p.gate(q.resolver, q.settlement),                       drop),
+        w.one("beacon",            i.beacon,           |p, q| p.collector(q.gate),                                    drop),
         // Execution.
         w.one("resolver",          i.resolver,         |p, q| p.resolver(q.input_waits, q.funds),                     drop),
         w.one("input-waiter",      i.input_waits,      |p, _| WaiterProcessor::new(p.input_availability()),           into(&q.executor, "executor")),
@@ -115,10 +120,12 @@ queues! {
     transactions: Request<DigestPending>,
     votes: VoteRequest,
     commits: CommitRequest,
+    beacon: BeaconInput,
     // Between processors.
     signatures: Request<Valid>,
     submit: Request<Verified>,
     handler: DecodedCommit,
+    gate: GateInput,
     resolver: Chunk,
     executor: Vec<Executable>,
     settlement: SettlementInput,
@@ -139,6 +146,8 @@ queues! {
 /// What the epoch's processors are built from, besides their queues: the
 /// store, the epoch, the tables they share and where the epoch starts.
 pub(crate) struct Parts {
+    /// The epoch's DKG, as every party sets it up.
+    pub dkg: Arc<DkgSetup>,
     pub store: Arc<store::Store>,
     pub epoch: Arc<EpochState>,
     pub epoch_store: EpochStore,
@@ -171,23 +180,35 @@ impl Parts {
             .with_signatures(built)
     }
 
+    /// Whether the epoch has the random beacon: the reference's
+    /// `randomness_state_enabled`.
+    fn has_beacon(&self) -> bool {
+        self.epoch.params.config.random_beacon()
+            && self.start.randomness_initial_shared_version.is_some()
+    }
+
     fn decoder(&self, built: BuiltWaits) -> CommitDecoder {
-        CommitDecoder::new(self.epoch.params.clone(), self.cache.clone()).with_signatures(built)
+        let decoder = CommitDecoder::new(self.epoch.params.clone(), self.cache.clone())
+            .with_signatures(built);
+        if self.has_beacon() {
+            decoder.with_dkg(self.dkg.clone(), self.stakes.len())
+        } else {
+            decoder
+        }
     }
 
     fn commit_stage(
         &self,
         output: OutputWriter,
-        resolver: Queue<Chunk>,
-        settlement: Queue<SettlementInput>,
+        gate: Queue<GateInput>,
+        beacon: Queue<BeaconInput>,
         checkpoint_waits: Queue<Command<ChunkSettled, PendingCheckpoint>>,
     ) -> CommitStage {
         CommitStage::new(
             self.epoch.params.clone(),
             self.start,
             output,
-            resolver,
-            settlement,
+            gate,
             checkpoint_waits,
             self.statuses.clone(),
             self.stakes.clone(),
@@ -196,7 +217,22 @@ impl Parts {
             &self.store,
             &self.epoch.params.config,
         ))
+        .with_randomness(self.dkg.clone())
+        .with_beacon(beacon)
         .with_backpressure(self.backpressure.clone())
+    }
+
+    fn gate(&self, resolver: Queue<Chunk>, settlement: Queue<SettlementInput>) -> RandomnessGate {
+        RandomnessGate::new(self.epoch_store.randomness_bytes(), resolver, settlement)
+    }
+
+    fn collector(&self, gate: Queue<GateInput>) -> SignatureCollector {
+        SignatureCollector::new(
+            self.epoch.params.epoch,
+            self.dkg.clone(),
+            self.epoch_store.clone(),
+            gate,
+        )
     }
 
     fn resolver(&self, inputs: Queue<InputCommand>, funds: Queue<FundsCommand>) -> VersionResolver {

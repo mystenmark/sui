@@ -22,6 +22,7 @@ use crate::checks::{self, VerifiedTransaction};
 
 use crate::consensus::cache::{CachedTransaction, ConsensusTxCache};
 use crate::consensus::capabilities::Announced;
+use crate::consensus::dkg::{DkgPayload, DkgSetup, DkgTraffic};
 use crate::consensus::execution_time::{Key, SharedObservations, duration};
 use crate::consensus::jwk::JwkVote;
 use crate::epoch::EpochParams;
@@ -57,6 +58,8 @@ pub struct DecodedCommit {
     pub jwks: Vec<JwkVote>,
     /// The capabilities validators announced, in commit order.
     pub capabilities: Vec<Announced>,
+    /// The random beacon's DKG messages and confirmations, in commit order.
+    pub dkg: Vec<DkgTraffic>,
     /// Where the transactions a quorum voted to reject were.
     pub rejected: Vec<(BlockRef, TransactionIndex)>,
     /// Transactions taken from the cache, and decoded again.
@@ -152,6 +155,12 @@ pub struct CommitDecoder {
     cache: Arc<ConsensusTxCache>,
     /// Where committed checkpoint signatures go; unrouted until set.
     signatures: Option<BuiltWaits>,
+    /// The epoch's DKG, if it has the random beacon: its traffic is left
+    /// out otherwise, as the reference ignores it.
+    dkg: Option<Arc<DkgSetup>>,
+    /// Whether a message of each member's was checked: a later one is a
+    /// duplicate, which the handler drops, so it is not checked again.
+    dkg_checked: Vec<bool>,
 }
 
 impl CommitDecoder {
@@ -160,7 +169,17 @@ impl CommitDecoder {
             epoch,
             cache,
             signatures: None,
+            dkg: None,
+            dkg_checked: Vec::new(),
         }
+    }
+
+    /// Decodes the random beacon's DKG traffic, as `setup` sets DKG up.
+    #[must_use]
+    pub fn with_dkg(mut self, setup: Arc<DkgSetup>, committee_size: usize) -> CommitDecoder {
+        self.dkg = Some(setup);
+        self.dkg_checked = vec![false; committee_size];
+        self
     }
 
     /// Routes committed checkpoint signatures to the built waiter.
@@ -192,6 +211,7 @@ impl CommitDecoder {
             observations: Vec::new(),
             jwks: Vec::new(),
             capabilities: Vec::new(),
+            dkg: Vec::new(),
             rejected: rejected
                 .iter()
                 .flat_map(|(block, indices)| indices.iter().map(|i| (*block, *i)))
@@ -252,6 +272,12 @@ impl CommitDecoder {
                             });
                             continue;
                         }
+                        Decoded::Dkg(transaction) => {
+                            decoded
+                                .dkg
+                                .extend(self.dkg_traffic(block.reference.author, &transaction));
+                            continue;
+                        }
                         Decoded::Other => continue,
                     }
                 };
@@ -285,6 +311,37 @@ impl CommitDecoder {
     }
 }
 
+impl CommitDecoder {
+    /// The DKG traffic `transaction` carries from the member at `author`:
+    /// none if the epoch has no random beacon, or its authority is not the
+    /// author. A message's checks run here, off the handler's thread.
+    fn dkg_traffic(
+        &mut self,
+        author: u32,
+        transaction: &Message<ConsensusTransaction<'static>>,
+    ) -> Option<DkgTraffic> {
+        let setup = self.dkg.as_ref()?;
+        let (dkg, message) = match transaction.get().kind() {
+            ConsensusTransactionKind::RandomnessDkgMessage(dkg) => (dkg, true),
+            ConsensusTransactionKind::RandomnessDkgConfirmation(dkg) => (dkg, false),
+            _ => unreachable!("DKG traffic"),
+        };
+        if !setup.is_author(author, &dkg.authority.bytes) {
+            return None;
+        }
+        let payload = if message {
+            let checked = &mut self.dkg_checked[author as usize];
+            let message = (!std::mem::replace(checked, true))
+                .then(|| setup.message(author, dkg.bytes))
+                .flatten();
+            DkgPayload::Message(message.map(Box::new))
+        } else {
+            DkgPayload::Confirmation(setup.confirmation(author, dkg.bytes))
+        };
+        Some(DkgTraffic { author, payload })
+    }
+}
+
 /// A committed transaction that missed the cache, by the kinds routed.
 // Returned and matched at once, and nearly always a user transaction.
 enum Decoded {
@@ -295,6 +352,8 @@ enum Decoded {
     /// Its author not yet set.
     Jwk(JwkVote),
     Capabilities(AuthorityCapabilitiesV2),
+    /// A DKG message or confirmation, not decoded yet.
+    Dkg(Message<ConsensusTransaction<'static>>),
     Other,
 }
 
@@ -359,6 +418,10 @@ fn decode_transaction(bytes: Vec<u8>, bump: &Bump) -> Decoded {
         }
         ConsensusTransactionKind::CapabilityNotificationV2(capabilities) => {
             return Decoded::Capabilities(AuthorityCapabilitiesV2::from(capabilities));
+        }
+        ConsensusTransactionKind::RandomnessDkgMessage(_)
+        | ConsensusTransactionKind::RandomnessDkgConfirmation(_) => {
+            return Decoded::Dkg(transaction);
         }
         _ => return Decoded::Other,
     };

@@ -17,6 +17,14 @@ use sui_protocol_config::ExecutionTimeEstimateParams;
 use crate::checks::VerifiedTransaction;
 use crate::consensus::sequence::shared_inputs;
 
+/// Which of a commit's two trackers: randomness-using transactions have
+/// their own, with a scaled budget and their own debts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Tracker {
+    Regular,
+    Randomness,
+}
+
 /// One commit's accumulated cost per consensus object, in microseconds of
 /// estimated execution time.
 pub struct CongestionTracker<'b> {
@@ -30,20 +38,28 @@ impl<'b> CongestionTracker<'b> {
     /// `commit_period_ms`, starting from each object's `debts`.
     pub fn new(
         params: &ExecutionTimeEstimateParams,
+        tracker: Tracker,
         commit_period_ms: u64,
         debts: impl IntoIterator<Item = (ObjectId, u64)>,
         bump: &'b Bump,
     ) -> CongestionTracker<'b> {
         let mut costs = containers::hash_map(bump, 0);
         costs.extend(debts);
+        // `Params::commit_budget` and `max_burst`, of the period's whole
+        // microseconds.
+        let scaled = |amount: u64| match tracker {
+            Tracker::Regular => amount,
+            Tracker::Randomness => amount.saturating_mul(params.randomness_scalar) / 100,
+        };
         CongestionTracker {
             costs,
-            // `Params::commit_budget`, of the period's whole microseconds.
-            budget: commit_period_ms
-                .saturating_mul(1000)
-                .saturating_mul(params.target_utilization)
-                / 100,
-            burst: params.allowed_txn_cost_overage_burst_limit_us,
+            budget: scaled(
+                commit_period_ms
+                    .saturating_mul(1000)
+                    .saturating_mul(params.target_utilization)
+                    / 100,
+            ),
+            burst: scaled(params.allowed_txn_cost_overage_burst_limit_us),
         }
     }
 

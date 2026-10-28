@@ -19,6 +19,7 @@ use messages::base::{Digest, Hashed, ObjectId, ObjectRef};
 use store::Live;
 use store::epoch::{EpochDb, Space};
 
+use crate::consensus::congestion::Tracker;
 use crate::consensus::deferral::DeferralKey;
 use crate::pipeline::keys::{StreamId, TxDigest};
 use crate::pipeline::tables::Generation;
@@ -172,6 +173,40 @@ impl EpochStore {
         })
     }
 
+    /// Records the random bytes of randomness round `round`, durably: peers
+    /// stop sending a round's signature once a checkpoint certifies it, so
+    /// a replay of the epoch finds them here.
+    ///
+    /// # Panics
+    /// If the database cannot be written.
+    pub fn put_randomness_bytes(&self, round: u64, bytes: &[u8]) {
+        let mut batch = self.db.batch();
+        batch.put(
+            Space::RandomnessBytes,
+            round.to_be_bytes().to_vec(),
+            bytes.to_vec(),
+        );
+        batch.commit().expect("the epoch's database writes");
+    }
+
+    /// The random bytes of each round recorded, by round.
+    ///
+    /// # Panics
+    /// If the database cannot be read.
+    pub fn randomness_bytes(&self) -> Vec<(u64, Vec<u8>)> {
+        self.db
+            .entries(Space::RandomnessBytes)
+            .expect("the epoch's database reads")
+            .into_iter()
+            .map(|(key, bytes)| {
+                (
+                    u64::from_be_bytes(key[..].try_into().expect("8 bytes")),
+                    bytes,
+                )
+            })
+            .collect()
+    }
+
     /// Checkpoint `seq`, built here, as the builder wrote it.
     ///
     /// # Panics
@@ -318,7 +353,7 @@ struct Quarantine {
     processed: HeapMessageMap<TxDigest, usize>,
     locks: SipMap<ObjectRef, (TxDigest, usize)>,
     streams: SipMap<StreamId, ((u32, u32), usize)>,
-    debts: SipMap<ObjectId, ((u64, u64), usize)>,
+    debts: SipMap<(Tracker, ObjectId), ((u64, u64), usize)>,
     /// The last chunk height of the last checkpoint committed.
     committed_height: u64,
 }
@@ -333,7 +368,10 @@ struct Output {
     locks: SipMap<ObjectRef, TxDigest>,
     streams: SipMap<StreamId, (u32, u32)>,
     /// Congestion debts recorded, each as (round, debt).
-    debts: SipMap<ObjectId, (u64, u64)>,
+    debts: SipMap<(Tracker, ObjectId), (u64, u64)>,
+    /// Randomness records written: DKG's progress and the rounds reserved,
+    /// by `Space::Randomness` key.
+    randomness: Vec<([u8; 3], Vec<u8>)>,
     /// The execution time observations taken: (generation, authority
     /// index) and the encoded estimates.
     observations: Vec<((u64, u32), Vec<u8>)>,
@@ -361,6 +399,7 @@ impl Default for Output {
             locks: SipMap::default(),
             streams: SipMap::default(),
             debts: SipMap::default(),
+            randomness: Vec::new(),
             observations: Vec::new(),
             deferred: Vec::new(),
             jwk_votes: Vec::new(),
@@ -425,32 +464,60 @@ impl ConsensusOutput {
             .insert(object, holder);
     }
 
-    /// The congestion debt last recorded for `object`, and the round it was
-    /// recorded in, as (round, debt), if any this epoch.
+    /// The congestion debt `tracker` last recorded for `object`, and the
+    /// round it was recorded in, as (round, debt), if any this epoch.
     ///
     /// # Panics
     /// If the database cannot be read.
-    pub fn congestion_debt(&self, object: &ObjectId) -> Option<(u64, u64)> {
+    pub fn congestion_debt(&self, tracker: Tracker, object: &ObjectId) -> Option<(u64, u64)> {
         let q = lock_quarantine(&self.quarantine);
-        if let Some(debt) = q.open.debts.get(object) {
+        let key = (tracker, *object);
+        if let Some(debt) = q.open.debts.get(&key) {
             return Some(*debt);
         }
-        if let Some((debt, _)) = q.debts.get(object) {
+        if let Some((debt, _)) = q.debts.get(&key) {
             return Some(*debt);
         }
-        q.db.get(Space::CongestionDebts, &object.0)
+        q.db.get(debt_space(tracker), &object.0)
             .expect("the epoch's database reads")
             .map(|v| bcs::from_bytes(&v).expect("a debt as written"))
     }
 
-    /// Records `object`'s congestion debt `debt` in `round`. Debts are never
-    /// deleted: a later commit decays a stale one (the reference's
-    /// `load_initial_object_debts`).
-    pub fn set_congestion_debt(&mut self, object: ObjectId, round: u64, debt: u64) {
+    /// Records `object`'s congestion debt `debt` in `tracker` in `round`.
+    /// Debts are never deleted: a later commit decays a stale one (the
+    /// reference's `load_initial_object_debts`).
+    pub fn set_congestion_debt(
+        &mut self,
+        tracker: Tracker,
+        object: ObjectId,
+        round: u64,
+        debt: u64,
+    ) {
         lock_quarantine(&self.quarantine)
             .open
             .debts
-            .insert(object, (round, debt));
+            .insert((tracker, object), (round, debt));
+    }
+
+    /// A randomness record the commit being decided wrote, by its
+    /// `Space::Randomness` key: it replaces any written.
+    pub fn put_randomness(&mut self, key: [u8; 3], value: Vec<u8>) {
+        lock_quarantine(&self.quarantine)
+            .open
+            .randomness
+            .push((key, value));
+    }
+
+    /// The randomness records of the commits written, in key order: for the
+    /// commit handler's start.
+    ///
+    /// # Panics
+    /// If the database cannot be read.
+    pub fn randomness(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        lock_quarantine(&self.quarantine)
+            .db
+            .entries(Space::Randomness)
+            .expect("the epoch's database reads")
     }
 
     /// The stream's last scheduled generation, (round, generation), if a
@@ -498,12 +565,14 @@ impl ConsensusOutput {
             .push(((generation, author), estimates));
     }
 
-    /// Defers transactions, `transactions` encoded, by `key`: one key per
-    /// commit, as the reference's.
+    /// Defers transactions, `transactions` encoded, by `key`, once per
+    /// commit. They replace any an earlier commit deferred by `key`, as the
+    /// reference's cache insert does: a randomness key keeps the round a
+    /// transaction was first deferred from, which another commit's
+    /// randomness deferrals may have taken.
     pub fn defer(&mut self, key: DeferralKey, transactions: Vec<u8>) {
         let mut q = lock_quarantine(&self.quarantine);
-        let previous = q.deferred.insert(key, transactions.clone());
-        assert!(previous.is_none(), "{key:?} deferred to twice");
+        q.deferred.insert(key, transactions.clone());
         q.open.deferred.push((key, Some(transactions)));
     }
 
@@ -742,13 +811,16 @@ impl Quarantine {
                 );
                 release(&mut self.streams, &stream, |last| &mut last.1);
             }
-            for (object, debt) in output.debts {
+            for ((tracker, object), debt) in output.debts {
                 batch.put(
-                    Space::CongestionDebts,
+                    debt_space(tracker),
                     object.0.to_vec(),
                     bcs::to_bytes(&debt).expect("a debt serializes"),
                 );
-                release(&mut self.debts, &object, |held| &mut held.1);
+                release(&mut self.debts, &(tracker, object), |held| &mut held.1);
+            }
+            for (key, value) in output.randomness {
+                batch.put(Space::Randomness, key.to_vec(), value);
             }
             for (key, transactions) in output.deferred {
                 let key = key.encode().to_vec();
@@ -796,6 +868,13 @@ fn release<K: std::hash::Hash + Eq, V, S: std::hash::BuildHasher>(
     *count -= 1;
     if *count == 0 {
         map.remove(key);
+    }
+}
+
+fn debt_space(tracker: Tracker) -> Space {
+    match tracker {
+        Tracker::Regular => Space::CongestionDebts,
+        Tracker::Randomness => Space::RandomnessDebts,
     }
 }
 

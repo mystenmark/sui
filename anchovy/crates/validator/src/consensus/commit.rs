@@ -29,26 +29,28 @@ use workqueue::Processor;
 
 use crate::checks::VerifiedTransaction;
 use crate::consensus::capabilities::{self, CapabilitySet};
-use crate::consensus::congestion::{self, CongestionTracker};
+use crate::consensus::congestion::{self, CongestionTracker, Tracker};
 use crate::consensus::decode::{CommittedTransaction, DecodedCommit};
 use crate::consensus::deferral::{DeferralKey, Deferred, decode_deferred, encode_deferred};
+use crate::consensus::dkg::{Dkg, DkgChanges, DkgSetup, DkgStatus, decode_status, encode_status};
 use crate::consensus::execution_time::{
     ExecutionTimeEstimator, Key, decode_estimates, encode_estimates,
 };
 use crate::consensus::jwk::{JwkAggregator, JwkVote, decode_vote, encode_vote, jwk_order};
 use crate::consensus::sequence::{
-    AuthenticatorUpdate, CancelledInput, Prologue, Schedule, Scheduled, Sequencer, SharedAccess,
-    SharedOrdinal, shared_inputs, uses_randomness,
+    AuthenticatorUpdate, CancelledInput, Prologue, RandomnessUpdate, Schedule, Scheduled,
+    Sequencer, SharedAccess, SharedOrdinal, shared_inputs, uses_randomness,
 };
 use crate::consensus::status::{ConsensusTxStatus, ConsensusTxStatusCache};
 use crate::epoch::EpochParams;
 use crate::epoch_store::ConsensusOutput;
 use crate::pipeline::backpressure::Backpressure;
 use crate::pipeline::items::{
-    Chunk, ChunkSettlement, EpochClose, ExecutableTransaction, PendingCheckpoint, ScheduledEntry,
-    SettlementInput, SystemKind, SystemTransaction,
+    Chunk, ChunkSettlement, EpochClose, ExecutableTransaction, GateInput, GatedChunk,
+    PendingCheckpoint, PendingUpdate, ScheduledEntry, SystemKind, SystemTransaction,
 };
 use crate::pipeline::keys::{AccumulatorVersion, ChunkSettled, StreamId, TxDigest};
+use crate::randomness::BeaconInput;
 
 /// Why a committed transaction was dropped.
 #[derive(Debug)]
@@ -129,6 +131,34 @@ pub struct CommitHandler {
     /// A commit at or past `epoch_end_ms` was handled: later commits' user
     /// transactions, observations and votes are dropped.
     certs_closed: bool,
+    /// The random beacon, if the epoch has it.
+    randomness: Option<Randomness>,
+}
+
+/// The random beacon's state, in an epoch that has it: the protocol enables
+/// it and the randomness state existed as the epoch started (the
+/// reference's `randomness_state_enabled`).
+struct Randomness {
+    initial_shared_version: u64,
+    dkg: Dkg,
+    /// The round the next reservation takes: rounds count from 0 each epoch.
+    next_round: u64,
+    /// The timestamp of the commit that reserved the last round.
+    last_round_ms: Option<u64>,
+}
+
+/// `Space::Randomness` keys: a record's kind, then a party id.
+const DKG_MESSAGE: u8 = 0;
+const DKG_CONFIRMATION: u8 = 1;
+const DKG_USED: [u8; 3] = [2, 0, 0];
+const DKG_STATUS: [u8; 3] = [3, 0, 0];
+const RANDOMNESS_ROUNDS: [u8; 3] = [4, 0, 0];
+
+fn party_key(kind: u8, author: u32) -> [u8; 3] {
+    let [hi, lo] = u16::try_from(author)
+        .expect("fewer than 2^16 members")
+        .to_be_bytes();
+    [kind, hi, lo]
 }
 
 impl CommitHandler {
@@ -176,6 +206,121 @@ impl CommitHandler {
             authenticator: authenticator.filter(|_| config.enable_jwk_consensus_updates()),
             epoch_end_ms: u64::MAX,
             certs_closed: false,
+            randomness: None,
+        }
+    }
+
+    /// Runs the random beacon, the randomness state shared at
+    /// `initial_shared_version`, with DKG as `setup` sets it up; its
+    /// progress in the commits written restored.
+    ///
+    /// # Panics
+    /// If a randomness record is not as this handler wrote it.
+    #[must_use]
+    pub fn with_randomness(
+        mut self,
+        initial_shared_version: u64,
+        setup: Arc<DkgSetup>,
+    ) -> CommitHandler {
+        let mut dkg = Dkg::new(setup);
+        let mut written = DkgChanges::default();
+        let (mut next_round, mut last_round_ms) = (0, None);
+        for (key, value) in self.output.randomness() {
+            let author = u32::from(u16::from_be_bytes([key[1], key[2]]));
+            let value = (!value.is_empty()).then_some(value);
+            match key[0] {
+                DKG_MESSAGE => written.messages.push((author, value)),
+                DKG_CONFIRMATION => written.confirmations.push((author, value)),
+                _ if key == DKG_USED => {
+                    written.used =
+                        Some(bcs::from_bytes(&value.expect("used")).expect("as written"));
+                }
+                _ if key == DKG_STATUS => {
+                    written.status = Some(decode_status(&value.expect("a status")));
+                }
+                _ if key == RANDOMNESS_ROUNDS => {
+                    let (next, last): (u64, u64) =
+                        bcs::from_bytes(&value.expect("rounds")).expect("as written");
+                    (next_round, last_round_ms) = (next, Some(last));
+                }
+                _ => panic!("randomness record {key:?}"),
+            }
+        }
+        dkg.restore([written]);
+        self.randomness = Some(Randomness {
+            initial_shared_version,
+            dkg,
+            next_round,
+            last_round_ms,
+        });
+        self
+    }
+
+    /// DKG's outcome so far, if the epoch has the random beacon.
+    pub fn dkg_status(&self) -> Option<&DkgStatus> {
+        self.randomness.as_ref().map(|r| r.dkg.status())
+    }
+
+    /// The reference's `init_randomness`, before the commit's DKG traffic:
+    /// the commit's randomness round, if DKG succeeded and the last round's
+    /// commit was long enough ago, and whether DKG failed.
+    fn reserve_randomness(
+        &mut self,
+        config: &ProtocolConfig,
+        timestamp_ms: u64,
+    ) -> (Option<u64>, bool) {
+        let Some(randomness) = &mut self.randomness else {
+            return (None, false);
+        };
+        match randomness.dkg.status() {
+            DkgStatus::Pending => (None, false),
+            DkgStatus::Failed => (None, true),
+            DkgStatus::Successful(_) => {
+                if randomness.last_round_ms.is_some_and(|last| {
+                    timestamp_ms.saturating_sub(last) < config.random_beacon_min_round_interval_ms()
+                }) {
+                    return (None, false);
+                }
+                let round = randomness.next_round;
+                randomness.next_round += 1;
+                randomness.last_round_ms = Some(timestamp_ms);
+                self.output.put_randomness(
+                    RANDOMNESS_ROUNDS,
+                    bcs::to_bytes(&(randomness.next_round, timestamp_ms)).expect("serializes"),
+                );
+                (Some(round), false)
+            }
+        }
+    }
+
+    /// The commit's DKG traffic, for the consensus output: the reference's
+    /// `process_dkg_updates`. Without the random beacon it is ignored, as
+    /// the reference's.
+    fn handle_dkg(
+        &mut self,
+        config: &ProtocolConfig,
+        traffic: Vec<crate::consensus::dkg::DkgTraffic>,
+        round: u64,
+    ) {
+        let Some(randomness) = &mut self.randomness else {
+            return;
+        };
+        let changes = randomness.dkg.handle(config, traffic, round);
+        let output = &mut self.output;
+        for (author, bytes) in changes.messages {
+            output.put_randomness(party_key(DKG_MESSAGE, author), bytes.unwrap_or_default());
+        }
+        for (author, bytes) in changes.confirmations {
+            output.put_randomness(
+                party_key(DKG_CONFIRMATION, author),
+                bytes.unwrap_or_default(),
+            );
+        }
+        if let Some(used) = changes.used {
+            output.put_randomness(DKG_USED, bcs::to_bytes(&used).expect("serializes"));
+        }
+        if let Some(status) = changes.status {
+            output.put_randomness(DKG_STATUS, encode_status(&status));
         }
     }
 
@@ -253,6 +398,10 @@ impl CommitHandler {
         let certs_closed = self.certs_closed;
         // The reference's `observe_commit`, before anything is estimated.
         self.observe_prior(config, commit.timestamp_ms);
+        // The commit's randomness round, as DKG stood before its traffic.
+        let (randomness_round, dkg_failed) = self.reserve_randomness(config, commit.timestamp_ms);
+        let randomness_deferrable = self.randomness.is_some() && randomness_round.is_none();
+        self.handle_dkg(config, commit.dkg, round);
 
         // 2. Lock owned inputs in consensus order, as the reference's
         //    `filter_consensus_txns`: a transaction an input of which another
@@ -346,7 +495,10 @@ impl CommitHandler {
         //    protocol order: `merge_and_reorder_transactions`.
         let mut previously_deferred = containers::message_map(bump, 0);
         let mut transactions = containers::Vec::with_capacity_in(accepted.len(), bump);
-        let due = self.output.take_deferred(DeferralKey::due_by(round));
+        let mut due = self.output.take_deferred(DeferralKey::due_by(round));
+        if randomness_round.is_some() || dkg_failed {
+            due.extend(self.output.take_deferred(DeferralKey::randomness()));
+        }
         let loaded_deferred = !due.is_empty();
         for (key, deferred) in due {
             for deferred in decode_deferred(&deferred) {
@@ -360,13 +512,17 @@ impl CommitHandler {
         let ordered = self.sequencer.order(config, transactions, bump);
 
         // 7. Each, in order, deferred, cancelled, or estimated and scheduled:
-        //    `handle_deferral_and_cancellation`. A contested holder is
+        //    `handle_deferral_and_cancellation`. Regular transactions come
+        //    first, then those using randomness, which DKG's failure
+        //    cancels, which wait for a commit with a randomness round, and
+        //    which have a tracker of their own. A contested holder is
         //    deferred a round, as a penalty for the double spend; past the
         //    deferral limit it goes on to congestion control, which defers a
         //    transaction starting past the commit's budget, and cancels it
-        //    past the limit. Randomness-using transactions skip congestion
-        //    control (`docs/upgrades_and_congestion_design.md`).
-        let mut tracker = self.congestion_tracker(config, round, &ordered, bump);
+        //    past the limit.
+        let mut tracker = self.congestion_tracker(config, Tracker::Regular, round, &ordered, bump);
+        let mut randomness_tracker =
+            self.congestion_tracker(config, Tracker::Randomness, round, &ordered, bump);
         let max_rounds = config.max_deferral_rounds_for_congestion_control();
         let mut deferred: containers::BTreeMap<DeferralKey, containers::Vec<Deferred>> =
             containers::BTreeMap::new_in(bump);
@@ -375,30 +531,41 @@ impl CommitHandler {
         let mut observed = containers::Vec::with_capacity_in(ordered.len(), bump);
         for transaction in ordered {
             let hashed = *transaction.get().0.digest();
-            let key = DeferralKey::next_round(
-                round,
-                previously_deferred
-                    .get(&hashed)
-                    .map_or(round, DeferralKey::deferred_from_round),
-            );
+            let randomness = uses_randomness(&transaction);
+            if randomness && dkg_failed {
+                let inputs = dkg_failed_inputs(&transaction);
+                admitted.push(Scheduled::Cancelled(transaction, inputs));
+                continue;
+            }
+            let deferred_from_round = previously_deferred
+                .get(&hashed)
+                .map_or(round, DeferralKey::deferred_from_round);
+            let mut key = DeferralKey::next_round(round, deferred_from_round);
             let double_spend =
                 contested.contains(&hashed) && config.defer_owned_object_double_spend();
             if !(double_spend && key.within_limit(max_rounds)) {
                 let estimate = self.execution_times.estimate_us(&transaction);
                 observed.push(estimate);
-                if uses_randomness(&transaction) {
-                    admitted.push(Scheduled::User(transaction));
-                    continue;
-                }
-                let Some(congested_objects) = tracker.congested(&transaction) else {
-                    tracker.charge(&transaction, estimate);
-                    admitted.push(Scheduled::User(transaction));
-                    continue;
-                };
-                if !key.within_limit(max_rounds) {
-                    let inputs = cancelled_inputs(&transaction, &congested_objects);
-                    admitted.push(Scheduled::Cancelled(transaction, inputs));
-                    continue;
+                if randomness && randomness_deferrable {
+                    key = DeferralKey::Randomness {
+                        deferred_from_round,
+                    };
+                } else {
+                    let tracker = if randomness {
+                        &mut randomness_tracker
+                    } else {
+                        &mut tracker
+                    };
+                    let Some(congested_objects) = tracker.congested(&transaction) else {
+                        tracker.charge(&transaction, estimate);
+                        admitted.push(Scheduled::User(transaction));
+                        continue;
+                    };
+                    if !key.within_limit(max_rounds) {
+                        let inputs = cancelled_inputs(&transaction, &congested_objects);
+                        admitted.push(Scheduled::Cancelled(transaction, inputs));
+                        continue;
+                    }
                 }
             }
             let origin = origins.remove(&hashed).expect("each transaction's origin");
@@ -412,7 +579,12 @@ impl CommitHandler {
                 });
         }
         for (object, debt) in tracker.debts() {
-            self.output.set_congestion_debt(object, round, debt);
+            self.output
+                .set_congestion_debt(Tracker::Regular, object, round, debt);
+        }
+        for (object, debt) in randomness_tracker.debts() {
+            self.output
+                .set_congestion_debt(Tracker::Randomness, object, round, debt);
         }
         let final_commit =
             self.close_epoch(config, commit.timestamp_ms, loaded_deferred, &mut deferred);
@@ -432,7 +604,17 @@ impl CommitHandler {
         // 8. The schedule: the prologue, the update, then the transactions,
         //    with shared accesses and their ordinals, linked to earlier
         //    rounds.
-        let mut schedule = self.sequencer.schedule(prologue, update, admitted, bump);
+        let randomness_update = randomness_round.map(|round| RandomnessUpdate {
+            round,
+            initial_shared_version: self
+                .randomness
+                .as_ref()
+                .expect("a round needs the beacon")
+                .initial_shared_version,
+        });
+        let mut schedule =
+            self.sequencer
+                .schedule(prologue, update, randomness_update, admitted, bump);
         self.link(schedule.all_accesses_mut());
         Some(HandledCommit {
             commit_index: commit.commit_index,
@@ -449,13 +631,15 @@ impl CommitHandler {
         })
     }
 
-    /// The commit's congestion tracker (the reference's
+    /// One of the commit's congestion trackers (the reference's
     /// `init_congestion_tracker`): its budget from the estimated commit
     /// period, and its objects' debts as recorded in earlier rounds, decayed
-    /// to `round`, for the objects of `ordered`'s regular transactions.
+    /// to `round`, for the objects of those of `ordered`'s transactions it
+    /// tracks: regular ones, or those using randomness.
     fn congestion_tracker<'b>(
         &self,
         config: &ProtocolConfig,
+        kind: Tracker,
         round: u64,
         ordered: &[VerifiedTransaction],
         bump: &'b Bump,
@@ -469,26 +653,31 @@ impl CommitHandler {
             .commit_times
             .interval_estimate_ms()
             .unwrap_or_else(|| config.min_checkpoint_interval_ms_as_option().unwrap_or(0));
-        let per_round = config
-            .max_accumulated_txn_cost_per_object_in_mysticeti_commit_as_option()
-            .unwrap_or(0);
+        let per_round = match kind {
+            Tracker::Regular => {
+                config.max_accumulated_txn_cost_per_object_in_mysticeti_commit_as_option()
+            }
+            Tracker::Randomness => config
+                .max_accumulated_randomness_txn_cost_per_object_in_mysticeti_commit_as_option(),
+        }
+        .unwrap_or(0);
         let mut objects = containers::Vec::new_in(bump);
         objects.extend(
             ordered
                 .iter()
-                .filter(|t| !uses_randomness(t))
+                .filter(|t| uses_randomness(t) == (kind == Tracker::Randomness))
                 .flat_map(|t| shared_inputs(t).map(|input| input.id)),
         );
         objects.sort_unstable();
         objects.dedup();
         let debts = objects.into_iter().filter_map(|object| {
-            let (recorded, debt) = self.output.congestion_debt(&object)?;
+            let (recorded, debt) = self.output.congestion_debt(kind, &object)?;
             Some((
                 object,
                 congestion::decayed(debt, recorded, round, per_round),
             ))
         });
-        CongestionTracker::new(&params, period_ms, debts, bump)
+        CongestionTracker::new(&params, kind, period_ms, debts, bump)
     }
 
     /// The reference's `handle_close_epoch`: once the epoch's time is up,
@@ -635,6 +824,28 @@ fn cancelled_inputs(
         .collect()
 }
 
+/// A randomness-using transaction cancelled because DKG failed: the
+/// randomness state reads as `RANDOMNESS_UNAVAILABLE`, its other consensus
+/// object inputs as `CANCELLED_READ` (the reference's
+/// `assign_versions_for_certificate`).
+fn dkg_failed_inputs(transaction: &VerifiedTransaction) -> Vec<CancelledInput> {
+    use sui_types::base_types::SequenceNumber;
+    shared_inputs(transaction)
+        .map(|input| CancelledInput {
+            id: input.id,
+            initial_shared_version: input.initial_shared_version.get(),
+            marker: if input.id == RANDOMNESS_STATE {
+                SequenceNumber::RANDOMNESS_UNAVAILABLE.value()
+            } else {
+                SequenceNumber::CANCELLED_READ.value()
+            },
+        })
+        .collect()
+}
+
+/// The randomness state (`SUI_RANDOMNESS_STATE_OBJECT_ID`).
+const RANDOMNESS_STATE: messages::base::ObjectId = messages::base::ObjectId::from_u16(0x8);
+
 /// The accumulator root (`SUI_ACCUMULATOR_ROOT_OBJECT_ID`), which each
 /// chunk's settlement writes.
 const ACCUMULATOR_ROOT: messages::base::ObjectId = messages::base::ObjectId::from_u16(0xacc);
@@ -720,6 +931,8 @@ pub struct EpochStart {
     /// The authenticator state's, if it exists: absent before the end of
     /// the epoch that creates it.
     pub authenticator_initial_shared_version: Option<u64>,
+    /// The randomness state's, likewise.
+    pub randomness_initial_shared_version: Option<u64>,
     /// The root's version the epoch's first chunk reads: where version
     /// assignment starts it (`Store::start_version`).
     pub accumulator_root_version: u64,
@@ -734,6 +947,9 @@ pub struct EpochStart {
 pub struct Decided<'b> {
     /// The commit's chunks, by height.
     pub chunks: containers::Vec<'b, Chunk>,
+    /// The randomness state update heading the chunk at a height, which
+    /// waits for its round's random bytes.
+    pub update: Option<(u64, PendingUpdate)>,
     /// Each chunk's settlement work, by height.
     pub settlements: containers::Vec<'b, ChunkSettlement>,
     /// The checkpoints the commit completed, by sequence number. A commit
@@ -750,24 +966,16 @@ pub struct Decided<'b> {
 /// builds the prologue transaction; and emits the results. Like
 /// `CommitHandler`, it reads only its input and state it wrote itself.
 ///
-/// Not here yet, as the design leaves them for later:
-/// - deferral and cancellation: the prologue lists no cancelled
-///   transactions, and execution time estimates budget nothing (they only
-///   go into the prologue's additional state digest);
-/// - randomness: transactions using it are scheduled last in the commit's
-///   chunks, not in chunks of their own;
-/// - the end of the epoch, beyond a stand-in: the first commit at or past the
-///   epoch's end time is its last, ending it at once, without draining
-///   deferred transactions or a close deadline; a commit's timestamp is not
-///   clamped to the epoch's start.
+/// A commit's timestamp is not clamped to the epoch's start yet.
 ///
 /// Inward:
 /// - `CommitDecoder`: `DecodedRequest`.
 ///
 /// Outward:
-/// - `VersionResolver`: each chunk's transactions (`Chunk`);
-/// - `SettlementScheduler`: each chunk's settlement work
-///   (`SettlementInput::Chunk`);
+/// - randomness gate, in height order: each chunk's transactions and its
+///   settlement work (`GatedChunk`), for `VersionResolver` and
+///   `SettlementScheduler`;
+/// - `SignatureCollector`: the group key, once DKG completes;
 /// - checkpoint waiter, wait for: each `PendingCheckpoint`, keyed by
 ///   `ChunkSettled` of each of its chunks.
 ///
@@ -792,11 +1000,12 @@ pub struct CommitStage {
     /// barrier, its root's one exclusive writer and with the root its only
     /// input, writes the next version.
     root_version: u64,
-    chunks_out: workqueue::Queue<Chunk>,
-    settlements_out: workqueue::Queue<SettlementInput>,
+    gate_out: workqueue::Queue<GateInput>,
     checkpoints_out: workqueue::Queue<waiter::Command<ChunkSettled, PendingCheckpoint>>,
     statuses: Arc<ConsensusTxStatusCache>,
     backpressure: Option<Arc<Backpressure>>,
+    /// Where the group key goes once DKG completes, until it has gone.
+    beacon: Option<workqueue::Queue<BeaconInput>>,
 }
 
 impl CommitStage {
@@ -804,8 +1013,7 @@ impl CommitStage {
         epoch: Arc<EpochParams>,
         start: EpochStart,
         output: ConsensusOutput,
-        chunks: workqueue::Queue<Chunk>,
-        settlements: workqueue::Queue<SettlementInput>,
+        gate: workqueue::Queue<GateInput>,
         checkpoints: workqueue::Queue<waiter::Command<ChunkSettled, PendingCheckpoint>>,
         statuses: Arc<ConsensusTxStatusCache>,
         committee: Vec<([u8; 96], u64)>,
@@ -839,12 +1047,46 @@ impl CommitStage {
             last_commit: record.map(|r| r.commit_index),
             closed: record.is_some_and(|r| r.closed),
             root_version: record.map_or(start.accumulator_root_version, |r| r.root_version),
-            chunks_out: chunks,
-            settlements_out: settlements,
+            gate_out: gate,
             checkpoints_out: checkpoints,
             statuses,
             backpressure: None,
+            beacon: None,
         }
+    }
+
+    /// Sends the group key to `beacon`'s signature collector once DKG
+    /// completes: now, if it completed before a restart.
+    #[must_use]
+    pub fn with_beacon(mut self, beacon: workqueue::Queue<BeaconInput>) -> CommitStage {
+        self.beacon = Some(beacon);
+        self.send_group_key();
+        self
+    }
+
+    fn send_group_key(&mut self) {
+        if let Some(DkgStatus::Successful(key)) = self.handler.dkg_status()
+            && let Some(beacon) = self.beacon.take()
+        {
+            push(
+                &beacon,
+                BeaconInput::GroupKey(key.clone()),
+                "signature collector",
+            );
+        }
+    }
+
+    /// Runs the random beacon (`CommitHandler::with_randomness`), if the
+    /// randomness state existed as the epoch started and the protocol
+    /// enables it.
+    #[must_use]
+    pub fn with_randomness(mut self, setup: Arc<DkgSetup>) -> CommitStage {
+        if let Some(version) = self.start.randomness_initial_shared_version
+            && self.epoch.config.random_beacon()
+        {
+            self.handler = self.handler.with_randomness(version, setup);
+        }
+        self
     }
 
     /// Starts the commit handler's estimator from the observations the
@@ -916,10 +1158,14 @@ impl CommitStage {
             Some(prologue_transaction(&prologue, &state_digest, cancelled));
 
         // 2. Each transaction with its shared accesses, in schedule order.
+        //    The randomness state update's bytes are not known yet: it is
+        //    left out, for the randomness gate to put in.
+        let randomness_start = schedule.randomness_start;
         let transactions =
             std::mem::replace(&mut schedule.transactions, containers::Vec::new_in(bump));
         let mut entries = containers::Vec::with_capacity_in(transactions.len(), bump);
         let mut digests = containers::Vec::with_capacity_in(transactions.len(), bump);
+        let mut update = None;
         for (i, scheduled) in transactions.into_iter().enumerate() {
             let (transaction, digest, origin) = match scheduled {
                 Scheduled::Prologue(_) => {
@@ -937,6 +1183,15 @@ impl CommitStage {
                     );
                     let digest = system.digest;
                     (ExecutableTransaction::System(system), digest, None)
+                }
+                Scheduled::RandomnessStateUpdate(randomness) => {
+                    update = Some(PendingUpdate {
+                        epoch: prologue.epoch,
+                        round: randomness.round,
+                        initial_shared_version: randomness.initial_shared_version,
+                        shared: schedule.accesses(i)[0],
+                    });
+                    continue;
                 }
                 Scheduled::User(transaction) => {
                     let digest = *transaction.get().0.digest();
@@ -971,6 +1226,12 @@ impl CommitStage {
                 cancelled: Vec::new(),
             });
         }
+        // The update, left out, stood at the randomness part's start.
+        let randomness = randomness_start.map(|start| {
+            let entries = entries.split_off(start);
+            let digests = digests.split_off(start);
+            (entries, digests, update)
+        });
 
         // 3. The epoch's last commit reserves the change-epoch transaction's
         //    write of the system state, after every other.
@@ -978,6 +1239,7 @@ impl CommitStage {
             self.closed = true;
             let writes_before = entries
                 .iter()
+                .chain(randomness.iter().flat_map(|(entries, ..)| entries.iter()))
                 .filter(|e| {
                     e.shared.iter().any(|a| {
                         a.id == SYSTEM_STATE
@@ -1004,20 +1266,37 @@ impl CommitStage {
         });
 
         // 4. Chunks and checkpoints.
-        let mut decided = self.chunk(epoch, &prologue, entries, digests, close, bump);
+        let mut decided = self.chunk(
+            epoch,
+            &prologue,
+            (entries, digests),
+            randomness,
+            close,
+            bump,
+        );
         decided.dropped = dropped;
         Some(decided)
     }
 
     /// Chunks of at most `max_transactions_per_checkpoint`, each with the
     /// next height, queued into checkpoints: the reference's
-    /// `create_pending_checkpoints`.
+    /// `create_pending_checkpoints`. The regular part's chunks go first; the
+    /// randomness part's, if any, are queued after the checkpoint queue is
+    /// flushed, so they head the next checkpoint (`merge_randomness_into_checkpoint`).
+    #[allow(clippy::type_complexity)]
     fn chunk<'b>(
         &mut self,
         epoch: &Arc<EpochParams>,
         prologue: &Prologue,
-        entries: containers::Vec<'b, ScheduledEntry>,
-        digests: containers::Vec<'b, TxDigest>,
+        regular: (
+            containers::Vec<'b, ScheduledEntry>,
+            containers::Vec<'b, TxDigest>,
+        ),
+        randomness: Option<(
+            containers::Vec<'b, ScheduledEntry>,
+            containers::Vec<'b, TxDigest>,
+            Option<PendingUpdate>,
+        )>,
         close: Option<(
             Vec<SharedAccess>,
             u64,
@@ -1028,27 +1307,108 @@ impl CommitStage {
         let config = &epoch.config;
         let max = usize::try_from(config.max_transactions_per_checkpoint())
             .expect("a checkpoint's size fits in usize");
-        let chunk_count = entries.len().div_ceil(max);
+        let min_interval = config.min_checkpoint_interval_ms_as_option().unwrap_or(0);
+        // The update counts toward its chunk's size, though not yet in it.
+        let randomness_len = randomness
+            .as_ref()
+            .map(|(entries, _, update)| entries.len() + usize::from(update.is_some()));
+        let chunk_count =
+            regular.0.len().div_ceil(max) + randomness_len.map_or(0, |len| len.div_ceil(max));
         let mut decided = Decided {
             chunks: containers::Vec::with_capacity_in(chunk_count, bump),
+            update: None,
             settlements: containers::Vec::with_capacity_in(chunk_count, bump),
             checkpoints: containers::Vec::new_in(bump),
             dropped: containers::Vec::new_in(bump),
         };
         let mut flushed = containers::Vec::new_in(bump);
-        let mut entries = entries.into_iter();
-        let mut digests = digests.into_iter();
-        for position in 0..chunk_count {
-            let entries: Vec<_> = entries.by_ref().take(max).collect();
-            let digests: Vec<_> = digests.by_ref().take(max).collect();
-            let height = self.queue.next_height();
-            let checkpoint_seq = self.queue.push_chunk(
-                height,
-                entries.len(),
-                prologue.timestamp_ms,
+        let (entries, digests) = regular;
+        self.push_chunks(
+            prologue,
+            entries,
+            digests,
+            0,
+            chunk_count,
+            max,
+            &mut decided,
+            &mut flushed,
+        );
+        flushed.extend(self.queue.flush(prologue.timestamp_ms, min_interval));
+        if let Some((entries, digests, update)) = randomness {
+            let first = decided.chunks.len();
+            let reserved = usize::from(update.is_some());
+            self.push_chunks(
+                prologue,
+                entries,
+                digests,
+                reserved,
+                chunk_count,
                 max,
+                &mut decided,
                 &mut flushed,
             );
+            decided.update = update.map(|update| (decided.chunks[first].height, update));
+        }
+        if close.is_some() {
+            flushed.extend(self.queue.flush_forced());
+        }
+        decided
+            .checkpoints
+            .extend(flushed.into_iter().map(|f| PendingCheckpoint {
+                seq: f.seq,
+                heights: f.heights,
+                timestamp_ms: f.timestamp_ms,
+                close: None,
+            }));
+        if let Some((shared, protocol_version, system_packages)) = close {
+            let last = decided
+                .checkpoints
+                .last_mut()
+                .expect("the last commit cuts the epoch's last checkpoint");
+            last.close = Some(EpochClose {
+                version: AccumulatorVersion(u64::from(prologue.commit_index)),
+                round: prologue.round,
+                root_version: self.root_version,
+                shared,
+                first_checkpoint: self.start.previous_checkpoint + 1,
+                observations: self.handler.execution_time_observations(),
+                protocol_version,
+                system_packages,
+            });
+        }
+        decided
+    }
+
+    /// Lays `entries` out in chunks of at most `max`, the first with room
+    /// left for `reserved` more, each taking the next height and its place
+    /// in the checkpoint queue. The commit has `chunk_count` chunks.
+    #[allow(clippy::too_many_arguments)]
+    fn push_chunks<'b>(
+        &mut self,
+        prologue: &Prologue,
+        entries: containers::Vec<'b, ScheduledEntry>,
+        digests: containers::Vec<'b, TxDigest>,
+        reserved: usize,
+        chunk_count: usize,
+        max: usize,
+        decided: &mut Decided<'b>,
+        flushed: &mut containers::Vec<'_, Flushed>,
+    ) {
+        let total = entries.len() + reserved;
+        let mut entries = entries.into_iter();
+        let mut digests = digests.into_iter();
+        let mut start = 0;
+        while start < total {
+            let size = max.min(total - start);
+            let taken = size - if start == 0 { reserved } else { 0 };
+            start += size;
+            let entries: Vec<_> = entries.by_ref().take(taken).collect();
+            let digests: Vec<_> = digests.by_ref().take(taken).collect();
+            let position = decided.chunks.len();
+            let height = self.queue.next_height();
+            let checkpoint_seq =
+                self.queue
+                    .push_chunk(height, size, prologue.timestamp_ms, max, flushed);
             let version = AccumulatorVersion(u64::from(prologue.commit_index));
             let root_version = self.root_version;
             self.root_version += 1;
@@ -1086,57 +1446,33 @@ impl CommitStage {
                 entries,
             });
         }
-        let min_interval = config.min_checkpoint_interval_ms_as_option().unwrap_or(0);
-        flushed.extend(self.queue.flush(prologue.timestamp_ms, min_interval));
-        if close.is_some() {
-            flushed.extend(self.queue.flush_forced());
-        }
-        decided
-            .checkpoints
-            .extend(flushed.into_iter().map(|f| PendingCheckpoint {
-                seq: f.seq,
-                heights: f.heights,
-                timestamp_ms: f.timestamp_ms,
-                close: None,
-            }));
-        if let Some((shared, protocol_version, system_packages)) = close {
-            let last = decided
-                .checkpoints
-                .last_mut()
-                .expect("the last commit cuts the epoch's last checkpoint");
-            last.close = Some(EpochClose {
-                version: AccumulatorVersion(u64::from(prologue.commit_index)),
-                round: prologue.round,
-                root_version: self.root_version,
-                shared,
-                first_checkpoint: self.start.previous_checkpoint + 1,
-                observations: self.handler.execution_time_observations(),
-                protocol_version,
-                system_packages,
-            });
-        }
-        decided
     }
 
     fn emit(&mut self, decided: Decided<'_>, bump: &Bump) {
         // Dropped transactions go nowhere: no processor waits on them yet.
         let Decided {
             chunks,
+            update,
             settlements,
             checkpoints,
             dropped: _,
         } = decided;
-        for chunk in chunks {
+        for (chunk, settlement) in chunks.into_iter().zip(settlements) {
+            let update = update.filter(|(height, _)| *height == chunk.height);
             if let Some(backpressure) = &self.backpressure {
-                backpressure.scheduled(chunk.height, chunk.entries.len());
+                backpressure.scheduled(
+                    chunk.height,
+                    chunk.entries.len() + usize::from(update.is_some()),
+                );
             }
-            push(&self.chunks_out, chunk, "resolver");
-        }
-        for settlement in settlements {
             push(
-                &self.settlements_out,
-                SettlementInput::Chunk(settlement),
-                "settlement",
+                &self.gate_out,
+                GateInput::Chunk(GatedChunk {
+                    chunk,
+                    settlement,
+                    update: update.map(|(_, update)| update),
+                }),
+                "randomness gate",
             );
         }
         if !checkpoints.is_empty() {
@@ -1225,6 +1561,7 @@ impl CommitStage {
             bump,
         );
         self.emit(decided, bump);
+        self.send_group_key();
         self.statuses.update_leader_round(leader_round);
         Some(())
     }
@@ -1470,6 +1807,30 @@ pub fn authenticator_state_update_transaction(
         kind,
         SystemKind::AuthenticatorStateUpdate {
             round: prologue.round,
+        },
+    )
+}
+
+/// The randomness state's update for `update`'s round, with its random
+/// bytes: the reference's `new_randomness_state_update`.
+pub fn randomness_state_update_transaction(
+    update: &PendingUpdate,
+    random_bytes: Vec<u8>,
+) -> SystemTransaction {
+    use messages::build::base::SequenceNumber;
+    use messages::build::system_transaction::RandomnessStateUpdate;
+    use messages::build::transaction::TransactionKind;
+
+    let kind = TransactionKind::RandomnessStateUpdate(RandomnessStateUpdate {
+        epoch: update.epoch,
+        randomness_round: messages::build::base::RandomnessRound(update.round),
+        random_bytes,
+        randomness_obj_initial_shared_version: SequenceNumber(update.initial_shared_version),
+    });
+    system_transaction(
+        kind,
+        SystemKind::RandomnessStateUpdate {
+            round: update.round,
         },
     )
 }

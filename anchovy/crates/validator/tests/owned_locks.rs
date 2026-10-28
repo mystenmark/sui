@@ -115,8 +115,7 @@ async fn the_stage_records_each_committed_transaction_s_status() {
     let object = random_object_ref();
     let first = sender.transaction(random_object_ref(), &[object]);
     let second = sender.transaction(random_object_ref(), &[object]);
-    let (chunks, _chunk_inbox) = workqueue::queue(16);
-    let (settlements, _settlement_inbox) = workqueue::queue(16);
+    let (gate, _gate_inbox) = workqueue::queue(16);
     let (checkpoints, _checkpoint_inbox) = workqueue::queue(16);
     let statuses = Arc::new(ConsensusTxStatusCache::new());
     let (output, _dir) = consensus_output();
@@ -126,13 +125,13 @@ async fn the_stage_records_each_committed_transaction_s_status() {
             previous_checkpoint: 0,
             accumulator_root_initial_shared_version: 1,
             authenticator_initial_shared_version: None,
+            randomness_initial_shared_version: None,
             accumulator_root_version: 1,
             epoch_start_timestamp_ms: 0,
             epoch_duration_ms: u64::MAX,
         },
         output,
-        chunks,
-        settlements,
+        gate,
         checkpoints,
         statuses.clone(),
         vec![([0; 96], 1)],
@@ -200,6 +199,7 @@ fn commit(index: u32, transactions: &[Claimed<'_>]) -> DecodedCommit {
         observations: Vec::new(),
         jwks: Vec::new(),
         capabilities: Vec::new(),
+        dkg: Vec::new(),
         rejected: Vec::new(),
         cache_hits: 0,
         cache_misses: transactions.len(),
@@ -217,6 +217,7 @@ fn scheduled(handled: &HandledCommit) -> Vec<Hashed> {
             Scheduled::User(t) => Some(digest_of(t)),
             Scheduled::Prologue(_)
             | Scheduled::AuthenticatorStateUpdate(_)
+            | Scheduled::RandomnessStateUpdate(_)
             | Scheduled::Cancelled(..) => None,
         })
         .collect()
@@ -645,8 +646,7 @@ fn the_stage_leaves_dropped_transactions_out_of_its_chunks() {
     let object = random_object_ref();
     let first = sender.transaction(random_object_ref(), &[object]);
     let second = sender.transaction(random_object_ref(), &[object]);
-    let (chunks, _chunk_inbox) = workqueue::queue(16);
-    let (settlements, _settlement_inbox) = workqueue::queue(16);
+    let (gate, _gate_inbox) = workqueue::queue(16);
     let (checkpoints, _checkpoint_inbox) = workqueue::queue(16);
     let (output, _dir) = consensus_output();
     let mut stage = CommitStage::new(
@@ -655,13 +655,13 @@ fn the_stage_leaves_dropped_transactions_out_of_its_chunks() {
             previous_checkpoint: 0,
             accumulator_root_initial_shared_version: 1,
             authenticator_initial_shared_version: None,
+            randomness_initial_shared_version: None,
             accumulator_root_version: 1,
             epoch_start_timestamp_ms: 0,
             epoch_duration_ms: u64::MAX,
         },
         output,
-        chunks,
-        settlements,
+        gate,
         checkpoints,
         Arc::new(validator::consensus::status::ConsensusTxStatusCache::new()),
         vec![([0; 96], 1)],
