@@ -12,6 +12,7 @@ pub mod epoch_store;
 pub mod pipeline;
 pub mod processors;
 pub mod proto;
+pub mod randomness;
 pub mod server;
 pub mod submit;
 pub mod tls;

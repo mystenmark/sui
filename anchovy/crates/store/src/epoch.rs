@@ -31,6 +31,8 @@ pub enum Space {
     JwkVotes,
     Capabilities,
     CongestionDebts,
+    Randomness,
+    RandomnessDebts,
     // Checkpoint builder state.
     Built,
     CheckpointHashes,
@@ -38,10 +40,11 @@ pub enum Space {
     // Everything else.
     Generations,
     StartVersions,
+    RandomnessBytes,
 }
 
 impl Space {
-    const ALL: [Space; 14] = [
+    const ALL: [Space; 17] = [
         Space::Processed,
         Space::Locks,
         Space::Streams,
@@ -51,11 +54,14 @@ impl Space {
         Space::JwkVotes,
         Space::Capabilities,
         Space::CongestionDebts,
+        Space::Randomness,
+        Space::RandomnessDebts,
         Space::Built,
         Space::CheckpointHashes,
         Space::Roots,
         Space::Generations,
         Space::StartVersions,
+        Space::RandomnessBytes,
     ];
 
     fn name(self) -> &'static str {
@@ -69,11 +75,14 @@ impl Space {
             Space::JwkVotes => "jwk_votes",
             Space::Capabilities => "capabilities",
             Space::CongestionDebts => "congestion_debts",
+            Space::Randomness => "randomness",
+            Space::RandomnessDebts => "randomness_debts",
             Space::Built => "built",
             Space::CheckpointHashes => "checkpoint_hashes",
             Space::Roots => "roots",
             Space::Generations => "generations",
             Space::StartVersions => "start_versions",
+            Space::RandomnessBytes => "randomness_bytes",
         }
     }
 
@@ -82,13 +91,19 @@ impl Space {
     fn key_len(self) -> usize {
         match self {
             // A digest, or for a JSON web key vote, its hash; or an object id.
-            Space::Processed | Space::JwkVotes | Space::CongestionDebts => 32,
+            Space::Processed
+            | Space::JwkVotes
+            | Space::CongestionDebts
+            | Space::RandomnessDebts => 32,
             Space::Locks => 32 + 8 + 32,
             Space::Streams | Space::StartVersions => 32 + 8,
             // An authority's index.
             Space::Capabilities => 4,
             Space::Generations => 32 + 8 + 4 + 4,
-            Space::Built | Space::CheckpointHashes | Space::Roots => 8,
+            // A sequence number, or a randomness round.
+            Space::Built | Space::CheckpointHashes | Space::Roots | Space::RandomnessBytes => 8,
+            // A record's kind, then a party id.
+            Space::Randomness => 1 + 2,
             Space::Commit => 1,
             // A generation and an authority's index.
             Space::ExecutionTimeObservations => 8 + 4,

@@ -12,6 +12,8 @@ use messages::Message;
 use messages::base::ObjectId;
 use messages::object::Object;
 
+use tokio::sync::oneshot;
+
 use crate::checks::VerifiedTransaction;
 use crate::consensus::execution_time::Key;
 use crate::consensus::sequence::SharedAccess;
@@ -51,6 +53,8 @@ pub enum SystemKind {
     /// The change-epoch transaction ending `epoch`: the last of its last
     /// checkpoint.
     ChangeEpoch { epoch: u64 },
+    /// The randomness state's update for randomness round `round`.
+    RandomnessStateUpdate { round: u64 },
 }
 
 /// A scheduled transaction with its shared accesses and, for a user
@@ -79,6 +83,46 @@ pub struct Chunk {
     pub height: u64,
     pub checkpoint_seq: u64,
     pub entries: Vec<ScheduledEntry>,
+}
+
+/// A chunk and its settlement, on their way from `CommitStage` through the
+/// randomness gate, which holds a chunk headed by a randomness state update
+/// until the round's random bytes arrive, and every chunk after it.
+#[derive(Debug)]
+pub struct GatedChunk {
+    pub chunk: Chunk,
+    pub settlement: ChunkSettlement,
+    /// The update heading the chunk, not yet in its entries or digests.
+    pub update: Option<PendingUpdate>,
+}
+
+/// A randomness state update waiting for its round's random bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingUpdate {
+    pub epoch: u64,
+    pub round: u64,
+    pub initial_shared_version: u64,
+    /// Its write of the randomness state.
+    pub shared: SharedAccess,
+}
+
+/// What the randomness gate takes.
+#[derive(Debug)]
+pub enum GateInput {
+    /// `CommitStage` → gate, in height order.
+    Chunk(GatedChunk),
+    /// A randomness round's random bytes (its signature's BCS), verified.
+    /// Signature processor → gate.
+    Bytes { round: u64, bytes: Vec<u8> },
+    /// Which round the gate waits for, if any, and the checkpoint its update
+    /// goes into. The p2p endpoint → gate, to fetch rounds peers stopped
+    /// pushing.
+    Waiting(oneshot::Sender<Option<(u64, u64)>>),
+}
+
+/// A full queue drops the question: the asker asks again.
+impl workqueue::Refuse for GateInput {
+    fn refuse(self, _: workqueue::Refusal) {}
 }
 
 /// What settling a chunk takes. `CommitHandler` → `SettlementScheduler`.

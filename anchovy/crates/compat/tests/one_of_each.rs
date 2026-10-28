@@ -51,7 +51,9 @@ use sui_types::transaction::{
     Argument, CallArg, Command, FundsWithdrawalArg, ObjectArg, SharedObjectMutability,
 };
 use sui_types::transaction::{SenderSignedData, Transaction, TransactionData};
-use sui_types::{SUI_CLOCK_OBJECT_ID, SUI_FRAMEWORK_PACKAGE_ID, TypeTag};
+use sui_types::{
+    SUI_CLOCK_OBJECT_ID, SUI_FRAMEWORK_PACKAGE_ID, SUI_RANDOMNESS_STATE_OBJECT_ID, TypeTag,
+};
 use tokio::runtime::Runtime;
 use validator::Validator;
 use validator::current::CurrentEpoch;
@@ -74,6 +76,9 @@ const STAKE: u64 = 20_000_000_000_000_000;
 struct Anchovy {
     /// None only while restarting.
     node: Option<Node>,
+    /// Its p2p endpoint, through which sui validators push it the random
+    /// beacon's signatures.
+    _p2p: node::p2p::P2p,
     runner: Runner,
     certified_inbox: Inbox<CertifiedCheckpoint>,
     certified: BTreeSet<u64>,
@@ -257,9 +262,27 @@ impl Network {
 
     /// As `new`, its genesis and sui validators configured by `configure`.
     fn configured(configure: impl FnOnce(ConfigBuilder) -> ConfigBuilder) -> Network {
+        Network::with_stakes(&[3 * STAKE, 3 * STAKE, STAKE], configure)
+    }
+
+    /// Four validators of equal stake, the last anchovy's: the three sui
+    /// validators complete the random beacon's DKG without anchovy, which
+    /// takes no part yet (reduced, each weighs 125 of 500; confirmations
+    /// need 333). Configured by `configure`.
+    fn with_beacon(configure: impl FnOnce(ConfigBuilder) -> ConfigBuilder) -> Network {
+        Network::with_stakes(&[STAKE; 4], configure)
+    }
+
+    /// A network of validators of `stakes`, the last anchovy's, configured
+    /// by `configure`.
+    fn with_stakes(
+        stakes: &[u64],
+        configure: impl FnOnce(ConfigBuilder) -> ConfigBuilder,
+    ) -> Network {
         telemetry_subscribers::init_for_testing();
-        let validators = [3 * STAKE, 3 * STAKE, STAKE]
-            .into_iter()
+        let validators = stakes
+            .iter()
+            .copied()
             .map(|stake| {
                 ValidatorGenesisConfigBuilder::new()
                     .with_stake(stake)
@@ -268,8 +291,9 @@ impl Network {
             .collect();
         let config =
             configure(ConfigBuilder::new_with_temp_dir().with_validators(validators)).build();
-        let (sui_configs, [anchovy_config]) = config.validator_configs.split_at(2) else {
-            unreachable!("three validators");
+        let (sui_configs, [anchovy_config]) = config.validator_configs.split_at(stakes.len() - 1)
+        else {
+            unreachable!("anchovy's validator last");
         };
         let committee = config.genesis.committee();
         let votes = |c: &NodeConfig| committee.weight(&c.protocol_public_key());
@@ -295,7 +319,11 @@ impl Network {
         let key = config.account_keys[0].copy();
         let sender = SuiAddress::from(key.public());
         report_forks();
-        let (anchovy, coins) = Anchovy::start(anchovy_config, &config.genesis, sender);
+        let (anchovy, coins) = {
+            // Its p2p endpoint runs on the runtime.
+            let _runtime = runtime.enter();
+            Anchovy::start(anchovy_config, &config.genesis, sender)
+        };
         *FORK_REPORT.lock().unwrap() = Some(ForkReport {
             sui: sui[0].get_node_handle().unwrap().state(),
             store: anchovy.node().perpetual.store.clone(),
@@ -723,6 +751,46 @@ impl Network {
         (anchovy.as_u64(), sui.as_u64())
     }
 
+    /// Publishes sui-core's `object_basics`, paid with coin `i`: its package.
+    fn object_basics(&mut self, i: usize) -> ObjectID {
+        let publish = self.publish(i, "object_basics");
+        self.execute(&publish)
+            .created()
+            .into_iter()
+            .find(|(_, owner)| *owner == Owner::Immutable)
+            .expect("a package")
+            .0
+            .0
+    }
+
+    /// A transaction reading the randomness state through `package`'s
+    /// `object_basics::use_random`, paid with coin `i`; and, given a
+    /// shared coin, first splitting a MIST off it.
+    fn use_random(&self, i: usize, package: ObjectID, shared: Option<ObjectID>) -> Transaction {
+        let random = CallArg::Object(self.shared(SUI_RANDOMNESS_STATE_OBJECT_ID, false));
+        let shared = shared.map(|id| CallArg::Object(self.shared(id, true)));
+        self.ptb(i, |b| {
+            if let Some(shared) = shared {
+                b.move_call(
+                    SUI_FRAMEWORK_PACKAGE_ID,
+                    ident_str!("pay").to_owned(),
+                    ident_str!("split").to_owned(),
+                    vec![GAS::type_tag()],
+                    vec![shared, CallArg::Pure(bcs::to_bytes(&1u64).unwrap())],
+                )
+                .unwrap();
+            }
+            b.move_call(
+                package,
+                ident_str!("object_basics").to_owned(),
+                ident_str!("use_random").to_owned(),
+                vec![],
+                vec![random],
+            )
+            .unwrap();
+        })
+    }
+
     /// Waits until anchovy has certified checkpoint `seq`, as sui did.
     fn wait_for_certified(&mut self, seq: u64) {
         self.wait_for(&format!("checkpoint {seq} to certify"), |network| {
@@ -760,8 +828,10 @@ impl Anchovy {
             keys,
         });
         node.start_epoch(&mut runner);
+        let p2p = Anchovy::p2p(&node, config.p2p_config.listen_address);
         let anchovy = Anchovy {
             node: Some(node),
+            _p2p: p2p,
             runner,
             certified_inbox,
             certified: BTreeSet::new(),
@@ -795,6 +865,18 @@ impl Anchovy {
         self.node.as_ref().expect("anchovy is running")
     }
 
+    /// `node`'s p2p endpoint, at `address`.
+    fn p2p(node: &Node, address: std::net::SocketAddr) -> node::p2p::P2p {
+        let perpetual = &node.perpetual;
+        node::p2p::start(
+            address,
+            perpetual.keys.network.secret(),
+            &perpetual.chain_identifier,
+            perpetual.current.clone(),
+        )
+        .expect("the p2p address binds")
+    }
+
     /// Stops anchovy wherever it is, as a crash would, and starts it again
     /// over its store as a new process: its pipeline resumes from what it
     /// committed, and consensus replays from its database.
@@ -802,14 +884,16 @@ impl Anchovy {
         // The report holds the store: let go, so that it closes.
         let sui = FORK_REPORT.lock().unwrap().take().map(|report| report.sui);
         node::epoch::Consensus::stop(&mut self.runner);
+        // The p2p endpoint stays, serving the same current epoch: rebinding
+        // its port at once races the old socket's release.
         let Perpetual {
             store,
             epochs,
+            current,
             state_sync,
             chain,
             chain_identifier,
             keys,
-            ..
         } = self.node.take().unwrap().into_perpetual();
         assert_eq!(
             Arc::strong_count(&store),
@@ -822,7 +906,7 @@ impl Anchovy {
         let mut node = Node::new(Perpetual {
             store: store.clone(),
             epochs,
-            current: CurrentEpoch::new(),
+            current,
             state_sync,
             chain,
             chain_identifier,
@@ -1240,6 +1324,100 @@ fn deferrals_hold_the_epoch_open_alike() {
         network.outcomes_together(&writes.iter().collect::<Vec<_>>());
     }
     let later = network.transfer(3);
+    network.execute(&later);
+    drop(network.runtime);
+}
+
+/// Transactions using randomness wait for DKG, then for commits with a
+/// randomness round, whose update heads them in a checkpoint of their own,
+/// alike: the update's effects carry the round's random bytes.
+#[test]
+fn randomness_waits_for_its_round_alike() {
+    let mut network = Network::with_beacon(|builder| builder);
+    let package = network.object_basics(0);
+    for round in 0..3 {
+        let uses: Vec<_> = (0..3)
+            .map(|i| network.use_random(i, package, None))
+            .collect();
+        network.execute_together(&uses.iter().collect::<Vec<_>>());
+        // Some submitted apart, so that a commit too close to the last
+        // round's defers them.
+        let apart = network.use_random(3, package, None);
+        network.submit_together(&[&apart]);
+        if round == 1 {
+            network.anchovy.restart();
+        }
+    }
+    let later = network.transfer(0);
+    network.execute(&later);
+    drop(network.runtime);
+}
+
+/// Without DKG, a transaction using randomness waits until DKG times out,
+/// then is cancelled, reading the randomness state as unavailable, alike.
+/// In the usual network sui cannot complete DKG without anchovy.
+#[test]
+fn randomness_is_cancelled_alike_once_dkg_fails() {
+    let _timeout = ProtocolConfig::apply_overrides_for_testing(|_, mut config| {
+        config.set_random_beacon_dkg_timeout_round_for_testing(40);
+        config
+    });
+    let mut network = Network::new();
+    let package = network.object_basics(0);
+    let uses: Vec<_> = (1..3)
+        .map(|i| network.use_random(i, package, None))
+        .collect();
+    let outcomes = network.outcomes_together(&uses.iter().collect::<Vec<_>>());
+    for cancelled in &outcomes {
+        assert!(
+            matches!(
+                cancelled.status(),
+                ExecutionStatus::Failure(ExecutionFailure {
+                    error: ExecutionErrorKind::ExecutionCancelledDueToRandomnessUnavailable,
+                    ..
+                })
+            ),
+            "{:?}",
+            cancelled.status()
+        );
+    }
+    let later = network.transfer(0);
+    network.execute(&later);
+    drop(network.runtime);
+}
+
+/// Writes of one shared coin by transactions using randomness congest
+/// their own tracker: the later ones are deferred, alike.
+#[test]
+fn congested_randomness_is_deferred_alike() {
+    let _budget = no_congestion_budget(10);
+    let mut network = Network::with_beacon(|builder| builder);
+    let package = network.object_basics(0);
+    let shared = shared_coin(&mut network, 1);
+    let writes: Vec<_> = (0..3)
+        .map(|gas| network.use_random(gas, package, Some(shared)))
+        .collect();
+    network.outcomes_together(&writes.iter().collect::<Vec<_>>());
+    let later = network.transfer(3);
+    network.execute(&later);
+    drop(network.runtime);
+}
+
+/// Randomness across epochs: each runs its own DKG and counts rounds from
+/// 0, and deferred randomness holds an epoch open, alike. The first epoch
+/// must outlast starting four validators under load: the sui validators, a
+/// quorum without anchovy, would leave it, and anchovy cannot catch up.
+#[test]
+fn randomness_spans_epochs_alike() {
+    let mut network = Network::with_beacon(|builder| builder.with_epoch_duration(30_000));
+    let package = network.object_basics(0);
+    while network.anchovy.epoch() < 2 {
+        let uses: Vec<_> = (1..3)
+            .map(|i| network.use_random(i, package, None))
+            .collect();
+        network.execute_together(&uses.iter().collect::<Vec<_>>());
+    }
+    let later = network.transfer(0);
     network.execute(&later);
     drop(network.runtime);
 }

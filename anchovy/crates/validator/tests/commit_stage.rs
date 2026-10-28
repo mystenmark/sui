@@ -30,7 +30,7 @@ use validator::consensus::execution_time::{Key, SharedObservations};
 use validator::epoch::EpochParams;
 use validator::epoch_store::{ConsensusOutput, EpochStore};
 use validator::pipeline::items::{
-    Chunk, ExecutableTransaction, PendingCheckpoint, SettlementInput, SystemKind,
+    ExecutableTransaction, GateInput, GatedChunk, PendingCheckpoint, SystemKind,
 };
 use validator::pipeline::keys::ChunkSettled;
 use workqueue::{Inbox, Processor};
@@ -64,8 +64,7 @@ fn epoch(max_transactions: u64, min_interval_ms: u64) -> Arc<EpochParams> {
 }
 
 struct Outputs {
-    chunks: Inbox<Chunk>,
-    settlements: Inbox<SettlementInput>,
+    gate: Inbox<GateInput>,
     checkpoints: Inbox<waiter::Command<ChunkSettled, PendingCheckpoint>>,
     /// The epoch store the stage writes, unless the test keeps it.
     dir: Option<tempfile::TempDir>,
@@ -80,13 +79,13 @@ fn stage(epoch: &Arc<EpochParams>) -> (CommitStage, Outputs) {
 
 /// A stage of a committee of one, over `output`.
 fn stage_over(epoch: &Arc<EpochParams>, output: ConsensusOutput) -> (CommitStage, Outputs) {
-    let (chunks, chunk_inbox) = workqueue::queue(1024);
-    let (settlements, settlement_inbox) = workqueue::queue(1024);
+    let (gate, gate_inbox) = workqueue::queue(1024);
     let (checkpoints, checkpoint_inbox) = workqueue::queue(1024);
     let start = EpochStart {
         previous_checkpoint: 10,
         accumulator_root_initial_shared_version: ROOT_VERSION,
         authenticator_initial_shared_version: None,
+        randomness_initial_shared_version: None,
         accumulator_root_version: ROOT_VERSION,
         epoch_start_timestamp_ms: 0,
         epoch_duration_ms: u64::MAX,
@@ -96,15 +95,13 @@ fn stage_over(epoch: &Arc<EpochParams>, output: ConsensusOutput) -> (CommitStage
             epoch.clone(),
             start,
             output,
-            chunks,
-            settlements,
+            gate,
             checkpoints,
             Arc::new(validator::consensus::status::ConsensusTxStatusCache::new()),
             vec![([0; 96], 10_000)],
         ),
         Outputs {
-            chunks: chunk_inbox,
-            settlements: settlement_inbox,
+            gate: gate_inbox,
             checkpoints: checkpoint_inbox,
             dir: None,
         },
@@ -197,6 +194,7 @@ fn commit(index: u32, round: u32, timestamp_ms: u64, transactions: &[Vec<u8>]) -
         observations: Vec::new(),
         jwks: Vec::new(),
         capabilities: Vec::new(),
+        dkg: Vec::new(),
         rejected: Vec::new(),
         cache_hits: 0,
         cache_misses: transactions.len(),
@@ -476,17 +474,20 @@ fn the_stage_emits_chunks_settlements_and_checkpoint_waits() {
     assert_eq!(stage.process(commit(1, 2, 50, &users), &mut bump), Some(()));
 
     let mut chunks = Vec::new();
-    while let Some(chunk) = outputs.chunks.try_pop() {
-        chunks.push((chunk.height, chunk.checkpoint_seq, chunk.entries.len()));
-    }
-    assert_eq!(chunks, vec![(1, 11, 4), (2, 12, 2)]);
     let mut settled = Vec::new();
-    while let Some(input) = outputs.settlements.try_pop() {
-        let SettlementInput::Chunk(settlement) = input else {
-            panic!("chunks to settle");
+    while let Some(input) = outputs.gate.try_pop() {
+        let GateInput::Chunk(GatedChunk {
+            chunk,
+            settlement,
+            update: None,
+        }) = input
+        else {
+            panic!("chunks without randomness");
         };
+        chunks.push((chunk.height, chunk.checkpoint_seq, chunk.entries.len()));
         settled.push((settlement.height, settlement.digests.len()));
     }
+    assert_eq!(chunks, vec![(1, 11, 4), (2, 12, 2)]);
     assert_eq!(settled, vec![(1, 4), (2, 2)]);
 
     // The pending checkpoints wait for their chunks' `ChunkSettled`.
@@ -510,5 +511,5 @@ fn the_stage_emits_chunks_settlements_and_checkpoint_waits() {
 
     // A commit handled before emits nothing.
     assert_eq!(stage.process(commit(1, 2, 50, &users), &mut bump), None);
-    assert!(outputs.chunks.try_pop().is_none());
+    assert!(outputs.gate.try_pop().is_none());
 }
