@@ -132,6 +132,7 @@ fn commit(index: u32, round: u32, transactions: &[&VerifiedTransaction]) -> Deco
         observations: Vec::new(),
         jwks: Vec::new(),
         capabilities: Vec::new(),
+        dkg: Vec::new(),
         rejected: Vec::new(),
         cache_hits: 0,
         cache_misses: transactions.len(),
@@ -152,7 +153,9 @@ fn scheduled(handled: &HandledCommit) -> Vec<(Hashed, Option<Vec<CancelledInput>
         .filter_map(|t| match t {
             Scheduled::User(t) => Some((digest(t), None)),
             Scheduled::Cancelled(t, inputs) => Some((digest(t), Some(inputs.clone()))),
-            Scheduled::Prologue(_) | Scheduled::AuthenticatorStateUpdate(_) => None,
+            Scheduled::Prologue(_)
+            | Scheduled::AuthenticatorStateUpdate(_)
+            | Scheduled::RandomnessStateUpdate(_) => None,
         })
         .collect()
 }
@@ -252,13 +255,13 @@ fn the_prologue_lists_cancelled_transactions() {
     let bump = containers::Bump::default();
     let epoch = epoch(0);
     let (output, _dir) = consensus_output();
-    let (chunks, _chunks) = workqueue::queue(16);
-    let (settlements, _settlements) = workqueue::queue(16);
+    let (gate, _gate) = workqueue::queue(16);
     let (checkpoints, _checkpoints) = workqueue::queue(16);
     let start = EpochStart {
         previous_checkpoint: 0,
         accumulator_root_initial_shared_version: 1,
         authenticator_initial_shared_version: None,
+        randomness_initial_shared_version: None,
         accumulator_root_version: 1,
         epoch_start_timestamp_ms: 0,
         epoch_duration_ms: u64::MAX,
@@ -267,8 +270,7 @@ fn the_prologue_lists_cancelled_transactions() {
         epoch.clone(),
         start,
         output,
-        chunks,
-        settlements,
+        gate,
         checkpoints,
         Arc::new(validator::consensus::status::ConsensusTxStatusCache::new()),
         vec![([0; 96], 10_000)],

@@ -135,7 +135,7 @@ fn main() {
                     let ordered = sequencer.order(&config, transactions, &bump);
                     let mut scheduled = containers::Vec::with_capacity_in(ordered.len(), &bump);
                     scheduled.extend(ordered.into_iter().map(Scheduled::User));
-                    let schedule = sequencer.schedule(prologue, None, scheduled, &bump);
+                    let schedule = sequencer.schedule(prologue, None, None, scheduled, &bump);
                     let took = start.elapsed();
                     let allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
                     assert_eq!(schedule.len(), commit_size + 1);

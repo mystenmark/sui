@@ -51,6 +51,8 @@ pub enum SystemKind {
     /// The change-epoch transaction ending `epoch`: the last of its last
     /// checkpoint.
     ChangeEpoch { epoch: u64 },
+    /// The randomness state's update for randomness round `round`.
+    RandomnessStateUpdate { round: u64 },
 }
 
 /// A scheduled transaction with its shared accesses and, for a user
@@ -79,6 +81,37 @@ pub struct Chunk {
     pub height: u64,
     pub checkpoint_seq: u64,
     pub entries: Vec<ScheduledEntry>,
+}
+
+/// A chunk and its settlement, on their way from `CommitStage` through the
+/// randomness gate, which holds a chunk headed by a randomness state update
+/// until the round's random bytes arrive, and every chunk after it.
+#[derive(Debug)]
+pub struct GatedChunk {
+    pub chunk: Chunk,
+    pub settlement: ChunkSettlement,
+    /// The update heading the chunk, not yet in its entries or digests.
+    pub update: Option<PendingUpdate>,
+}
+
+/// A randomness state update waiting for its round's random bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingUpdate {
+    pub epoch: u64,
+    pub round: u64,
+    pub initial_shared_version: u64,
+    /// Its write of the randomness state.
+    pub shared: SharedAccess,
+}
+
+/// What the randomness gate takes.
+#[derive(Debug)]
+pub enum GateInput {
+    /// `CommitStage` → gate, in height order.
+    Chunk(GatedChunk),
+    /// A randomness round's random bytes (its signature's BCS), verified.
+    /// Signature processor → gate.
+    Bytes { round: u64, bytes: Vec<u8> },
 }
 
 /// What settling a chunk takes. `CommitHandler` → `SettlementScheduler`.

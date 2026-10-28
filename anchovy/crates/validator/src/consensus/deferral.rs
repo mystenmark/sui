@@ -69,6 +69,16 @@ impl DeferralKey {
         key(0)..key(round + 1)
     }
 
+    /// Every randomness key: the reference's `full_range_for_randomness`.
+    pub fn randomness() -> std::ops::Range<DeferralKey> {
+        DeferralKey::Randomness {
+            deferred_from_round: 0,
+        }..DeferralKey::ConsensusRound {
+            future_round: 0,
+            deferred_from_round: 0,
+        }
+    }
+
     /// Bytes ordered as the keys are.
     pub fn encode(&self) -> [u8; KEY_LEN] {
         let (variant, first, second) = match *self {

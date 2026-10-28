@@ -47,6 +47,7 @@ use validator::consensus::commit::{CommitStage, EpochStart};
 use validator::consensus::decode::{CommittedTransaction, DecodedCommit};
 use validator::epoch::EpochParams;
 use validator::epoch_store::{ConsensusOutput, EpochStore};
+use validator::pipeline::items::GateInput;
 use workqueue::Processor;
 
 struct Counting;
@@ -168,6 +169,7 @@ fn commit(index: u32, transactions: &[Vec<u8>]) -> DecodedCommit {
         observations: Vec::new(),
         jwks: Vec::new(),
         capabilities: Vec::new(),
+        dkg: Vec::new(),
         rejected: Vec::new(),
         cache_hits: 0,
         cache_misses: 0,
@@ -189,13 +191,13 @@ fn main() {
     println!("commit  objects  ns/tx  allocs/tx");
     for commit_size in [100, 1000] {
         for objects in [10, 100_000] {
-            let (chunks, chunk_inbox) = workqueue::queue(1024);
-            let (settlements, settlement_inbox) = workqueue::queue(1024);
+            let (gate, gate_inbox) = workqueue::queue(1024);
             let (checkpoints, checkpoint_inbox) = workqueue::queue(1024);
             let start = EpochStart {
                 previous_checkpoint: 0,
                 accumulator_root_initial_shared_version: 1,
                 authenticator_initial_shared_version: None,
+                randomness_initial_shared_version: None,
                 accumulator_root_version: 1,
                 epoch_start_timestamp_ms: 0,
                 epoch_duration_ms: u64::MAX,
@@ -205,8 +207,7 @@ fn main() {
                 epoch.clone(),
                 start,
                 output,
-                chunks,
-                settlements,
+                gate,
                 checkpoints,
                 Arc::new(validator::consensus::status::ConsensusTxStatusCache::new()),
                 vec![([0; 96], 1)],
@@ -224,10 +225,9 @@ fn main() {
                 let allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
                 bump.reset();
                 let mut emitted = 0;
-                while let Some(chunk) = chunk_inbox.try_pop() {
-                    emitted += chunk.entries.len();
+                while let Some(GateInput::Chunk(gated)) = gate_inbox.try_pop() {
+                    emitted += gated.chunk.entries.len();
                 }
-                while settlement_inbox.try_pop().is_some() {}
                 while checkpoint_inbox.try_pop().is_some() {}
                 assert_eq!(emitted, commit_size + 1);
                 // The first commit sizes the tables.

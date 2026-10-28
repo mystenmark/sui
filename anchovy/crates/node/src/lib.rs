@@ -143,6 +143,7 @@ fn epoch_start(
         accumulator_root_version,
         accumulator_root_initial_shared_version: initial_shared_version,
         authenticator_initial_shared_version: objects.authenticator_state,
+        randomness_initial_shared_version: objects.randomness_state,
         epoch_start_timestamp_ms: record.epoch_start_timestamp_ms,
         epoch_duration_ms: record.epoch_duration_ms,
     }

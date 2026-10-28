@@ -19,6 +19,7 @@ foldhash.workspace = true
 hashbrown.workspace = true
 messages.workspace = true
 prost.workspace = true
+rand.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 serde.workspace = true
