@@ -31,9 +31,11 @@ beacon enabled: DKG outcome, randomness rounds, randomness deferral and
 - Fixed: the epoch's last commit cuts its regular chunks into a checkpoint
   before its randomness chunks (a fork the epoch scenario found).
 
+- The collector signs and aggregates with real shares (unit test).
+
 ## Remaining
 
-- Unit test of signing and aggregation with real shares.
+- Nothing for phase 18.
 
 ## Left out
 
