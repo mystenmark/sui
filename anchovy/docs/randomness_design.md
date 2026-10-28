@@ -124,12 +124,27 @@ is part of its chunk and its settlement.
   kept, up to a window of 50 rounds past the last released one (R5.2).
 - **Peers.** Sui validators push only after their own DKG completes, to
   their committee's p2p addresses (R5.3), so anchovy dials nobody in 18a.
+- **Rounds missed.** Peers stop pushing a round once they certify it, so a
+  round that completed while anchovy was down never arrives: after any
+  restart, rounds certified meanwhile are lost. The p2p endpoint asks the
+  gate, every second, which round it waits for and which checkpoint the
+  update goes into (a queue entry with a oneshot). A round waited for at two
+  asks in a row is fetched from a connected member through sui's state sync
+  service (`GetCheckpointSummary`, then `GetCheckpointContentsV2`). The
+  update's bytes go to the collector as a full signature, verified against
+  `c0` like any other. The members are connected already: they push to it.
 
 ## 6. Compat
 
-- With 18a, anchovy deals nothing. The harness gives anchovy less stake,
-  so the two sui validators alone reach 2t'−1. Phase 18b restores the
-  current stakes.
+- With 18a, anchovy deals nothing. The beacon scenarios run four
+  validators of equal stake, three of them sui's: reduced, each weighs 125
+  of 500, so the sui validators reach 2t'−1 = 333 alone. The other
+  scenarios keep the three-validator network, where DKG fails at its
+  timeout. Phase 18b can return the beacon scenarios to three validators.
+- The sui validators are a quorum without anchovy, and anchovy cannot
+  catch up an epoch they left. So a compat test claims four of nextest's
+  threads (`.config/nextest.toml`), and the epoch scenario's first epoch
+  outlasts starting four validators under load (30 s).
 - New scenarios:
   - randomness-using transactions before DKG completes (deferred), then
     after (scheduled with the round's update);
@@ -149,5 +164,6 @@ is part of its chunk and its settlement.
 - Peer blocking for bad partial signatures (R5.2): it protects sui's
   aggregation from load, and anchovy drops bad partials without blocking.
 - The consensus observer relay (R6.4).
-- Syncing certified checkpoints when a round's signature never arrives
-  (gap 8).
+- Syncing certified checkpoints in general (gap 8): only a missed round's
+  update is fetched. A validator left an epoch behind by a quorum that does
+  not need it still cannot catch up.
