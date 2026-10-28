@@ -1404,10 +1404,12 @@ fn congested_randomness_is_deferred_alike() {
 }
 
 /// Randomness across epochs: each runs its own DKG and counts rounds from
-/// 0, and deferred randomness holds an epoch open, alike.
+/// 0, and deferred randomness holds an epoch open, alike. The first epoch
+/// must outlast starting four validators under load: the sui validators, a
+/// quorum without anchovy, would leave it, and anchovy cannot catch up.
 #[test]
 fn randomness_spans_epochs_alike() {
-    let mut network = Network::with_beacon(|builder| builder.with_epoch_duration(5_000));
+    let mut network = Network::with_beacon(|builder| builder.with_epoch_duration(30_000));
     let package = network.object_basics(0);
     while network.anchovy.epoch() < 2 {
         let uses: Vec<_> = (1..3)

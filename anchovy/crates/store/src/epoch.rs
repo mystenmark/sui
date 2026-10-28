@@ -100,9 +100,8 @@ impl Space {
             // An authority's index.
             Space::Capabilities => 4,
             Space::Generations => 32 + 8 + 4 + 4,
-            Space::Built | Space::CheckpointHashes | Space::Roots => 8,
-            // A randomness round.
-            Space::RandomnessBytes => 8,
+            // A sequence number, or a randomness round.
+            Space::Built | Space::CheckpointHashes | Space::Roots | Space::RandomnessBytes => 8,
             // A record's kind, then a party id.
             Space::Randomness => 1 + 2,
             Space::Commit => 1,

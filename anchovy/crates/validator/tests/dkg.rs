@@ -38,7 +38,7 @@ fn network(stakes: &[u64]) -> Network {
         .collect();
     let mut order: Vec<usize> = (0..keys.len()).collect();
     order.sort_by_key(|&i| committee[i].0);
-    committee.sort();
+    committee.sort_unstable();
     let config = ProtocolConfig::get_for_version(ProtocolVersion::MAX, Chain::Unknown);
     let setup = Arc::new(DkgSetup::new(&committee, &config, &[3; 32], 1));
     let parties = order

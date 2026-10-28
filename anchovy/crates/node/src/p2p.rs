@@ -86,11 +86,8 @@ pub fn start(
     config.max_response_frame_size = Some(MAX_RESPONSE);
     // sui's `ChainIdentifier` displays as its first four bytes.
     let server_name = format!(
-        "sui-{}",
-        chain_identifier.bytes[..4]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
+        "sui-{:08x}",
+        u32::from_be_bytes(chain_identifier.bytes[..4].try_into().expect("4 bytes"))
     );
     let network = Network::bind(address)
         .server_name(server_name)
@@ -217,7 +214,7 @@ async fn call<T: serde::Serialize, U: serde::de::DeserializeOwned>(
     if !response.status().is_success() {
         return None;
     }
-    decode(response.into_body(), MAX_RESPONSE).ok()
+    decode(response.body(), MAX_RESPONSE).ok()
 }
 
 /// Pushes a peer's signatures to the running epoch's collector, answering
@@ -279,12 +276,12 @@ impl<U: serde::de::DeserializeOwned> Decoder for SnappyDecoder<U> {
     type Error = std::io::Error;
 
     fn decode(&mut self, buf: Bytes) -> Result<U, std::io::Error> {
-        decode(buf, MAX_REQUEST)
+        decode(&buf, MAX_REQUEST)
     }
 }
 
 /// `buf`, snappy-framed BCS, decompressed to at most `max` bytes.
-fn decode<U: serde::de::DeserializeOwned>(buf: Bytes, max: usize) -> std::io::Result<U> {
+fn decode<U: serde::de::DeserializeOwned>(buf: &Bytes, max: usize) -> std::io::Result<U> {
     let mut bytes = Vec::new();
     snap::read::FrameDecoder::new(&buf[..])
         .take(max as u64)
