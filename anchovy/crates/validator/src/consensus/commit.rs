@@ -1444,7 +1444,13 @@ impl CommitStage {
             &mut decided,
             &mut flushed,
         );
-        flushed.extend(self.queue.flush(prologue.timestamp_ms, min_interval));
+        // The epoch's last commit cuts its regular chunks into a checkpoint
+        // of their own: its randomness chunks make the last.
+        flushed.extend(if close.is_some() {
+            self.queue.flush_forced()
+        } else {
+            self.queue.flush(prologue.timestamp_ms, min_interval)
+        });
         if let Some((entries, digests, update)) = randomness {
             let first = decided.chunks.len();
             let reserved = usize::from(update.is_some());
