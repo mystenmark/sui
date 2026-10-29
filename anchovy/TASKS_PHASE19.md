@@ -42,18 +42,20 @@ mode skipped for now):
 Step 3, catching up (`docs/state_sync_design.md`: two front ends into one
 executor, the chunk lock, a fast path):
 
-- [ ] 3b: the checkpoint fetcher, summary verification, and the fast path.
-  - [ ] `Committee::verify_certified`: epoch, signers, quorum, aggregate.
-  - [ ] `SyncedScheduler` (per epoch): chains fetched summaries from the
-    committed checkpoint, verifies each, and waits it on
-    `CheckpointBuilt(seq)`; answers the fetcher with what to fetch next.
-  - [ ] The built router fork-checks a synced checkpoint and hands it to
-    the committer, which commits each checkpoint once, in order, from
-    either source: a cut checkpoint commits even if consensus is gone
-    before its signatures arrive.
-  - [ ] The fetcher on the p2p endpoint: peers' availability every 5 s,
-    summaries by sequence number, a bounded window ahead of the committed
-    checkpoint.
+- [x] 3b: the checkpoint fetcher, summary verification, and the fast path.
+  - `Committee::verify_certified`: epoch, signers, quorum, aggregate.
+  - `SyncedScheduler` (crate `synced`, per epoch) chains fetched summaries
+    from the committed checkpoint, verifies each, and waits it on
+    `CheckpointBuilt(seq)`; it answers the fetcher with what to fetch next,
+    within 256 of the committed checkpoint.
+  - The built router fork-checks a synced checkpoint and hands it to the
+    committer, which commits each checkpoint once, in order, from either
+    source: a cut checkpoint commits even if its signatures never arrive.
+  - The follower on the p2p endpoint asks committee members' availability
+    every 5 s and fetches summaries by sequence number, in batches of 16.
+  - Seen in the crash compat test: after the restart, checkpoints the
+    reference certified meanwhile come through the fast path. No test
+    asserts it yet; 3c's end-of-epoch test depends on it.
 - [ ] 3c: the chunk lock, the slow path (synced execution), certified
   randomness into the gate, and the consensus path's checks of
   transactions executed already.
