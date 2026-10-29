@@ -15,6 +15,10 @@ fn only_versions_the_executor_runs_are_supported() {
             assert!(executor::runs(&config), "{chain:?} version {v}");
         }
         let below = ProtocolConfig::get_for_version(supported.min.prev(), chain);
-        assert!(!executor::runs(&below), "{chain:?} below {:?}", supported.min);
+        assert!(
+            !executor::runs(&below),
+            "{chain:?} below {:?}",
+            supported.min
+        );
     }
 }

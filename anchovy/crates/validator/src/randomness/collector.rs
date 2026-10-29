@@ -130,7 +130,19 @@ impl SignatureCollector {
             gate,
             store,
         };
-        for (round, _) in collector.store.randomness_bytes() {
+        // Recent rounds are pushed again: a peer may have needed this
+        // member's signature for one completed just before a restart.
+        for (round, bytes) in collector.store.randomness_bytes() {
+            let sig = bcs::from_bytes(&bytes).expect("stored bytes are a signature");
+            collector.outgoing.insert(
+                round,
+                SendSignaturesRequest {
+                    epoch,
+                    round,
+                    partial_sigs: Vec::new(),
+                    sig: Some(sig),
+                },
+            );
             collector.mark_done(round);
         }
         collector
