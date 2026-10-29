@@ -55,6 +55,27 @@ impl workqueue::Refuse for Request {
     fn refuse(self, _: workqueue::Refusal) {}
 }
 
+/// Certified summaries fetched from peers (`CertifiedCheckpointSummary`
+/// BCS), in sequence order, for the running epoch's `SyncedScheduler`.
+pub struct SyncRequest {
+    pub summaries: Vec<Vec<u8>>,
+    /// What to fetch next.
+    pub reply: oneshot::Sender<Wanted>,
+}
+
+impl workqueue::Refuse for SyncRequest {
+    fn refuse(self, _: workqueue::Refusal) {}
+}
+
+/// What the synced scheduler would take next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Wanted {
+    /// The next checkpoint to fetch; none once the epoch's last is verified.
+    pub next: Option<u64>,
+    /// How many, from `next`, may be fetched now.
+    pub room: u64,
+}
+
 pub struct CheckpointServer {
     store: Arc<store::Store>,
 }

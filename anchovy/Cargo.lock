@@ -11170,6 +11170,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "synced"
+version = "0.1.0"
+dependencies = [
+ "aggregator",
+ "bcs",
+ "fastcrypto",
+ "messages",
+ "store",
+ "sui-types",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "validator",
+ "waiter",
+ "workqueue",
+]
+
+[[package]]
 name = "synstructure"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
