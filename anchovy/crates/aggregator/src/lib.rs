@@ -14,6 +14,7 @@ use fastcrypto::bls12381::min_sig::{
 };
 use fastcrypto::traits::{AggregateAuthenticator, ToFromBytes, VerifyingKey};
 use messages::base::Digest;
+use messages::checkpoint::CertifiedCheckpointSummary;
 use roaring::RoaringBitmap;
 use tracing::{error, warn};
 use validator::pipeline::backpressure::Backpressure;
@@ -122,6 +123,58 @@ impl Committee {
 
     fn member(&self, position: u32) -> &Member {
         &self.members[position as usize]
+    }
+}
+
+/// Why a certified summary does not verify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertificateError {
+    /// The summary or its signature is of another epoch than the committee.
+    WrongEpoch,
+    /// The signers bitmap does not decode, or names a position outside the
+    /// committee.
+    BadSigners,
+    /// The signers' stake is short of a quorum.
+    NoQuorum,
+    /// The aggregate signature does not verify.
+    BadSignature,
+}
+
+impl Committee {
+    /// Checks `certified` as sui's `CertifiedCheckpointSummary::verify`
+    /// does: the epochs first, then the signers, their stake, and the
+    /// aggregate signature over the summary.
+    pub fn verify_certified(
+        &self,
+        certified: &CertifiedCheckpointSummary<'_>,
+        bump: &Bump,
+    ) -> Result<(), CertificateError> {
+        let info = &certified.auth_signature;
+        if info.epoch != self.epoch || certified.data.epoch != self.epoch {
+            return Err(CertificateError::WrongEpoch);
+        }
+        let signers = RoaringBitmap::deserialize_from(info.signers_map)
+            .map_err(|_| CertificateError::BadSigners)?;
+        let mut keys = containers::Vec::with_capacity_in(signers.len() as usize, bump);
+        let mut stake: Stake = 0;
+        for position in &signers {
+            if position as usize >= self.members.len() {
+                return Err(CertificateError::BadSigners);
+            }
+            let member = self.member(position);
+            stake += member.stake;
+            keys.push(member.key.clone());
+        }
+        if stake < self.quorum_threshold() {
+            return Err(CertificateError::NoQuorum);
+        }
+        let signature = BLS12381AggregateSignature::from_bytes(info.signature)
+            .map_err(|_| CertificateError::BadSignature)?;
+        let mut scratch = Vec::new();
+        let message = signing_message(&mut scratch, certified.data.bytes, self.epoch);
+        signature
+            .verify(&keys, message)
+            .map_err(|_| CertificateError::BadSignature)
     }
 }
 
