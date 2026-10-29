@@ -38,6 +38,10 @@ use validator::randomness::{BeaconInput, SendSignaturesRequest};
 const MAX_REQUEST: usize = 1 << 20;
 const MAX_RESPONSE: usize = 128 << 20;
 
+/// How often this member pushes its signatures to its peers: the
+/// reference's `send_partial_signatures_interval`.
+const PUSH_INTERVAL: Duration = Duration::from_secs(5);
+
 /// How often the gate is asked which round it waits for. A round waited
 /// for at two asks in a row is fetched: pushes come within moments.
 const ASK_INTERVAL: Duration = Duration::from_secs(1);
@@ -46,11 +50,22 @@ const ASK_INTERVAL: Duration = Duration::from_secs(1);
 pub struct P2p {
     pub network: Network,
     fetcher: tokio::task::JoinHandle<()>,
+    pusher: tokio::task::JoinHandle<()>,
+}
+
+impl P2p {
+    /// Stops serving, its port free once this returns.
+    pub async fn shutdown(self) {
+        self.fetcher.abort();
+        self.pusher.abort();
+        let _ = self.network.shutdown().await;
+    }
 }
 
 impl Drop for P2p {
     fn drop(&mut self) {
         self.fetcher.abort();
+        self.pusher.abort();
     }
 }
 
@@ -94,8 +109,84 @@ pub fn start(
         .private_key(network_key)
         .config(config)
         .start(router)?;
-    let fetcher = tokio::spawn(fetch_missing(network.clone(), current));
-    Ok(P2p { network, fetcher })
+    let fetcher = tokio::spawn(fetch_missing(network.clone(), current.clone()));
+    let pusher = tokio::spawn(push_signatures(network.clone(), current));
+    Ok(P2p {
+        network,
+        fetcher,
+        pusher,
+    })
+}
+
+/// Pushes what this member signed, or the full signature once known, to
+/// every other member, every `PUSH_INTERVAL`, as the reference's
+/// `send_signatures_task`: the collector says what.
+async fn push_signatures(network: Network, current: CurrentEpoch) {
+    let own = PeerId(network.peer_id().0);
+    let mut interval = tokio::time::interval(PUSH_INTERVAL);
+    loop {
+        interval.tick().await;
+        let Some(epoch) = current.now() else {
+            continue;
+        };
+        let (answer, outgoing) = oneshot::channel();
+        if epoch
+            .beacon
+            .try_push(BeaconInput::Outgoing(answer))
+            .is_err()
+        {
+            continue;
+        }
+        let Ok(outgoing) = outgoing.await else {
+            continue;
+        };
+        if outgoing.is_empty() {
+            continue;
+        }
+        for (key, address) in epoch.network_keys.iter().zip(&epoch.p2p_addresses) {
+            let peer = PeerId(*key);
+            if peer == own {
+                continue;
+            }
+            let (network, address, outgoing) = (network.clone(), address.clone(), outgoing.clone());
+            tokio::spawn(async move {
+                if network.peer(peer).is_none() {
+                    let Some(address) = anemo_address(&address) else {
+                        return;
+                    };
+                    let connect = network.connect_with_peer_id(address, peer);
+                    if !matches!(
+                        tokio::time::timeout(PUSH_INTERVAL, connect).await,
+                        Ok(Ok(_))
+                    ) {
+                        return;
+                    }
+                }
+                for request in outgoing {
+                    let _: Option<()> =
+                        call(&network, peer, "/sui.Randomness/SendSignatures", request).await;
+                }
+            });
+        }
+    }
+}
+
+/// A p2p multiaddr (`/ip4/<host>/udp/<port>`, or `/ip6` or `/dns`) as a
+/// host and port.
+fn anemo_address(multiaddr: &str) -> Option<(String, u16)> {
+    let parts: Vec<&str> = multiaddr.split('/').collect();
+    let [
+        "",
+        "ip4" | "ip6" | "dns" | "dns4" | "dns6",
+        host,
+        "udp",
+        port,
+        ..,
+    ] = parts[..]
+    else {
+        return None;
+    };
+    Some((host.to_owned(), port.parse().ok()?))
 }
 
 /// Asks the running epoch's gate which round it waits for; a round waited

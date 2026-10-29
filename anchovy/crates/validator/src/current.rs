@@ -28,6 +28,9 @@ pub struct EpochHandle {
     /// key, by committee index: who may push it signatures.
     pub beacon: Queue<BeaconInput>,
     pub network_keys: Vec<[u8; 32]>,
+    /// Each member's p2p address (a multiaddr), by committee index: where
+    /// this member pushes its signatures.
+    pub p2p_addresses: Vec<String>,
     /// The randomness gate, asked which round it waits for.
     pub randomness_gate: Queue<GateInput>,
 }

@@ -36,7 +36,9 @@ use validator::pipeline::items::{
 use validator::pipeline::keys::{ChunkSettled, EffectsKey};
 use validator::pipeline::tables::{CheckpointStore, ChunkTable, GenerationTable};
 use validator::processors::{Request, SignatureVerifier, TransactionValidator};
-use validator::randomness::{BeaconInput, RandomnessGate, SignatureCollector};
+use validator::randomness::{
+    BeaconInput, DkgParty, PartyInput, RandomnessGate, SignatureCollector,
+};
 use validator::submit::SubmitChecker;
 use waiter::{Command, WaiterProcessor};
 use workqueue::{Activity, Inbox, Processor, Queue, Sink, Worker, WorkerHandle};
@@ -68,10 +70,11 @@ pub(crate) fn spawn(
         // Consensus.
         w.one("voting",            i.votes,            |p, q| p.voter(q.built_waits),                                  drop),
         w.one("commit-decode",     i.commits,          |p, q| p.decoder(q.built_waits),                                into(&q.handler, "handler")),
-        w.one("commit-handler",    i.handler,          move |p, q| p.commit_stage(output, q.gate, q.beacon, q.checkpoint_waits), drop),
+        w.one("commit-handler",    i.handler,          move |p, q| p.commit_stage(output, q.gate, q.beacon, q.party, q.checkpoint_waits), drop),
         // The random beacon.
         w.one("randomness-gate",   i.gate,             |p, q| p.gate(q.resolver, q.settlement),                       drop),
         w.one("beacon",            i.beacon,           |p, q| p.collector(q.gate),                                    drop),
+        w.one("dkg-party",         i.party,            |p, q| p.party(q.beacon),                                      drop),
         // Execution.
         w.one("resolver",          i.resolver,         |p, q| p.resolver(q.input_waits, q.funds),                     drop),
         w.one("input-waiter",      i.input_waits,      |p, _| WaiterProcessor::new(p.input_availability()),           into(&q.executor, "executor")),
@@ -126,6 +129,7 @@ queues! {
     submit: Request<Verified>,
     handler: DecodedCommit,
     gate: GateInput,
+    party: PartyInput,
     resolver: Chunk,
     executor: Vec<Executable>,
     settlement: SettlementInput,
@@ -197,14 +201,23 @@ impl Parts {
         }
     }
 
+    /// This validator's committee index, if a member.
+    fn own_index(&self) -> Option<u32> {
+        self.stakes
+            .iter()
+            .position(|(name, _)| name == self.key.public())
+            .map(|i| u32::try_from(i).expect("fewer than 2^32 members"))
+    }
+
     fn commit_stage(
         &self,
         output: OutputWriter,
         gate: Queue<GateInput>,
         beacon: Queue<BeaconInput>,
+        party: Queue<PartyInput>,
         checkpoint_waits: Queue<Command<ChunkSettled, PendingCheckpoint>>,
     ) -> CommitStage {
-        CommitStage::new(
+        let stage = CommitStage::new(
             self.epoch.params.clone(),
             self.start,
             output,
@@ -219,7 +232,21 @@ impl Parts {
         ))
         .with_randomness(self.dkg.clone())
         .with_beacon(beacon)
-        .with_backpressure(self.backpressure.clone())
+        .with_backpressure(self.backpressure.clone());
+        match self.own_index() {
+            Some(own) => stage.with_party(own, party),
+            None => stage,
+        }
+    }
+
+    fn party(&self, collector: Queue<BeaconInput>) -> DkgParty {
+        DkgParty::new(
+            &self.dkg,
+            *self.key.public(),
+            self.key.secret(),
+            self.consensus.clone(),
+            collector,
+        )
     }
 
     fn gate(&self, resolver: Queue<Chunk>, settlement: Queue<SettlementInput>) -> RandomnessGate {
@@ -230,6 +257,8 @@ impl Parts {
         SignatureCollector::new(
             self.epoch.params.epoch,
             self.dkg.clone(),
+            self.own_index()
+                .map(|own| u16::try_from(own).expect("fewer than 2^16 members")),
             self.epoch_store.clone(),
             gate,
         )

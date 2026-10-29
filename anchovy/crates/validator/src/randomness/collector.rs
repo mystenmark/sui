@@ -5,9 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use containers::Bump;
-use fastcrypto::groups::bls12381::G1Element;
+use fastcrypto::groups::bls12381::{G1Element, Scalar};
 use fastcrypto_tbls::nodes::Nodes;
-use fastcrypto_tbls::tbls::{PartialSignature, ThresholdBls};
+use fastcrypto_tbls::tbls::{PartialSignature, Share, ThresholdBls};
 use fastcrypto_tbls::types::ThresholdBls12381MinSig;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -21,6 +21,10 @@ use crate::randomness::signature_message;
 /// How far past the lowest round without bytes a pushed signature may be:
 /// the reference's `max_partial_sigs_rounds_ahead`.
 const ROUNDS_AHEAD: u64 = 50;
+
+/// How many rounds below the lowest without bytes this member's signatures
+/// are still pushed: a peer that has them drops them.
+const ROUNDS_BEHIND: u64 = 20;
 
 /// What a peer pushes over the `Randomness` service: the reference's
 /// `SendSignaturesRequest`, BCS on the wire.
@@ -46,6 +50,13 @@ pub enum BeaconInput {
         request: SendSignaturesRequest,
         taken: oneshot::Sender<()>,
     },
+    /// This member's shares, once DKG completed. `DkgParty` → collector.
+    Shares(Vec<Share<Scalar>>),
+    /// A randomness round reserved. `CommitStage` → collector.
+    Round(u64),
+    /// What this member pushes to its peers now. The p2p endpoint →
+    /// collector.
+    Outgoing(oneshot::Sender<Vec<SendSignaturesRequest>>),
 }
 
 /// A full queue drops the push; peers push again until the round is
@@ -54,15 +65,19 @@ impl Refuse for BeaconInput {
     fn refuse(self, _: Refusal) {}
 }
 
-/// Turns the signatures peers push into each randomness round's random
-/// bytes: a full signature verified against the group key, or partial
-/// signatures of enough weight aggregated (the reference's
-/// `RandomnessEventLoop`, receiving only). Signatures arriving before DKG
-/// completes here are kept until it does.
+/// Turns signatures into each randomness round's random bytes: a full
+/// signature verified against the group key, or partial signatures of
+/// enough weight aggregated, this member's among them once it has shares
+/// (the reference's `RandomnessEventLoop`). Signatures arriving before DKG
+/// completes here are kept until it does. What this member signs, and the
+/// full signature once known, are what it pushes.
 ///
 /// Inward:
-/// - `CommitStage`: the group key (`BeaconInput::GroupKey`);
-/// - randomness service: pushed signatures (`BeaconInput::Signatures`).
+/// - `CommitStage`: the group key (`BeaconInput::GroupKey`) and each round
+///   reserved (`BeaconInput::Round`);
+/// - `DkgParty`: this member's shares (`BeaconInput::Shares`);
+/// - randomness service: pushed signatures (`BeaconInput::Signatures`);
+/// - p2p endpoint: what to push (`BeaconInput::Outgoing`).
 ///
 /// Outward:
 /// - `RandomnessGate`: each round's bytes (`GateInput::Bytes`).
@@ -80,6 +95,13 @@ pub struct SignatureCollector {
     partials: BTreeMap<u64, BTreeMap<u16, Vec<PartialSignature<G1Element>>>>,
     /// Pushes kept until the group key arrives.
     early: Vec<(u16, SendSignaturesRequest)>,
+    /// This member's committee index, if a member, and its shares.
+    own: Option<u16>,
+    shares: Option<Vec<Share<Scalar>>>,
+    /// Rounds reserved without bytes, signed once there are shares.
+    requested: BTreeSet<u64>,
+    /// What this member pushes, by round.
+    outgoing: BTreeMap<u64, SendSignaturesRequest>,
     gate: workqueue::Queue<GateInput>,
 }
 
@@ -89,6 +111,7 @@ impl SignatureCollector {
     pub fn new(
         epoch: u64,
         setup: Arc<DkgSetup>,
+        own: Option<u16>,
         store: EpochStore,
         gate: workqueue::Queue<GateInput>,
     ) -> SignatureCollector {
@@ -100,6 +123,10 @@ impl SignatureCollector {
             done: BTreeSet::new(),
             partials: BTreeMap::new(),
             early: Vec::new(),
+            own,
+            shares: None,
+            requested: BTreeSet::new(),
+            outgoing: BTreeMap::new(),
             gate,
             store,
         };
@@ -124,6 +151,38 @@ impl SignatureCollector {
         }
         self.partials
             .retain(|r, _| *r >= self.low && !self.done.contains(r));
+        self.requested.remove(&round);
+        let behind = self.low.saturating_sub(ROUNDS_BEHIND);
+        self.outgoing.retain(|r, _| *r >= behind);
+    }
+
+    /// Signs `round` with this member's shares: its partial signatures
+    /// count toward the round's, and are pushed.
+    fn sign(&mut self, round: u64) {
+        let (Some(own), Some(shares)) = (self.own, &self.shares) else {
+            return;
+        };
+        let partials =
+            ThresholdBls12381MinSig::partial_sign_batch(shares.iter(), &signature_message(round));
+        self.outgoing.insert(
+            round,
+            SendSignaturesRequest {
+                epoch: self.epoch,
+                round,
+                partial_sigs: partials
+                    .iter()
+                    .map(|p| bcs::to_bytes(p).expect("a partial signature serializes"))
+                    .collect(),
+                sig: None,
+            },
+        );
+        self.partials
+            .entry(round)
+            .or_default()
+            .insert(own, partials);
+        if self.key.is_some() {
+            self.try_aggregate(round);
+        }
     }
 
     fn receive(&mut self, party: u16, request: SendSignaturesRequest) {
@@ -209,6 +268,10 @@ impl SignatureCollector {
     }
 
     fn produce(&mut self, round: u64, sig: &G1Element) {
+        if let Some(outgoing) = self.outgoing.get_mut(&round) {
+            outgoing.partial_sigs.clear();
+            outgoing.sig = Some(*sig);
+        }
         let bytes = bcs::to_bytes(sig).expect("a signature serializes");
         self.store.put_randomness_bytes(round, &bytes);
         self.mark_done(round);
@@ -231,6 +294,24 @@ impl Processor for SignatureCollector {
                 for (party, request) in std::mem::take(&mut self.early) {
                     self.receive(party, request);
                 }
+                for round in self.partials.keys().copied().collect::<Vec<_>>() {
+                    self.try_aggregate(round);
+                }
+            }
+            BeaconInput::Shares(shares) => {
+                self.shares = Some(shares);
+                for round in self.requested.clone() {
+                    self.sign(round);
+                }
+            }
+            BeaconInput::Round(round) => {
+                if self.wanted(round) {
+                    self.requested.insert(round);
+                    self.sign(round);
+                }
+            }
+            BeaconInput::Outgoing(answer) => {
+                let _ = answer.send(self.outgoing.values().cloned().collect());
             }
             BeaconInput::Signatures {
                 party,

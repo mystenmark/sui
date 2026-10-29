@@ -24,10 +24,18 @@ beacon enabled: DKG outcome, randomness rounds, randomness deferral and
 - Compat: four beacon scenarios (rounds and a restart, DKG failure,
   randomness congestion, epochs); all 19 pass.
 
+- Phase 18a merged (mystenmark/sui#18).
+- Phase 18b (`mlogan-phase18b`): the DKG party, signing rounds, pushing to
+  peers at their system-state p2p addresses; beacon scenarios back on three
+  validators; consensus-glue's validators run p2p endpoints.
+- Fixed: the epoch's last commit cuts its regular chunks into a checkpoint
+  before its randomness chunks (a fork the epoch scenario found).
+
+- The collector signs and aggregates with real shares (unit test).
+
 ## Remaining
 
-- Phase 18b: anchovy's own DKG messages and confirmations, partial
-  signatures, pushing them to peers.
+- Nothing for phase 18.
 
 ## Left out
 

@@ -75,8 +75,9 @@ pub struct Pipeline {
     /// From peers: the random beacon's signatures.
     pub beacon: Queue<BeaconInput>,
     randomness_gate: Queue<GateInput>,
-    /// Each member's network key, by committee index.
+    /// Each member's network key and p2p address, by committee index.
     network_keys: Vec<[u8; 32]>,
+    p2p_addresses: Vec<String>,
     /// What became of each committed transaction, by position.
     pub statuses: Arc<ConsensusTxStatusCache>,
     consensus: TransactionClient,
@@ -335,6 +336,11 @@ impl Pipeline {
             beacon: queues.beacon,
             randomness_gate: queues.gate,
             network_keys: record.committee.iter().map(|m| m.network_key).collect(),
+            p2p_addresses: record
+                .committee
+                .iter()
+                .map(|m| m.p2p_address.clone())
+                .collect(),
             statuses: parts.statuses.clone(),
             consensus,
             store: store.clone(),
@@ -373,6 +379,7 @@ impl Pipeline {
             },
             beacon: self.beacon.clone(),
             network_keys: self.network_keys.clone(),
+            p2p_addresses: self.p2p_addresses.clone(),
             randomness_gate: self.randomness_gate.clone(),
         })
     }

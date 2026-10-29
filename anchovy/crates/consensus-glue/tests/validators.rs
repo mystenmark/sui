@@ -90,6 +90,9 @@ struct Running {
     store: Arc<store::Store>,
     current: CurrentEpoch,
     task: JoinHandle<()>,
+    /// Through which the members push each other the random beacon's
+    /// signatures.
+    p2p: node::p2p::P2p,
 }
 
 struct Member {
@@ -145,6 +148,8 @@ struct Network {
     /// Every epoch's committee: the validator set never changes.
     stakes: BTreeMap<AuthorityName, u64>,
     chain_identifier: Digest,
+    /// Each validator's port: consensus's on TCP, p2p's on UDP.
+    ports: Vec<u16>,
     sender: SuiAddress,
     key: AccountKeyPair,
     coins: Vec<ObjectID>,
@@ -184,6 +189,7 @@ impl Network {
             members,
             stakes,
             chain_identifier: Digest::new(genesis.chain_identifier),
+            ports,
             sender,
             key,
             coins: genesis.coins,
@@ -213,11 +219,22 @@ impl Network {
             chain_identifier: self.chain_identifier,
             keys,
         };
+        let p2p = {
+            let _runtime = self.runtime.enter();
+            node::p2p::start(
+                std::net::SocketAddr::from(([127, 0, 0, 1], self.ports[v])),
+                perpetual.keys.network.secret(),
+                &perpetual.chain_identifier,
+                current.clone(),
+            )
+            .expect("the p2p address binds")
+        };
         let task = self.runtime.spawn(Node::new(perpetual).run(runner));
         member.running = Some(Running {
             store,
             current,
             task,
+            p2p,
         });
     }
 
@@ -226,6 +243,7 @@ impl Network {
         let member = &mut self.members[v];
         let running = member.running.take().unwrap();
         running.task.abort();
+        self.runtime.block_on(running.p2p.shutdown());
         let stopped = self.runtime.block_on(running.task);
         assert!(stopped.unwrap_err().is_cancelled(), "the node was running");
         // Checkpoints certified and not committed are certified again.

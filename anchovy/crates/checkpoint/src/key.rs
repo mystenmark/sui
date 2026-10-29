@@ -35,6 +35,17 @@ impl ProtocolKey {
         &self.public
     }
 
+    /// The secret's bytes: the random beacon's DKG decrypts this member's
+    /// shares with it, as the reference's `RandomnessManager` does.
+    pub fn secret(&self) -> [u8; 32] {
+        self.keypair
+            .copy()
+            .private()
+            .as_bytes()
+            .try_into()
+            .expect("a 32-byte secret")
+    }
+
     pub fn sign(&self, message: &[u8]) -> [u8; 48] {
         self.keypair
             .sign(message)

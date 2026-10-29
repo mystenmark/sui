@@ -1,6 +1,6 @@
-# Each compat test runs a network of three or four validators: run as many at
-# once as the machine has room for, or their consensus falls behind their
-# epochs, and a validator a quorum leaves behind cannot catch up.
+# Each compat test runs a network of three validators: run as many at once as
+# the machine has room for, or their consensus falls behind their epochs, and
+# a validator a quorum leaves behind cannot catch up.
 [[profile.default.overrides]]
 filter = 'package(compat)'
 threads-required = 4

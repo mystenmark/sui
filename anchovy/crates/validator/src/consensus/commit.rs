@@ -50,7 +50,7 @@ use crate::pipeline::items::{
     PendingCheckpoint, PendingUpdate, ScheduledEntry, SystemKind, SystemTransaction,
 };
 use crate::pipeline::keys::{AccumulatorVersion, ChunkSettled, StreamId, TxDigest};
-use crate::randomness::BeaconInput;
+use crate::randomness::{BeaconInput, PartyInput};
 
 /// Why a committed transaction was dropped.
 #[derive(Debug)]
@@ -133,6 +133,18 @@ pub struct CommitHandler {
     certs_closed: bool,
     /// The random beacon, if the epoch has it.
     randomness: Option<Randomness>,
+    /// What the commits handled decided of the beacon, for this member's
+    /// party and signer, until taken.
+    beacon_events: Vec<BeaconEvent>,
+}
+
+/// What a commit decided of the random beacon, for this member's part in it.
+#[derive(Debug)]
+pub enum BeaconEvent {
+    /// For its DKG party.
+    Party(PartyInput),
+    /// A randomness round reserved, for its signer.
+    Round(u64),
 }
 
 /// The random beacon's state, in an epoch that has it: the protocol enables
@@ -207,6 +219,7 @@ impl CommitHandler {
             epoch_end_ms: u64::MAX,
             certs_closed: false,
             randomness: None,
+            beacon_events: Vec::new(),
         }
     }
 
@@ -256,6 +269,41 @@ impl CommitHandler {
         self
     }
 
+    /// What the commits handled since the last call decided of the beacon.
+    pub fn take_beacon_events(&mut self) -> Vec<BeaconEvent> {
+        std::mem::take(&mut self.beacon_events)
+    }
+
+    /// The beacon's state as restored, for the member at `own`'s part in
+    /// it: DKG's progress, then whether its message and confirmation were
+    /// sequenced; and the last rounds reserved, which may still lack bytes.
+    pub fn restored_beacon(&self, own: u32, rounds: u64) -> Vec<BeaconEvent> {
+        let Some(randomness) = &self.randomness else {
+            return Vec::new();
+        };
+        let dkg = &randomness.dkg;
+        let mut events: Vec<BeaconEvent> = dkg
+            .processed()
+            .map(|m| BeaconEvent::Party(PartyInput::Message(Box::new(m.clone()))))
+            .collect();
+        if let Some(used) = dkg.used() {
+            events.push(BeaconEvent::Party(PartyInput::Merged(used)));
+        }
+        if let DkgStatus::Successful(_) = dkg.status() {
+            events.push(BeaconEvent::Party(PartyInput::Completed(
+                dkg.confirmations(),
+            )));
+        }
+        let (message_seen, confirmation_seen) = dkg.seen(own);
+        events.push(BeaconEvent::Party(PartyInput::Started {
+            message_seen,
+            confirmation_seen,
+        }));
+        let next = randomness.next_round;
+        events.extend((next.saturating_sub(rounds)..next).map(BeaconEvent::Round));
+        events
+    }
+
     /// DKG's outcome so far, if the epoch has the random beacon.
     pub fn dkg_status(&self) -> Option<&DkgStatus> {
         self.randomness.as_ref().map(|r| r.dkg.status())
@@ -284,6 +332,7 @@ impl CommitHandler {
                 let round = randomness.next_round;
                 randomness.next_round += 1;
                 randomness.last_round_ms = Some(timestamp_ms);
+                self.beacon_events.push(BeaconEvent::Round(round));
                 self.output.put_randomness(
                     RANDOMNESS_ROUNDS,
                     bcs::to_bytes(&(randomness.next_round, timestamp_ms)).expect("serializes"),
@@ -307,6 +356,29 @@ impl CommitHandler {
         };
         let changes = randomness.dkg.handle(config, traffic, round);
         let output = &mut self.output;
+        for bytes in changes
+            .messages
+            .iter()
+            .filter_map(|(_, bytes)| bytes.as_ref())
+        {
+            let sui_types::messages_consensus::VersionedDkgMessage::V1(message) =
+                bcs::from_bytes(bytes).expect("a message as encoded")
+            else {
+                unreachable!("version 1 as encoded");
+            };
+            self.beacon_events
+                .push(BeaconEvent::Party(PartyInput::Message(Box::new(message))));
+        }
+        if let Some(used) = &changes.used {
+            self.beacon_events
+                .push(BeaconEvent::Party(PartyInput::Merged(used.clone())));
+        }
+        if let Some(DkgStatus::Successful(_)) = &changes.status {
+            self.beacon_events
+                .push(BeaconEvent::Party(PartyInput::Completed(
+                    randomness.dkg.confirmations(),
+                )));
+        }
         for (author, bytes) in changes.messages {
             output.put_randomness(party_key(DKG_MESSAGE, author), bytes.unwrap_or_default());
         }
@@ -1004,8 +1076,12 @@ pub struct CommitStage {
     checkpoints_out: workqueue::Queue<waiter::Command<ChunkSettled, PendingCheckpoint>>,
     statuses: Arc<ConsensusTxStatusCache>,
     backpressure: Option<Arc<Backpressure>>,
-    /// Where the group key goes once DKG completes, until it has gone.
+    /// The signature collector: the group key goes once DKG completes,
+    /// and each round reserved.
     beacon: Option<workqueue::Queue<BeaconInput>>,
+    key_sent: bool,
+    /// This member's DKG party, if it is a member.
+    party: Option<workqueue::Queue<PartyInput>>,
 }
 
 impl CommitStage {
@@ -1052,6 +1128,8 @@ impl CommitStage {
             statuses,
             backpressure: None,
             beacon: None,
+            key_sent: false,
+            party: None,
         }
     }
 
@@ -1064,12 +1142,45 @@ impl CommitStage {
         self
     }
 
+    /// Takes part in the beacon as the member at committee index `own`,
+    /// through `party` and the signature collector, from the state
+    /// restored: the last rounds reserved are signed again, as the
+    /// reference's `RandomnessManager::try_new` requests them.
+    #[must_use]
+    pub fn with_party(mut self, own: u32, party: workqueue::Queue<PartyInput>) -> CommitStage {
+        /// The reference's `max_partial_sigs_rounds_ahead`.
+        const ROUNDS: u64 = 50;
+        self.party = Some(party);
+        let events = self.handler.restored_beacon(own, ROUNDS);
+        self.send_beacon_events(events);
+        self
+    }
+
+    fn send_beacon_events(&self, events: Vec<BeaconEvent>) {
+        for event in events {
+            match event {
+                BeaconEvent::Party(input) => {
+                    if let Some(party) = &self.party {
+                        push(party, input, "DKG party");
+                    }
+                }
+                BeaconEvent::Round(round) => {
+                    if let Some(beacon) = &self.beacon {
+                        push(beacon, BeaconInput::Round(round), "signature collector");
+                    }
+                }
+            }
+        }
+    }
+
     fn send_group_key(&mut self) {
-        if let Some(DkgStatus::Successful(key)) = self.handler.dkg_status()
-            && let Some(beacon) = self.beacon.take()
+        if !self.key_sent
+            && let Some(DkgStatus::Successful(key)) = self.handler.dkg_status()
+            && let Some(beacon) = &self.beacon
         {
+            self.key_sent = true;
             push(
-                &beacon,
+                beacon,
                 BeaconInput::GroupKey(key.clone()),
                 "signature collector",
             );
@@ -1333,7 +1444,13 @@ impl CommitStage {
             &mut decided,
             &mut flushed,
         );
-        flushed.extend(self.queue.flush(prologue.timestamp_ms, min_interval));
+        // The epoch's last commit cuts its regular chunks into a checkpoint
+        // of their own: its randomness chunks make the last.
+        flushed.extend(if close.is_some() {
+            self.queue.flush_forced()
+        } else {
+            self.queue.flush(prologue.timestamp_ms, min_interval)
+        });
         if let Some((entries, digests, update)) = randomness {
             let first = decided.chunks.len();
             let reserved = usize::from(update.is_some());
@@ -1562,6 +1679,8 @@ impl CommitStage {
         );
         self.emit(decided, bump);
         self.send_group_key();
+        let events = self.handler.take_beacon_events();
+        self.send_beacon_events(events);
         self.statuses.update_leader_round(leader_round);
         Some(())
     }
