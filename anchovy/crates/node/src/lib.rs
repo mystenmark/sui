@@ -175,7 +175,7 @@ fn announce_capabilities(
         *protocol_key.public(),
         epoch.params.chain,
         &epoch.params.config,
-        execution::upgrade::supported_protocol_versions(),
+        execution::upgrade::supported_protocol_versions(epoch.params.chain),
         system_objects.accumulator_root.is_some(),
     );
     let consensus = consensus.clone();

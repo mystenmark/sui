@@ -263,7 +263,7 @@ impl Epoch {
         let record = EpochRecord::load(&perpetual.store);
         // As the reference's `check_protocol_version`: a binary that cannot
         // run the epoch's version stops rather than diverge.
-        let supported = execution::upgrade::supported_protocol_versions();
+        let supported = execution::upgrade::supported_protocol_versions(perpetual.chain);
         if !execution::upgrade::is_supported(supported, record.protocol_version) {
             eprintln!(
                 "epoch {} runs protocol version {}, outside this binary's {supported:?}",
