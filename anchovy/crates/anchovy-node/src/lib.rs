@@ -34,6 +34,8 @@ const CERTIFIED_CAPACITY: usize = 1024;
 pub struct Genesis {
     pub objects: Vec<Object>,
     pub checkpoint: BuiltCheckpoint,
+    /// Its `CertifiedCheckpointSummary` BCS.
+    pub certified: Vec<u8>,
     /// The genesis checkpoint's digest.
     pub chain_identifier: [u8; 32],
 }
@@ -62,6 +64,7 @@ impl Genesis {
             objects: genesis.objects().to_vec(),
             chain_identifier: checkpoint.digest,
             checkpoint,
+            certified: bcs::to_bytes(summary.inner()).expect("a summary serializes"),
         }
     }
 
@@ -75,6 +78,7 @@ impl Genesis {
             node::epoch::genesis(
                 store,
                 &self.checkpoint,
+                self.certified.clone(),
                 self.objects.iter().map(|o| o.digest().into_inner()),
             );
         }

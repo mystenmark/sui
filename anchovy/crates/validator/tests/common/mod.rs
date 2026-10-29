@@ -251,6 +251,7 @@ pub fn current(
     let (effects, effects_inbox) = workqueue::queue(16);
     let (beacon, beacon_inbox) = workqueue::queue(16);
     let (randomness_gate, gate_inbox) = workqueue::queue(16);
+    let (checkpoint_queries, queries_inbox) = workqueue::queue(16);
     let current = CurrentEpoch::new();
     current.set(Arc::new(EpochHandle {
         epoch: epoch.clone(),
@@ -265,9 +266,17 @@ pub fn current(
         network_keys: Vec::new(),
         p2p_addresses: Vec::new(),
         randomness_gate,
+        checkpoint_queries,
     }));
     (
         current,
-        (normal, priority, effects_inbox, beacon_inbox, gate_inbox),
+        (
+            normal,
+            priority,
+            effects_inbox,
+            beacon_inbox,
+            gate_inbox,
+            queries_inbox,
+        ),
     )
 }

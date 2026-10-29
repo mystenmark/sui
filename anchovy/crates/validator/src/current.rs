@@ -33,6 +33,8 @@ pub struct EpochHandle {
     pub p2p_addresses: Vec<String>,
     /// The randomness gate, asked which round it waits for.
     pub randomness_gate: Queue<GateInput>,
+    /// The checkpoint server, asked by peers' state sync.
+    pub checkpoint_queries: Queue<crate::state_sync::Request>,
 }
 
 /// The running epoch, if any. Cloned handles see the same epoch.

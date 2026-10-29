@@ -74,10 +74,8 @@ impl CheckpointCommitter {
             .expect("a checkpoint is certified only once built here");
         let transactions = crate::transactions(&built.contents, bump);
         self.store.commit_checkpoint(
-            seq,
+            built.record(certified.summary.to_vec()),
             &transactions,
-            built.encode(),
-            certified.summary.to_vec(),
             bump,
         );
         self.generations.commit(&transactions, bump);

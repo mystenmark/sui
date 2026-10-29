@@ -39,6 +39,7 @@ use validator::processors::{Request, SignatureVerifier, TransactionValidator};
 use validator::randomness::{
     BeaconInput, DkgParty, PartyInput, RandomnessGate, SignatureCollector,
 };
+use validator::state_sync::{self, CheckpointServer};
 use validator::submit::SubmitChecker;
 use waiter::{Command, WaiterProcessor};
 use workqueue::{Activity, Inbox, Processor, Queue, Sink, Worker, WorkerHandle};
@@ -92,6 +93,8 @@ pub(crate) fn spawn(
         w.one("summary",           i.summary,          |p, q| p.summary(q.built_waits),                               drop),
         w.one("aggregator",        i.aggregator,       move |p, q| p.aggregator(state_sync, q.built_waits),           into(&q.committer, "committer")),
         w.one("committer",         i.committer,        move |p, _| p.committer(committed, ended),                     drop),
+        // Serving peers.
+        w.one("checkpoint-server", i.checkpoint_queries, |p, _| CheckpointServer::new(p.store.clone()),         drop),
     ]
 }
 
@@ -124,6 +127,7 @@ queues! {
     votes: VoteRequest,
     commits: CommitRequest,
     beacon: BeaconInput,
+    checkpoint_queries: state_sync::Request,
     // Between processors.
     signatures: Request<Valid>,
     submit: Request<Verified>,

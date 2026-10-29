@@ -195,6 +195,18 @@ pub struct BuiltCheckpoint {
 }
 
 impl BuiltCheckpoint {
+    /// As the object store commits it, with its certified summary.
+    pub fn record(&self, certified: Vec<u8>) -> store::CheckpointRecord {
+        store::CheckpointRecord {
+            seq: self.seq,
+            checkpoint: self.encode(),
+            certified,
+            digest: messages::base::Digest::new(self.digest),
+            contents_digest: *messages::base::Hashed::of("CheckpointContents", &self.contents)
+                .digest(),
+        }
+    }
+
     /// As the object store keeps it (`Store::commit_checkpoint`).
     pub fn encode(&self) -> Vec<u8> {
         bcs::to_bytes(&(

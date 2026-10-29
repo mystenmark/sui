@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The validator's p2p endpoint, as sui validators reach it: an anemo
-//! server on its p2p address, under its network key, serving only sui's
+//! server on its p2p address, under its network key, serving sui's
 //! `Randomness` service, through which they push the random beacon's
-//! signatures (`docs/randomness_reference.md` R5.3). Other routes answer
+//! signatures (`docs/randomness_reference.md` R5.3), and its `StateSync`
+//! service, through which the running epoch's checkpoint server answers
+//! for committed checkpoints (`validator::state_sync`). Other routes answer
 //! not found.
 //!
 //! Peers stop pushing a round once they certify it, so a round that
@@ -27,12 +29,14 @@ use anemo::{Network, PeerId, Request, Response, Router};
 use bytes::Bytes;
 use fastcrypto::groups::bls12381::G1Element;
 use messages::base::Digest;
+use sui_types::digests::{CheckpointContentsDigest, CheckpointDigest};
 use sui_types::messages_checkpoint::{CertifiedCheckpointSummary, VersionedFullCheckpointContents};
 use sui_types::transaction::{TransactionDataAPI as _, TransactionKind};
 use tokio::sync::oneshot;
 use validator::current::CurrentEpoch;
 use validator::pipeline::items::GateInput;
 use validator::randomness::{BeaconInput, SendSignaturesRequest};
+use validator::state_sync::{self, Query};
 
 /// sui's limits on a p2p request frame, and a response frame.
 const MAX_REQUEST: usize = 1 << 20;
@@ -72,7 +76,7 @@ impl Drop for P2p {
 /// Starts the endpoint at `address`, under the Ed25519 network key
 /// `network_key`, on the chain `chain_identifier` names, in the current
 /// runtime. Pushes, and fetched rounds, go to the running epoch's
-/// collector.
+/// collector, and state sync queries to its checkpoint server.
 ///
 /// # Errors
 /// If `address` cannot be bound.
@@ -95,7 +99,44 @@ pub fn start(
             Ok::<_, Infallible>(rpc.unary(service, request).await)
         }
     });
-    let router = Router::new().route("/sui.Randomness/SendSignatures", route);
+    let router = Router::new()
+        .route("/sui.Randomness/SendSignatures", route)
+        .route(
+            "/sui.StateSync/PushCheckpointSummary",
+            tower::service_fn(push_checkpoint_summary),
+        )
+        .route(
+            "/sui.StateSync/GetCheckpointSummary",
+            serve(current.clone(), |request| match request {
+                GetCheckpointSummaryRequest::Latest => Query::Latest,
+                GetCheckpointSummaryRequest::ByDigest(digest) => {
+                    Query::ByDigest(Digest::new(digest.into_inner()))
+                }
+                GetCheckpointSummaryRequest::BySequenceNumber(seq) => Query::BySequenceNumber(seq),
+            }),
+        )
+        .route(
+            "/sui.StateSync/GetCheckpointContents",
+            serve(current.clone(), |digest: CheckpointContentsDigest| {
+                Query::Contents {
+                    digest: Digest::new(digest.into_inner()),
+                    versioned: false,
+                }
+            }),
+        )
+        .route(
+            "/sui.StateSync/GetCheckpointContentsV2",
+            serve(current.clone(), |digest: CheckpointContentsDigest| {
+                Query::Contents {
+                    digest: Digest::new(digest.into_inner()),
+                    versioned: true,
+                }
+            }),
+        )
+        .route(
+            "/sui.StateSync/GetCheckpointAvailability",
+            serve(current.clone(), |()| Query::Availability),
+        );
     let mut config = anemo::Config::default();
     config.max_request_frame_size = Some(MAX_REQUEST);
     config.max_response_frame_size = Some(MAX_RESPONSE);
@@ -116,6 +157,65 @@ pub fn start(
         fetcher,
         pusher,
     })
+}
+
+/// A `StateSync` route: its request decoded as `T` and made a query, which
+/// the running epoch's checkpoint server answers. Waits while no epoch runs:
+/// a peer's first query checks this validator's chain, and one that fails
+/// leaves it out of the peer's state sync until it reconnects.
+fn serve<T>(
+    current: CurrentEpoch,
+    query: fn(T) -> Query,
+) -> impl tower::Service<
+    Request<Bytes>,
+    Response = Response<Bytes>,
+    Error = Infallible,
+    Future: Send + 'static,
+> + Clone
++ Send
++ 'static
+where
+    T: serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    tower::service_fn(move |request: Request<Bytes>| {
+        let current = current.clone();
+        async move {
+            let mut rpc = anemo::rpc::server::Rpc::new(BcsSnappy::<(), T>::default(), Encoded);
+            let service = tower::service_fn(move |request: Request<T>| {
+                let current = current.clone();
+                async move {
+                    let (reply, answer) = oneshot::channel();
+                    let request = state_sync::Request {
+                        query: query(request.into_body()),
+                        reply,
+                    };
+                    current
+                        .get()
+                        .await
+                        .checkpoint_queries
+                        .try_push(request)
+                        .map_err(|_| Status::new(StatusCode::InternalServerError))?;
+                    let bytes = answer
+                        .await
+                        .map_err(|_| Status::new(StatusCode::InternalServerError))?;
+                    Ok::<_, Status>(Response::new(bytes))
+                }
+            });
+            Ok::<_, Infallible>(rpc.unary(service, request).await)
+        }
+    })
+}
+
+/// Pushed summaries are taken and let go: nothing syncs from them yet.
+async fn push_checkpoint_summary(request: Request<Bytes>) -> Result<Response<Bytes>, Infallible> {
+    let mut rpc = anemo::rpc::server::Rpc::new(
+        BcsSnappy::<(), CertifiedCheckpointSummary>::default(),
+        BcsSnappy::<(), ()>::default(),
+    );
+    let service = tower::service_fn(|_: Request<CertifiedCheckpointSummary>| async {
+        Ok::<_, Status>(Response::new(()))
+    });
+    Ok(rpc.unary(service, request).await)
 }
 
 /// Pushes what this member signed, or the full signature once known, to
@@ -243,12 +343,10 @@ async fn fetch_missing(network: Network, current: CurrentEpoch) {
 }
 
 /// sui's `GetCheckpointSummaryRequest`.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 enum GetCheckpointSummaryRequest {
-    #[allow(dead_code)]
     Latest,
-    #[allow(dead_code)]
-    ByDigest([u8; 32]),
+    ByDigest(CheckpointDigest),
     BySequenceNumber(u64),
 }
 
@@ -378,6 +476,48 @@ fn decode<U: serde::de::DeserializeOwned>(buf: &Bytes, max: usize) -> std::io::R
         .take(max as u64)
         .read_to_end(&mut bytes)?;
     bcs::from_bytes(&bytes).map_err(std::io::Error::other)
+}
+
+/// A response the checkpoint server encoded already, as `BcsSnappy` would.
+struct Encoded;
+
+struct PassThrough;
+
+impl Encoder for PassThrough {
+    type Item = Bytes;
+    type Error = Infallible;
+
+    fn encode(&mut self, item: Bytes) -> Result<Bytes, Infallible> {
+        Ok(item)
+    }
+}
+
+impl Decoder for PassThrough {
+    type Item = Bytes;
+    type Error = Infallible;
+
+    fn decode(&mut self, buf: Bytes) -> Result<Bytes, Infallible> {
+        Ok(buf)
+    }
+}
+
+impl Codec for Encoded {
+    type Encode = Bytes;
+    type Decode = Bytes;
+    type Encoder = PassThrough;
+    type Decoder = PassThrough;
+
+    fn encoder(&mut self) -> PassThrough {
+        PassThrough
+    }
+
+    fn decoder(&mut self) -> PassThrough {
+        PassThrough
+    }
+
+    fn format_name(&self) -> &'static str {
+        "bcs"
+    }
 }
 
 impl<T, U> Codec for BcsSnappy<T, U>

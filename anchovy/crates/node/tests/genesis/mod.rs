@@ -26,6 +26,9 @@ pub struct Genesis {
     pub objects: Vec<Object>,
     #[allow(dead_code, reason = "not every test crate runs the pipeline")]
     pub checkpoint: BuiltCheckpoint,
+    /// Its `CertifiedCheckpointSummary` BCS.
+    #[allow(dead_code, reason = "not every test crate runs the pipeline")]
+    pub certified: Vec<u8>,
     /// The genesis checkpoint's digest.
     #[allow(dead_code, reason = "not every test crate runs the pipeline")]
     pub chain_identifier: [u8; 32],
@@ -185,6 +188,7 @@ pub fn from_sui(genesis: &sui_config::genesis::Genesis, account: SuiAddress) -> 
         objects: genesis.objects().to_vec(),
         chain_identifier: checkpoint.digest,
         checkpoint,
+        certified: bcs::to_bytes(summary.inner()).unwrap(),
         coins,
     }
 }

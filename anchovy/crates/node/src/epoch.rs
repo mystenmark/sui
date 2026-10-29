@@ -165,8 +165,9 @@ impl EpochRecord {
     }
 }
 
-/// Writes the genesis checkpoint and the first epoch's start record, read
-/// from the system state genesis created, unless the store has them. The
+/// Writes the genesis checkpoint, `certified` its certified summary, and the
+/// first epoch's start record, read from the system state genesis created,
+/// unless the store has them. The
 /// genesis objects, with digests `objects`, must be in the store.
 ///
 /// # Panics
@@ -174,6 +175,7 @@ impl EpochRecord {
 pub fn genesis(
     store: &store::Store,
     checkpoint: &BuiltCheckpoint,
+    certified: Vec<u8>,
     objects: impl IntoIterator<Item = [u8; 32]>,
 ) {
     if store.epoch_start().expect("the store reads").is_some() {
@@ -184,7 +186,7 @@ pub fn genesis(
     assert_eq!(state.epoch, 0, "genesis starts epoch 0");
     let root = state_hasher::encode(&state_hasher::of_objects(objects));
     store.commit_genesis_checkpoint(
-        checkpoint.encode(),
+        checkpoint.record(certified),
         EpochRecord::new(state, 0, root).encode(),
     );
 }

@@ -12419,6 +12419,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "snap",
  "store",
  "sui-protocol-config",
  "sui-types",

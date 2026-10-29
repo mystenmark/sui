@@ -33,7 +33,9 @@ use sui_protocol_config::{
     ProtocolConfig, ProtocolVersion,
 };
 use sui_swarm_config::genesis_config::ValidatorGenesisConfigBuilder;
+use sui_swarm_config::network_config::NetworkConfig;
 use sui_swarm_config::network_config_builder::ConfigBuilder;
+use sui_swarm_config::node_config_builder::FullnodeConfigBuilder;
 use sui_types::base_types::AuthorityName;
 use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
 use sui_types::committee::{Committee, CommitteeTrait as _};
@@ -111,6 +113,7 @@ struct Network {
     committee: Committee,
     /// The validators' names, sui's in order, then anchovy's.
     names: Vec<AuthorityName>,
+    config: NetworkConfig,
 }
 
 /// The secret of an Ed25519 key pair, as anchovy holds it.
@@ -341,6 +344,7 @@ impl Network {
             coins,
             committee: config.genesis.committee(),
             names,
+            config,
         }
     }
 
@@ -843,6 +847,7 @@ impl Anchovy {
         node::epoch::genesis(
             &store,
             &genesis.checkpoint,
+            genesis.certified.clone(),
             genesis.objects.iter().map(|o| o.digest().into_inner()),
         );
         let (state_sync, certified_inbox) = workqueue::queue(1024);
@@ -1484,5 +1489,61 @@ fn randomness_takes_signatures_from_both_alike() {
     }
     let later = network.transfer(0);
     network.execute(&later);
+    drop(network.runtime);
+}
+
+/// A sui full node whose only peer is anchovy syncs what anchovy committed,
+/// and executes it alike. The sui validators are stopped first, so nothing
+/// else could serve it.
+#[test]
+fn a_full_node_syncs_from_anchovy_alike() {
+    let mut network = Network::new();
+    let package = network.object_basics(0);
+    let shared = network.share(1);
+    network.execute(&shared);
+    let transactions = [network.transfer(0), network.use_random(2, package, None)];
+    let transactions: Vec<_> = transactions.iter().collect();
+    let effects = network.execute_together(&transactions);
+    let last = transactions
+        .iter()
+        .map(|t| network.anchovy.checkpoint_of(t.digest()).unwrap())
+        .max()
+        .unwrap();
+    network.wait_for("anchovy to commit the checkpoints", |network| {
+        let store = &network.anchovy.node().perpetual.store;
+        (store.committed_checkpoint().unwrap() >= Some(last)).then_some(())
+    });
+    for sui in &network.sui {
+        sui.stop();
+    }
+
+    let mut config = FullnodeConfigBuilder::new().build(&mut OsRng, &network.config);
+    let anchovy = network.config.validator_configs[2]
+        .p2p_config
+        .external_address
+        .clone();
+    config
+        .p2p_config
+        .seed_peers
+        .retain(|peer| Some(&peer.address) == anchovy.as_ref());
+    assert_eq!(config.p2p_config.seed_peers.len(), 1);
+    let full_node = sui_swarm::memory::Node::new(config);
+    network.runtime.block_on(full_node.start()).unwrap();
+    let state = full_node.get_node_handle().unwrap().state();
+    network.wait_for("the full node to execute the checkpoints", |_| {
+        state
+            .get_checkpoint_store()
+            .get_highest_executed_checkpoint_seq_number()
+            .unwrap()
+            .filter(|executed| *executed >= last)
+    });
+    for (transaction, effects) in transactions.iter().zip(&effects) {
+        let synced = state
+            .get_transaction_cache_reader()
+            .get_executed_effects(transaction.digest())
+            .unwrap();
+        assert_eq!(&synced, effects);
+    }
+    full_node.stop();
     drop(network.runtime);
 }

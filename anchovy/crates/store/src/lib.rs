@@ -81,6 +81,17 @@ pub struct Removed {
     pub removal: Removal,
 }
 
+/// A checkpoint as it is committed.
+pub struct CheckpointRecord {
+    pub seq: u64,
+    /// As the pipeline encodes it.
+    pub checkpoint: Vec<u8>,
+    /// `CertifiedCheckpointSummary` BCS.
+    pub certified: Vec<u8>,
+    pub digest: Digest,
+    pub contents_digest: Digest,
+}
+
 /// What one transaction changes, applied atomically.
 #[derive(Default)]
 pub struct Commit {

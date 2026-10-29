@@ -170,6 +170,7 @@ impl Network {
             node::epoch::genesis(
                 &store,
                 &genesis.checkpoint,
+                genesis.certified.clone(),
                 genesis.objects.iter().map(|o| o.digest().into_inner()),
             );
             stakes = EpochRecord::load(&store)

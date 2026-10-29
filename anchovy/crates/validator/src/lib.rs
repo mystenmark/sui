@@ -14,6 +14,7 @@ pub mod processors;
 pub mod proto;
 pub mod randomness;
 pub mod server;
+pub mod state_sync;
 pub mod submit;
 pub mod tls;
 
