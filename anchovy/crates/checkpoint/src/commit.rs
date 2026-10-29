@@ -4,6 +4,7 @@
 //! Committing certified checkpoints to the database
 //! (`docs/writeback_cache_design.md`, Commit path).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use messages::fast::Bump;
@@ -24,7 +25,12 @@ use workqueue::Processor;
 /// it claiming outputs a crash lost. Once the epoch's last checkpoint has
 /// committed, says so: the epoch is over. The start of a `CheckpointExecutor`.
 ///
-/// Inward: `CheckpointAggregator`: `Vec<CertifiedCheckpoint>`, in sequence
+/// Each checkpoint commits once, in sequence order, with whichever
+/// certificate comes first: any quorum's certificate over the summary built
+/// here is as good as another.
+///
+/// Inward: `CheckpointAggregator`, and the built waiter's fork check of
+/// those fetched from peers: `Vec<CertifiedCheckpoint>`, each in sequence
 /// order.
 ///
 /// Reads: the checkpoint store. Prunes: the chunk table. Writes: the object
@@ -40,6 +46,8 @@ pub struct CheckpointCommitter {
     backpressure: Arc<Backpressure>,
     /// The epoch's last checkpoint, once committed.
     ended: watch::Sender<Option<u64>>,
+    /// Certified past the next to commit, by sequence number.
+    waiting: BTreeMap<u64, CertifiedCheckpoint>,
 }
 
 impl CheckpointCommitter {
@@ -60,6 +68,7 @@ impl CheckpointCommitter {
             consensus_output,
             backpressure,
             ended,
+            waiting: BTreeMap::new(),
         }
     }
 
@@ -94,9 +103,16 @@ impl Processor for CheckpointCommitter {
     type Output = ();
 
     fn process(&mut self, certified: Vec<CertifiedCheckpoint>, bump: &mut Bump) -> Option<()> {
-        for checkpoint in &certified {
-            self.commit(checkpoint, bump);
+        let mut next = self.checkpoints.last_committed() + 1;
+        for checkpoint in certified {
+            if checkpoint.seq >= next {
+                self.waiting.entry(checkpoint.seq).or_insert(checkpoint);
+            }
+        }
+        while let Some(checkpoint) = self.waiting.remove(&next) {
+            self.commit(&checkpoint, bump);
             bump.reset();
+            next += 1;
         }
         None
     }

@@ -422,11 +422,18 @@ pub enum BuiltWaitItem {
         certified: CertifiedCheckpoint,
         local: Option<Arc<BuiltCheckpoint>>,
     },
+    /// A certified checkpoint fetched from peers, waiting for the local one
+    /// to compare it with, then to be committed. `SyncedScheduler` → built
+    /// waiter → fork check → `CheckpointCommitter`.
+    Synced {
+        certified: CertifiedCheckpoint,
+        local: Option<Arc<BuiltCheckpoint>>,
+    },
 }
 
 impl waiter::Receive<Arc<BuiltCheckpoint>> for BuiltWaitItem {
     fn receive(&mut self, _: usize, built: Arc<BuiltCheckpoint>) {
-        if let BuiltWaitItem::Certified { local, .. } = self {
+        if let BuiltWaitItem::Certified { local, .. } | BuiltWaitItem::Synced { local, .. } = self {
             *local = Some(built);
         }
     }
@@ -440,7 +447,9 @@ pub type BuiltCommand =
 pub type BuiltWaits = workqueue::Queue<BuiltCommand>;
 
 /// A certified checkpoint. `CheckpointAggregator` → state sync, and →
-/// `CheckpointCommitter`, in sequence order.
+/// `CheckpointCommitter`, in sequence order; or fetched from peers,
+/// `SyncedScheduler` → built waiter → `CheckpointCommitter`, in sequence
+/// order.
 #[derive(Debug, Clone)]
 pub struct CertifiedCheckpoint {
     pub seq: u64,

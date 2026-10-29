@@ -88,7 +88,7 @@ pub(crate) fn spawn(
         w.one("checkpoint-waiter", i.checkpoint_waits, |p, _| WaiterProcessor::new(p.chunk_availability()),           into(&q.contents, "contents")),
         w.one("contents",          i.contents,         |p, q| p.contents(q.hasher, q.built_waits),                    drop),
         w.one("state-hasher",      i.hasher,           |p, q| p.state_hasher(q.closer),                               drop),
-        w.one("built-waiter",      i.built_waits,      |p, _| WaiterProcessor::new(p.built_availability()),           BuiltRouter { epoch_closer: q.closer.clone(), aggregator: q.aggregator.clone() }),
+        w.one("built-waiter",      i.built_waits,      |p, _| WaiterProcessor::new(p.built_availability()),           BuiltRouter { epoch_closer: q.closer.clone(), aggregator: q.aggregator.clone(), committer: q.committer.clone() }),
         w.one("epoch-closer",      i.closer,           |p, q| p.epoch_closer(q.resolver, q.effects_waits, q.hasher, q.summary), drop),
         w.one("summary",           i.summary,          |p, q| p.summary(q.built_waits),                               drop),
         w.one("aggregator",        i.aggregator,       move |p, q| p.aggregator(state_sync, q.built_waits),           into(&q.committer, "committer")),

@@ -324,6 +324,11 @@ impl CheckpointStore {
         Some(Arc::new(BuiltCheckpoint::decode(&bytes)))
     }
 
+    /// The last checkpoint committed.
+    pub fn last_committed(&self) -> u64 {
+        self.committed.load(Ordering::Acquire)
+    }
+
     /// Checkpoint `seq` has committed: those before it are read from the
     /// object store from now on.
     pub fn committed(&self, seq: u64) {
