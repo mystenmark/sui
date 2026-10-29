@@ -7,6 +7,7 @@
 //! checkpoints it built, and on a certificate of one it did not build (a
 //! fork) it panics, aborting the test. So a test needs only wait for
 //! anchovy to certify what it submitted.
+//! (One test splits the stake otherwise, to need anchovy's signatures.)
 
 #[path = "../../node/tests/genesis/mod.rs"]
 mod genesis;
@@ -33,8 +34,9 @@ use sui_protocol_config::{
 };
 use sui_swarm_config::genesis_config::ValidatorGenesisConfigBuilder;
 use sui_swarm_config::network_config_builder::ConfigBuilder;
+use sui_types::base_types::AuthorityName;
 use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
-use sui_types::committee::CommitteeTrait as _;
+use sui_types::committee::{Committee, CommitteeTrait as _};
 use sui_types::crypto::{AccountKeyPair, NetworkKeyPair};
 use sui_types::digests::TransactionDigest;
 use sui_types::effects::TransactionEffects;
@@ -56,6 +58,7 @@ use sui_types::{
 };
 use tokio::runtime::Runtime;
 use validator::Validator;
+use validator::consensus::dkg::DkgSetup;
 use validator::current::CurrentEpoch;
 use validator::pipeline::items::CertifiedCheckpoint;
 use validator::pipeline::tables::CheckpointStore;
@@ -105,6 +108,9 @@ struct Network {
     sender: SuiAddress,
     key: AccountKeyPair,
     coins: Vec<ObjectID>,
+    committee: Committee,
+    /// The validators' names, sui's in order, then anchovy's.
+    names: Vec<AuthorityName>,
 }
 
 /// The secret of an Ed25519 key pair, as anchovy holds it.
@@ -262,8 +268,22 @@ impl Network {
 
     /// As `new`, its genesis and sui validators configured by `configure`.
     fn configured(configure: impl FnOnce(ConfigBuilder) -> ConfigBuilder) -> Network {
+        let network = Network::with_stakes([3 * STAKE, 3 * STAKE, STAKE], configure);
+        let (anchovy, sui) = network.names.split_last().unwrap();
+        let votes = |name| network.committee.weight(name);
+        assert!(sui.iter().map(votes).sum::<u64>() >= network.committee.quorum_threshold());
+        assert!(votes(anchovy) < network.committee.validity_threshold());
+        network
+    }
+
+    /// Three validators staking `stakes`, the last anchovy's, the genesis
+    /// and sui validators configured by `configure`.
+    fn with_stakes(
+        stakes: [u64; 3],
+        configure: impl FnOnce(ConfigBuilder) -> ConfigBuilder,
+    ) -> Network {
         telemetry_subscribers::init_for_testing();
-        let validators = [3 * STAKE, 3 * STAKE, STAKE]
+        let validators = stakes
             .into_iter()
             .map(|stake| {
                 ValidatorGenesisConfigBuilder::new()
@@ -276,10 +296,11 @@ impl Network {
         let (sui_configs, [anchovy_config]) = config.validator_configs.split_at(2) else {
             unreachable!("three validators");
         };
-        let committee = config.genesis.committee();
-        let votes = |c: &NodeConfig| committee.weight(&c.protocol_public_key());
-        assert!(sui_configs.iter().map(votes).sum::<u64>() >= committee.quorum_threshold());
-        assert!(votes(anchovy_config) < committee.validity_threshold());
+        let names = config
+            .validator_configs
+            .iter()
+            .map(NodeConfig::protocol_public_key)
+            .collect();
 
         let runtime = Runtime::new().unwrap();
         let sui: Vec<_> = sui_configs
@@ -318,7 +339,35 @@ impl Network {
             sender,
             key,
             coins,
+            committee: config.genesis.committee(),
+            names,
         }
+    }
+
+    /// Each validator's reduced weight in the random beacon, in `names`'
+    /// order, and the threshold of signatures and shares, t'.
+    fn beacon_weights(&self) -> (Vec<u16>, u16) {
+        let members: Vec<([u8; 96], u64)> = self
+            .committee
+            .voting_rights
+            .iter()
+            .map(|(name, votes)| (name.0, *votes))
+            .collect();
+        let config = ProtocolConfig::get_for_version(
+            ProtocolVersion::new(self.protocol_versions().0),
+            Chain::Unknown,
+        );
+        let setup = DkgSetup::new(&members, &config, &[0; 32], 0);
+        let weights = self
+            .names
+            .iter()
+            .map(|name| {
+                let id = members.iter().position(|(n, _)| *n == name.0).unwrap();
+                let node = setup.nodes().iter().find(|node| usize::from(node.id) == id);
+                node.unwrap().weight
+            })
+            .collect();
+        (weights, setup.threshold())
     }
 
     /// Object `id`, as anchovy has it.
@@ -1397,6 +1446,41 @@ fn randomness_spans_epochs_alike() {
             .map(|i| network.use_random(i, package, None))
             .collect();
         network.execute_together(&uses.iter().collect::<Vec<_>>());
+    }
+    let later = network.transfer(0);
+    network.execute(&later);
+    drop(network.runtime);
+}
+
+/// Sui validator A and anchovy with 3,334 votes each, sui validator B with
+/// 3,332: once DKG completes with all three, B stops. A and anchovy then
+/// have a quorum only together, and in the beacon each weighs less than t'
+/// alone: every round takes both sides' signatures, and every checkpoint
+/// both sides' votes. A fork stalls the network rather than panicking.
+#[test]
+fn randomness_takes_signatures_from_both_alike() {
+    let mut network = Network::with_stakes([3 * STAKE, STAKE, 3 * STAKE], |builder| builder);
+    let votes = |i: usize| network.committee.weight(&network.names[i]);
+    let quorum = network.committee.quorum_threshold();
+    assert!(votes(0) < quorum && votes(2) < quorum && votes(0) + votes(2) >= quorum);
+    let (weights, threshold) = network.beacon_weights();
+    assert!(weights[0] < threshold && weights[2] < threshold);
+    assert!(weights[0] + weights[2] >= threshold);
+    // DKG completes only with all three's confirmations.
+    assert!(weights[0] + weights[2] < 2 * threshold - 1);
+
+    let package = network.object_basics(0);
+    let first = network.use_random(1, package, None);
+    network.execute(&first);
+    network.sui[1].stop();
+    for round in 0..3 {
+        let uses: Vec<_> = (1..3)
+            .map(|i| network.use_random(i, package, None))
+            .collect();
+        network.execute_together(&uses.iter().collect::<Vec<_>>());
+        if round == 1 {
+            network.anchovy.restart();
+        }
     }
     let later = network.transfer(0);
     network.execute(&later);
