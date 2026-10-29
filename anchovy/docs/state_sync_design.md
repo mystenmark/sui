@@ -74,16 +74,51 @@ there is no mode to switch:
 
 - The **checkpoint fetcher** is perpetual and runs on the p2p endpoint. It
   polls peers' `GetCheckpointAvailability` every 5 s (R2.3), and fetches
-  and verifies summaries past the committed checkpoint (R2.6). It fetches
-  contents only for a certified checkpoint the node has not built itself.
-- The **synced scheduler**, per epoch, turns each verified checkpoint into
-  executor work items, in checkpoint order.
-- The **executor** runs consensus and synced items alike. It is the single
-  claim point: it checks whether a transaction executed already before
-  running it. With several workers, it would also keep the digests in
-  flight.
-- The **committer** commits a checkpoint once, by whichever path finishes
-  it first. The other path compares its checkpoint with the committed one.
+  and verifies summaries past the committed checkpoint (R2.6).
+- The **synced scheduler**, per epoch, takes each verified checkpoint in
+  order. Under the checkpoint lock, it either compares it with the one
+  built locally, or fetches its contents and turns it into executor work
+  items.
+- The **executor** runs consensus and synced items alike.
+
+### The checkpoint lock
+
+The two paths never work on the same checkpoint at once. Per epoch, a
+mutex holds:
+
+- `consensus`: the highest sequence number the consensus path has claimed;
+- `synced`: the sequence number the synced scheduler is executing, if any.
+
+The commit handler assigns each chunk its checkpoint as it handles the
+commit, so the consensus path knows its claim exactly:
+
+- **Consensus.** Before handling a commit, it claims up to the open
+  checkpoint plus the most checkpoints the commit can cut, which its
+  transaction count and `max_transactions_per_checkpoint` bound. It waits
+  while `synced` lies in that range. After handling the commit, `consensus`
+  is the open checkpoint. A checkpoint stays claimed until it is built;
+  the built waiter's `CheckpointBuilt(seq)` is the release.
+- **Synced.** For checkpoint K:
+  - K ≤ `consensus`: the consensus path has it. The scheduler waits for
+    `CheckpointBuilt(K)` and checks that the built digest is the certified
+    one (R5.1). It fetches no contents and executes nothing.
+  - K > `consensus`: it sets `synced` to K, executes and commits K, then
+    clears `synced`.
+
+What this buys:
+
+- A transaction is in one checkpoint, so the two paths never execute one
+  concurrently. A path can still find a transaction executed already, by
+  the other path earlier or before a restart, but never in flight.
+- Each checkpoint is committed by the path that claimed it. When the
+  consensus path later builds a checkpoint the synced path committed, it
+  compares.
+- In normal operation the synced path costs a summary fetch and a digest
+  comparison per checkpoint.
+
+The consensus path never skips a checkpoint the synced path executed:
+handling a commit only waits for the checkpoint in flight. It catches up
+behind, checking every transaction as below.
 
 ### Verifying (R3)
 
@@ -161,8 +196,9 @@ version, so balances the synced path has written ahead do not disturb it.
 whose settlement transactions are found executed and checked like any
 other.
 
-The checkpoint builder compares each checkpoint it builds with the
-committed one, as fork detection does now, and commits nothing.
+The checkpoint builder compares each checkpoint it builds with the one
+the synced path committed, as fork detection does now, and commits
+nothing.
 
 ### The end of an epoch
 
