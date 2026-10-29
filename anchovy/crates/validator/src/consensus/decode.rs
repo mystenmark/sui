@@ -51,6 +51,8 @@ pub struct DecodedCommit {
     pub leader: BlockRef,
     pub timestamp_ms: u64,
     pub digest: [u8; 32],
+    /// Its blocks, in commit order.
+    pub blocks: Vec<BlockRef>,
     pub transactions: Vec<CommittedTransaction>,
     /// The execution time observations it carries, in commit order.
     pub observations: Vec<SharedObservations>,
@@ -207,6 +209,7 @@ impl CommitDecoder {
             leader,
             timestamp_ms,
             digest,
+            blocks: blocks.iter().map(|b| b.reference).collect(),
             transactions: Vec::new(),
             observations: Vec::new(),
             jwks: Vec::new(),

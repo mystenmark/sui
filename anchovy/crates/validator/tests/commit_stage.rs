@@ -176,6 +176,7 @@ fn commit(index: u32, round: u32, timestamp_ms: u64, transactions: &[Vec<u8>]) -
         leader: block,
         timestamp_ms,
         digest: [index as u8; 32],
+        blocks: vec![block],
         transactions: transactions
             .iter()
             .enumerate()

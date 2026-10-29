@@ -182,6 +182,7 @@ fn commit(index: u32, transactions: &[Claimed<'_>]) -> DecodedCommit {
         leader: block,
         timestamp_ms: 1000 * u64::from(index),
         digest: [index as u8; 32],
+        blocks: vec![block],
         transactions: transactions
             .iter()
             .enumerate()

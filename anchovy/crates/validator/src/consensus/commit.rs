@@ -18,7 +18,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ::consensus::{BlockRef, TransactionIndex};
+use ::consensus::{BlockRef, PING_TRANSACTION_INDEX, TransactionIndex};
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest as _};
 use containers::Bump;
@@ -1645,6 +1645,7 @@ impl CommitStage {
         let rejected = std::mem::take(&mut commit.rejected);
         let mut positions = containers::Vec::with_capacity_in(commit.transactions.len(), bump);
         positions.extend(commit.transactions.iter().map(|t| (t.block, t.index)));
+        let blocks = std::mem::take(&mut commit.blocks);
         let commit_index = commit.commit_index;
         let decided = self.decide(commit, bump)?;
         let record = CommitRecord {
@@ -1674,7 +1675,13 @@ impl CommitStage {
                         ConsensusTxStatus::Finalized
                     };
                     (b, i, status)
-                })),
+                }))
+                // A ping waits for its block's commit.
+                .chain(
+                    blocks
+                        .into_iter()
+                        .map(|b| (b, PING_TRANSACTION_INDEX, ConsensusTxStatus::Finalized)),
+                ),
             bump,
         );
         self.emit(decided, bump);
