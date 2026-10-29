@@ -7,6 +7,7 @@
 //! checkpoints it built, and on a certificate of one it did not build (a
 //! fork) it panics, aborting the test. So a test needs only wait for
 //! anchovy to certify what it submitted.
+//! (One test splits the stake otherwise, to need anchovy's signatures.)
 
 #[path = "../../node/tests/genesis/mod.rs"]
 mod genesis;
@@ -33,8 +34,9 @@ use sui_protocol_config::{
 };
 use sui_swarm_config::genesis_config::ValidatorGenesisConfigBuilder;
 use sui_swarm_config::network_config_builder::ConfigBuilder;
+use sui_types::base_types::AuthorityName;
 use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
-use sui_types::committee::CommitteeTrait as _;
+use sui_types::committee::{Committee, CommitteeTrait as _};
 use sui_types::crypto::{AccountKeyPair, NetworkKeyPair};
 use sui_types::digests::TransactionDigest;
 use sui_types::effects::TransactionEffects;
@@ -56,6 +58,7 @@ use sui_types::{
 };
 use tokio::runtime::Runtime;
 use validator::Validator;
+use validator::consensus::dkg::DkgSetup;
 use validator::current::CurrentEpoch;
 use validator::pipeline::items::CertifiedCheckpoint;
 use validator::pipeline::tables::CheckpointStore;
@@ -105,6 +108,9 @@ struct Network {
     sender: SuiAddress,
     key: AccountKeyPair,
     coins: Vec<ObjectID>,
+    committee: Committee,
+    /// The validators' names, sui's in order, then anchovy's.
+    names: Vec<AuthorityName>,
 }
 
 /// The secret of an Ed25519 key pair, as anchovy holds it.
@@ -262,27 +268,23 @@ impl Network {
 
     /// As `new`, its genesis and sui validators configured by `configure`.
     fn configured(configure: impl FnOnce(ConfigBuilder) -> ConfigBuilder) -> Network {
-        Network::with_stakes(&[3 * STAKE, 3 * STAKE, STAKE], configure)
+        let network = Network::with_stakes([3 * STAKE, 3 * STAKE, STAKE], configure);
+        let (anchovy, sui) = network.names.split_last().unwrap();
+        let votes = |name| network.committee.weight(name);
+        assert!(sui.iter().map(votes).sum::<u64>() >= network.committee.quorum_threshold());
+        assert!(votes(anchovy) < network.committee.validity_threshold());
+        network
     }
 
-    /// Four validators of equal stake, the last anchovy's: the three sui
-    /// validators complete the random beacon's DKG without anchovy, which
-    /// takes no part yet (reduced, each weighs 125 of 500; confirmations
-    /// need 333). Configured by `configure`.
-    fn with_beacon(configure: impl FnOnce(ConfigBuilder) -> ConfigBuilder) -> Network {
-        Network::with_stakes(&[STAKE; 4], configure)
-    }
-
-    /// A network of validators of `stakes`, the last anchovy's, configured
-    /// by `configure`.
+    /// Three validators staking `stakes`, the last anchovy's, the genesis
+    /// and sui validators configured by `configure`.
     fn with_stakes(
-        stakes: &[u64],
+        stakes: [u64; 3],
         configure: impl FnOnce(ConfigBuilder) -> ConfigBuilder,
     ) -> Network {
         telemetry_subscribers::init_for_testing();
         let validators = stakes
-            .iter()
-            .copied()
+            .into_iter()
             .map(|stake| {
                 ValidatorGenesisConfigBuilder::new()
                     .with_stake(stake)
@@ -291,14 +293,14 @@ impl Network {
             .collect();
         let config =
             configure(ConfigBuilder::new_with_temp_dir().with_validators(validators)).build();
-        let (sui_configs, [anchovy_config]) = config.validator_configs.split_at(stakes.len() - 1)
-        else {
-            unreachable!("anchovy's validator last");
+        let (sui_configs, [anchovy_config]) = config.validator_configs.split_at(2) else {
+            unreachable!("three validators");
         };
-        let committee = config.genesis.committee();
-        let votes = |c: &NodeConfig| committee.weight(&c.protocol_public_key());
-        assert!(sui_configs.iter().map(votes).sum::<u64>() >= committee.quorum_threshold());
-        assert!(votes(anchovy_config) < committee.validity_threshold());
+        let names = config
+            .validator_configs
+            .iter()
+            .map(NodeConfig::protocol_public_key)
+            .collect();
 
         let runtime = Runtime::new().unwrap();
         let sui: Vec<_> = sui_configs
@@ -337,7 +339,35 @@ impl Network {
             sender,
             key,
             coins,
+            committee: config.genesis.committee(),
+            names,
         }
+    }
+
+    /// Each validator's reduced weight in the random beacon, in `names`'
+    /// order, and the threshold of signatures and shares, t'.
+    fn beacon_weights(&self) -> (Vec<u16>, u16) {
+        let members: Vec<([u8; 96], u64)> = self
+            .committee
+            .voting_rights
+            .iter()
+            .map(|(name, votes)| (name.0, *votes))
+            .collect();
+        let config = ProtocolConfig::get_for_version(
+            ProtocolVersion::new(self.protocol_versions().0),
+            Chain::Unknown,
+        );
+        let setup = DkgSetup::new(&members, &config, &[0; 32], 0);
+        let weights = self
+            .names
+            .iter()
+            .map(|name| {
+                let id = members.iter().position(|(n, _)| *n == name.0).unwrap();
+                let node = setup.nodes().iter().find(|node| usize::from(node.id) == id);
+                node.unwrap().weight
+            })
+            .collect();
+        (weights, setup.threshold())
     }
 
     /// Object `id`, as anchovy has it.
@@ -1330,10 +1360,12 @@ fn deferrals_hold_the_epoch_open_alike() {
 
 /// Transactions using randomness wait for DKG, then for commits with a
 /// randomness round, whose update heads them in a checkpoint of their own,
-/// alike: the update's effects carry the round's random bytes.
+/// alike: the update's effects carry the round's random bytes. Reduced, the
+/// sui validators weigh 350 of 525, short of the 351 confirmations need:
+/// DKG completes only with anchovy's confirmation.
 #[test]
 fn randomness_waits_for_its_round_alike() {
-    let mut network = Network::with_beacon(|builder| builder);
+    let mut network = Network::new();
     let package = network.object_basics(0);
     for round in 0..3 {
         let uses: Vec<_> = (0..3)
@@ -1354,12 +1386,12 @@ fn randomness_waits_for_its_round_alike() {
 }
 
 /// Without DKG, a transaction using randomness waits until DKG times out,
-/// then is cancelled, reading the randomness state as unavailable, alike.
-/// In the usual network sui cannot complete DKG without anchovy.
+/// then is cancelled, reading the randomness state as unavailable, alike:
+/// timed out before any confirmation can be committed.
 #[test]
 fn randomness_is_cancelled_alike_once_dkg_fails() {
     let _timeout = ProtocolConfig::apply_overrides_for_testing(|_, mut config| {
-        config.set_random_beacon_dkg_timeout_round_for_testing(40);
+        config.set_random_beacon_dkg_timeout_round_for_testing(1);
         config
     });
     let mut network = Network::new();
@@ -1391,7 +1423,7 @@ fn randomness_is_cancelled_alike_once_dkg_fails() {
 #[test]
 fn congested_randomness_is_deferred_alike() {
     let _budget = no_congestion_budget(10);
-    let mut network = Network::with_beacon(|builder| builder);
+    let mut network = Network::new();
     let package = network.object_basics(0);
     let shared = shared_coin(&mut network, 1);
     let writes: Vec<_> = (0..3)
@@ -1404,18 +1436,51 @@ fn congested_randomness_is_deferred_alike() {
 }
 
 /// Randomness across epochs: each runs its own DKG and counts rounds from
-/// 0, and deferred randomness holds an epoch open, alike. The first epoch
-/// must outlast starting four validators under load: the sui validators, a
-/// quorum without anchovy, would leave it, and anchovy cannot catch up.
+/// 0, and deferred randomness holds an epoch open, alike.
 #[test]
 fn randomness_spans_epochs_alike() {
-    let mut network = Network::with_beacon(|builder| builder.with_epoch_duration(30_000));
+    let mut network = Network::with_epoch_duration(Some(10_000));
     let package = network.object_basics(0);
     while network.anchovy.epoch() < 2 {
         let uses: Vec<_> = (1..3)
             .map(|i| network.use_random(i, package, None))
             .collect();
         network.execute_together(&uses.iter().collect::<Vec<_>>());
+    }
+    let later = network.transfer(0);
+    network.execute(&later);
+    drop(network.runtime);
+}
+
+/// Sui validator A and anchovy with 3,334 votes each, sui validator B with
+/// 3,332: once DKG completes with all three, B stops. A and anchovy then
+/// have a quorum only together, and in the beacon each weighs less than t'
+/// alone: every round takes both sides' signatures, and every checkpoint
+/// both sides' votes. A fork stalls the network rather than panicking.
+#[test]
+fn randomness_takes_signatures_from_both_alike() {
+    let mut network = Network::with_stakes([3 * STAKE, STAKE, 3 * STAKE], |builder| builder);
+    let votes = |i: usize| network.committee.weight(&network.names[i]);
+    let quorum = network.committee.quorum_threshold();
+    assert!(votes(0) < quorum && votes(2) < quorum && votes(0) + votes(2) >= quorum);
+    let (weights, threshold) = network.beacon_weights();
+    assert!(weights[0] < threshold && weights[2] < threshold);
+    assert!(weights[0] + weights[2] >= threshold);
+    // DKG completes only with all three's confirmations.
+    assert!(weights[0] + weights[2] < 2 * threshold - 1);
+
+    let package = network.object_basics(0);
+    let first = network.use_random(1, package, None);
+    network.execute(&first);
+    network.sui[1].stop();
+    for round in 0..3 {
+        let uses: Vec<_> = (1..3)
+            .map(|i| network.use_random(i, package, None))
+            .collect();
+        network.execute_together(&uses.iter().collect::<Vec<_>>());
+        if round == 1 {
+            network.anchovy.restart();
+        }
     }
     let later = network.transfer(0);
     network.execute(&later);

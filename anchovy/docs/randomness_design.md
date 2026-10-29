@@ -13,8 +13,8 @@ Phase 18a: anchovy follows the random beacon without holding shares.
 - It receives the beacon's signatures that sui validators push over
   anemo, verifies them, and executes each round's `RandomnessStateUpdate`.
 
-Phase 18b, later: anchovy takes part. It deals and confirms in DKG, and
-partial-signs and pushes each round. 18b adds a key holder and an anemo
+Phase 18b: anchovy takes part. It deals and confirms in DKG, and
+partial-signs and pushes each round (§6). 18b adds a key holder and an anemo
 client; nothing of 18a changes.
 
 Dependencies: `fastcrypto-tbls` at the fastcrypto revision already in
@@ -90,7 +90,8 @@ randomness, in one pass, so the update writes `0x8` before its readers
 checkpoint queue, and **then** pushes the randomness part's chunks, when
 the commit has a round or `DkgFailed` cancellations (R5.6). Those chunks
 wait in the queue as the first roots of the next checkpoint. The epoch's
-last commit forces a flush after them. The commit's recorded height is
+last commit forces a flush before them, and again after them, so they make
+the epoch's last checkpoint on their own (R5.6.4). The commit's recorded height is
 its last chunk's, whichever part that is. A commit whose randomness chunks
 are pending is not `drained`, so its record is not the restart point.
 That costs replay, not correctness.
@@ -134,17 +135,41 @@ is part of its chunk and its settlement.
   update's bytes go to the collector as a full signature, verified against
   `c0` like any other. The members are connected already: they push to it.
 
-## 6. Compat
+## 6. Taking part (phase 18b)
 
-- With 18a, anchovy deals nothing. The beacon scenarios run four
-  validators of equal stake, three of them sui's: reduced, each weighs 125
-  of 500, so the sui validators reach 2t'−1 = 333 alone. The other
-  scenarios keep the three-validator network, where DKG fails at its
-  timeout. Phase 18b can return the beacon scenarios to three validators.
+- **The party.** `DkgParty`, a processor, holds a `dkg_v1::Party` made from
+  the protocol key's secret. When it acts follows the commit handler's
+  observer, which every validator runs alike: `CommitStage` sends it each
+  message the handler processed (it decrypts its shares), the merge (it
+  merges the same messages and submits its confirmation, with its
+  complaints), and the completion (it completes, with its shares, which go
+  to the collector). At start it deals and submits its message, unless one
+  of its messages was sequenced or DKG merged already. Restarted,
+  `CommitStage` replays the state the handler restored, then says whether
+  its message and confirmation were sequenced: decryption is
+  deterministic, so the shares come back from the protocol key alone.
+- **Signing.** `CommitStage` sends the collector each round reserved, and
+  at start the last 50 reserved, which may lack bytes. The collector
+  partial-signs each with this member's shares; its partials count toward
+  the round's like a peer's.
+- **Pushing.** Every 5 s the p2p endpoint asks the collector what to push
+  (a queue entry with a oneshot): this member's partials of each round
+  without bytes, or the full signature once known, for rounds down to 20
+  below the lowest without bytes. It sends them to every other member over
+  `sui.Randomness/SendSignatures`, dialing a member's p2p address, from the
+  system state, if not connected.
+
+## 7. Compat
+
+- The beacon scenarios run the usual three validators. Reduced, the sui
+  validators weigh 350 of 525, short of the 351 confirmations need, so DKG
+  completes only with anchovy's confirmation. The DKG failure scenario
+  times DKG out at round 1, before any confirmation can be committed.
+- consensus-glue's four anchovy validators run their p2p endpoints: they
+  complete DKG and sign rounds among themselves.
 - The sui validators are a quorum without anchovy, and anchovy cannot
   catch up an epoch they left. So a compat test claims four of nextest's
-  threads (`.config/nextest.toml`), and the epoch scenario's first epoch
-  outlasts starting four validators under load (30 s).
+  threads (`.config/nextest.toml`).
 - New scenarios:
   - randomness-using transactions before DKG completes (deferred), then
     after (scheduled with the round's update);
@@ -159,8 +184,6 @@ is part of its chunk and its settlement.
 
 ## Left out
 
-- Anchovy's own shares, its DKG messages and confirmations, and pushing
-  partial signatures: 18b.
 - Peer blocking for bad partial signatures (R5.2): it protects sui's
   aggregation from load, and anchovy drops bad partials without blocking.
 - The consensus observer relay (R6.4).

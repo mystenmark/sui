@@ -244,6 +244,32 @@ impl Dkg {
         &self.status
     }
 
+    /// The messages processed, by sender.
+    pub fn processed(&self) -> impl Iterator<Item = &DkgMessage> {
+        self.processed.iter().flatten()
+    }
+
+    /// The senders of the messages merged, once merged.
+    pub fn used(&self) -> Option<Vec<u16>> {
+        self.used
+            .as_ref()
+            .map(|used| used.iter().map(|m| m.sender).collect())
+    }
+
+    /// The confirmations kept, by sender.
+    pub fn confirmations(&self) -> Vec<DkgConfirmation> {
+        self.confirmations.iter().flatten().cloned().collect()
+    }
+
+    /// Whether a message, and a confirmation, of the member at `author`'s
+    /// have been sequenced.
+    pub fn seen(&self, author: u32) -> (bool, bool) {
+        (
+            self.messages_seen[author as usize],
+            self.confirmations_seen[author as usize],
+        )
+    }
+
     /// Takes a commit's DKG traffic, in commit order, then advances: the
     /// reference's `process_dkg_updates`. `round` is the commit's leader
     /// round. What changed is returned for the consensus output.

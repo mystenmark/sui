@@ -474,6 +474,8 @@ impl Network {
         while let Ok(guard) = self.lanes.0.try_recv() {
             if is_capability_notification(&guard) {
                 self.announced.push(guard);
+            } else if is_dkg(&guard) {
+                // The tests run no random beacon: its DKG never completes.
             } else {
                 self.pending.push(guard);
             }
@@ -1067,6 +1069,22 @@ async fn wait(
     .expect("answered")
     .unwrap();
     response.into_inner().inner.unwrap()
+}
+
+/// Whether `guard` is the pipeline's DKG message or confirmation.
+fn is_dkg(guard: &TransactionsGuard) -> bool {
+    guard.transactions.iter().all(|bytes| {
+        messages::Message::<messages::consensus::ConsensusTransaction<'static>>::parse(
+            bytes.clone(),
+        )
+        .is_ok_and(|t| {
+            matches!(
+                t.get().kind(),
+                messages::consensus::ConsensusTransactionKind::RandomnessDkgMessage(_)
+                    | messages::consensus::ConsensusTransactionKind::RandomnessDkgConfirmation(_)
+            )
+        })
+    })
 }
 
 /// Whether `guard` is the pipeline's capability notification.
