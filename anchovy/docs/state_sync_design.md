@@ -7,8 +7,8 @@ reference as RCF R*n*.
 
 Scope:
 1. **Serving** fullnodes and lagging sui validators (R6 scenario i). Built.
-2. **Catching up** the rest of an epoch that a quorum has left (R6 scenario
-   ii, R5.3).
+2. **Catching up** a lagging consensus, or the rest of an epoch that a
+   quorum has left (R6 scenario ii, R5.3).
 
 Running as a fullnode (scenario iii) is out of scope, though the synced
 epoch below is most of it.
@@ -41,53 +41,49 @@ them by polling every 5 s instead.
 
 When a quorum reconfigures into epoch N+1, it stops epoch N's consensus. A
 validator whose consensus has not yet delivered the commits behind N's
-last checkpoints can never get them. The reference catches it up by
-executing the certified checkpoints it fetches from peers, transaction by
-transaction, with versions taken from their effects (R4, R5.3).
+last checkpoints can never get them. Less drastically, a validator whose
+consensus lags falls behind the certified chain. The reference executes
+certified checkpoints fetched from peers, with versions taken from their
+effects (R4, R5.3), alongside consensus (R5.1).
 
-### Two modes, never mixed within one run of an epoch
+### A validator validates
 
-An epoch runs in one of two modes:
+Executing a certified checkpoint keeps a node from falling behind, but it
+takes the quorum's word. A validator must still perform every action the
+quorum performed, and notice if the quorum deviated from the protocol.
+So:
 
-- **consensus**, as today;
-- **synced**: the rest of the epoch is executed from certified checkpoints
-  fetched from peers, without consensus.
+- **The consensus path always runs** over every commit consensus delivers,
+  including funds reservation, whether or not the synced path got there
+  first. The reference skips funds scheduling when checkpoint execution
+  is ahead (R4.5). Anchovy does not.
+- **Whichever path reaches a transaction second verifies it.** The synced
+  path checks the stored effects against the certified ones. The
+  consensus path checks every decision it made (versions, cancellation,
+  the funds verdict, the accumulator version) against the stored effects.
+  Any mismatch means the quorum or this node deviated, and it panics.
 
-A node switches from consensus to synced at a committed checkpoint, by
-dropping the consensus pipeline. It never runs both over one epoch at once.
+Only commits consensus never delivers, at an epoch's end, are taken on
+the quorum's certificate alone.
 
-The reference does mix them. A validator executes any certified checkpoint
-it has not built itself on the synced path, while consensus runs (R5.1). It
-avoids races through a per-transaction guard, and by initialising each
-object's next version under a mutex when either path first touches it
-(R4.7, R5.2).
+### Two front ends, one executor
 
-Anchovy has neither, by design. Shared inputs resolve through ordinals and
-the generation table, which only the executor writes. Executing synced
-transactions alongside would mean a second writer of that table, and
-keeping the consensus path's generations consistent with outputs it did not
-produce. Switching at a committed checkpoint keeps each pipeline the only
-writer of its state, and makes the switch an ordinary restart point:
-everything past the committed checkpoint is discarded and executed again.
+The synced path is a second front end into the consensus pipeline's input
+waiter, executor, effects waiter and committer. Nothing is torn down, and
+there is no mode to switch:
 
-### When to switch
-
-The **checkpoint fetcher** is perpetual and runs on the p2p endpoint. Like
-the reference's loop, it polls connected peers' `GetCheckpointAvailability`
-every 5 s (R2.3). It then fetches and verifies summaries past the running
-epoch's committed checkpoint (R2.6).
-
-The node switches the running epoch to synced when both hold:
-
-- the fetcher has verified the epoch's final checkpoint, the one with
-  `end_of_epoch_data`: a quorum has certified the epoch's end;
-- the running epoch has committed no checkpoint for `STALL` (30 s).
-
-The second condition keeps an ordinary lag from switching modes: consensus
-catches up a validator that is merely behind, as long as the epoch's
-commits are served. After a restart, a node starts in consensus mode and
-replays as today. If its epoch has ended on the network, it stalls, and the
-rule switches it.
+- The **checkpoint fetcher** is perpetual and runs on the p2p endpoint. It
+  polls peers' `GetCheckpointAvailability` every 5 s (R2.3), and fetches
+  and verifies summaries past the committed checkpoint (R2.6). It fetches
+  contents only for a certified checkpoint the node has not built itself.
+- The **synced scheduler**, per epoch, turns each verified checkpoint into
+  executor work items, in checkpoint order.
+- The **executor** runs consensus and synced items alike. It is the single
+  claim point: it checks whether a transaction executed already before
+  running it. With several workers, it would also keep the digests in
+  flight.
+- The **committer** commits a checkpoint once, by whichever path finishes
+  it first. The other path compares its checkpoint with the committed one.
 
 ### Verifying (R3)
 
@@ -103,67 +99,102 @@ rule switches it.
 Summaries and contents are held in memory, a bounded window ahead of the
 execution. After a restart they are fetched again.
 
-### The synced epoch
+### Synced items
 
-`SyncedEpoch` replaces the consensus pipeline for the rest of the epoch. It
-is per epoch: dropping it stops it. In checkpoint order, for each verified
-checkpoint after the committed one:
+A synced item carries the transaction, its certified effects digest, and
+everything the consensus path would have decided, taken from the
+certificate:
 
-1. **Execute** its transactions one at a time, in contents order, which is
-   causal. Each is executed by `Execution::execute_at` with:
-   - each consensus object at the input version its effects record
-     (R4.3). A cancelled transaction's marker versions come through as
-     `Input::Cancelled`. A stream-ended object comes through as
-     `Input::Ended`, whose deleting transaction is the one among the
-     effects' dependencies that deleted it at that version;
-   - the accumulator version taken from the checkpoint's barrier
-     settlement (R4.4);
-   - `Funds::Insufficient` if and only if the effects' status is
-     `InsufficientFundsForWithdraw` (R4.5).
+- each consensus object at the input version its effects record (R4.3),
+  as an exact `ObjectVersion` wait in the input waiter. It never touches
+  the generation table. A cancelled transaction's marker versions come
+  through as `Input::Cancelled`. A stream-ended object comes through as
+  `Input::Ended`, whose deleting transaction is the one among the effects'
+  dependencies that deleted it at that version;
+- the accumulator version, from the checkpoint's barrier settlement
+  (R4.4);
+- `Funds::Insufficient` if and only if the effects' status is
+  `InsufficientFundsForWithdraw` (R4.5). The synced path cannot wait for
+  the funds reserver without waiting for consensus.
 
-   The effects digest must equal the certified one. Otherwise this
-   validator has forked, and it panics (R4.10). The outputs go to the store
-   as uncommitted, as the executor's do.
-2. **Hash** the checkpoint's effects into the running state hash, as the
-   state hasher does.
-3. **Commit** the checkpoint with its certified summary: a
-   `BuiltCheckpoint` made from the summary, its contents and the totals the
-   summary states.
+If the transaction executed already, the executor checks that its stored
+effects digest is the certified one. Otherwise it executes it, and the
+effects digest must be the certified one (R4.10). Either way, a mismatch
+means this node forked, and it panics.
 
-The final checkpoint's change-epoch transaction runs last, after everything
-else in the epoch (RCF R3.3). Once it commits, the epoch has ended, and the
-node loop reconfigures as it does today. The next epoch starts in consensus
-mode. If that epoch has also ended on the network, the rule switches it
-too.
+**Start versions.** The consensus path takes generation 0 of a stream from
+`EpochStore::start_version`, which falls back to the live object when
+nothing in the epoch recorded it. That is right only before anything in
+the epoch has written the object. So a synced item records the start
+version of each consensus object it writes, from its effects' input
+version, before it executes. Every other version the consensus path reads,
+it reads by version, and the store keeps every version, so nothing the
+synced path writes ahead can disturb it.
 
-Execution is sequential. Parallel execution, as the consensus pipeline
-does it, can come later. Contents order makes each transaction's inputs
-exist when it runs.
+Once all of a checkpoint's transactions have executed, the scheduler
+hashes its effects into the running state hash and commits it with its
+certified summary: a `BuiltCheckpoint` made from the summary, its contents
+and the totals the summary states.
 
-### Switching
+### The consensus path, behind
 
-1. Drop the consensus pipeline. This stops consensus and joins every
-   worker, as at the end of an epoch.
-2. `Store::clear_uncommitted`. Outputs past the committed checkpoint are
-   dropped, to be executed again from certified contents.
-3. Start `SyncedEpoch` from the committed checkpoint.
+When the executor finds a consensus item's transaction executed already
+(by the synced path, or before a restart), it does not execute it. It
+checks the stored effects against what the consensus path decided:
 
-Nothing is written durably. A restart is an ordinary consensus-mode start.
+- each shared input's version, `Ended`, or cancellation marker, against
+  the effects' input versions;
+- the funds verdict: `Cancelled` if and only if the effects' status is
+  `InsufficientFundsForWithdraw`;
+- for a barrier, the root's input version, against the chunk's
+  accumulator version.
+
+Then it records generations and funds settlements from the effects, as it
+does now. With the verdict checked, `Settle::Deposit` and `Settle::Credit`
+from the stored effects are exactly what executing would have produced, so
+the funds ledger matches the quorum's.
+
+The funds reserver needs nothing new. It runs on every consensus commit.
+It reads a first-seen account's balance at the settled root version by
+version, so balances the synced path has written ahead do not disturb it.
+`Settle::Settled` comes from the consensus path's settlement scheduler,
+whose settlement transactions are found executed and checked like any
+other.
+
+The checkpoint builder compares each checkpoint it builds with the
+committed one, as fork detection does now, and commits nothing.
+
+### The end of an epoch
+
+The final checkpoint's change-epoch transaction runs last, after
+everything else in the epoch (RCF R3.3). Once its checkpoint commits, by
+either path, the node loop reconfigures as it does now, dropping the
+epoch's pipeline with both front ends. A node whose consensus has been
+left behind finishes the epoch on the synced path alone. After a restart,
+replay checks every transaction executed before the crash, against
+outputs this node produced.
 
 ## Out of scope
 
 - Running as a fullnode, and leaving or joining the committee (RCF R4.19).
+  A fullnode is the synced front end without the consensus one.
 - Archive fallback (R2.11), and peer scoring beyond trying the next peer
   (R2.8-R2.9).
 - Pushing certified checkpoints (R2.4).
-- Mixing the two paths within an epoch (R5.1).
+- Several executor workers.
 
 ## Tests
 
 - **Serving (built):** a sui full node whose only peer is anchovy syncs
   every checkpoint from it, and executes it alike.
 - **Catching up:** anchovy is stopped while the sui validators pass an
-  epoch's end, with short epochs. Restarted, it finishes the epoch through
-  synced mode, then follows consensus in the next.
+  epoch's end, with short epochs. Restarted, it finishes the epoch on the
+  synced path, then follows consensus in the next.
+- **Lagging:** anchovy's consensus is delayed while the synced path runs
+  ahead within an epoch, with funds withdrawals near their balances. The
+  consensus path catches up, checks every transaction, and agrees.
+- **Deviation:** a certified checkpoint whose effects disagree with the
+  consensus path's funds verdict, or its versions, panics once consensus
+  reaches it.
 - **Unit:** versions, accumulator versions and verdicts derived from
   certified effects, against checkpoints the compat network certified.
