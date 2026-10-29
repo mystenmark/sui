@@ -6357,6 +6357,7 @@ dependencies = [
  "sui-genesis-builder",
  "sui-protocol-config",
  "sui-types",
+ "synced",
  "tempfile",
  "tokio",
  "tonic 0.14.6",

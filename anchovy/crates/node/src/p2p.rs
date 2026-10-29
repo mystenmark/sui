@@ -9,6 +9,10 @@
 //! for committed checkpoints (`validator::state_sync`). Other routes answer
 //! not found.
 //!
+//! It follows the certified chain from the running epoch's committee: what
+//! they have certified past what this validator has goes to the epoch's
+//! synced scheduler (`synced`), which verifies it.
+//!
 //! Peers stop pushing a round once they certify it, so a round that
 //! completed while this validator was down never arrives. For those, it
 //! fetches the round's checkpoint from a connected peer through sui's state
@@ -36,7 +40,8 @@ use tokio::sync::oneshot;
 use validator::current::CurrentEpoch;
 use validator::pipeline::items::GateInput;
 use validator::randomness::{BeaconInput, SendSignaturesRequest};
-use validator::state_sync::{self, Query};
+use validator::state_sync::{self, Query, SyncRequest, Wanted};
+use workqueue::Queue;
 
 /// sui's limits on a p2p request frame, and a response frame.
 const MAX_REQUEST: usize = 1 << 20;
@@ -45,6 +50,13 @@ const MAX_RESPONSE: usize = 128 << 20;
 /// How often this member pushes its signatures to its peers: the
 /// reference's `send_partial_signatures_interval`.
 const PUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often peers are asked how far they have certified, as the
+/// reference's state sync asks.
+const SYNC_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How many summaries are fetched before they are handed over.
+const SYNC_BATCH: u64 = 16;
 
 /// How often the gate is asked which round it waits for. A round waited
 /// for at two asks in a row is fetched: pushes come within moments.
@@ -55,21 +67,26 @@ pub struct P2p {
     pub network: Network,
     fetcher: tokio::task::JoinHandle<()>,
     pusher: tokio::task::JoinHandle<()>,
+    follower: tokio::task::JoinHandle<()>,
 }
 
 impl P2p {
     /// Stops serving, its port free once this returns.
     pub async fn shutdown(self) {
+        self.abort();
+        let _ = self.network.shutdown().await;
+    }
+
+    fn abort(&self) {
         self.fetcher.abort();
         self.pusher.abort();
-        let _ = self.network.shutdown().await;
+        self.follower.abort();
     }
 }
 
 impl Drop for P2p {
     fn drop(&mut self) {
-        self.fetcher.abort();
-        self.pusher.abort();
+        self.abort();
     }
 }
 
@@ -151,11 +168,13 @@ pub fn start(
         .config(config)
         .start(router)?;
     let fetcher = tokio::spawn(fetch_missing(network.clone(), current.clone()));
-    let pusher = tokio::spawn(push_signatures(network.clone(), current));
+    let pusher = tokio::spawn(push_signatures(network.clone(), current.clone()));
+    let follower = tokio::spawn(follow_chain(network.clone(), current));
     Ok(P2p {
         network,
         fetcher,
         pusher,
+        follower,
     })
 }
 
@@ -250,17 +269,8 @@ async fn push_signatures(network: Network, current: CurrentEpoch) {
             }
             let (network, address, outgoing) = (network.clone(), address.clone(), outgoing.clone());
             tokio::spawn(async move {
-                if network.peer(peer).is_none() {
-                    let Some(address) = anemo_address(&address) else {
-                        return;
-                    };
-                    let connect = network.connect_with_peer_id(address, peer);
-                    if !matches!(
-                        tokio::time::timeout(PUSH_INTERVAL, connect).await,
-                        Ok(Ok(_))
-                    ) {
-                        return;
-                    }
+                if !connect(&network, peer, &address).await {
+                    return;
                 }
                 for request in outgoing {
                     let _: Option<()> =
@@ -268,6 +278,127 @@ async fn push_signatures(network: Network, current: CurrentEpoch) {
                 }
             });
         }
+    }
+}
+
+/// Whether `peer` is connected, connecting to it at `address` (a p2p
+/// multiaddr) if not.
+async fn connect(network: &Network, peer: PeerId, address: &str) -> bool {
+    if network.peer(peer).is_some() {
+        return true;
+    }
+    let Some(address) = anemo_address(address) else {
+        return false;
+    };
+    let connect = network.connect_with_peer_id(address, peer);
+    matches!(
+        tokio::time::timeout(PUSH_INTERVAL, connect).await,
+        Ok(Ok(_))
+    )
+}
+
+/// Follows the certified chain: every `SYNC_INTERVAL`, and at once again
+/// while a round takes summaries, fetches what the running epoch's synced
+/// scheduler wants from the first committee member that has it.
+async fn follow_chain(network: Network, current: CurrentEpoch) {
+    let mut interval = tokio::time::interval(SYNC_INTERVAL);
+    loop {
+        interval.tick().await;
+        // Not the handle itself: it holds the store, which must be let go
+        // as the node stops, whatever a peer keeps this waiting for.
+        let Some((sync, members)) = current.now().map(|epoch| {
+            let members: Vec<(PeerId, String)> = epoch
+                .network_keys
+                .iter()
+                .map(|key| PeerId(*key))
+                .zip(epoch.p2p_addresses.iter().cloned())
+                .collect();
+            (epoch.checkpoint_sync.clone(), members)
+        }) else {
+            continue;
+        };
+        while follow_round(&network, &sync, &members).await {}
+    }
+}
+
+/// Fetches up to `SYNC_BATCH` summaries the scheduler wants from the first
+/// member that has them, trying the next if they are rejected. Returns
+/// whether the scheduler took any.
+async fn follow_round(
+    network: &Network,
+    sync: &Queue<SyncRequest>,
+    members: &[(PeerId, String)],
+) -> bool {
+    let Some(mut wanted) = hand_over(sync, Vec::new()).await else {
+        return false;
+    };
+    let own = PeerId(network.peer_id().0);
+    for &(peer, ref address) in members {
+        let Some(next) = wanted.next.filter(|_| wanted.room > 0) else {
+            return false;
+        };
+        if peer == own || !connect(network, peer, address).await {
+            continue;
+        }
+        let Some(highest) = highest_certified(network, peer).await else {
+            continue;
+        };
+        let last = highest.min(next + wanted.room.min(SYNC_BATCH) - 1);
+        let mut summaries = Vec::new();
+        for seq in next..=last {
+            let Some(summary) = certified_summary(network, peer, seq).await else {
+                break;
+            };
+            summaries.push(summary);
+        }
+        if summaries.is_empty() {
+            continue;
+        }
+        let Some(after) = hand_over(sync, summaries).await else {
+            return false;
+        };
+        if after.next != wanted.next {
+            return true;
+        }
+        wanted = after;
+    }
+    false
+}
+
+/// Hands `summaries` to the epoch's synced scheduler; what it wants next,
+/// unless the epoch has stopped.
+async fn hand_over(sync: &Queue<SyncRequest>, summaries: Vec<Vec<u8>>) -> Option<Wanted> {
+    let (reply, wanted) = oneshot::channel();
+    sync.try_push(SyncRequest { summaries, reply }).ok()?;
+    wanted.await.ok()
+}
+
+/// The highest checkpoint `peer` has certified.
+async fn highest_certified(network: &Network, peer: PeerId) -> Option<u64> {
+    let (highest, _lowest): (CertifiedCheckpointSummary, u64) = call(
+        network,
+        peer,
+        "/sui.StateSync/GetCheckpointAvailability",
+        (),
+    )
+    .await?;
+    Some(highest.sequence_number)
+}
+
+/// `peer`'s certified summary of checkpoint `seq`, as sent:
+/// `CertifiedCheckpointSummary` BCS.
+async fn certified_summary(network: &Network, peer: PeerId, seq: u64) -> Option<Vec<u8>> {
+    let bytes = call_raw(
+        network,
+        peer,
+        "/sui.StateSync/GetCheckpointSummary",
+        GetCheckpointSummaryRequest::BySequenceNumber(seq),
+    )
+    .await?;
+    // `Option<CertifiedCheckpointSummary>`.
+    match bytes.split_first() {
+        Some((1, summary)) => Some(summary.to_vec()),
+        _ => None,
     }
 }
 
@@ -392,6 +523,16 @@ async fn call<T: serde::Serialize, U: serde::de::DeserializeOwned>(
     route: &str,
     request: T,
 ) -> Option<U> {
+    bcs::from_bytes(&call_raw(network, peer, route, request).await?).ok()
+}
+
+/// A unary call of `route` on `peer`: the response's BCS, decompressed.
+async fn call_raw<T: serde::Serialize>(
+    network: &Network,
+    peer: PeerId,
+    route: &str,
+    request: T,
+) -> Option<Vec<u8>> {
     let mut peer = network.peer(peer)?;
     let body = SnappyEncoder(PhantomData).encode(request).ok()?;
     let mut request = Request::new(body);
@@ -403,7 +544,7 @@ async fn call<T: serde::Serialize, U: serde::de::DeserializeOwned>(
     if !response.status().is_success() {
         return None;
     }
-    decode(response.body(), MAX_RESPONSE).ok()
+    decompress(response.body(), MAX_RESPONSE).ok()
 }
 
 /// Pushes a peer's signatures to the running epoch's collector, answering
@@ -469,13 +610,18 @@ impl<U: serde::de::DeserializeOwned> Decoder for SnappyDecoder<U> {
     }
 }
 
-/// `buf`, snappy-framed BCS, decompressed to at most `max` bytes.
+/// `buf`, snappy-framed BCS, decoded from at most `max` bytes.
 fn decode<U: serde::de::DeserializeOwned>(buf: &Bytes, max: usize) -> std::io::Result<U> {
+    bcs::from_bytes(&decompress(buf, max)?).map_err(std::io::Error::other)
+}
+
+/// `buf`, snappy-framed, decompressed to at most `max` bytes.
+fn decompress(buf: &Bytes, max: usize) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     snap::read::FrameDecoder::new(&buf[..])
         .take(max as u64)
         .read_to_end(&mut bytes)?;
-    bcs::from_bytes(&bytes).map_err(std::io::Error::other)
+    Ok(bytes)
 }
 
 /// A response the checkpoint server encoded already, as `BcsSnappy` would.

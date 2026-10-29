@@ -17,6 +17,7 @@ use messages::transaction::DigestPending;
 use resolver::{InputAvailability, VersionResolver};
 use settlement::{FundsReserver, SettlementScheduler};
 use state_hasher::{StateHasher, StateHashes};
+use synced::SyncedScheduler;
 use tokio::sync::watch;
 use validator::checks::{Valid, Verified};
 use validator::consensus::cache::ConsensusTxCache;
@@ -95,6 +96,8 @@ pub(crate) fn spawn(
         w.one("committer",         i.committer,        move |p, _| p.committer(committed, ended),                     drop),
         // Serving peers.
         w.one("checkpoint-server", i.checkpoint_queries, |p, _| CheckpointServer::new(p.store.clone()),         drop),
+        // Following peers.
+        w.one("synced",            i.checkpoint_sync,  |p, q| p.synced(q.built_waits),                             drop),
     ]
 }
 
@@ -128,6 +131,7 @@ queues! {
     commits: CommitRequest,
     beacon: BeaconInput,
     checkpoint_queries: state_sync::Request,
+    checkpoint_sync: state_sync::SyncRequest,
     // Between processors.
     signatures: Request<Valid>,
     submit: Request<Verified>,
@@ -394,6 +398,15 @@ impl Parts {
         )
         .with_fork_checks(built)
         .with_backpressure(self.backpressure.clone())
+    }
+
+    fn synced(&self, built: BuiltWaits) -> SyncedScheduler {
+        SyncedScheduler::new(
+            self.committee.clone(),
+            self.checkpoints.clone(),
+            &self.store,
+            built,
+        )
     }
 
     fn committer(

@@ -76,6 +76,7 @@ pub struct Pipeline {
     pub beacon: Queue<BeaconInput>,
     randomness_gate: Queue<GateInput>,
     checkpoint_queries: Queue<validator::state_sync::Request>,
+    checkpoint_sync: Queue<validator::state_sync::SyncRequest>,
     /// Each member's network key and p2p address, by committee index.
     network_keys: Vec<[u8; 32]>,
     p2p_addresses: Vec<String>,
@@ -337,6 +338,7 @@ impl Pipeline {
             beacon: queues.beacon,
             randomness_gate: queues.gate,
             checkpoint_queries: queues.checkpoint_queries,
+            checkpoint_sync: queues.checkpoint_sync,
             network_keys: record.committee.iter().map(|m| m.network_key).collect(),
             p2p_addresses: record
                 .committee
@@ -384,6 +386,7 @@ impl Pipeline {
             p2p_addresses: self.p2p_addresses.clone(),
             randomness_gate: self.randomness_gate.clone(),
             checkpoint_queries: self.checkpoint_queries.clone(),
+            checkpoint_sync: self.checkpoint_sync.clone(),
         })
     }
 }
