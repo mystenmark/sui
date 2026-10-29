@@ -25,9 +25,15 @@ mode skipped for now):
   just before it were never pushed again, stalling a peer that needed this
   member's signature. Recent rounds' signatures are now pushed again.
 
+- [x] Step 2: `anchovy-node` runs from sui's `validator.yaml`: its keys,
+  `genesis.blob` (installed into a fresh database; a database holding
+  another chain is refused), `db_path`, the RPC and p2p addresses, and
+  consensus parameters. The chain is named by the genesis digest.
+  Certified checkpoints are dropped until state sync exists.
+
 ## In progress
 
-- [ ] Step 2: the node binary.
+- [ ] Step 3: certified-checkpoint state sync, with a StateSync server.
 
 ## Left out / later
 
