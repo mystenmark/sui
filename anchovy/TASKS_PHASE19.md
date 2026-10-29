@@ -31,9 +31,17 @@ mode skipped for now):
   consensus parameters. The chain is named by the genesis digest.
   Certified checkpoints are dropped until state sync exists.
 
+- [x] Step 3a: the StateSync server. The running epoch's checkpoint server
+  answers sui's five routes from committed checkpoints (new summary- and
+  contents-digest indexes; genesis's certified summary installed with
+  genesis). A sui full node whose only peer is anchovy syncs and executes
+  alike (compat).
+
 ## In progress
 
-- [ ] Step 3: certified-checkpoint state sync, with a StateSync server.
+- [ ] Step 3b/3c: catching up an epoch whose consensus is gone
+  (`docs/state_sync_design.md`): a checkpoint fetcher, and a synced epoch
+  that executes certified checkpoints with versions from their effects.
 
 ## Left out / later
 
@@ -41,3 +49,5 @@ mode skipped for now):
 - Gas model 14 and older (the executor's legacy path): needed before
   mainnet or testnet reach version 138 to join them.
 - Safe mode.
+- Pushing certified checkpoints to peers (they poll every 5 s instead).
+- Running as a fullnode.
