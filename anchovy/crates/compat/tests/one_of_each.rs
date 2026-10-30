@@ -1184,6 +1184,28 @@ fn an_idle_network_certifies_checkpoints() {
     drop(network.runtime);
 }
 
+/// Transactions of one commit past `max_transactions_per_checkpoint` are
+/// split into chunks, each settled and cut into checkpoints alike.
+#[test]
+fn a_commit_past_the_checkpoint_limit_splits_alike() {
+    let _limit = ProtocolConfig::apply_overrides_for_testing(|_, mut config| {
+        config.set_randomize_checkpoint_tx_limit_in_tests_for_testing(false);
+        config.set_max_transactions_per_checkpoint_for_testing(2);
+        config
+    });
+    let mut network = Network::new();
+    let transfers: Vec<_> = (0..5).map(|gas| network.transfer(gas)).collect();
+    network.execute_together(&transfers.iter().collect::<Vec<_>>());
+    let checkpoints: std::collections::BTreeSet<_> = transfers
+        .iter()
+        .map(|t| network.anchovy.checkpoint_of(t.digest()).unwrap())
+        .collect();
+    assert!(checkpoints.len() >= 3, "{checkpoints:?}");
+    let later = network.transfer(0);
+    network.execute(&later);
+    drop(network.runtime);
+}
+
 /// Gives the version below the highest the highest's gas model, the only
 /// one anchovy's executor runs, alike for sui and anchovy (one process, one
 /// override): before any config is read, held for the test.

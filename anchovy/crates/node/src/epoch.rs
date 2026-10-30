@@ -281,6 +281,7 @@ impl Epoch {
             record.reference_gas_price,
             u32::try_from(record.committee.len()).expect("a committee of fewer than 2^32"),
             record.epoch_start_timestamp_ms,
+            previous_digest(&perpetual.store, record.previous_checkpoint),
             [],
         ));
         let committee = Arc::new(
@@ -336,6 +337,17 @@ impl Drop for Epoch {
     fn drop(&mut self) {
         self.current.clear();
     }
+}
+
+/// Committed checkpoint `seq`'s summary digest.
+fn previous_digest(store: &store::Store, seq: u64) -> [u8; 32] {
+    BuiltCheckpoint::decode(
+        &store
+            .checkpoint(seq)
+            .expect("the store reads")
+            .expect("the epoch's previous checkpoint is committed"),
+    )
+    .digest
 }
 
 /// Whether the current epoch's last checkpoint has committed: the epoch is
