@@ -84,12 +84,15 @@ there is no mode to switch:
 ### The chunk lock
 
 The two paths never work on the same settlement chunk at once. A chunk is
-a commit's transactions (at most `max_transactions_per_checkpoint`), then
-its settlement transactions, ending with its barrier. Chunks never span
-commits, and their heights count from 1 each epoch. A checkpoint is a run
-of whole chunks, cut across commits, so a certified checkpoint splits into
-chunks at its barriers, numbered by counting the epoch's barriers before
-it. The epoch's change-epoch transaction follows the last barrier.
+up to `max_transactions_per_checkpoint` of a commit's transactions, then
+their settlement transactions, ending with its barrier. A commit past the
+limit splits into several chunks. Chunks never span commits, and their
+heights count from 1 each epoch. A checkpoint is a run of whole chunks of
+at most the limit in all, cut across commits and within them: a split
+commit's chunks may land in consecutive checkpoints. So a certified
+checkpoint splits into chunks at its barriers, numbered by counting the
+epoch's barriers before it. The epoch's change-epoch transaction follows
+the last barrier.
 
 Per epoch, a mutex holds:
 
@@ -103,9 +106,9 @@ them. A chunk is released by `ChunkSettled(height)`.
 
 **Synced**, for checkpoint K:
 
-- **Fast path: K ≤ `cut`.** A checkpoint is cut only once a later chunk
-  exists, so every chunk of K is claimed and K will be built without
-  another commit. The scheduler waits for `CheckpointBuilt(K)` and checks
+- **Fast path: K ≤ `cut`.** A checkpoint is cut only once all its chunks
+  are assigned, by a commit handled already, so every chunk of K is claimed
+  and K will be built without another commit. The scheduler waits for `CheckpointBuilt(K)` and checks
   that the built digest is the certified one (R5.1). It fetches no
   contents and executes nothing. This is the common case.
 - **Slow path: K > `cut`.** K is open or unseen, and may never be cut if
@@ -161,8 +164,9 @@ certificate:
   through as `Input::Cancelled`. A stream-ended object comes through as
   `Input::Ended`, whose deleting transaction is the one among the effects'
   dependencies that deleted it at that version;
-- the accumulator version, from the checkpoint's barrier settlement
-  (R4.4);
+- the accumulator version, from the barrier settlement ending its chunk
+  (R4.4). It counts commits, so the chunks of a split commit share it,
+  even across checkpoints;
 - `Funds::Insufficient` if and only if the effects' status is
   `InsufficientFundsForWithdraw` (R4.5). The synced path cannot wait for
   the funds reserver without waiting for consensus.
@@ -196,8 +200,8 @@ checks the stored effects against what the consensus path decided:
   the effects' input versions;
 - the funds verdict: `Cancelled` if and only if the effects' status is
   `InsufficientFundsForWithdraw`;
-- for a barrier, the root's input version, against the chunk's
-  accumulator version.
+- for a barrier, the root's input version, against the chunk's root
+  version, which counts chunks.
 
 Then it records generations and funds settlements from the effects, as it
 does now. With the verdict checked, `Settle::Deposit` and `Settle::Credit`
