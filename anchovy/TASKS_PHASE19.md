@@ -59,6 +59,24 @@ executor, the chunk lock, a fast path):
 - [ ] 3c: the chunk lock, the slow path (synced execution), certified
   randomness into the gate, and the consensus path's checks of
   transactions executed already.
+  - [x] The lock (`validator::pipeline::chunk_lock`): the commit stage
+    claims each commit's chunks before emitting them and reports its last
+    cut; the synced scheduler closes it when dropped.
+  - [ ] Fetch contents for checkpoints past the cut; verify them against
+    the summary; split them into chunks at barriers (the transaction whose
+    effects change `0xacc`), numbered on from the cut or the previous
+    synced checkpoint.
+  - [ ] Synced executables: owned and package keys from the transaction,
+    consensus objects at their effects' input versions, `Ended` and
+    cancellation markers, the funds verdict from the status, the expected
+    effects digest; start versions recorded before executing; no
+    generations or funds settles.
+  - [ ] Wait each synced chunk executed, release it; once all of K's chunks
+    are executed or settled, build K from its summary and contents (state
+    hash included) and commit it.
+  - [ ] The consensus path's checks of transactions executed already.
+  - [ ] Certified randomness bytes into the gate.
+  - [ ] Compat: catching up an epoch's end; a lagging consensus; deviation.
 
 ## Left out / later
 
