@@ -231,9 +231,8 @@ impl Pipeline {
         ));
         let next_to_certify = committed_seq + 1;
 
-        // Where the epoch resumes: after the last commit its consensus
-        // output was written through, else from its start, before any of its
-        // chunks: heights count from 1 each epoch.
+        // The last chunk of the last checkpoint committed, 0 if none this
+        // epoch: heights count from 1 each epoch.
         let committed_height = if committed_seq > record.previous_checkpoint {
             BuiltCheckpoint::decode(
                 &store
@@ -245,9 +244,6 @@ impl Pipeline {
         } else {
             0
         };
-        consensus_output
-            .committed_checkpoints()
-            .committed_through(committed_height);
         builder_output.delete_state_hashes_above(committed_seq);
         let resumed = consensus_output
             .record()

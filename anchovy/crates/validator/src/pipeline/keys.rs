@@ -75,3 +75,16 @@ pub struct ChunkSettled(pub u64);
 /// once the checkpoint store holds it, or committed it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CheckpointBuilt(pub u64);
+
+/// The output waiter's keys: what consensus output waits for before it is
+/// written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CheckpointProgress {
+    /// The consensus path built checkpoint `seq`, and every one before it,
+    /// in this run: every transaction of their chunks executed or was
+    /// checked. Available once the checkpoint store says so.
+    BuiltHere(u64),
+    /// Checkpoint `seq` committed. Available once the checkpoint store says
+    /// so.
+    Committed(u64),
+}

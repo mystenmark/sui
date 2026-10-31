@@ -26,11 +26,11 @@ use sui_types::messages_checkpoint::{
 use sui_types::messages_consensus::{ConsensusTransaction, ConsensusTransactionKind};
 use sui_types::transaction::SenderSignedData as SuiSigned;
 use validator::epoch::EpochParams;
-use validator::epoch_store::{BuilderOutput, BuiltCheckpoints, EpochStore};
+use validator::epoch_store::{BuilderOutput, EpochStore};
 use validator::pipeline::items::{
     BuiltWaitItem, CheckpointContentsBuilt, ExecutedEffects, PendingCheckpoint, SettledChunk,
 };
-use validator::pipeline::keys::CheckpointBuilt;
+use validator::pipeline::keys::{CheckpointBuilt, CheckpointProgress};
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable};
 use waiter::{Command, WaiterProcessor};
 use workqueue::{Inbox, Processor, queue};
@@ -40,7 +40,6 @@ struct Mainnet {
     store: Arc<Store>,
     epoch_store: EpochStore,
     builder: BuilderOutput,
-    built: BuiltCheckpoints,
     _dir: tempfile::TempDir,
     _epochs: tempfile::TempDir,
 }
@@ -71,13 +70,12 @@ impl Mainnet {
                 .unwrap();
         }
         let epochs = tempfile::tempdir().unwrap();
-        let (epoch_store, consensus, builder) = EpochStore::open(epochs.path(), 0);
+        let (epoch_store, _, builder) = EpochStore::open(epochs.path(), 0);
         Mainnet {
             checkpoint,
             store,
             epoch_store,
             builder,
-            built: consensus.built_checkpoints(),
             _dir: dir,
             _epochs: epochs,
         }
@@ -428,6 +426,7 @@ fn out_of_order_checkpoints_summarize_in_order() {
     let (to_hasher, hasher_inbox) = queue(16);
     let (built, built_inbox) = queue(16);
     let (consensus, _normal, mut signatures) = consensus::TransactionClient::new(16);
+    let (outputs, output_waits) = queue(64);
     let mut contents = ContentsBuilder::new(
         epoch.clone(),
         chunks,
@@ -444,7 +443,7 @@ fn out_of_order_checkpoints_summarize_in_order() {
         key(),
         built,
         consensus,
-        m.built.clone(),
+        outputs,
     );
 
     // Runs the built waiter and the summary builder until quiet; returns the
@@ -513,6 +512,20 @@ fn out_of_order_checkpoints_summarize_in_order() {
     }
 
     assert_eq!(resolved, vec![11, 12, 13]);
+    let built_here: Vec<CheckpointProgress> = drain(&output_waits)
+        .into_iter()
+        .flat_map(|command| match command {
+            Command::Resolve(keys) => keys.into_iter().map(|(key, ())| key),
+            Command::Wait(_) => panic!("the summary builder only notifies"),
+        })
+        .collect();
+    assert_eq!(
+        built_here,
+        (11..=13)
+            .map(CheckpointProgress::BuiltHere)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(checkpoints.built_here(), 13);
 
     // Each on the priority lane, alone.
     let signed: Vec<u64> = std::iter::from_fn(|| signatures.try_recv().ok())

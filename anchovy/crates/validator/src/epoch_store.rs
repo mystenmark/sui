@@ -58,12 +58,11 @@ impl EpochStore {
                 deferred,
                 open: Output::default(),
                 queued: std::collections::VecDeque::new(),
+                written: 0,
                 processed: containers::heap_message_map(0),
                 locks: SipMap::default(),
                 streams: SipMap::default(),
                 debts: SipMap::default(),
-                committed_height: 0,
-                built_height: 0,
             })),
         };
         let builder = BuilderOutput { db: db.clone() };
@@ -351,27 +350,17 @@ fn stream_key(id: &ObjectId, initial_shared_version: u64) -> [u8; 40] {
 /// cloned. Read back only by the commit handler too.
 ///
 /// A quarantine, as the reference's `ConsensusOutputQuarantine`: each
-/// commit's output stays in memory until the checkpoints covering it have
-/// committed and been built here, and is written then, so the store never
-/// holds output a crash could make the replay decide otherwise. Built here
-/// too, as a certified checkpoint can commit before consensus reaches it:
-/// written then, its output's checks of transactions executed already
-/// would never run again. Reads look in memory, then the store.
+/// commit's output stays in memory until `OutputCommitter` writes it, once
+/// the checkpoints covering it are built here and committed, so the store
+/// never holds output a crash could make the replay decide otherwise. Reads
+/// look in memory, then the store.
 pub struct ConsensusOutput {
     quarantine: Arc<Mutex<Quarantine>>,
 }
 
-/// Tells the quarantine which checkpoints have committed: for the
-/// checkpoint committer.
+/// Writes the quarantine's output: for `OutputCommitter`.
 #[derive(Clone)]
-pub struct CommittedCheckpoints {
-    quarantine: Arc<Mutex<Quarantine>>,
-}
-
-/// Tells the quarantine which checkpoints consensus has built here: for the
-/// summary builder.
-#[derive(Clone)]
-pub struct BuiltCheckpoints {
+pub struct OutputCommits {
     quarantine: Arc<Mutex<Quarantine>>,
 }
 
@@ -382,8 +371,10 @@ struct Quarantine {
     deferred: BTreeMap<DeferralKey, Vec<u8>>,
     /// The commit being decided.
     open: Output,
-    /// Decided commits not yet written, in commit order.
+    /// Decided commits not yet written, in commit order, and how many
+    /// finished before the first.
     queued: std::collections::VecDeque<Output>,
+    written: u64,
     /// The latest queued value of each key, and how many queued outputs
     /// wrote it: a key leaves memory with the last of them, as the
     /// reference's `RefCountedHashMap`.
@@ -391,10 +382,6 @@ struct Quarantine {
     locks: SipMap<ObjectRef, (TxDigest, usize)>,
     streams: SipMap<StreamId, ((u32, u32), usize)>,
     debts: SipMap<(Tracker, ObjectId), ((u64, u64), usize)>,
-    /// The last chunk height of the last checkpoint committed.
-    committed_height: u64,
-    /// The last chunk height of the last checkpoint built here in this run.
-    built_height: u64,
 }
 
 /// A table keyed by object references or ids from transactions' inputs,
@@ -425,10 +412,6 @@ struct Output {
     capabilities: Vec<(u32, Vec<u8>)>,
     /// The commit stage's state after the commit, encoded.
     record: Vec<u8>,
-    /// The last chunk height the commit assigned.
-    height: u64,
-    /// Whether no chunk waited for a checkpoint after the commit.
-    drained: bool,
 }
 
 impl Default for Output {
@@ -445,8 +428,6 @@ impl Default for Output {
             new_jwks: None,
             capabilities: Vec::new(),
             record: Vec::new(),
-            height: 0,
-            drained: false,
         }
     }
 }
@@ -739,22 +720,15 @@ impl ConsensusOutput {
             .collect()
     }
 
-    /// Ends the commit being decided: `record` is the commit stage's state
-    /// after it, `height` the last chunk height it assigned, and `drained`
-    /// whether no chunk waits for a checkpoint after it. Written once the
-    /// checkpoints through `height` have committed, and a drained commit at
-    /// or after it can be written too.
-    ///
-    /// # Panics
-    /// If the database cannot be written.
-    pub fn finish_commit(&mut self, record: Vec<u8>, height: u64, drained: bool) {
+    /// Ends the commit being decided, `record` the commit stage's state
+    /// after it. Returns how many commits have finished in this run, this
+    /// one included: what `OutputCommits::write_through` takes.
+    pub fn finish_commit(&mut self, record: Vec<u8>) -> u64 {
         let mut q = lock_quarantine(&self.quarantine);
         let mut output = std::mem::take(&mut q.open);
         output.record = record;
-        output.height = height;
-        output.drained = drained;
         q.queue(output);
-        q.flush();
+        q.written + q.queued.len() as u64
     }
 
     /// The commit stage's state after the last commit written, as
@@ -769,47 +743,29 @@ impl ConsensusOutput {
             .expect("the epoch's database reads")
     }
 
-    /// The handle the checkpoint committer tells of each commit.
-    pub fn committed_checkpoints(&self) -> CommittedCheckpoints {
-        CommittedCheckpoints {
-            quarantine: self.quarantine.clone(),
-        }
-    }
-
-    /// The handle the summary builder tells of each checkpoint built.
-    pub fn built_checkpoints(&self) -> BuiltCheckpoints {
-        BuiltCheckpoints {
+    /// The handle that writes the output.
+    pub fn output_commits(&self) -> OutputCommits {
+        OutputCommits {
             quarantine: self.quarantine.clone(),
         }
     }
 }
 
-impl CommittedCheckpoints {
-    /// The checkpoints through the chunk at `height` have committed: writes
-    /// what they cover.
+impl OutputCommits {
+    /// Writes the output of the first `n` commits finished in this run, and
+    /// the record after the `n`th, in one batch; those written already are
+    /// skipped. The record must be all of the commit stage's state: the
+    /// `n`th commit left no chunk waiting for a checkpoint.
     ///
     /// # Panics
     /// If the database cannot be written.
-    pub fn committed_through(&self, height: u64) {
+    pub fn write_through(&self, n: u64) {
         let mut q = lock_quarantine(&self.quarantine);
-        q.committed_height = q.committed_height.max(height);
-        q.flush();
-    }
-}
-
-impl BuiltCheckpoints {
-    /// The checkpoints through the chunk at `height` are built here: every
-    /// transaction of theirs executed, or was checked, on the consensus
-    /// path. Chunks settle in height order, so this covers every chunk
-    /// below too, rebuilt after a restart or not. Writes what they cover, if
-    /// committed.
-    ///
-    /// # Panics
-    /// If the database cannot be written.
-    pub fn built_through(&self, height: u64) {
-        let mut q = lock_quarantine(&self.quarantine);
-        q.built_height = q.built_height.max(height);
-        q.flush();
+        let count = n.saturating_sub(q.written);
+        assert!(count <= q.queued.len() as u64, "commit {n} is not finished");
+        if count > 0 {
+            q.write(usize::try_from(count).expect("a count of queued outputs"));
+        }
     }
 }
 
@@ -833,24 +789,14 @@ impl Quarantine {
         self.queued.push_back(output);
     }
 
-    /// Writes the queued outputs whose checkpoints have committed, through
-    /// the last of them after which no chunk waited for a checkpoint: a
-    /// later one's chunks are in checkpoints only a replay from a drained
-    /// commit rebuilds (the reference's `1ad56a6b81`). One batch, with the
-    /// last record.
-    fn flush(&mut self) {
-        let covered = self
-            .queued
-            .iter()
-            .take_while(|o| o.height <= self.committed_height.min(self.built_height))
-            .count();
-        let Some(last) = self.queued.range(..covered).rposition(|o| o.drained) else {
-            return;
-        };
+    /// Writes the first `count` queued outputs in one batch, with the last
+    /// one's record.
+    fn write(&mut self, count: usize) {
+        self.written += count as u64;
         let mut batch = self.db.batch();
         let mut record = Vec::new();
         let mut new_jwks = None;
-        for output in self.queued.drain(..=last) {
+        for output in self.queued.drain(..count) {
             for digest in output.processed {
                 batch.put(Space::Processed, digest.bytes.to_vec(), Vec::new());
                 release(&mut self.processed, &digest, |count| count);

@@ -10,6 +10,7 @@ mod close;
 mod commit;
 pub mod contents;
 mod key;
+mod output;
 pub mod summary;
 
 use std::sync::Arc;
@@ -23,12 +24,11 @@ use messages::fast::Bump;
 use messages::reader::Reader;
 use messages::transaction::SenderSignedData;
 use validator::epoch::EpochParams;
-use validator::epoch_store::BuiltCheckpoints;
 use validator::pipeline::items::{
     BuiltWaitItem, BuiltWaits, CheckpointContentsBuilt, CheckpointEffects, ExecutedEffects,
-    LastOfEpoch, PendingCheckpoint,
+    LastOfEpoch, OutputWaits, PendingCheckpoint,
 };
-use validator::pipeline::keys::{CheckpointBuilt, ChunkSettled};
+use validator::pipeline::keys::{CheckpointBuilt, CheckpointProgress, ChunkSettled};
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable};
 use waiter::{Availability, Command, WaitBatch};
 use workqueue::{Processor, Queue};
@@ -37,6 +37,7 @@ pub use built::{BuiltAvailability, BuiltRouter, check_fork};
 pub use close::EpochCloser;
 pub use commit::CheckpointCommitter;
 pub use key::ProtocolKey;
+pub use output::{OutputAvailability, OutputCommitter};
 
 /// Pushes `item` to `queue`. Inside the pipeline a full queue is a sizing
 /// bug, not load to shed; a closed one means the pipeline is shutting down.
@@ -202,17 +203,17 @@ impl Processor for ContentsBuilder {
 /// Outward:
 /// - built waiter, resolve: `CheckpointBuilt(seq)`, to the checkpoint built,
 ///   releasing `seq + 1`, its signatures and its certificate's fork check;
+/// - output waiter, notify: `CheckpointProgress::BuiltHere(seq)`;
 /// - consensus (black box): its checkpoint signature, at high priority.
 ///
-/// Reads and writes: the checkpoint store. Writes: the consensus output's
-/// built state, once each checkpoint is recorded.
+/// Reads and writes: the checkpoint store.
 pub struct SummaryBuilder {
     epoch: Arc<EpochParams>,
     checkpoints: Arc<CheckpointStore>,
     key: Arc<ProtocolKey>,
     built: BuiltWaits,
     consensus: TransactionClient,
-    consensus_output: BuiltCheckpoints,
+    outputs: OutputWaits,
 }
 
 impl SummaryBuilder {
@@ -222,7 +223,7 @@ impl SummaryBuilder {
         key: Arc<ProtocolKey>,
         built: BuiltWaits,
         consensus: TransactionClient,
-        consensus_output: BuiltCheckpoints,
+        outputs: OutputWaits,
     ) -> SummaryBuilder {
         SummaryBuilder {
             epoch,
@@ -230,7 +231,7 @@ impl SummaryBuilder {
             key,
             built,
             consensus,
-            consensus_output,
+            outputs,
         }
     }
 }
@@ -276,11 +277,15 @@ impl Processor for SummaryBuilder {
                 },
             };
             let checkpoint = self.checkpoints.insert_built(checkpoint);
-            self.consensus_output.built_through(checkpoint.last_height);
             resolved.push((CheckpointBuilt(seq), checkpoint));
         }
         // Every summary is in the checkpoint store: resolve.
+        let built_here = resolved
+            .iter()
+            .map(|(CheckpointBuilt(seq), _)| CheckpointProgress::BuiltHere(*seq))
+            .collect::<Vec<_>>();
         push(&self.built, Command::Resolve(resolved), "built waiter");
+        push(&self.outputs, Command::notify(built_here), "output waiter");
         for signature in signatures {
             // Where it is included is not needed: the built waiter waits for
             // whatever signatures consensus commits. Failing only as

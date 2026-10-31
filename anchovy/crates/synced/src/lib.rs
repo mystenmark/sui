@@ -479,7 +479,7 @@ impl SyncedScheduler {
         .expect("a verified summary parses")
         .data;
         let gas = summary.epoch_rolling_gas_cost_summary;
-        self.checkpoints.insert_built(BuiltCheckpoint {
+        self.checkpoints.insert_certified(BuiltCheckpoint {
             seq,
             summary: summary.bytes.to_vec(),
             digest: summary.digest.bytes,

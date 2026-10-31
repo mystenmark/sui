@@ -471,6 +471,17 @@ pub type BuiltCommand =
 /// The built waiter's queue.
 pub type BuiltWaits = workqueue::Queue<BuiltCommand>;
 
+/// Consensus output through the `n`th commit finished, written once its
+/// checkpoints are built here and committed. `CommitStage` → output waiter
+/// → `OutputCommitter`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputThrough(pub u64);
+
+pub type OutputCommand = waiter::Command<crate::pipeline::keys::CheckpointProgress, OutputThrough>;
+
+/// The output waiter's queue.
+pub type OutputWaits = workqueue::Queue<OutputCommand>;
+
 /// A certified checkpoint. `CheckpointAggregator` → state sync, and →
 /// `CheckpointCommitter`, in sequence order; or fetched from peers,
 /// `SyncedScheduler` → built waiter → `CheckpointCommitter`, in sequence

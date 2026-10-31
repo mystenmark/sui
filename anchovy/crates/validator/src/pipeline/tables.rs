@@ -270,6 +270,8 @@ pub struct CheckpointStore {
     built: Mutex<BTreeMap<u64, Arc<BuiltCheckpoint>>>,
     /// The last checkpoint committed.
     committed: AtomicU64,
+    /// The last checkpoint the consensus path built in this run.
+    built_here: AtomicU64,
 }
 
 impl CheckpointStore {
@@ -286,16 +288,34 @@ impl CheckpointStore {
             output,
             built: Mutex::default(),
             committed: AtomicU64::new(committed),
+            built_here: AtomicU64::new(0),
         }
     }
 
-    /// Records `checkpoint`, built here.
+    /// Records `checkpoint`, which the consensus path built here.
+    ///
+    /// # Panics
+    /// As `insert_certified`.
+    pub fn insert_built(&self, checkpoint: BuiltCheckpoint) -> Arc<BuiltCheckpoint> {
+        let seq = checkpoint.seq;
+        let checkpoint = self.insert_certified(checkpoint);
+        self.built_here.fetch_max(seq, Ordering::AcqRel);
+        checkpoint
+    }
+
+    /// The last checkpoint the consensus path built in this run, 0 if none.
+    pub fn built_here(&self) -> u64 {
+        self.built_here.load(Ordering::Acquire)
+    }
+
+    /// Records `checkpoint`, taken from its certificate and contents, to be
+    /// committed before the consensus path builds it.
     ///
     /// # Panics
     /// If a checkpoint of the same sequence number was built with another
     /// digest, in this run or before a restart: a fork, as this validator
     /// may have signed the first.
-    pub fn insert_built(&self, checkpoint: BuiltCheckpoint) -> Arc<BuiltCheckpoint> {
+    pub fn insert_certified(&self, checkpoint: BuiltCheckpoint) -> Arc<BuiltCheckpoint> {
         if let Some(bytes) = self.store.built(checkpoint.seq) {
             assert!(
                 BuiltCheckpoint::decode(&bytes).digest == checkpoint.digest,

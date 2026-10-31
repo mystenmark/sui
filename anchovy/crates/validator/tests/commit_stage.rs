@@ -267,8 +267,7 @@ fn prologue_after(observed: bool, restart: bool, split: &[u8]) -> Hashed {
     let epoch = epoch(10_000, 0);
     let dir = tempfile::tempdir().unwrap();
     let (_, output, _) = EpochStore::open(dir.path(), 0);
-    let committed = output.committed_checkpoints();
-    let built = output.built_checkpoints();
+    let commits = output.output_commits();
     let (mut stage, _outputs) = stage_over(&epoch, output);
     let mut first = commit(1, 2, 1_000, &[]);
     if observed {
@@ -280,11 +279,11 @@ fn prologue_after(observed: bool, restart: bool, split: &[u8]) -> Hashed {
         }];
     }
     stage.process(first, &mut bump);
-    // The first commit's checkpoint commits: its output is written.
-    committed.committed_through(u64::MAX);
-    built.built_through(u64::MAX);
+    // The first commit's checkpoint is built and commits: its output is
+    // written.
+    commits.write_through(1);
     if restart {
-        drop((stage, committed, built));
+        drop((stage, commits));
         let (_, output, _) = EpochStore::open(dir.path(), 0);
         stage = stage_over(&epoch, output).0;
         assert!(

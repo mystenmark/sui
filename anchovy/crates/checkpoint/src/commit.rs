@@ -9,17 +9,18 @@ use std::sync::Arc;
 
 use messages::fast::Bump;
 use tokio::sync::watch;
-use validator::epoch_store::CommittedCheckpoints;
 use validator::pipeline::backpressure::Backpressure;
-use validator::pipeline::items::CertifiedCheckpoint;
+use validator::pipeline::items::{CertifiedCheckpoint, OutputWaits};
+use validator::pipeline::keys::CheckpointProgress;
 use validator::pipeline::tables::{CheckpointStore, GenerationTable};
+use waiter::Command;
 use workqueue::Processor;
 
 /// Commits each certified checkpoint's transactions from the writeback
 /// cache to the database, with its record, certificate and the committed
-/// watermark, in one batch. Then writes the epoch store's state that waited
-/// for the checkpoint: the generations its transactions produced, and the
-/// consensus output it covers. In that order, as the reference's
+/// watermark, in one batch. Then writes the generations its transactions
+/// produced, and tells the output waiter, which may then write the consensus
+/// output it covers. In that order, as the reference's
 /// `execute_checkpoint`: a crash between them leaves the epoch store behind
 /// the object store, which a replay catches up; the other order could leave
 /// it claiming outputs a crash lost. Once the epoch's last checkpoint has
@@ -33,15 +34,17 @@ use workqueue::Processor;
 /// those fetched from peers: `Vec<CertifiedCheckpoint>`, each in sequence
 /// order.
 ///
+/// Outward: output waiter, notify: `CheckpointProgress::Committed(seq)`.
+///
 /// Reads: the checkpoint store. Writes: the object
-/// store, as its only committer; the generation table's and the consensus
-/// output's committed state; backpressure's committed watermark, which
-/// releases the commit answers it withheld.
+/// store, as its only committer; the generation table's committed state;
+/// backpressure's committed watermark, which releases the commit answers it
+/// withheld.
 pub struct CheckpointCommitter {
     store: Arc<store::Store>,
     checkpoints: Arc<CheckpointStore>,
     generations: Arc<GenerationTable>,
-    consensus_output: CommittedCheckpoints,
+    outputs: OutputWaits,
     backpressure: Arc<Backpressure>,
     /// The epoch's last checkpoint, once committed.
     ended: watch::Sender<Option<u64>>,
@@ -54,7 +57,7 @@ impl CheckpointCommitter {
         store: Arc<store::Store>,
         checkpoints: Arc<CheckpointStore>,
         generations: Arc<GenerationTable>,
-        consensus_output: CommittedCheckpoints,
+        outputs: OutputWaits,
         backpressure: Arc<Backpressure>,
         ended: watch::Sender<Option<u64>>,
     ) -> CheckpointCommitter {
@@ -62,7 +65,7 @@ impl CheckpointCommitter {
             store,
             checkpoints,
             generations,
-            consensus_output,
+            outputs,
             backpressure,
             ended,
             waiting: BTreeMap::new(),
@@ -85,11 +88,18 @@ impl CheckpointCommitter {
             bump,
         );
         self.generations.commit(&transactions, bump);
-        self.consensus_output.committed_through(built.last_height);
         self.checkpoints.committed(seq);
         self.backpressure.committed(seq, built.last_height);
         if built.root_state.is_some() {
             self.ended.send_replace(Some(seq));
+        }
+        // Inside the pipeline a full queue is a sizing bug; a closed one
+        // means the pipeline is shutting down.
+        if let Err(workqueue::PushError::Full(_)) = self
+            .outputs
+            .try_push(Command::notify([CheckpointProgress::Committed(seq)]))
+        {
+            panic!("the output waiter refused a committed checkpoint");
         }
     }
 }
