@@ -107,3 +107,58 @@ fn a_certified_transaction_with_other_effects_is_a_fork() {
     keyed[0].0.synced.as_mut().unwrap().effects = Hashed::of("TransactionEffects", &[]);
     common::InputWaiter::new(&twin).run_keyed(&mut twin, keyed);
 }
+
+/// The consensus path reaches transactions the synced path executed: it
+/// checks what it decided against their effects, and records the same
+/// generations as a node that executed them itself.
+#[test]
+fn the_consensus_path_behind_checks_and_records_alike() {
+    let mut node = Node::new(4);
+    let mut twin = node.twin(4);
+    let (shared, share) = node.new_shared_by(0);
+    let stream = shared.stream();
+    let first = node.increment(node.coin(1), shared);
+    let read = node.read(node.coin(2), shared);
+    let second = node.increment(node.coin(3), shared);
+    let digests = [share, digest(&first), digest(&read), digest(&second)];
+    let consensus = |node: &Node| {
+        vec![
+            node.executable(first.clone(), vec![shared.access(true, 5, 0)], vec![]),
+            node.executable(read.clone(), vec![shared.access(false, 5, 1)], vec![]),
+            node.executable(second.clone(), vec![shared.access(true, 5, 1)], vec![]),
+        ]
+    };
+    let executables = consensus(&node);
+    common::InputWaiter::new(&node).run(&mut node, executables);
+    let mut waiter = common::InputWaiter::new(&twin);
+    waiter.run_keyed(&mut twin, certified(&executed(&node, &digests)));
+
+    let executables = consensus(&twin);
+    let mut waiter = common::InputWaiter::new(&twin);
+    waiter.run(&mut twin, executables);
+    assert_eq!(waiter.waiting(), 0);
+    for generation in 0..=2 {
+        assert_eq!(
+            twin.generations.get(stream, 5, generation),
+            node.generations.get(stream, 5, generation)
+        );
+    }
+}
+
+/// The consensus path cancelled a transaction the quorum certified as run.
+#[test]
+#[should_panic(expected = "deviation: transaction")]
+fn a_decision_the_certified_effects_contradict_panics() {
+    let mut node = Node::new(2);
+    let mut twin = node.twin(2);
+    let (shared, share) = node.new_shared_by(0);
+    let write = node.increment(node.coin(1), shared);
+    let digests = [share, digest(&write)];
+    let executable = node.executable(write.clone(), vec![shared.access(true, 5, 0)], vec![]);
+    common::InputWaiter::new(&node).run(&mut node, vec![executable]);
+    common::InputWaiter::new(&twin).run_keyed(&mut twin, certified(&executed(&node, &digests)));
+
+    let mut cancelled = twin.executable(write, vec![], vec![]);
+    cancelled.entry.cancelled = vec![(shared.stream().id, u64::MAX - 1)];
+    common::InputWaiter::new(&twin).run(&mut twin, vec![cancelled]);
+}

@@ -10,8 +10,10 @@ use containers::Bump;
 use execution::{Funds, Input};
 use messages::Message;
 use messages::effects::{
-    AccumulatorOperation, AccumulatorValue, ObjectOut, TransactionEffects, VersionedEffects,
+    AccumulatorOperation, AccumulatorValue, ObjectIn, ObjectOut, TransactionEffects,
+    UnchangedConsensusKind, VersionedEffects,
 };
+use messages::execution_status::{ExecutionErrorKind, ExecutionStatus};
 use messages::object::{Object, Owner};
 use messages::transaction::SharedObjectMutability;
 use validator::consensus::sequence::SharedAccess;
@@ -19,8 +21,8 @@ use validator::epoch::EpochState;
 use validator::epoch_store::EpochStore;
 use validator::pipeline::items::{
     EffectsWaitItem, EpochCloserInput, Executable, ExecutableTransaction, FundsCommand,
-    InputCommand, InputValue, ReservationStatus, Settle, SettlementInput, Synced, SystemKind,
-    SystemTransaction,
+    InputCommand, InputValue, ReservationStatus, ScheduledEntry, Settle, SettlementInput, Synced,
+    SystemKind, SystemTransaction,
 };
 use validator::pipeline::keys::{AccumulatorVersion, EffectsKey, InputKey, StreamId, TxDigest};
 use validator::pipeline::tables::{Generation, GenerationTable};
@@ -49,8 +51,10 @@ use workqueue::{Processor, PushError, Queue, Sink};
 ///   `k + 1`: the version its effects give, or `Ended` if it deleted or
 ///   wrapped the object or took it out of consensus. A stream its effects do
 ///   not change (an input that had ended, say) keeps the generation it read.
-/// - **Executed already** (a replayed commit): it is not executed again, but
-///   its generations are recorded from its stored effects.
+/// - **Executed already** (by the synced path, or a replayed commit): it is
+///   not executed again, but what was decided about it is checked against
+///   its stored effects (`check_decisions`), then its generations are
+///   recorded from them.
 /// - **Certified** (`Executable::synced`, from the synced scheduler): its
 ///   consensus objects come at the versions its certified effects give, it
 ///   first records where each it writes starts the epoch, and its effects
@@ -238,6 +242,7 @@ impl Executor {
         }
 
         // 2. Its effects: stored, or from executing and committing it.
+        let executed_already = stored.is_some();
         let (effects, written) = match stored {
             Some(effects) => (effects, containers::Vec::new_in(bump)),
             None => self.execute_now(
@@ -253,6 +258,9 @@ impl Executor {
         let VersionedEffects::V2(effects_v2) = &effects.get().version else {
             unreachable!("execution produces V2 effects");
         };
+        if executed_already {
+            check_decisions(entry, &self.resolved, funds, effects_v2, digest);
+        }
         if let ExecutableTransaction::System(SystemTransaction {
             kind: SystemKind::Barrier { .. },
             ..
@@ -575,6 +583,93 @@ fn funds_settled(
                 reservation.version,
             ));
         }
+    }
+}
+
+/// How a transaction's effects say it read a consensus object.
+#[derive(Debug, PartialEq, Eq)]
+enum Read {
+    Version(u64),
+    Ended(u64),
+    Cancelled(u64),
+}
+
+/// How `effects` say their transaction read consensus object `id`, if they
+/// name it.
+fn read_of(
+    effects: &messages::effects::TransactionEffectsV2<'_>,
+    id: &messages::base::ObjectId,
+) -> Option<Read> {
+    if let Some(change) = effects.changed_objects.iter().find(|c| c.id == id)
+        && let ObjectIn::Exist { version, .. } = change.input_state
+    {
+        return Some(Read::Version(version));
+    }
+    let (_, kind) = effects
+        .unchanged_consensus_objects
+        .iter()
+        .find(|(o, _)| *o == id)?;
+    match *kind {
+        UnchangedConsensusKind::ReadOnlyRoot(version, _) => Some(Read::Version(version)),
+        UnchangedConsensusKind::MutateConsensusStreamEnded(version)
+        | UnchangedConsensusKind::ReadConsensusStreamEnded(version) => Some(Read::Ended(version)),
+        UnchangedConsensusKind::Cancelled(marker) => Some(Read::Cancelled(marker)),
+        UnchangedConsensusKind::PerEpochConfig => None,
+    }
+}
+
+/// What the consensus path decided about a transaction executed already
+/// (by the synced path, or before a restart) against its stored `effects`:
+/// each shared input's version or stream end as `resolved`, each
+/// cancellation marker, and the funds verdict. A cancelled transaction's
+/// effects record only the cancellation.
+///
+/// # Panics
+/// On a mismatch: the quorum, or this validator, deviated from the
+/// protocol.
+fn check_decisions(
+    entry: &ScheduledEntry,
+    resolved: &[Generation],
+    funds: Funds,
+    effects: &messages::effects::TransactionEffectsV2<'_>,
+    digest: TxDigest,
+) {
+    for (access, generation) in entry.shared.iter().zip(resolved) {
+        let decided = match *generation {
+            Generation::Version { version, .. } => Read::Version(version),
+            Generation::Ended { version, .. } => Read::Ended(version),
+        };
+        let read = read_of(effects, &access.id);
+        assert!(
+            read.as_ref() == Some(&decided),
+            "deviation: transaction {digest:?} read {:?} as {read:?}, not as decided, {decided:?}",
+            access.id
+        );
+    }
+    for &(id, marker) in &entry.cancelled {
+        let read = read_of(effects, &id);
+        assert!(
+            read == Some(Read::Cancelled(marker)),
+            "deviation: transaction {digest:?} read {id:?} as {read:?}, not cancelled at {marker}"
+        );
+    }
+    if entry.cancelled.is_empty() {
+        let insufficient = matches!(
+            effects.status,
+            ExecutionStatus::Failure {
+                error: ExecutionErrorKind::InsufficientFundsForWithdraw,
+                ..
+            }
+        );
+        assert!(
+            insufficient == (funds == Funds::Insufficient),
+            "deviation: transaction {digest:?} ran with funds {}, not as reserved",
+            if insufficient {
+                "insufficient"
+            } else {
+                "sufficient"
+            }
+        );
     }
 }
 
