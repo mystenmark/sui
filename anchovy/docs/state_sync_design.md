@@ -227,6 +227,14 @@ The checkpoint builder compares each checkpoint it builds with the one
 the synced path committed, as fork detection does now, and commits
 nothing.
 
+The consensus output quarantine writes a commit's output once its
+checkpoints have both committed and been built here. A synced commit
+alone is not enough: a commit decided but whose transactions the executor
+has not yet checked would be written, and after a crash never decided
+again, so its checks would never run. Settlement goes one chunk at a time
+in height order, so a checkpoint built here means every chunk through its
+last has executed or been checked.
+
 ### The end of an epoch
 
 The final checkpoint's change-epoch transaction runs last, after

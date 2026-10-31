@@ -86,10 +86,12 @@ executor, the chunk lock, a fast path):
     cancellation markers, the funds verdict unless cancelled.
   - [x] Compat: a lagging consensus (`Lagging` holds anchovy's commits).
   - [ ] Compat: catching up an epoch's end; deviation.
-  - Known gaps: a crash after a synced commit, before the consensus path
-    passes the same chunks, skips those chunks' checks (the quarantine
-    counts them committed); stream-ended inputs on the synced path are
-    untested.
+  - [x] Consensus output is written once its checkpoints are committed
+    and built here (`BuiltCheckpoints::built_through`): before, a synced
+    commit wrote output of commits decided but not yet checked, which a
+    crash would never re-decide. Backpressure ignores chunks scheduled
+    below a committed checkpoint.
+  - Known gaps: stream-ended inputs on the synced path are untested.
 
 ## Left out / later
 
