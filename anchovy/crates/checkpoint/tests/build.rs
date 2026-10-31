@@ -157,7 +157,7 @@ fn previous(seq: u64, epoch: u64, digest: [u8; 32], total: u64, gas: [u64; 4]) -
         epoch_rolling_gas: gas,
         last_height: 0,
         timestamp_ms: 0,
-        root_state: None,
+        ends_epoch: false,
     }
 }
 

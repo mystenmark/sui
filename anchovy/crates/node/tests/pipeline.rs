@@ -908,7 +908,7 @@ fn the_epoch_ends_with_a_checkpoint_closing_it() {
         network.sui_committee.voting_rights
     );
     let committed = network.committed(last);
-    let root = state_hasher::decode(committed.root_state.as_ref().unwrap());
+    let root = network.pipeline().state_hashes.root(last).unwrap();
     assert_eq!(
         end.epoch_commitments,
         vec![CheckpointCommitment::ECMHLiveObjectSetDigest(

@@ -50,7 +50,7 @@ impl Setup {
             epoch_rolling_gas: [0; 4],
             last_height: seq,
             timestamp_ms: 0,
-            root_state: None,
+            ends_epoch: false,
         };
         store.commit_genesis_checkpoint(built(0).record(vec![0]), vec![]);
         for seq in 1..=count {

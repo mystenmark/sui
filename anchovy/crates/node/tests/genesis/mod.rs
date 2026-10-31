@@ -175,7 +175,7 @@ pub fn from_sui(genesis: &sui_config::genesis::Genesis, account: SuiAddress) -> 
         ],
         last_height: 0,
         timestamp_ms: summary.timestamp_ms,
-        root_state: None,
+        ends_epoch: false,
     };
     let mut coins: Vec<ObjectID> = genesis
         .objects()

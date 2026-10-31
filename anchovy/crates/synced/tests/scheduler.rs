@@ -117,7 +117,7 @@ fn record(summary: &CheckpointSummary, certificate: Vec<u8>) -> store::Checkpoin
         epoch_rolling_gas: [0; 4],
         last_height: 0,
         timestamp_ms: 0,
-        root_state: None,
+        ends_epoch: false,
     }
     .record(certificate)
 }
@@ -322,4 +322,17 @@ fn checkpoints_past_the_cut_ask_for_their_contents() {
         wanted.contents[0].1.bytes,
         s.chain[2].content_digest.into_inner()
     );
+}
+
+/// The epoch's last checkpoint past the cut takes the slow path too: once
+/// the quorum has left the epoch, consensus may never cut it.
+#[test]
+fn the_epoch_s_last_checkpoint_past_the_cut_asks_for_its_contents() {
+    let mut s = Setup::cut_at(2, true, Cut { seq: 1, height: 1 });
+    let summaries = vec![s.certified(1), s.certified(2)];
+    let (waiting, wanted) = s.sync(summaries);
+    assert_eq!(waiting, vec![1]);
+    assert_eq!(wanted.next, None);
+    let asked: Vec<_> = wanted.contents.iter().map(|(seq, _)| *seq).collect();
+    assert_eq!(asked, vec![2]);
 }

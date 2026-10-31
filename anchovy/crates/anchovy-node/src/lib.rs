@@ -58,7 +58,7 @@ impl Genesis {
             ],
             last_height: 0,
             timestamp_ms: summary.timestamp_ms,
-            root_state: None,
+            ends_epoch: false,
         };
         Genesis {
             objects: genesis.objects().to_vec(),

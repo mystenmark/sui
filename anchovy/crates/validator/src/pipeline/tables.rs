@@ -189,9 +189,8 @@ pub struct BuiltCheckpoint {
     /// and checkpoint intervals continue from.
     pub last_height: u64,
     pub timestamp_ms: u64,
-    /// The epoch's last checkpoint only: the live object set's ECMH after it
-    /// (`StateHash` BCS), which the next epoch continues from.
-    pub root_state: Option<Vec<u8>>,
+    /// Whether it is the epoch's last checkpoint.
+    pub ends_epoch: bool,
 }
 
 impl BuiltCheckpoint {
@@ -218,7 +217,7 @@ impl BuiltCheckpoint {
             self.epoch_rolling_gas,
             self.last_height,
             self.timestamp_ms,
-            &self.root_state,
+            self.ends_epoch,
         ))
         .expect("a checkpoint encodes")
     }
@@ -235,7 +234,7 @@ impl BuiltCheckpoint {
             epoch_rolling_gas,
             last_height,
             timestamp_ms,
-            root_state,
+            ends_epoch,
         ) = bcs::from_bytes(bytes).expect("a stored checkpoint decodes");
         BuiltCheckpoint {
             seq,
@@ -246,7 +245,7 @@ impl BuiltCheckpoint {
             epoch_rolling_gas,
             last_height,
             timestamp_ms,
-            root_state,
+            ends_epoch,
         }
     }
 }

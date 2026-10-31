@@ -65,6 +65,8 @@ struct Verified {
 struct Slow {
     certified: CertifiedCheckpoint,
     contents_digest: Digest,
+    /// It is the epoch's last.
+    ends: bool,
     /// The last chunk height before it, if the cut was just before it; else
     /// the last of the checkpoint split before it.
     after: Option<u64>,
@@ -114,7 +116,9 @@ pub struct Outputs {
 ///   path, it checks each one's effects against the certified ones,
 ///   releases its chunks, and commits the checkpoint as certified.
 ///
-/// Not yet: the epoch's last checkpoint takes the fast path.
+/// The epoch's last checkpoint's change-epoch transaction follows its last
+/// barrier, outside every chunk: the slow path runs it last, at the
+/// versions its effects give, as any other.
 ///
 /// Answers each request with what to fetch next: summaries up to `WINDOW`
 /// past the last committed checkpoint, nothing once the epoch's last is
@@ -250,7 +254,7 @@ impl SyncedScheduler {
                         summary: certified.into(),
                     };
                     let cut = self.chunk_lock.cut();
-                    if seq <= cut.seq || verified.ends {
+                    if seq <= cut.seq {
                         if verified.rounds && self.checkpoints.built(seq).is_none() {
                             self.rounds_wanted.insert(seq, verified.contents);
                         }
@@ -267,6 +271,7 @@ impl SyncedScheduler {
                         self.slow.push_back(Slow {
                             certified,
                             contents_digest: verified.contents,
+                            ends: verified.ends,
                             after: (cut.seq + 1 == seq).then_some(cut.height),
                             contents: None,
                         });
@@ -351,10 +356,11 @@ impl SyncedScheduler {
             contents::verify(&bytes, &slow.contents_digest, bump).expect("verified as fetched");
         let transactions = contents.transactions();
         let ends = contents::chunk_ends(transactions);
+        let settled = *ends.last().expect("a checkpoint has chunks");
         assert_eq!(
-            ends.last().copied(),
-            Some(transactions.len()),
-            "a checkpoint before the epoch's last ends with a barrier"
+            settled < transactions.len(),
+            slow.ends,
+            "the epoch's last checkpoint, and only it, ends with its change-epoch transaction"
         );
         self.feed_rounds(transactions);
         let first = slow.after.unwrap_or(self.split_height) + 1;
@@ -392,6 +398,22 @@ impl SyncedScheduler {
                 }
             }
             start = end;
+        }
+        // Outside every chunk; its input versions order it after the epoch's
+        // other writers. Whichever path runs it second finds it executed.
+        if let Some(change_epoch) = transactions.get(settled) {
+            let root_version = barrier_root_version(&transactions[settled - 1]) + 1;
+            let executable = item::executable(
+                change_epoch,
+                last,
+                root_version,
+                |id: &ObjectId, version: u64, _: &[TransactionDigest]| {
+                    panic!("the change-epoch transaction found {id:?}'s stream ended at {version}")
+                },
+                &mut self.keys,
+                &mut self.packages,
+            );
+            runs.push(executable, self.keys.drain(..));
         }
         if !runs.is_empty() {
             push(&self.outputs.inputs, Command::Wait(runs), "input waiter");
@@ -497,14 +519,14 @@ impl SyncedScheduler {
             ],
             last_height: running.last_height,
             timestamp_ms: summary.timestamp_ms,
-            root_state: None,
+            ends_epoch: summary.end_of_epoch_data.is_some(),
         });
         push(
             &self.outputs.hasher,
             CheckpointEffects {
                 seq,
                 effects,
-                last_of_epoch: false,
+                closing: false,
             },
             "state hasher",
         );

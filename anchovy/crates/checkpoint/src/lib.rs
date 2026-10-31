@@ -176,7 +176,7 @@ impl Processor for ContentsBuilder {
                     CheckpointEffects {
                         seq,
                         effects,
-                        last_of_epoch: false,
+                        closing: false,
                     },
                     "hasher",
                 );
@@ -271,10 +271,7 @@ impl Processor for SummaryBuilder {
                     .last()
                     .expect("a checkpoint has chunks"),
                 timestamp_ms: built.pending.timestamp_ms,
-                root_state: match &built.last {
-                    Some(LastOfEpoch::Closed(end)) => Some(end.root_state.clone()),
-                    _ => None,
-                },
+                ends_epoch: built.last.is_some(),
             };
             let checkpoint = self.checkpoints.insert_built(checkpoint);
             resolved.push((CheckpointBuilt(seq), checkpoint));

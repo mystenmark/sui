@@ -360,8 +360,8 @@ pub struct SettledChunk {
 pub struct CheckpointEffects {
     pub seq: u64,
     pub effects: Vec<ExecutedEffects>,
-    /// The epoch's last checkpoint: its root goes to `EpochCloser`.
-    pub last_of_epoch: bool,
+    /// From `EpochCloser`, closing the epoch: the root after it goes back.
+    pub closing: bool,
 }
 
 /// A checkpoint's contents, built without the previous checkpoint.
@@ -417,10 +417,8 @@ pub struct EndOfEpoch {
     /// Each member's protocol key and voting power, in committee order.
     pub next_committee: Vec<([u8; 96], u64)>,
     pub next_protocol_version: u64,
-    /// The live object set's ECMH after the checkpoint (`StateHash` BCS),
-    /// which the next epoch's root continues from.
-    pub root_state: Vec<u8>,
-    /// Its digest, the epoch's commitment, when the protocol commits it.
+    /// The digest of the live object set's ECMH after the checkpoint, the
+    /// epoch's commitment, when the protocol commits it.
     pub root_state_digest: Option<[u8; 32]>,
 }
 

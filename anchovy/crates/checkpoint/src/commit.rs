@@ -90,7 +90,7 @@ impl CheckpointCommitter {
         self.generations.commit(&transactions, bump);
         self.checkpoints.committed(seq);
         self.backpressure.committed(seq, built.last_height);
-        if built.root_state.is_some() {
+        if built.ends_epoch {
             self.ended.send_replace(Some(seq));
         }
         // Inside the pipeline a full queue is a sizing bug; a closed one

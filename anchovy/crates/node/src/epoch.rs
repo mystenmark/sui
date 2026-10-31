@@ -12,9 +12,15 @@ use std::sync::Arc;
 use aggregator::Committee;
 use checkpoint::ProtocolKey;
 use consensus::TransactionClient;
-use execution::system_state::Member;
+use execution::system_state::{Member, SystemState};
+use fastcrypto::hash::MultisetHash;
+use messages::arena::BumpAlloc;
 use messages::base::Digest;
-use sui_protocol_config::Chain;
+use messages::checkpoint::{CertifiedCheckpointSummary, CheckpointCommitmentKind};
+use messages::fast::Bump;
+use messages::reader::Reader;
+use state_hasher::{StateHash, StateHashes};
+use sui_protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
 use validator::current::CurrentEpoch;
 use validator::epoch::EpochState;
 use validator::epoch_store::EpochStore;
@@ -360,34 +366,53 @@ pub fn epoch_ended(store: &store::Store) -> bool {
     let Some((seq, bytes)) = store.last_checkpoint().expect("the store reads") else {
         return false;
     };
-    // The previous epoch's last checkpoint has a root too.
-    seq > record.previous_checkpoint && BuiltCheckpoint::decode(&bytes).root_state.is_some()
+    // The previous epoch's last checkpoint ends an epoch too.
+    seq > record.previous_checkpoint && BuiltCheckpoint::decode(&bytes).ends_epoch
+}
+
+/// The root after the current epoch's last committed checkpoint, from the
+/// epoch's `hashes`: as stored, or folded again from committed effects.
+fn committed_root(store: &store::Store, hashes: &StateHashes) -> StateHash {
+    let current = EpochRecord::load(store);
+    let (last, _) = store
+        .last_checkpoint()
+        .expect("the store reads")
+        .expect("the genesis checkpoint is committed");
+    hashes.committed_root(
+        store,
+        last,
+        current.previous_checkpoint,
+        &state_hasher::decode(&current.root_state),
+    )
 }
 
 /// Writes the next epoch's start record, once the current epoch's last
 /// checkpoint has committed: from the system state it wrote, following it,
-/// and continuing its root. Idempotent until written; the write is the
-/// durable point at which the node is in the next epoch.
+/// and continuing `root`, the root after it. Each is checked against the
+/// certified end-of-epoch data first. Idempotent until written; the write
+/// is the durable point at which the node is in the next epoch.
 ///
 /// # Panics
-/// If the current epoch has not ended, the store cannot be read or written,
-/// or the system state is not the next epoch's.
-pub fn reconfigure(store: &store::Store) {
+/// If the current epoch has not ended, the store cannot be read or
+/// written, or the system state is not the next epoch's. On a fork: the
+/// next committee, protocol version or root is not what the quorum
+/// certified.
+pub fn reconfigure(store: &store::Store, root: &StateHash, chain: Chain) {
     assert!(epoch_ended(store), "only an ended epoch is followed");
     let current = EpochRecord::load(store);
-    let (last, bytes) = store
+    let (last, _) = store
         .last_checkpoint()
         .expect("the store reads")
         .expect("the epoch's last checkpoint is committed");
-    let root_state = BuiltCheckpoint::decode(&bytes)
-        .root_state
-        .expect("an epoch's last checkpoint has its root");
     let state = execution::system_state::read(store).expect("the store holds the system state");
     assert_eq!(
         state.epoch,
         current.epoch + 1,
         "the system state is the next epoch's"
     );
+    let config =
+        ProtocolConfig::get_for_version(ProtocolVersion::new(current.protocol_version), chain);
+    check_end_of_epoch(store, last, &state, root, &config);
     // Every executed transaction was in a checkpoint, and the last one has
     // committed.
     assert_eq!(
@@ -397,7 +422,63 @@ pub fn reconfigure(store: &store::Store) {
     );
     store.commit_epoch_start(
         state.epoch,
-        EpochRecord::new(state, last, root_state).encode(),
+        EpochRecord::new(state, last, state_hasher::encode(root)).encode(),
+    );
+}
+
+/// Checks checkpoint `last`'s certified end-of-epoch data against `next`,
+/// the system state its change-epoch transaction wrote here, and `root`,
+/// the root after it, as `config` commits it.
+fn check_end_of_epoch(
+    store: &store::Store,
+    last: u64,
+    next: &SystemState,
+    root: &StateHash,
+    config: &ProtocolConfig,
+) {
+    let bytes = store
+        .certified(last)
+        .expect("the store reads")
+        .expect("a committed checkpoint's certificate is stored");
+    let bump = Bump::default();
+    let summary =
+        CertifiedCheckpointSummary::parse(&mut Reader::new(&bytes), &mut BumpAlloc(&bump))
+            .expect("a stored certificate parses")
+            .data;
+    let end = summary
+        .end_of_epoch_data
+        .expect("the epoch's last checkpoint has end-of-epoch data");
+    let committee: Vec<([u8; 96], u64)> = end
+        .next_epoch_committee
+        .iter()
+        .map(|m| (m.authority.bytes, m.stake.get()))
+        .collect();
+    assert!(
+        committee == next.stakes(),
+        "fork: checkpoint {last} certifies another next committee"
+    );
+    assert_eq!(
+        end.next_epoch_protocol_version, next.protocol_version,
+        "fork: checkpoint {last} certifies another next protocol version"
+    );
+    let commitments: Vec<_> = end
+        .epoch_commitments
+        .iter()
+        .map(|c| (c.kind(), c.digest.bytes))
+        .collect();
+    let expected: Vec<_> = config
+        .commit_root_state_digest()
+        .then(|| {
+            (
+                CheckpointCommitmentKind::EcmhLiveObjectSetDigest,
+                root.digest().digest,
+            )
+        })
+        .into_iter()
+        .collect();
+    assert!(
+        commitments == expected,
+        "fork: checkpoint {last} certifies another root"
     );
 }
 
@@ -435,14 +516,19 @@ impl Node {
     /// Starts the store's current epoch, its consensus started by
     /// `consensus`, first reconfiguring if that epoch has already ended: a
     /// crash after its last checkpoint committed, before the next epoch's
-    /// record.
+    /// record. The root is then read from, or folded again in, the ended
+    /// epoch's store.
     ///
     /// # Panics
     /// If an epoch is running.
     pub fn start_epoch(&mut self, consensus: &mut impl Consensus) -> &Epoch {
         assert!(self.running.is_none(), "one epoch at a time");
-        if epoch_ended(&self.perpetual.store) {
-            reconfigure(&self.perpetual.store);
+        let perpetual = &self.perpetual;
+        if epoch_ended(&perpetual.store) {
+            let current = EpochRecord::load(&perpetual.store).epoch;
+            let (epoch_store, _, builder) = EpochStore::open(&perpetual.epochs, current);
+            let root = committed_root(&perpetual.store, &StateHashes::new(epoch_store, builder));
+            reconfigure(&perpetual.store, &root, perpetual.chain);
         }
         self.running
             .insert(Epoch::start(&self.perpetual, consensus))
@@ -461,8 +547,9 @@ impl Node {
             "the epoch has ended"
         );
         epoch.drain();
+        let root = committed_root(&self.perpetual.store, &epoch.pipeline.state_hashes);
         drop(epoch);
-        reconfigure(&self.perpetual.store);
+        reconfigure(&self.perpetual.store, &root, self.perpetual.chain);
         let next = EpochRecord::load(&self.perpetual.store).epoch;
         store::epoch::prune_before(&self.perpetual.epochs, next)
             .expect("old epochs' stores are deleted");

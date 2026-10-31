@@ -1646,3 +1646,24 @@ fn a_lagging_consensus_follows_certified_checkpoints_alike() {
     network.execute(&later);
     drop(network.runtime);
 }
+
+/// Anchovy's consensus is held while sui's validators pass the epoch's end:
+/// it finishes the epoch on certified checkpoints alone, the last with its
+/// change-epoch transaction, then follows consensus in the next.
+#[test]
+fn a_lagging_consensus_catches_up_an_epoch_s_end_alike() {
+    let mut network = Network::with_epoch_duration(Some(5_000));
+    network.anchovy.runner.held.store(true, Ordering::SeqCst);
+    let transfer = network.transfer(0);
+    network.submit_through_sui(&[&transfer]);
+    network.wait_for("anchovy in epoch 1", |network| {
+        (network.anchovy.epoch() >= 1).then_some(())
+    });
+    let effects = network.anchovy.effects(transfer.digest()).unwrap();
+    assert!(effects.status().is_ok(), "{:?}", effects.status());
+
+    network.anchovy.runner.held.store(false, Ordering::SeqCst);
+    let later = network.transfer(0);
+    network.execute(&later);
+    drop(network.runtime);
+}

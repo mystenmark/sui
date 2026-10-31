@@ -118,7 +118,7 @@ fn roots_fold_in_order() {
             processor
                 .process(
                     CheckpointEffects {
-                        last_of_epoch: false,
+                        closing: false,
                         seq,
                         effects: effects.clone()
                     },
@@ -159,7 +159,7 @@ fn roots_fold_in_order_whatever_the_arrival_order() {
         let seq = first + i as u64;
         processor.process(
             CheckpointEffects {
-                last_of_epoch: false,
+                closing: false,
                 seq,
                 effects: checkpoints[i].clone(),
             },
@@ -196,7 +196,7 @@ fn a_checkpoint_hashed_again_alike_folds_once() {
     let mut hash = |seq: u64| {
         processor.process(
             CheckpointEffects {
-                last_of_epoch: false,
+                closing: false,
                 seq,
                 effects: checkpoints[seq as usize].clone(),
             },
@@ -221,7 +221,7 @@ fn a_checkpoint_hashed_again_differently_panics() {
     for effects in checkpoints {
         processor.process(
             CheckpointEffects {
-                last_of_epoch: false,
+                closing: false,
                 seq: 3,
                 effects,
             },
