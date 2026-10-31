@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 aggregator.workspace = true
 messages.workspace = true
+resolver.workspace = true
 store.workspace = true
 tracing.workspace = true
 validator.workspace = true

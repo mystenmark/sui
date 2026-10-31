@@ -4,6 +4,9 @@
 //! Following the certified checkpoint chain from peers
 //! (`docs/state_sync_design.md`, Catching up).
 
+pub mod contents;
+pub mod item;
+
 use std::sync::Arc;
 
 use aggregator::{CertificateError, Committee};

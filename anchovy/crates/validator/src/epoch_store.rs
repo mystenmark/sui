@@ -111,12 +111,39 @@ impl EpochStore {
             });
         }
         let live = objects.live(id).expect("the store reads")?;
-        let mut value = live.version.to_le_bytes().to_vec();
-        value.extend_from_slice(&live.digest.bytes);
+        self.put_start_version(&key, live);
+        Some(live)
+    }
+
+    /// Records `start` as where version assignment starts shared object
+    /// `id` in the epoch, unless a start is recorded already: a certified
+    /// transaction writing it, executed before anything in the epoch
+    /// assigned it a version, read it at its start.
+    ///
+    /// # Panics
+    /// If the database cannot be read or written.
+    pub fn seed_start_version(&self, id: &ObjectId, initial_shared_version: u64, start: Live) {
+        let _initializing = self
+            .start_versions
+            .lock()
+            .expect("the lock is not poisoned");
+        let key = stream_key(id, initial_shared_version);
+        if self
+            .db
+            .get(Space::StartVersions, &key)
+            .expect("the epoch's database reads")
+            .is_none()
+        {
+            self.put_start_version(&key, start);
+        }
+    }
+
+    fn put_start_version(&self, key: &[u8], start: Live) {
+        let mut value = start.version.to_le_bytes().to_vec();
+        value.extend_from_slice(&start.digest.bytes);
         let mut batch = self.db.batch();
         batch.put(Space::StartVersions, key.to_vec(), value);
         batch.commit().expect("the epoch's database writes");
-        Some(live)
     }
 }
 

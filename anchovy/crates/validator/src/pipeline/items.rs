@@ -215,6 +215,28 @@ pub struct Executable {
     /// What each of its input waiter keys resolved to, by the key's position:
     /// filled in by the input waiter.
     pub inputs: Vec<Option<InputValue>>,
+    /// Set on a transaction of a certified checkpoint the synced scheduler
+    /// runs; then `entry.shared` is empty and nothing was reserved.
+    pub synced: Option<Box<Synced>>,
+}
+
+/// What a certified transaction's effects decide, in place of the consensus
+/// path's decisions (`docs/state_sync_design.md`, Synced items). Its
+/// consensus objects at their input versions are among its keys, as
+/// `ObjectVersion`; a cancelled one's markers are in `entry.cancelled`.
+#[derive(Debug)]
+pub struct Synced {
+    /// The certified effects digest, which its effects must have.
+    pub effects: TxDigest,
+    /// Each consensus object input whose stream had ended: its id, the
+    /// version it ended at, and the transaction that ended it.
+    pub ended: Vec<(ObjectId, u64, [u8; 32])>,
+    /// Its funds withdrawals were insufficient (R4.5).
+    pub insufficient: bool,
+    /// Each consensus object it writes and its input version and digest:
+    /// where the epoch's version assignment starts it, if nothing in the
+    /// epoch touched it before.
+    pub writes: Vec<(StreamId, u64, messages::base::Digest)>,
 }
 
 /// What the input waiter takes: transactions waiting on their inputs, and

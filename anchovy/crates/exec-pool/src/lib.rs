@@ -19,7 +19,7 @@ use validator::epoch::EpochState;
 use validator::epoch_store::EpochStore;
 use validator::pipeline::items::{
     EffectsWaitItem, EpochCloserInput, Executable, ExecutableTransaction, FundsCommand,
-    InputCommand, InputValue, ReservationStatus, Settle, SettlementInput, SystemKind,
+    InputCommand, InputValue, ReservationStatus, Settle, SettlementInput, Synced, SystemKind,
     SystemTransaction,
 };
 use validator::pipeline::keys::{AccumulatorVersion, EffectsKey, InputKey, StreamId, TxDigest};
@@ -50,6 +50,11 @@ use workqueue::{Processor, PushError, Queue, Sink};
 ///   not change (an input that had ended, say) keeps the generation it read.
 /// - **Executed already** (a replayed commit): it is not executed again, but
 ///   its generations are recorded from its stored effects.
+/// - **Certified** (`Executable::synced`, from the synced scheduler): its
+///   consensus objects come at the versions its certified effects give, it
+///   first records where each it writes starts the epoch, and its effects
+///   must be the certified ones. It records no generations and settles no
+///   funds.
 /// - **Execution never fails.** Every transaction released here can run
 ///   (it may abort, with effects); an error outside the transaction (the
 ///   store, an input not found) is a bug, and panics.
@@ -150,6 +155,19 @@ impl Executor {
         };
 
         let stored = self.stored_effects(digest);
+        if let Some(synced) = &executable.synced {
+            self.execute_synced(
+                executable,
+                synced,
+                digest,
+                bytes,
+                stored,
+                resolved_keys,
+                bump,
+            );
+            effects_keys.push(EffectsKey(digest.into()));
+            return;
+        }
         // Executed and committed before a restart: its checkpoint will not
         // commit again, so what it produced is written at once.
         let committed = stored.is_some() && !self.store.is_uncommitted(&digest);
@@ -249,16 +267,6 @@ impl Executor {
         }
 
         // 3. The generations it produced, then its outputs, to resolve.
-        let object_at = |id: &messages::base::ObjectId, version: u64| -> Message<Object<'static>> {
-            match written.iter().find(|(w, v, _)| w == id && *v == version) {
-                Some((_, _, object)) => object.clone(),
-                None => self
-                    .store
-                    .object(id, version)
-                    .expect("the store reads")
-                    .expect("an executed transaction's outputs are stored"),
-            }
-        };
         for (i, access) in entry.shared.iter().enumerate() {
             if access.mutability != SharedObjectMutability::Mutable {
                 continue;
@@ -270,7 +278,9 @@ impl Executor {
             self.generations
                 .record(stream, round, generation, produced, digest, committed);
             let object = match produced {
-                Generation::Version { version, .. } => Some(object_at(&access.id, version)),
+                Generation::Version { version, .. } => {
+                    Some(self.object_at(&written, &access.id, version))
+                }
                 Generation::Ended { .. } => None,
             };
             resolved_keys.push((
@@ -285,20 +295,106 @@ impl Executor {
         if let ExecutableTransaction::User(_) = &entry.transaction {
             funds_settled(effects_v2, executable, funds, deposits);
         }
-        for change in effects_v2.changed_objects {
+        self.outputs(effects_v2, &written, resolved_keys);
+        effects_keys.push(EffectsKey(digest.into()));
+    }
+
+    /// Runs certified transaction `executable` (see `Executable::synced`),
+    /// unless it executed already, and pushes the keys of its outputs. It
+    /// records no generations and settles no funds: the consensus path
+    /// does, from its stored effects, once it reaches it.
+    ///
+    /// # Panics
+    /// If its effects are not the certified ones: this validator forked.
+    #[allow(clippy::too_many_arguments)]
+    fn execute_synced(
+        &mut self,
+        executable: &Executable,
+        synced: &Synced,
+        digest: TxDigest,
+        bytes: &[u8],
+        stored: Option<Message<TransactionEffects<'static>>>,
+        resolved_keys: &mut Vec<(InputKey, InputValue)>,
+        bump: &Bump,
+    ) {
+        let (effects, written) = if let Some(effects) = stored {
+            (effects, containers::Vec::new_in(bump))
+        } else {
+            for &(stream, version, digest) in &synced.writes {
+                self.epoch_store.seed_start_version(
+                    &stream.id,
+                    stream.initial_shared_version,
+                    store::Live { version, digest },
+                );
+            }
+            let mut provided = containers::Vec::new_in(bump);
+            for value in &executable.inputs {
+                match value.as_ref().expect("every key resolved") {
+                    InputValue::Object(object) => provided.push((
+                        *object.get().id().expect("an input object has an id"),
+                        Input::Object(object.get().bytes),
+                    )),
+                    other => panic!("a certified transaction's input resolved to {other:?}"),
+                }
+            }
+            for &(id, marker) in &executable.entry.cancelled {
+                provided.push((id, Input::Cancelled(marker)));
+            }
+            for &(id, version, transaction) in &synced.ended {
+                provided.push((
+                    id,
+                    Input::Ended {
+                        version,
+                        transaction,
+                    },
+                ));
+            }
+            let funds = if synced.insufficient {
+                Funds::Insufficient
+            } else {
+                Funds::MaybeSufficient
+            };
+            self.execute_now(
+                digest,
+                bytes,
+                &provided,
+                funds,
+                executable.root_version,
+                bump,
+            )
+        };
+        assert!(
+            effects.get().digest == synced.effects,
+            "fork: transaction {digest:?} of a certified checkpoint has other effects than certified"
+        );
+        let VersionedEffects::V2(effects_v2) = &effects.get().version else {
+            unreachable!("execution produces V2 effects");
+        };
+        self.outputs(effects_v2, &written, resolved_keys);
+    }
+
+    /// Pushes the keys of what `effects` wrote: each object at its version,
+    /// and each package by id too. `written` holds those just executed.
+    fn outputs(
+        &self,
+        effects: &messages::effects::TransactionEffectsV2<'_>,
+        written: &WrittenObjects<'_>,
+        resolved_keys: &mut Vec<(InputKey, InputValue)>,
+    ) {
+        for change in effects.changed_objects {
             match change.output_state {
                 ObjectOut::ObjectWrite(..) => {
-                    let version = effects_v2.lamport_version;
+                    let version = effects.lamport_version;
                     resolved_keys.push((
                         InputKey::ObjectVersion {
                             id: *change.id,
                             version,
                         },
-                        InputValue::Object(object_at(change.id, version)),
+                        InputValue::Object(self.object_at(written, change.id, version)),
                     ));
                 }
                 ObjectOut::PackageWrite(version, _) => {
-                    let package = object_at(change.id, version);
+                    let package = self.object_at(written, change.id, version);
                     resolved_keys.push((
                         InputKey::ObjectVersion {
                             id: *change.id,
@@ -312,7 +408,24 @@ impl Executor {
                 ObjectOut::NotExist | ObjectOut::AccumulatorWriteV1(_) => {}
             }
         }
-        effects_keys.push(EffectsKey(digest.into()));
+    }
+
+    /// Object `id` at `version`: from `written`, if just executed, else
+    /// from the store.
+    fn object_at(
+        &self,
+        written: &WrittenObjects<'_>,
+        id: &messages::base::ObjectId,
+        version: u64,
+    ) -> Message<Object<'static>> {
+        match written.iter().find(|(w, v, _)| w == id && *v == version) {
+            Some((_, _, object)) => object.clone(),
+            None => self
+                .store
+                .object(id, version)
+                .expect("the store reads")
+                .expect("an executed transaction's outputs are stored"),
+        }
     }
 
     /// The effects of the transaction with `digest`, if it executed already.
@@ -703,6 +816,7 @@ mod tests {
             },
             resolved_base: vec![],
             inputs: vec![],
+            synced: None,
         }
     }
 
