@@ -62,21 +62,32 @@ executor, the chunk lock, a fast path):
   - [x] The lock (`validator::pipeline::chunk_lock`): the commit stage
     claims each commit's chunks before emitting them and reports its last
     cut; the synced scheduler closes it when dropped.
-  - [ ] Fetch contents for checkpoints past the cut; verify them against
+  - [x] Fetch contents for checkpoints past the cut; verify them against
     the summary; split them into chunks at barriers (the transaction whose
     effects change `0xacc`), numbered on from the cut or the previous
     synced checkpoint.
-  - [ ] Synced executables: owned and package keys from the transaction,
-    consensus objects at their effects' input versions, `Ended` and
-    cancellation markers, the funds verdict from the status, the expected
-    effects digest; start versions recorded before executing; no
-    generations or funds settles.
-  - [ ] Wait each synced chunk executed, release it; once all of K's chunks
-    are executed or settled, build K from its summary and contents (state
-    hash included) and commit it.
+  - [x] Synced executables (`synced::item`): owned and package keys from
+    the transaction, consensus objects at their effects' input versions,
+    `Ended` and cancellation markers, the funds verdict from the status,
+    the expected effects digest; start versions seeded before executing;
+    no generations or funds settles.
+  - [x] Wait each checkpoint's transactions executed, check their effects,
+    release its chunks, insert it as built, hash it, commit it. The
+    commit stage still builds it and compares (`insert_built`); the state
+    hasher accepts a checkpoint hashed again alike. Chunks are taken from
+    the chunk table as their checkpoint is built, not pruned at commit.
+  - [x] Certified randomness bytes to the signature collector
+    (`BeaconInput::Certified`), from split checkpoints and from cut ones
+    not built yet that list rounds.
+  - [ ] The epoch's last checkpoint on the slow path (it takes the fast
+    path for now): change-epoch last, the root state for its record.
   - [ ] The consensus path's checks of transactions executed already.
-  - [ ] Certified randomness bytes into the gate.
-  - [ ] Compat: catching up an epoch's end; a lagging consensus; deviation.
+  - [x] Compat: a lagging consensus (`Lagging` holds anchovy's commits).
+  - [ ] Compat: catching up an epoch's end; deviation.
+  - Known gaps: a crash after a synced commit, before the consensus path
+    passes the same chunks, skips those chunks' checks (the quarantine
+    counts them committed); stream-ended inputs on the synced path are
+    untested.
 
 ## Left out / later
 
