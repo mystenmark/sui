@@ -24,6 +24,7 @@ use validator::pipeline::items::{
 };
 use validator::pipeline::keys::{AccumulatorVersion, EffectsKey, InputKey, StreamId, TxDigest};
 use validator::pipeline::tables::{Generation, GenerationTable};
+use validator::state_sync::SyncedInput;
 use waiter::{Availability, Command};
 use workqueue::{Processor, PushError, Queue, Sink};
 
@@ -698,6 +699,7 @@ impl Availability<EffectsKey> for EffectsAvailability {
 pub struct EffectsRouter {
     pub settlement: Queue<SettlementInput>,
     pub epoch_closer: Queue<EpochCloserInput>,
+    pub synced: Queue<SyncedInput>,
 }
 
 impl Sink<Vec<EffectsWaitItem>> for EffectsRouter {
@@ -723,6 +725,9 @@ impl Sink<Vec<EffectsWaitItem>> for EffectsRouter {
                     EpochCloserInput::ChangeEpochExecuted,
                     "epoch closer",
                 ),
+                EffectsWaitItem::SyncedExecuted(seq) => {
+                    push(&self.synced, SyncedInput::Executed(seq), "synced scheduler");
+                }
             }
         }
     }

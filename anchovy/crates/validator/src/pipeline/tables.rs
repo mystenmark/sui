@@ -143,11 +143,11 @@ impl GenerationTable {
     }
 }
 
-/// Settled chunks by height, in memory: only checkpoints not yet committed
-/// read them, so they are pruned as checkpoints commit, and a replay
-/// settles them again. Written by `SettlementScheduler` (owner: the
-/// settlement work), read by the checkpoint waiter's availability check and
-/// by `ContentsBuilder`, pruned by `CheckpointCommitter`.
+/// Settled chunks by height, in memory: only checkpoints not yet built read
+/// them, so each is taken as its checkpoint's contents are built, and a
+/// replay settles them again. Written by `SettlementScheduler` (owner: the
+/// settlement work), read by the checkpoint waiter's availability check,
+/// taken by `ContentsBuilder`.
 #[derive(Default)]
 pub struct ChunkTable {
     chunks: Mutex<HashMap<u64, Arc<SettledChunk>, foldhash::fast::RandomState>>,
@@ -166,9 +166,9 @@ impl ChunkTable {
         lock(&self.chunks).get(&height).cloned()
     }
 
-    /// Drops the chunks at or below `height`.
-    pub fn prune_through(&self, height: u64) {
-        lock(&self.chunks).retain(|&h, _| h > height);
+    /// Removes the chunk at `height`, if settled.
+    pub fn take(&self, height: u64) -> Option<Arc<SettledChunk>> {
+        lock(&self.chunks).remove(&height)
     }
 }
 

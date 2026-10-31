@@ -326,6 +326,9 @@ pub enum EffectsWaitItem {
     /// The change-epoch transaction executed. `EpochCloser` → effects waiter
     /// → `EpochCloser`.
     ChangeEpochExecuted,
+    /// Every transaction of certified checkpoint `seq` executed.
+    /// `SyncedScheduler` → effects waiter → `SyncedScheduler`.
+    SyncedExecuted(u64),
 }
 
 /// A transaction's executed effects, as the chunk table and checkpointing

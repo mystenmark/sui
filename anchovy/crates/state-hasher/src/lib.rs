@@ -222,7 +222,8 @@ fn committed_effects(store: &store::Store, seq: u64, bump: &mut Bump) -> Vec<Exe
 /// changed object's digest, remove each old one's), then folds it into the
 /// running root once the previous root is folded.
 ///
-/// Checkpoints may arrive in any order. The previous root is this
+/// Checkpoints may arrive in any order, and again: a checkpoint hashed
+/// again must hash alike. The previous root is this
 /// processor's own state, so the wait for it is the `pending` map: a
 /// checkpoint's hash is kept there until every earlier one is folded.
 ///
@@ -277,11 +278,16 @@ impl Processor for StateHasher {
 
     fn process(&mut self, effects: CheckpointEffects, bump: &mut Bump) -> Option<()> {
         let seq = effects.seq;
-        assert!(
-            seq >= self.next && !self.pending.contains_key(&seq),
-            "checkpoint {seq} hashed twice"
-        );
         let hash = accumulate(&effects.effects, bump);
+        // Both front ends hash a checkpoint the synced scheduler commits
+        // before this validator builds it.
+        if seq < self.next || self.pending.contains_key(&seq) {
+            assert!(
+                self.hashes.checkpoint(seq).as_ref() == Some(&hash),
+                "fork: checkpoint {seq} hashed differently"
+            );
+            return None;
+        }
         self.hashes.insert_checkpoint(seq, &hash);
         self.pending.insert(seq, (hash, effects.last_of_epoch));
         while let Some((hash, last_of_epoch)) = self.pending.remove(&self.next) {

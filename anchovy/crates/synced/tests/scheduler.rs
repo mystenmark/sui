@@ -28,7 +28,7 @@ use validator::pipeline::chunk_lock::{ChunkLock, Cut};
 use validator::pipeline::items::{BuiltCommand, BuiltWaitItem};
 use validator::pipeline::keys::CheckpointBuilt;
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore};
-use validator::state_sync::{SyncRequest, Wanted};
+use validator::state_sync::{SyncRequest, SyncedInput, Wanted};
 use waiter::Command;
 use workqueue::{Inbox, Processor};
 
@@ -135,8 +135,20 @@ struct Setup {
 
 impl Setup {
     /// Genesis committed, and checkpoints 1 to `length` in the chain, the
-    /// last ending the epoch if `ends`.
+    /// last ending the epoch if `ends`; every one of them cut.
     fn new(length: u64, ends: bool) -> Setup {
+        Setup::cut_at(
+            length,
+            ends,
+            Cut {
+                seq: length,
+                height: length,
+            },
+        )
+    }
+
+    /// `new`, the commit stage having cut the checkpoints through `cut`.
+    fn cut_at(length: u64, ends: bool, cut: Cut) -> Setup {
         let signers = Signers::new();
         let mut chain = vec![summary(0, None)];
         for seq in 1..=length {
@@ -159,12 +171,20 @@ impl Setup {
         );
         let checkpoints = Arc::new(CheckpointStore::new(store.clone(), 0, epoch_store, builder));
         let (built, inbox) = workqueue::queue(16);
+        let lock = Arc::new(ChunkLock::new(cut.height, cut));
         let scheduler = SyncedScheduler::new(
             Arc::new(signers.committee()),
+            store,
             checkpoints.clone(),
-            &store,
-            Arc::new(ChunkLock::new(0, Cut { seq: 0, height: 0 })),
-            built,
+            lock.clone(),
+            synced::Outputs {
+                built,
+                inputs: workqueue::queue(16).0,
+                effects: workqueue::queue(16).0,
+                hasher: workqueue::queue(16).0,
+                committer: workqueue::queue(16).0,
+                beacon: workqueue::queue(16).0,
+            },
         );
         Setup {
             signers,
@@ -186,7 +206,11 @@ impl Setup {
     fn sync(&mut self, summaries: Vec<Vec<u8>>) -> (Vec<u64>, Wanted) {
         let (reply, wanted) = oneshot::channel();
         self.scheduler.process(
-            SyncRequest { summaries, reply },
+            SyncedInput::Request(SyncRequest {
+                summaries,
+                contents: Vec::new(),
+                reply,
+            }),
             &mut workqueue::Bump::default(),
         );
         let mut waiting = Vec::new();
@@ -207,7 +231,11 @@ impl Setup {
 }
 
 fn wanted(next: Option<u64>, room: u64) -> Wanted {
-    Wanted { next, room }
+    Wanted {
+        next,
+        room,
+        contents: Vec::new(),
+    }
 }
 
 #[test]
@@ -276,4 +304,21 @@ fn the_epoch_s_last_checkpoint_ends_the_chain() {
     let summaries = vec![s.certified(1), s.certified(2), s.certified(2)];
     assert_eq!(s.sync(summaries), (vec![1, 2], wanted(None, WINDOW - 2)));
     assert_eq!(s.sync(vec![]), (vec![], wanted(None, WINDOW - 2)));
+}
+
+/// Past the cut, a checkpoint waits for no build: its contents are asked
+/// for, a few at a time.
+#[test]
+fn checkpoints_past_the_cut_ask_for_their_contents() {
+    let mut s = Setup::cut_at(7, false, Cut { seq: 1, height: 3 });
+    let summaries = (1..=7).map(|seq| s.certified(seq)).collect();
+    let (waiting, wanted) = s.sync(summaries);
+    assert_eq!(waiting, vec![1]);
+    assert_eq!(wanted.next, Some(8));
+    let asked: Vec<_> = wanted.contents.iter().map(|(seq, _)| *seq).collect();
+    assert_eq!(asked, vec![2, 3, 4, 5]);
+    assert_eq!(
+        wanted.contents[0].1.bytes,
+        s.chain[2].content_digest.into_inner()
+    );
 }

@@ -40,7 +40,7 @@ use tokio::sync::oneshot;
 use validator::current::CurrentEpoch;
 use validator::pipeline::items::GateInput;
 use validator::randomness::{BeaconInput, SendSignaturesRequest};
-use validator::state_sync::{self, Query, SyncRequest, Wanted};
+use validator::state_sync::{self, Query, SyncRequest, SyncedInput, Wanted};
 use workqueue::Queue;
 
 /// sui's limits on a p2p request frame, and a response frame.
@@ -321,43 +321,51 @@ async fn follow_chain(network: Network, current: CurrentEpoch) {
     }
 }
 
-/// Fetches up to `SYNC_BATCH` summaries the scheduler wants from the first
-/// member that has them, trying the next if they are rejected. Returns
-/// whether the scheduler took any.
+/// Fetches what the scheduler wants from the first member that has it: up
+/// to `SYNC_BATCH` summaries, and the contents it asks for; trying the next
+/// member if nothing is taken. Returns whether the scheduler took anything.
 async fn follow_round(
     network: &Network,
-    sync: &Queue<SyncRequest>,
+    sync: &Queue<SyncedInput>,
     members: &[(PeerId, String)],
 ) -> bool {
-    let Some(mut wanted) = hand_over(sync, Vec::new()).await else {
+    let Some(mut wanted) = hand_over(sync, Vec::new(), Vec::new()).await else {
         return false;
     };
     let own = PeerId(network.peer_id().0);
     for &(peer, ref address) in members {
-        let Some(next) = wanted.next.filter(|_| wanted.room > 0) else {
+        let next = wanted.next.filter(|_| wanted.room > 0);
+        if next.is_none() && wanted.contents.is_empty() {
             return false;
-        };
+        }
         if peer == own || !connect(network, peer, address).await {
             continue;
         }
-        let Some(highest) = highest_certified(network, peer).await else {
-            continue;
-        };
-        let last = highest.min(next + wanted.room.min(SYNC_BATCH) - 1);
         let mut summaries = Vec::new();
-        for seq in next..=last {
-            let Some(summary) = certified_summary(network, peer, seq).await else {
-                break;
-            };
-            summaries.push(summary);
+        if let Some(next) = next
+            && let Some(highest) = highest_certified(network, peer).await
+        {
+            let last = highest.min(next + wanted.room.min(SYNC_BATCH) - 1);
+            for seq in next..=last {
+                let Some(summary) = certified_summary(network, peer, seq).await else {
+                    break;
+                };
+                summaries.push(summary);
+            }
         }
-        if summaries.is_empty() {
+        let mut contents = Vec::new();
+        for &(seq, digest) in &wanted.contents {
+            if let Some(bytes) = full_contents(network, peer, digest).await {
+                contents.push((seq, bytes));
+            }
+        }
+        if summaries.is_empty() && contents.is_empty() {
             continue;
         }
-        let Some(after) = hand_over(sync, summaries).await else {
+        let Some(after) = hand_over(sync, summaries, contents).await else {
             return false;
         };
-        if after.next != wanted.next {
+        if after.next != wanted.next || after.contents != wanted.contents {
             return true;
         }
         wanted = after;
@@ -365,12 +373,38 @@ async fn follow_round(
     false
 }
 
-/// Hands `summaries` to the epoch's synced scheduler; what it wants next,
-/// unless the epoch has stopped.
-async fn hand_over(sync: &Queue<SyncRequest>, summaries: Vec<Vec<u8>>) -> Option<Wanted> {
+/// Hands what was fetched to the epoch's synced scheduler; what it wants
+/// next, unless the epoch has stopped.
+async fn hand_over(
+    sync: &Queue<SyncedInput>,
+    summaries: Vec<Vec<u8>>,
+    contents: Vec<(u64, Vec<u8>)>,
+) -> Option<Wanted> {
     let (reply, wanted) = oneshot::channel();
-    sync.try_push(SyncRequest { summaries, reply }).ok()?;
+    sync.try_push(SyncedInput::Request(SyncRequest {
+        summaries,
+        contents,
+        reply,
+    }))
+    .ok()?;
     wanted.await.ok()
+}
+
+/// `peer`'s full contents with contents digest `digest`, as sent:
+/// `VersionedFullCheckpointContents` BCS.
+async fn full_contents(network: &Network, peer: PeerId, digest: Digest) -> Option<Vec<u8>> {
+    let bytes = call_raw(
+        network,
+        peer,
+        "/sui.StateSync/GetCheckpointContentsV2",
+        CheckpointContentsDigest::new(digest.bytes),
+    )
+    .await?;
+    // `Option<VersionedFullCheckpointContents>`.
+    match bytes.split_first() {
+        Some((1, contents)) => Some(contents.to_vec()),
+        _ => None,
+    }
 }
 
 /// The highest checkpoint `peer` has certified.

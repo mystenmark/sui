@@ -14,6 +14,7 @@ mod genesis;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
@@ -84,11 +85,56 @@ struct Anchovy {
     /// Its p2p endpoint, through which sui validators push it the random
     /// beacon's signatures.
     _p2p: node::p2p::P2p,
-    runner: Runner,
+    runner: Lagging,
     certified_inbox: Inbox<CertifiedCheckpoint>,
     certified: BTreeSet<u64>,
     // Dropped after the node.
     dir: tempfile::TempDir,
+}
+
+/// Anchovy's consensus, whose commits are held back from its pipeline while
+/// `held`: its consensus lags while sui's validators go on.
+struct Lagging {
+    runner: Runner,
+    held: Arc<AtomicBool>,
+}
+
+impl Lagging {
+    fn new(runner: Runner) -> Lagging {
+        Lagging {
+            runner,
+            held: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl node::epoch::Consensus for Lagging {
+    fn start(&mut self, mut start: node::epoch::ConsensusStart) -> consensus::TransactionClient {
+        let (proxy, commits) = workqueue::queue(1024);
+        let pipeline = std::mem::replace(&mut start.output.commits, proxy);
+        let held = self.held.clone();
+        // Until the pipeline's queue closes, as the epoch ends.
+        std::thread::spawn(move || {
+            loop {
+                match commits.try_pop() {
+                    Some(commit) => {
+                        while held.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        if pipeline.try_push(commit).is_err() {
+                            return;
+                        }
+                    }
+                    None => std::thread::sleep(Duration::from_millis(2)),
+                }
+            }
+        });
+        self.runner.start(start)
+    }
+
+    fn stop(&mut self) {
+        node::epoch::Consensus::stop(&mut self.runner);
+    }
 }
 
 /// Not waiting at start for peers to return anchovy's last block: its
@@ -852,7 +898,7 @@ impl Anchovy {
         );
         let (state_sync, certified_inbox) = workqueue::queue(1024);
         let keys = keys(config);
-        let mut runner = Runner::new(&keys, parameters());
+        let mut runner = Lagging::new(Runner::new(&keys, parameters()));
         let mut node = Node::new(Perpetual {
             store,
             epochs: dir.path().join("epochs"),
@@ -937,7 +983,10 @@ impl Anchovy {
         );
         drop(store);
         let store = Arc::new(store::Store::open(&self.dir.path().join("perpetual")).unwrap());
-        self.runner = Runner::new(&keys, parameters());
+        self.runner = Lagging {
+            runner: Runner::new(&keys, parameters()),
+            held: self.runner.held.clone(),
+        };
         let mut node = Node::new(Perpetual {
             store: store.clone(),
             epochs,
@@ -1567,5 +1616,33 @@ fn a_full_node_syncs_from_anchovy_alike() {
         assert_eq!(&synced, effects);
     }
     full_node.stop();
+    drop(network.runtime);
+}
+
+/// Anchovy's consensus lags while sui's validators certify checkpoints:
+/// anchovy executes and commits them from their certificates, past its own
+/// cut, then its consensus catches up behind them and agrees.
+#[test]
+fn a_lagging_consensus_follows_certified_checkpoints_alike() {
+    let mut network = Network::new();
+    let shared = shared_coin(&mut network, 0);
+    network.anchovy.runner.held.store(true, Ordering::SeqCst);
+
+    let transfer = network.transfer(1);
+    let write = network.split_shared(2, shared);
+    network.submit_through_sui(&[&transfer, &write]);
+    for transaction in [&transfer, &write] {
+        let seq = network.wait_for("a certified checkpoint executed", |network| {
+            let seq = network.anchovy.checkpoint_of(transaction.digest())?;
+            let committed = network.anchovy.checkpoints().last_committed();
+            (committed >= seq).then_some(seq)
+        });
+        let effects = network.anchovy.effects(transaction.digest()).unwrap();
+        assert!(effects.status().is_ok(), "{seq}: {:?}", effects.status());
+    }
+
+    network.anchovy.runner.held.store(false, Ordering::SeqCst);
+    let later = network.split_shared(3, shared);
+    network.execute(&later);
     drop(network.runtime);
 }

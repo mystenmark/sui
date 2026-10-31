@@ -65,7 +65,8 @@ fn push<T>(queue: &Queue<T>, item: T, name: &str) {
 /// - built waiter, wait for: `BuiltWaitItem::Next`, keyed by
 ///   `CheckpointBuilt(seq - 1)`.
 ///
-/// Reads: the chunk table; the object store's transactions, for their
+/// Takes: each chunk of the checkpoints it builds, from the chunk table.
+/// Reads: the object store's transactions, for their
 /// signatures (stored with their effects, so present for every settled
 /// chunk).
 pub struct ContentsBuilder {
@@ -103,9 +104,10 @@ impl ContentsBuilder {
     ) -> (CheckpointContentsBuilt, Vec<ExecutedEffects>) {
         let mut effects = Vec::new();
         for &height in &pending.heights {
+            // A chunk is in one checkpoint, built once.
             let chunk = self
                 .chunks
-                .get(height)
+                .take(height)
                 .expect("a ready checkpoint's chunks are in the chunk table");
             effects.extend(chunk.effects.iter().cloned());
         }

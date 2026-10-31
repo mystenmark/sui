@@ -55,25 +55,41 @@ impl workqueue::Refuse for Request {
     fn refuse(self, _: workqueue::Refusal) {}
 }
 
-/// Certified summaries fetched from peers (`CertifiedCheckpointSummary`
-/// BCS), in sequence order, for the running epoch's `SyncedScheduler`.
+/// What the running epoch's `SyncedScheduler` takes.
+pub enum SyncedInput {
+    /// From the fetcher on the p2p endpoint.
+    Request(SyncRequest),
+    /// Every transaction of the certified checkpoint `seq` it ran has
+    /// executed. Effects waiter → scheduler.
+    Executed(u64),
+}
+
+impl workqueue::Refuse for SyncedInput {
+    fn refuse(self, _: workqueue::Refusal) {}
+}
+
+/// What the fetcher fetched from peers, for the synced scheduler.
 pub struct SyncRequest {
+    /// Certified summaries (`CertifiedCheckpointSummary` BCS), in sequence
+    /// order.
     pub summaries: Vec<Vec<u8>>,
+    /// Contents `Wanted::contents` asked for, by sequence number:
+    /// `VersionedFullCheckpointContents` BCS.
+    pub contents: Vec<(u64, Vec<u8>)>,
     /// What to fetch next.
     pub reply: oneshot::Sender<Wanted>,
 }
 
-impl workqueue::Refuse for SyncRequest {
-    fn refuse(self, _: workqueue::Refusal) {}
-}
-
 /// What the synced scheduler would take next.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Wanted {
     /// The next checkpoint to fetch; none once the epoch's last is verified.
     pub next: Option<u64>,
     /// How many, from `next`, may be fetched now.
     pub room: u64,
+    /// Checkpoints whose contents it needs, by sequence number, with their
+    /// contents digests.
+    pub contents: Vec<(u64, Digest)>,
 }
 
 pub struct CheckpointServer {

@@ -14,7 +14,7 @@ use messages::reader::Reader;
 use messages::transaction::TransactionKind;
 
 /// The accumulator root: each chunk's barrier, and only it, changes it.
-const ACCUMULATOR_ROOT: ObjectId = ObjectId::from_u16(0xacc);
+pub const ACCUMULATOR_ROOT: ObjectId = ObjectId::from_u16(0xacc);
 
 /// Why fetched contents are not a certified checkpoint's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

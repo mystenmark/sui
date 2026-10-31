@@ -77,7 +77,7 @@ pub struct Pipeline {
     pub beacon: Queue<BeaconInput>,
     randomness_gate: Queue<GateInput>,
     checkpoint_queries: Queue<validator::state_sync::Request>,
-    checkpoint_sync: Queue<validator::state_sync::SyncRequest>,
+    checkpoint_sync: Queue<validator::state_sync::SyncedInput>,
     /// Each member's network key and p2p address, by committee index.
     network_keys: Vec<[u8; 32]>,
     p2p_addresses: Vec<String>,

@@ -12,7 +12,7 @@ use sui_types::messages_checkpoint::CheckpointContents;
 use validator::epoch_store::EpochStore;
 use validator::pipeline::backpressure::{Backpressure, Limits};
 use validator::pipeline::items::CertifiedCheckpoint;
-use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable, GenerationTable};
+use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, GenerationTable};
 use workqueue::Processor;
 
 struct Setup {
@@ -60,7 +60,6 @@ impl Setup {
         let committer = CheckpointCommitter::new(
             store.clone(),
             checkpoints,
-            Arc::new(ChunkTable::new()),
             Arc::new(GenerationTable::new(epoch_store)),
             consensus.committed_checkpoints(),
             Arc::new(Backpressure::new(limits, 0)),

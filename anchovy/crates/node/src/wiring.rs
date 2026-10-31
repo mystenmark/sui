@@ -82,7 +82,7 @@ pub(crate) fn spawn(
         w.one("resolver",          i.resolver,         |p, q| p.resolver(q.input_waits, q.funds),                     drop),
         w.one("input-waiter",      i.input_waits,      |p, _| WaiterProcessor::new(p.input_availability()),           into(&q.executor, "executor")),
         w.one("executor",          i.executor,         |p, q| p.executor(q.input_waits, q.effects_waits, q.funds),    drop),
-        w.one("effects-waiter",    i.effects_waits,    |p, _| WaiterProcessor::new(p.effects_availability()),         EffectsRouter { settlement: q.settlement.clone(), epoch_closer: q.closer.clone() }),
+        w.one("effects-waiter",    i.effects_waits,    |p, _| WaiterProcessor::new(p.effects_availability()),         EffectsRouter { settlement: q.settlement.clone(), epoch_closer: q.closer.clone(), synced: q.checkpoint_sync.clone() }),
         // Settlement and funds.
         w.one("settlement",        i.settlement,       |p, q| p.settlement(q.effects_waits, q.input_waits, q.checkpoint_waits, q.funds), drop),
         w.one("funds",             i.funds,            |p, q| p.funds(q.input_waits),                                 drop),
@@ -98,7 +98,7 @@ pub(crate) fn spawn(
         // Serving peers.
         w.one("checkpoint-server", i.checkpoint_queries, |p, _| CheckpointServer::new(p.store.clone()),         drop),
         // Following peers.
-        w.one("synced",            i.checkpoint_sync,  |p, q| p.synced(q.built_waits),                             drop),
+        w.one("synced",            i.checkpoint_sync,  Parts::synced,                                            drop),
     ]
 }
 
@@ -132,7 +132,7 @@ queues! {
     commits: CommitRequest,
     beacon: BeaconInput,
     checkpoint_queries: state_sync::Request,
-    checkpoint_sync: state_sync::SyncRequest,
+    checkpoint_sync: state_sync::SyncedInput,
     // Between processors.
     signatures: Request<Valid>,
     submit: Request<Verified>,
@@ -404,13 +404,20 @@ impl Parts {
         .with_backpressure(self.backpressure.clone())
     }
 
-    fn synced(&self, built: BuiltWaits) -> SyncedScheduler {
+    fn synced(&self, q: Queues) -> SyncedScheduler {
         SyncedScheduler::new(
             self.committee.clone(),
+            self.store.clone(),
             self.checkpoints.clone(),
-            &self.store,
             self.chunk_lock.clone(),
-            built,
+            synced::Outputs {
+                built: q.built_waits,
+                inputs: q.input_waits,
+                effects: q.effects_waits,
+                hasher: q.hasher,
+                committer: q.committer,
+                beacon: q.beacon,
+            },
         )
     }
 
@@ -422,7 +429,6 @@ impl Parts {
         CheckpointCommitter::new(
             self.store.clone(),
             self.checkpoints.clone(),
-            self.chunks.clone(),
             self.generations.clone(),
             committed,
             self.backpressure.clone(),

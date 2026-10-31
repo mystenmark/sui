@@ -12,7 +12,7 @@ use tokio::sync::watch;
 use validator::epoch_store::CommittedCheckpoints;
 use validator::pipeline::backpressure::Backpressure;
 use validator::pipeline::items::CertifiedCheckpoint;
-use validator::pipeline::tables::{CheckpointStore, ChunkTable, GenerationTable};
+use validator::pipeline::tables::{CheckpointStore, GenerationTable};
 use workqueue::Processor;
 
 /// Commits each certified checkpoint's transactions from the writeback
@@ -33,14 +33,13 @@ use workqueue::Processor;
 /// those fetched from peers: `Vec<CertifiedCheckpoint>`, each in sequence
 /// order.
 ///
-/// Reads: the checkpoint store. Prunes: the chunk table. Writes: the object
+/// Reads: the checkpoint store. Writes: the object
 /// store, as its only committer; the generation table's and the consensus
 /// output's committed state; backpressure's committed watermark, which
 /// releases the commit answers it withheld.
 pub struct CheckpointCommitter {
     store: Arc<store::Store>,
     checkpoints: Arc<CheckpointStore>,
-    chunks: Arc<ChunkTable>,
     generations: Arc<GenerationTable>,
     consensus_output: CommittedCheckpoints,
     backpressure: Arc<Backpressure>,
@@ -54,7 +53,6 @@ impl CheckpointCommitter {
     pub fn new(
         store: Arc<store::Store>,
         checkpoints: Arc<CheckpointStore>,
-        chunks: Arc<ChunkTable>,
         generations: Arc<GenerationTable>,
         consensus_output: CommittedCheckpoints,
         backpressure: Arc<Backpressure>,
@@ -63,7 +61,6 @@ impl CheckpointCommitter {
         CheckpointCommitter {
             store,
             checkpoints,
-            chunks,
             generations,
             consensus_output,
             backpressure,
@@ -89,7 +86,6 @@ impl CheckpointCommitter {
         );
         self.generations.commit(&transactions, bump);
         self.consensus_output.committed_through(built.last_height);
-        self.chunks.prune_through(built.last_height);
         self.checkpoints.committed(seq);
         self.backpressure.committed(seq, built.last_height);
         if built.root_state.is_some() {

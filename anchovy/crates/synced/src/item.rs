@@ -48,7 +48,10 @@ pub fn executable(
     };
 
     keys.clear();
-    resolver::object_keys(data, keys, packages);
+    // A system transaction's gas payment is a placeholder, not an input.
+    if let TransactionKind::ProgrammableTransaction(_) = data.kind() {
+        resolver::object_keys(data, keys, packages);
+    }
     let mut writes = Vec::new();
     for change in effects.changed_objects {
         if let ObjectIn::Exist {
