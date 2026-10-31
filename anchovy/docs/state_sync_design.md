@@ -113,17 +113,25 @@ them. A chunk is released by `ChunkSettled(height)`.
   contents and executes nothing. This is the common case.
 - **Slow path: K > `cut`.** K is open or unseen, and may never be cut if
   consensus has stopped. The scheduler fetches its contents and splits
-  them into chunks. A chunk at or below `handled` is the consensus path's:
-  it waits for `ChunkSettled`, then checks each transaction's stored
-  effects digest against the certified one. A chunk above `handled` it
-  adds to `synced`, executes, and removes once settled. Once all of K's
-  chunks have settled, it commits K.
+  them into chunks. A chunk at or below `handled` is the consensus path's.
+  A chunk above `handled` it adds to `synced` and executes. It waits for
+  every transaction of K to have effects, by either path, then checks each
+  one's against the certified digest, removes K's chunks from `synced`,
+  and commits K.
 
 The randomness gate holds a chunk headed by a randomness state update, and
 every chunk after it, until the round's bytes arrive, which may never
-happen once the quorum has moved on. So the synced scheduler gives the gate
-the bytes in each certified checkpoint's randomness state update, verified
-against the epoch's DKG public key. A claimed chunk then always settles.
+happen once the quorum has moved on. So the synced scheduler gives the
+signature collector the bytes in each split checkpoint's randomness state
+updates, which it verifies against the epoch's DKG public key. A cut
+checkpoint that lists rounds and is not built yet has its contents fetched
+for its rounds alone: one built already needed none. A claimed chunk then
+always settles.
+
+The commit stage still builds each checkpoint the synced path committed,
+and the checkpoint store compares the two. So a chunk leaves the chunk
+table when its checkpoint is built, not when some checkpoint commits, and
+the state hasher accepts a checkpoint hashed again if it hashes alike.
 
 What this buys:
 
