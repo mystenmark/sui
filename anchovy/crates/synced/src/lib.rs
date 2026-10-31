@@ -22,7 +22,7 @@ use tracing::warn;
 use validator::pipeline::chunk_lock::ChunkLock;
 use validator::pipeline::items::{
     BuiltWaitItem, BuiltWaits, CertifiedCheckpoint, CheckpointEffects, EffectsWaitItem,
-    ExecutedEffects, InputCommand,
+    ExecutedEffects, GateInput, InputCommand,
 };
 use validator::pipeline::keys::{CheckpointBuilt, EffectsKey, InputKey};
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore};
@@ -90,6 +90,7 @@ pub struct Outputs {
     pub hasher: Queue<CheckpointEffects>,
     pub committer: Queue<Vec<CertifiedCheckpoint>>,
     pub beacon: Queue<BeaconInput>,
+    pub gate: Queue<GateInput>,
 }
 
 /// Verifies certified summaries fetched from peers, in sequence order, each
@@ -131,6 +132,8 @@ pub struct Outputs {
 ///   transaction's `EffectsKey`;
 /// - `SignatureCollector`: the random bytes of each randomness state update
 ///   in the checkpoints it splits (`BeaconInput::Certified`);
+/// - randomness gate: `GateInput::Released`, after releasing chunks in the
+///   chunk lock;
 /// - `StateHasher`: `CheckpointEffects` of each checkpoint it commits;
 /// - `CheckpointCommitter`: each checkpoint it commits.
 ///
@@ -140,8 +143,6 @@ pub struct SyncedScheduler {
     committee: Arc<Committee>,
     store: Arc<store::Store>,
     checkpoints: Arc<CheckpointStore>,
-    /// Closed when the scheduler is dropped, so the commit stage never
-    /// waits on a chunk it held.
     chunk_lock: Arc<ChunkLock>,
     outputs: Outputs,
     /// The last checkpoint verified, or committed, and its digest.
@@ -468,8 +469,11 @@ impl SyncedScheduler {
                 effects: t.effects.bytes.into(),
             });
         }
-        for height in running.synced {
-            self.chunk_lock.release(height);
+        if !running.synced.is_empty() {
+            for height in running.synced {
+                self.chunk_lock.release(height);
+            }
+            push(&self.outputs.gate, GateInput::Released, "randomness gate");
         }
 
         let summary = CertifiedCheckpointSummary::parse(
@@ -594,12 +598,6 @@ fn deleter(
 fn push<T>(queue: &Queue<T>, item: T, name: &str) {
     if let Err(PushError::Full(_)) = queue.try_push(item) {
         panic!("the {name} queue refused synced work");
-    }
-}
-
-impl Drop for SyncedScheduler {
-    fn drop(&mut self) {
-        self.chunk_lock.close();
     }
 }
 

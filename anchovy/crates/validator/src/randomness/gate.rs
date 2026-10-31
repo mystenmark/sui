@@ -2,18 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 
 use containers::Bump;
 use workqueue::Processor;
 
 use crate::consensus::commit::randomness_state_update_transaction;
+use crate::pipeline::chunk_lock::ChunkLock;
 use crate::pipeline::items::{
     Chunk, ExecutableTransaction, GateInput, GatedChunk, ScheduledEntry, SettlementInput,
 };
 
-/// Passes chunks from `CommitStage` on in height order, holding a chunk
-/// headed by a randomness state update, and every chunk after it, until its
-/// round's random bytes arrive; then puts the update at the chunk's head.
+/// Passes chunks from `CommitStage` on in height order, holding a chunk,
+/// and every chunk after it, until:
+/// - if headed by a randomness state update, its round's random bytes
+///   arrive; then it puts the update at the chunk's head;
+/// - if the synced scheduler is running the chunk's transactions from its
+///   certified checkpoint, the chunk lock no longer holds it.
+///
 /// A later chunk could not go ahead: funds reservations follow consensus
 /// order.
 ///
@@ -21,6 +27,8 @@ use crate::pipeline::items::{
 /// - `CommitStage`: each chunk (`GateInput::Chunk`), in height order;
 /// - `SignatureCollector`: each round's bytes (`GateInput::Bytes`), durable
 ///   in the epoch store first;
+/// - `SyncedScheduler`: chunks released in the chunk lock
+///   (`GateInput::Released`), after it releases them there;
 /// - p2p endpoint: which round it waits for (`GateInput::Waiting`).
 ///
 /// Outward:
@@ -31,6 +39,8 @@ pub struct RandomnessGate {
     held: VecDeque<GatedChunk>,
     /// Bytes arrived for rounds not released yet, by round.
     bytes: BTreeMap<u64, Vec<u8>>,
+    /// Shared with the synced scheduler, if any.
+    chunk_lock: Option<Arc<ChunkLock>>,
     chunks_out: workqueue::Queue<Chunk>,
     settlements_out: workqueue::Queue<SettlementInput>,
 }
@@ -45,13 +55,28 @@ impl RandomnessGate {
         RandomnessGate {
             held: VecDeque::new(),
             bytes: recorded.into_iter().collect(),
+            chunk_lock: None,
             chunks_out: chunks,
             settlements_out: settlements,
         }
     }
 
+    /// Holds each chunk the synced scheduler runs, through `lock`.
+    #[must_use]
+    pub fn with_chunk_lock(mut self, lock: Arc<ChunkLock>) -> RandomnessGate {
+        self.chunk_lock = Some(lock);
+        self
+    }
+
     fn release(&mut self) {
         while let Some(front) = self.held.front() {
+            if self
+                .chunk_lock
+                .as_ref()
+                .is_some_and(|lock| lock.held(front.chunk.height))
+            {
+                return;
+            }
             let bytes = match &front.update {
                 Some(update) => match self.bytes.remove(&update.round) {
                     Some(bytes) => {
@@ -110,10 +135,12 @@ impl Processor for RandomnessGate {
             GateInput::Bytes { round, bytes } => {
                 self.bytes.insert(round, bytes);
             }
+            GateInput::Released => {}
             GateInput::Waiting(answer) => {
                 let waiting = self.held.front().and_then(|front| {
                     let update = front.update.as_ref()?;
-                    Some((update.round, front.chunk.checkpoint_seq))
+                    (!self.bytes.contains_key(&update.round))
+                        .then_some((update.round, front.chunk.checkpoint_seq))
                 });
                 let _ = answer.send(waiting);
                 return None;
@@ -121,5 +148,78 @@ impl Processor for RandomnessGate {
         }
         self.release();
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use messages::base::ObjectId;
+    use messages::transaction::SharedObjectMutability;
+
+    use super::*;
+    use crate::consensus::sequence::{SharedAccess, SharedOrdinal};
+    use crate::pipeline::chunk_lock::Cut;
+    use crate::pipeline::items::ChunkSettlement;
+    use crate::pipeline::keys::AccumulatorVersion;
+
+    fn gated(height: u64) -> GatedChunk {
+        GatedChunk {
+            chunk: Chunk {
+                version: AccumulatorVersion(1),
+                root_version: 1,
+                round: 1,
+                height,
+                checkpoint_seq: 1,
+                entries: Vec::new(),
+            },
+            settlement: ChunkSettlement {
+                version: AccumulatorVersion(1),
+                root_version: 1,
+                last_of_commit: true,
+                round: 1,
+                height,
+                checkpoint_seq: 1,
+                digests: Vec::new(),
+                root: SharedAccess {
+                    id: ObjectId([0xac; 32]),
+                    initial_shared_version: 1,
+                    mutability: SharedObjectMutability::Mutable,
+                    ordinal: SharedOrdinal {
+                        round: 1,
+                        writes_before: 0,
+                    },
+                    base: None,
+                },
+            },
+            update: None,
+        }
+    }
+
+    #[test]
+    fn a_chunk_the_synced_scheduler_runs_waits_until_released() {
+        let lock = Arc::new(ChunkLock::new(0, Cut { seq: 0, height: 0 }));
+        let (chunks, chunks_out) = workqueue::queue(16);
+        let (settlements, _settlements_out) = workqueue::queue(16);
+        let mut gate =
+            RandomnessGate::new(Vec::new(), chunks, settlements).with_chunk_lock(lock.clone());
+        let mut run = |input| gate.process(input, &mut Bump::default());
+        let heights = || {
+            std::iter::from_fn(|| chunks_out.try_pop())
+                .map(|c| c.height)
+                .collect::<Vec<_>>()
+        };
+
+        // The synced scheduler took chunk 2 before the commit stage claimed
+        // it.
+        lock.take(2, 2);
+        lock.claim(3, Cut { seq: 1, height: 3 });
+        for height in 1..=3 {
+            run(GateInput::Chunk(gated(height)));
+        }
+        assert_eq!(heights(), vec![1], "chunk 3 waits behind chunk 2");
+
+        lock.release(2);
+        run(GateInput::Released);
+        assert_eq!(heights(), vec![2, 3]);
     }
 }

@@ -184,6 +184,7 @@ impl Setup {
                 hasher: workqueue::queue(16).0,
                 committer: workqueue::queue(16).0,
                 beacon: workqueue::queue(16).0,
+                gate: workqueue::queue(16).0,
             },
         );
         Setup {

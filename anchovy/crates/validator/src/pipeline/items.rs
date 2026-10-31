@@ -118,6 +118,9 @@ pub enum GateInput {
     /// goes into. The p2p endpoint → gate, to fetch rounds peers stopped
     /// pushing.
     Waiting(oneshot::Sender<Option<(u64, u64)>>),
+    /// The synced scheduler released chunks in the chunk lock. Synced
+    /// scheduler → gate.
+    Released,
 }
 
 /// A full queue drops the question: the asker asks again.

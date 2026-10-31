@@ -1681,12 +1681,8 @@ impl CommitStage {
             seq: self.queue.next_seq - 1,
             height: self.queue.cut_height,
         };
-        if let Some(lock) = &self.chunk_lock
-            && !lock.claim(self.queue.height, cut)
-        {
-            // The synced scheduler stopped holding them: the pipeline is
-            // shutting down.
-            return None;
+        if let Some(lock) = &self.chunk_lock {
+            lock.claim(self.queue.height, cut);
         }
         let record = CommitRecord {
             commit_index,

@@ -4,14 +4,15 @@
 //! Which front end runs each settlement chunk (`docs/state_sync_design.md`,
 //! "The chunk lock"): the commit stage, for the chunks of the commits it
 //! handles; the synced scheduler, for chunks of certified checkpoints past
-//! them. The two never run one chunk at once.
+//! them. The two never run one chunk at once: a chunk of the commit stage's
+//! that the synced scheduler holds waits in the randomness gate until
+//! released.
 
 use std::collections::BTreeSet;
-use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 pub struct ChunkLock {
     state: Mutex<State>,
-    released: Condvar,
 }
 
 struct State {
@@ -21,8 +22,6 @@ struct State {
     cut: Cut,
     /// The chunk heights the synced scheduler is running.
     synced: BTreeSet<u64>,
-    /// The synced scheduler has stopped: nothing it holds will be released.
-    closed: bool,
 }
 
 /// The last checkpoint the commit stage cut.
@@ -42,9 +41,7 @@ impl ChunkLock {
                 handled,
                 cut,
                 synced: BTreeSet::new(),
-                closed: false,
             }),
-            released: Condvar::new(),
         }
     }
 
@@ -53,24 +50,18 @@ impl ChunkLock {
     }
 
     /// The commit stage claims the chunks through `handled`, having cut the
-    /// checkpoints through `cut`, then waits until the synced scheduler
-    /// holds none of them. False if the synced scheduler stopped first.
-    ///
-    /// The claim comes first, so the synced scheduler takes none of them
-    /// while the commit stage waits.
-    pub fn claim(&self, handled: u64, cut: Cut) -> bool {
+    /// checkpoints through `cut`, before emitting them: the synced
+    /// scheduler takes none of them from now on.
+    pub fn claim(&self, handled: u64, cut: Cut) {
         let mut state = self.state();
-        let first = state.handled + 1;
         debug_assert!(handled >= state.handled && cut.seq >= state.cut.seq);
         state.handled = handled;
         state.cut = cut;
-        let state = self
-            .released
-            .wait_while(state, |s| {
-                !s.closed && s.synced.range(first..=handled).next().is_some()
-            })
-            .unwrap_or_else(PoisonError::into_inner);
-        !state.closed || state.synced.range(first..=handled).next().is_none()
+    }
+
+    /// Whether the synced scheduler is running the chunk at `height`.
+    pub fn held(&self, height: u64) -> bool {
+        self.state().synced.contains(&height)
     }
 
     /// The last checkpoint the commit stage cut: every chunk of it and of
@@ -90,17 +81,10 @@ impl ChunkLock {
         handled
     }
 
-    /// The synced scheduler has run the chunk at `height`.
+    /// The synced scheduler has run the chunk at `height`. The randomness
+    /// gate is told after: it may hold the chunk.
     pub fn release(&self, height: u64) {
         let removed = self.state().synced.remove(&height);
         debug_assert!(removed, "chunk {height} was taken");
-        self.released.notify_all();
-    }
-
-    /// The synced scheduler has stopped: the commit stage waits for nothing
-    /// it held.
-    pub fn close(&self) {
-        self.state().closed = true;
-        self.released.notify_all();
     }
 }

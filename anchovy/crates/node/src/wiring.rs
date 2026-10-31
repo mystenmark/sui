@@ -270,6 +270,7 @@ impl Parts {
 
     fn gate(&self, resolver: Queue<Chunk>, settlement: Queue<SettlementInput>) -> RandomnessGate {
         RandomnessGate::new(self.epoch_store.randomness_bytes(), resolver, settlement)
+            .with_chunk_lock(self.chunk_lock.clone())
     }
 
     fn collector(&self, gate: Queue<GateInput>) -> SignatureCollector {
@@ -431,6 +432,7 @@ impl Parts {
                 hasher: q.hasher,
                 committer: q.committer,
                 beacon: q.beacon,
+                gate: q.gate,
             },
         )
     }
