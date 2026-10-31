@@ -94,15 +94,16 @@ checkpoint splits into chunks at its barriers, numbered by counting the
 epoch's barriers before it. The epoch's change-epoch transaction follows
 the last barrier.
 
-Per epoch, a mutex holds:
+Per epoch, a table holds:
 
 - `handled`: the height of the last chunk the commit handler assigned, and
   `cut`: the last checkpoint it cut;
 - `synced`: the chunk heights the synced scheduler is executing.
 
 **Consensus.** Handling a commit claims its chunks, exactly: they are
-complete once it is handled. It waits only while `synced` holds one of
-them. A chunk is released by `ChunkSettled(height)`.
+complete once it is handled. The claim never waits. A claimed chunk that
+`synced` holds waits in the randomness gate, with every chunk after it,
+until the synced scheduler removes it from `synced` and tells the gate.
 
 **Synced**, for checkpoint K:
 
@@ -227,13 +228,14 @@ The checkpoint builder compares each checkpoint it builds with the one
 the synced path committed, as fork detection does now, and commits
 nothing.
 
-The consensus output quarantine writes a commit's output once its
-checkpoints have both committed and been built here. A synced commit
-alone is not enough: a commit decided but whose transactions the executor
-has not yet checked would be written, and after a crash never decided
-again, so its checks would never run. Settlement goes one chunk at a time
-in height order, so a checkpoint built here means every chunk through its
-last has executed or been checked.
+A commit's consensus output waits in the output waiter on
+`CheckpointProgress::BuiltHere(s)` and `Committed(s)`, `s` the last
+checkpoint cut, and `OutputCommitter` writes it once both hold. A synced
+commit alone is not enough: a commit decided but whose transactions the
+executor has not yet checked would be written, and after a crash never
+decided again, so its checks would never run. Settlement goes one chunk at
+a time in height order, so a checkpoint built here means every chunk
+through its last has executed or been checked.
 
 ### The end of an epoch
 

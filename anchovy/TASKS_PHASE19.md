@@ -87,10 +87,13 @@ executor, the chunk lock, a fast path):
   - [x] Compat: a lagging consensus (`Lagging` holds anchovy's commits).
   - [ ] Compat: catching up an epoch's end; deviation.
   - [x] Consensus output is written once its checkpoints are committed
-    and built here (`BuiltCheckpoints::built_through`): before, a synced
-    commit wrote output of commits decided but not yet checked, which a
-    crash would never re-decide. Backpressure ignores chunks scheduled
-    below a committed checkpoint.
+    and built here: the output waiter on `CheckpointProgress`, then
+    `OutputCommitter`. Before, a synced commit wrote output of commits
+    decided but not yet checked, which a crash would never re-decide.
+    Backpressure ignores chunks scheduled below a committed checkpoint.
+  - [x] The chunk lock's claim no longer blocks the commit stage: the
+    randomness gate holds a chunk the synced scheduler runs until told it
+    is released.
   - Known gaps: stream-ended inputs on the synced path are untested.
 
 ## Left out / later

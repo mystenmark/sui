@@ -34,6 +34,14 @@ Diagram: `consensus_pipeline.svg`.
 - **Black boxes.** Consensus, which takes transactions, asks for votes and
   emits commits; RPC clients; state sync.
 
+**Conditions go through waiters.** Work that waits for another
+processor's progress waits in a waiter on keys, so each processor reads as
+an action taken once its keys hold. A processor may still order its own
+work (the state hasher folds roots in sequence), accumulate toward a
+threshold (the aggregator's quorum), or hold its input for a condition it
+is the documented home of (the randomness gate). It never blocks its
+thread on another processor.
+
 Every arrow in the diagram is a queue, except store reads and writes. Every
 waiter has three kinds of edge:
 - **wait for:** from the processor enqueuing work;
@@ -491,6 +499,8 @@ effects waiter does.
 | (`FundsReserver`) | `Reservation(account, amount, v)`, resolving `Fulfilled` or `Cancelled` | `VersionResolver` | `Settle::Deposit` and `Settle::Credit` from `Executor`, `Settle::Settled` from `SettlementScheduler` | the rules of "Funds reservation" |
 | checkpoint | `ChunkSettled(height)` | `CommitHandler` (pending checkpoint) | `SettlementScheduler` | chunk table has it |
 | built | `CheckpointBuilt(seq)`, resolving the checkpoint built | `ContentsBuilder`, `BlockVoter`, `CommitDecoder`, `CheckpointAggregator` | `SummaryBuilder` | checkpoint store has it, or committed it |
+| output | `CheckpointProgress::BuiltHere(seq)` | `CommitStage` (consensus output) | `SummaryBuilder` | the consensus path built through `seq` in this run |
+| output | `CheckpointProgress::Committed(seq)` | `CommitStage` (consensus output) | `CheckpointCommitter` | checkpoint store committed through `seq` |
 
 ## What must match the reference
 
