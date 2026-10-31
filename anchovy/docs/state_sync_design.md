@@ -120,6 +120,11 @@ until the synced scheduler removes it from `synced` and tells the gate.
   one's against the certified digest, removes K's chunks from `synced`,
   and commits K.
 
+The epoch's last checkpoint takes the same paths. Its change-epoch
+transaction follows its last barrier, outside every chunk, so the slow
+path runs it after the chunks, at the input versions its effects give;
+those order it after the epoch's other writers.
+
 The randomness gate holds a chunk headed by a randomness state update, and
 every chunk after it, until the round's bytes arrive, which may never
 happen once the quorum has moved on. So the synced scheduler gives the
@@ -241,11 +246,15 @@ through its last has executed or been checked.
 
 The final checkpoint's change-epoch transaction runs last, after
 everything else in the epoch (RCF R3.3). Once its checkpoint commits, by
-either path, the node loop reconfigures as it does now, dropping the
-epoch's pipeline with both front ends. A node whose consensus has been
-left behind finishes the epoch on the synced path alone. After a restart,
-replay checks every transaction executed before the crash, against
-outputs this node produced.
+either path, the committer tells the node loop, which drops the epoch's
+pipeline with both front ends and writes the next epoch's record. The
+record's root comes from the epoch's state hashes, folded from committed
+effects if missing, so the synced path needs no root of its own. The next
+committee, protocol version and root are checked against the certified
+end-of-epoch data first. A node whose consensus has been left behind
+finishes the epoch on the synced path alone. After a restart, replay
+checks every transaction executed before the crash, against outputs this
+node produced.
 
 ## Out of scope
 

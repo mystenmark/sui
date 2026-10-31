@@ -79,13 +79,17 @@ executor, the chunk lock, a fast path):
   - [x] Certified randomness bytes to the signature collector
     (`BeaconInput::Certified`), from split checkpoints and from cut ones
     not built yet that list rounds.
-  - [ ] The epoch's last checkpoint on the slow path (it takes the fast
-    path for now): change-epoch last, the root state for its record.
+  - [x] The epoch's last checkpoint on the slow path: change-epoch runs
+    after its chunks as a synced item. Checkpoint records no longer carry
+    the root; `reconfigure` folds it from the epoch's state hashes and
+    checks next committee, protocol version and root against the
+    certificate.
   - [x] The consensus path's checks of transactions executed already
     (`check_decisions`): shared input versions and stream ends,
     cancellation markers, the funds verdict unless cancelled.
   - [x] Compat: a lagging consensus (`Lagging` holds anchovy's commits).
-  - [ ] Compat: catching up an epoch's end; deviation.
+  - [x] Compat: catching up an epoch's end (consensus held across it).
+  - [ ] Compat: deviation.
   - [x] Consensus output is written once its checkpoints are committed
     and built here: the output waiter on `CheckpointProgress`, then
     `OutputCommitter`. Before, a synced commit wrote output of commits
