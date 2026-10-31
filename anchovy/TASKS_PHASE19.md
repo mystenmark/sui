@@ -81,7 +81,9 @@ executor, the chunk lock, a fast path):
     not built yet that list rounds.
   - [ ] The epoch's last checkpoint on the slow path (it takes the fast
     path for now): change-epoch last, the root state for its record.
-  - [ ] The consensus path's checks of transactions executed already.
+  - [x] The consensus path's checks of transactions executed already
+    (`check_decisions`): shared input versions and stream ends,
+    cancellation markers, the funds verdict unless cancelled.
   - [x] Compat: a lagging consensus (`Lagging` holds anchovy's commits).
   - [ ] Compat: catching up an epoch's end; deviation.
   - Known gaps: a crash after a synced commit, before the consensus path
