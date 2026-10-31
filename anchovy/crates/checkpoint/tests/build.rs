@@ -26,7 +26,7 @@ use sui_types::messages_checkpoint::{
 use sui_types::messages_consensus::{ConsensusTransaction, ConsensusTransactionKind};
 use sui_types::transaction::SenderSignedData as SuiSigned;
 use validator::epoch::EpochParams;
-use validator::epoch_store::{BuilderOutput, EpochStore};
+use validator::epoch_store::{BuilderOutput, BuiltCheckpoints, EpochStore};
 use validator::pipeline::items::{
     BuiltWaitItem, CheckpointContentsBuilt, ExecutedEffects, PendingCheckpoint, SettledChunk,
 };
@@ -40,6 +40,7 @@ struct Mainnet {
     store: Arc<Store>,
     epoch_store: EpochStore,
     builder: BuilderOutput,
+    built: BuiltCheckpoints,
     _dir: tempfile::TempDir,
     _epochs: tempfile::TempDir,
 }
@@ -70,12 +71,13 @@ impl Mainnet {
                 .unwrap();
         }
         let epochs = tempfile::tempdir().unwrap();
-        let (epoch_store, _, builder) = EpochStore::open(epochs.path(), 0);
+        let (epoch_store, consensus, builder) = EpochStore::open(epochs.path(), 0);
         Mainnet {
             checkpoint,
             store,
             epoch_store,
             builder,
+            built: consensus.built_checkpoints(),
             _dir: dir,
             _epochs: epochs,
         }
@@ -436,8 +438,14 @@ fn out_of_order_checkpoints_summarize_in_order() {
     let mut waiter = WaiterProcessor::new(BuiltAvailability {
         checkpoints: checkpoints.clone(),
     });
-    let mut summary =
-        SummaryBuilder::new(epoch.clone(), checkpoints.clone(), key(), built, consensus);
+    let mut summary = SummaryBuilder::new(
+        epoch.clone(),
+        checkpoints.clone(),
+        key(),
+        built,
+        consensus,
+        m.built.clone(),
+    );
 
     // Runs the built waiter and the summary builder until quiet; returns the
     // sequence numbers summarized, in order. Records the checkpoints the

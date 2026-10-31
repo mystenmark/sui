@@ -63,6 +63,7 @@ impl EpochStore {
                 streams: SipMap::default(),
                 debts: SipMap::default(),
                 committed_height: 0,
+                built_height: 0,
             })),
         };
         let builder = BuilderOutput { db: db.clone() };
@@ -351,9 +352,11 @@ fn stream_key(id: &ObjectId, initial_shared_version: u64) -> [u8; 40] {
 ///
 /// A quarantine, as the reference's `ConsensusOutputQuarantine`: each
 /// commit's output stays in memory until the checkpoints covering it have
-/// committed, and is written then, so the store never holds output a crash
-/// could make the replay decide otherwise. Reads look in memory, then the
-/// store.
+/// committed and been built here, and is written then, so the store never
+/// holds output a crash could make the replay decide otherwise. Built here
+/// too, as a certified checkpoint can commit before consensus reaches it:
+/// written then, its output's checks of transactions executed already
+/// would never run again. Reads look in memory, then the store.
 pub struct ConsensusOutput {
     quarantine: Arc<Mutex<Quarantine>>,
 }
@@ -362,6 +365,13 @@ pub struct ConsensusOutput {
 /// checkpoint committer.
 #[derive(Clone)]
 pub struct CommittedCheckpoints {
+    quarantine: Arc<Mutex<Quarantine>>,
+}
+
+/// Tells the quarantine which checkpoints consensus has built here: for the
+/// summary builder.
+#[derive(Clone)]
+pub struct BuiltCheckpoints {
     quarantine: Arc<Mutex<Quarantine>>,
 }
 
@@ -383,6 +393,8 @@ struct Quarantine {
     debts: SipMap<(Tracker, ObjectId), ((u64, u64), usize)>,
     /// The last chunk height of the last checkpoint committed.
     committed_height: u64,
+    /// The last chunk height of the last checkpoint built here in this run.
+    built_height: u64,
 }
 
 /// A table keyed by object references or ids from transactions' inputs,
@@ -763,6 +775,13 @@ impl ConsensusOutput {
             quarantine: self.quarantine.clone(),
         }
     }
+
+    /// The handle the summary builder tells of each checkpoint built.
+    pub fn built_checkpoints(&self) -> BuiltCheckpoints {
+        BuiltCheckpoints {
+            quarantine: self.quarantine.clone(),
+        }
+    }
 }
 
 impl CommittedCheckpoints {
@@ -774,6 +793,22 @@ impl CommittedCheckpoints {
     pub fn committed_through(&self, height: u64) {
         let mut q = lock_quarantine(&self.quarantine);
         q.committed_height = q.committed_height.max(height);
+        q.flush();
+    }
+}
+
+impl BuiltCheckpoints {
+    /// The checkpoints through the chunk at `height` are built here: every
+    /// transaction of theirs executed, or was checked, on the consensus
+    /// path. Chunks settle in height order, so this covers every chunk
+    /// below too, rebuilt after a restart or not. Writes what they cover, if
+    /// committed.
+    ///
+    /// # Panics
+    /// If the database cannot be written.
+    pub fn built_through(&self, height: u64) {
+        let mut q = lock_quarantine(&self.quarantine);
+        q.built_height = q.built_height.max(height);
         q.flush();
     }
 }
@@ -807,7 +842,7 @@ impl Quarantine {
         let covered = self
             .queued
             .iter()
-            .take_while(|o| o.height <= self.committed_height)
+            .take_while(|o| o.height <= self.committed_height.min(self.built_height))
             .count();
         let Some(last) = self.queued.range(..covered).rposition(|o| o.drained) else {
             return;

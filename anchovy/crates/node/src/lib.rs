@@ -310,7 +310,11 @@ impl Pipeline {
             checkpoints,
             statuses: Arc::new(ConsensusTxStatusCache::new()),
             state_hashes,
-            backpressure: Arc::new(Backpressure::new(BACKPRESSURE, committed_seq)),
+            backpressure: Arc::new(Backpressure::new(
+                BACKPRESSURE,
+                committed_seq,
+                committed_height,
+            )),
             start,
             next_to_certify,
             first_hashed,

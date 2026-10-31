@@ -62,7 +62,7 @@ impl Setup {
             checkpoints,
             Arc::new(GenerationTable::new(epoch_store)),
             consensus.committed_checkpoints(),
-            Arc::new(Backpressure::new(limits, 0)),
+            Arc::new(Backpressure::new(limits, 0, 0)),
             tokio::sync::watch::channel(None).0,
         );
         Setup {

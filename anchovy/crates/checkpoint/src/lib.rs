@@ -23,6 +23,7 @@ use messages::fast::Bump;
 use messages::reader::Reader;
 use messages::transaction::SenderSignedData;
 use validator::epoch::EpochParams;
+use validator::epoch_store::BuiltCheckpoints;
 use validator::pipeline::items::{
     BuiltWaitItem, BuiltWaits, CheckpointContentsBuilt, CheckpointEffects, ExecutedEffects,
     LastOfEpoch, PendingCheckpoint,
@@ -203,13 +204,15 @@ impl Processor for ContentsBuilder {
 ///   releasing `seq + 1`, its signatures and its certificate's fork check;
 /// - consensus (black box): its checkpoint signature, at high priority.
 ///
-/// Reads and writes: the checkpoint store.
+/// Reads and writes: the checkpoint store. Writes: the consensus output's
+/// built state, once each checkpoint is recorded.
 pub struct SummaryBuilder {
     epoch: Arc<EpochParams>,
     checkpoints: Arc<CheckpointStore>,
     key: Arc<ProtocolKey>,
     built: BuiltWaits,
     consensus: TransactionClient,
+    consensus_output: BuiltCheckpoints,
 }
 
 impl SummaryBuilder {
@@ -219,6 +222,7 @@ impl SummaryBuilder {
         key: Arc<ProtocolKey>,
         built: BuiltWaits,
         consensus: TransactionClient,
+        consensus_output: BuiltCheckpoints,
     ) -> SummaryBuilder {
         SummaryBuilder {
             epoch,
@@ -226,6 +230,7 @@ impl SummaryBuilder {
             key,
             built,
             consensus,
+            consensus_output,
         }
     }
 }
@@ -271,6 +276,7 @@ impl Processor for SummaryBuilder {
                 },
             };
             let checkpoint = self.checkpoints.insert_built(checkpoint);
+            self.consensus_output.built_through(checkpoint.last_height);
             resolved.push((CheckpointBuilt(seq), checkpoint));
         }
         // Every summary is in the checkpoint store: resolve.

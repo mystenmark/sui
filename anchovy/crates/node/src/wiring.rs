@@ -27,7 +27,9 @@ use validator::consensus::dkg::DkgSetup;
 use validator::consensus::status::ConsensusTxStatusCache;
 use validator::consensus::vote::{BlockVoter, VoteRequest};
 use validator::epoch::EpochState;
-use validator::epoch_store::{CommittedCheckpoints, ConsensusOutput as OutputWriter, EpochStore};
+use validator::epoch_store::{
+    BuiltCheckpoints, CommittedCheckpoints, ConsensusOutput as OutputWriter, EpochStore,
+};
 use validator::pipeline::backpressure::Backpressure;
 use validator::pipeline::chunk_lock::ChunkLock;
 use validator::pipeline::items::{
@@ -63,6 +65,7 @@ pub(crate) fn spawn(
 ) -> Vec<WorkerHandle> {
     let w = Spawner { parts, queues: q.clone() };
     let committed = output.committed_checkpoints();
+    let built = output.built_checkpoints();
     vec![
         // Submission.
         w.thread("submission")
@@ -92,7 +95,7 @@ pub(crate) fn spawn(
         w.one("state-hasher",      i.hasher,           |p, q| p.state_hasher(q.closer),                               drop),
         w.one("built-waiter",      i.built_waits,      |p, _| WaiterProcessor::new(p.built_availability()),           BuiltRouter { epoch_closer: q.closer.clone(), aggregator: q.aggregator.clone(), committer: q.committer.clone() }),
         w.one("epoch-closer",      i.closer,           |p, q| p.epoch_closer(q.resolver, q.effects_waits, q.hasher, q.summary), drop),
-        w.one("summary",           i.summary,          |p, q| p.summary(q.built_waits),                               drop),
+        w.one("summary",           i.summary,          move |p, q| p.summary(q.built_waits, built),                   drop),
         w.one("aggregator",        i.aggregator,       move |p, q| p.aggregator(state_sync, q.built_waits),           into(&q.committer, "committer")),
         w.one("committer",         i.committer,        move |p, _| p.committer(committed, ended),                     drop),
         // Serving peers.
@@ -379,13 +382,14 @@ impl Parts {
         )
     }
 
-    fn summary(&self, built: BuiltWaits) -> SummaryBuilder {
+    fn summary(&self, built: BuiltWaits, consensus_output: BuiltCheckpoints) -> SummaryBuilder {
         SummaryBuilder::new(
             self.epoch.params.clone(),
             self.checkpoints.clone(),
             self.key.clone(),
             built,
             self.consensus.clone(),
+            consensus_output,
         )
     }
 
