@@ -45,6 +45,7 @@ use crate::consensus::status::{ConsensusTxStatus, ConsensusTxStatusCache};
 use crate::epoch::EpochParams;
 use crate::epoch_store::ConsensusOutput;
 use crate::pipeline::backpressure::Backpressure;
+use crate::pipeline::chunk_lock::{ChunkLock, Cut};
 use crate::pipeline::items::{
     Chunk, ChunkSettlement, EpochClose, ExecutableTransaction, GateInput, GatedChunk,
     PendingCheckpoint, PendingUpdate, ScheduledEntry, SystemKind, SystemTransaction,
@@ -1082,6 +1083,8 @@ pub struct CommitStage {
     key_sent: bool,
     /// This member's DKG party, if it is a member.
     party: Option<workqueue::Queue<PartyInput>>,
+    /// Shared with the synced scheduler, if any.
+    chunk_lock: Option<Arc<ChunkLock>>,
 }
 
 impl CommitStage {
@@ -1130,6 +1133,7 @@ impl CommitStage {
             beacon: None,
             key_sent: false,
             party: None,
+            chunk_lock: None,
         }
     }
 
@@ -1210,6 +1214,14 @@ impl CommitStage {
         self.handler = self
             .handler
             .with_stored_observations(&self.epoch.config, stored);
+        self
+    }
+
+    /// Claims each commit's chunks from the synced scheduler through
+    /// `lock` before emitting them.
+    #[must_use]
+    pub fn with_chunk_lock(mut self, lock: Arc<ChunkLock>) -> CommitStage {
+        self.chunk_lock = Some(lock);
         self
     }
 
@@ -1648,6 +1660,17 @@ impl CommitStage {
         let blocks = std::mem::take(&mut commit.blocks);
         let commit_index = commit.commit_index;
         let decided = self.decide(commit, bump)?;
+        let cut = Cut {
+            seq: self.queue.next_seq - 1,
+            height: self.queue.cut_height,
+        };
+        if let Some(lock) = &self.chunk_lock
+            && !lock.claim(self.queue.height, cut)
+        {
+            // The synced scheduler stopped holding them: the pipeline is
+            // shutting down.
+            return None;
+        }
         let record = CommitRecord {
             commit_index,
             leader_round,
@@ -1713,6 +1736,8 @@ struct CheckpointQueue {
     pending_transactions: usize,
     height: u64,
     next_seq: u64,
+    /// The last chunk height in the last checkpoint cut.
+    cut_height: u64,
 }
 
 impl CheckpointQueue {
@@ -1726,6 +1751,7 @@ impl CheckpointQueue {
             pending_transactions: 0,
             height: 0,
             next_seq: previous_checkpoint + 1,
+            cut_height: 0,
         }
     }
 
@@ -1738,6 +1764,7 @@ impl CheckpointQueue {
             pending_transactions: 0,
             height,
             next_seq,
+            cut_height: height,
         }
     }
 
@@ -1785,6 +1812,7 @@ impl CheckpointQueue {
             timestamp_ms: self.pending_timestamp,
         };
         self.last_built_timestamp = self.pending_timestamp;
+        self.cut_height = *flushed.heights.last().expect("a checkpoint has chunks");
         self.pending_transactions = 0;
         self.next_seq += 1;
         Some(flushed)

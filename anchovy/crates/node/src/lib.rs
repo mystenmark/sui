@@ -36,6 +36,7 @@ use validator::current::EpochHandle;
 use validator::epoch::EpochState;
 use validator::epoch_store::{BuilderOutput, ConsensusOutput as OutputWriter, EpochStore};
 use validator::pipeline::backpressure::{Backpressure, Limits};
+use validator::pipeline::chunk_lock::{ChunkLock, Cut};
 use validator::pipeline::items::{CertifiedCheckpoint, EffectsWaitItem, GateInput};
 use validator::pipeline::keys::EffectsKey;
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable, GenerationTable};
@@ -299,6 +300,13 @@ impl Pipeline {
             cache: Arc::new(ConsensusTxCache::new()),
             generations: Arc::new(GenerationTable::new(epoch_store.clone())),
             chunks: Arc::new(ChunkTable::new()),
+            chunk_lock: Arc::new(ChunkLock::new(
+                resumed.map_or(0, |r| r.height),
+                Cut {
+                    seq: resumed.map_or(record.previous_checkpoint, |r| r.next_seq - 1),
+                    height: resumed.map_or(0, |r| r.height),
+                },
+            )),
             checkpoints,
             statuses: Arc::new(ConsensusTxStatusCache::new()),
             state_hashes,

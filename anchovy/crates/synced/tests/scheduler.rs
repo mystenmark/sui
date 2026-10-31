@@ -24,6 +24,7 @@ use sui_types::supported_protocol_versions::ProtocolVersion;
 use synced::{SyncedScheduler, WINDOW};
 use tokio::sync::oneshot;
 use validator::epoch_store::EpochStore;
+use validator::pipeline::chunk_lock::{ChunkLock, Cut};
 use validator::pipeline::items::{BuiltCommand, BuiltWaitItem};
 use validator::pipeline::keys::CheckpointBuilt;
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore};
@@ -162,6 +163,7 @@ impl Setup {
             Arc::new(signers.committee()),
             checkpoints.clone(),
             &store,
+            Arc::new(ChunkLock::new(0, Cut { seq: 0, height: 0 })),
             built,
         );
         Setup {

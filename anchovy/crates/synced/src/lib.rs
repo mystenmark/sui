@@ -12,6 +12,7 @@ use messages::base::Digest;
 use messages::checkpoint::CertifiedCheckpointSummary;
 use messages::reader::Reader;
 use tracing::warn;
+use validator::pipeline::chunk_lock::ChunkLock;
 use validator::pipeline::items::{BuiltWaitItem, BuiltWaits, CertifiedCheckpoint};
 use validator::pipeline::keys::CheckpointBuilt;
 use validator::pipeline::tables::CheckpointStore;
@@ -61,6 +62,9 @@ enum Rejected {
 pub struct SyncedScheduler {
     committee: Arc<Committee>,
     checkpoints: Arc<CheckpointStore>,
+    /// Closed when the scheduler is dropped, so the commit stage never
+    /// waits on a chunk it held.
+    chunk_lock: Arc<ChunkLock>,
     built: BuiltWaits,
     /// The last checkpoint verified, or committed, and its digest.
     last: (u64, Digest),
@@ -75,6 +79,7 @@ impl SyncedScheduler {
         committee: Arc<Committee>,
         checkpoints: Arc<CheckpointStore>,
         store: &store::Store,
+        chunk_lock: Arc<ChunkLock>,
         built: BuiltWaits,
     ) -> SyncedScheduler {
         let seq = checkpoints.last_committed();
@@ -92,6 +97,7 @@ impl SyncedScheduler {
             ended: summary.epoch == committee.epoch() && summary.end_of_epoch_data.is_some(),
             committee,
             checkpoints,
+            chunk_lock,
             built,
         }
     }
@@ -124,6 +130,12 @@ impl SyncedScheduler {
             summary.digest.into(),
             summary.end_of_epoch_data.is_some(),
         )))
+    }
+}
+
+impl Drop for SyncedScheduler {
+    fn drop(&mut self) {
+        self.chunk_lock.close();
     }
 }
 

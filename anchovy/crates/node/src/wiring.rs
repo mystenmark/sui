@@ -29,6 +29,7 @@ use validator::consensus::vote::{BlockVoter, VoteRequest};
 use validator::epoch::EpochState;
 use validator::epoch_store::{CommittedCheckpoints, ConsensusOutput as OutputWriter, EpochStore};
 use validator::pipeline::backpressure::Backpressure;
+use validator::pipeline::chunk_lock::ChunkLock;
 use validator::pipeline::items::{
     BuiltCommand, BuiltWaits, CertifiedCheckpoint, CheckpointContentsBuilt, CheckpointEffects,
     CheckpointSignature, Chunk, EffectsWaitItem, EpochCloserInput, Executable, FundsCommand,
@@ -173,6 +174,8 @@ pub(crate) struct Parts {
     pub cache: Arc<ConsensusTxCache>,
     pub generations: Arc<GenerationTable>,
     pub chunks: Arc<ChunkTable>,
+    /// Shared by the commit stage and the synced scheduler.
+    pub chunk_lock: Arc<ChunkLock>,
     pub checkpoints: Arc<CheckpointStore>,
     pub statuses: Arc<ConsensusTxStatusCache>,
     pub state_hashes: Arc<StateHashes>,
@@ -240,7 +243,8 @@ impl Parts {
         ))
         .with_randomness(self.dkg.clone())
         .with_beacon(beacon)
-        .with_backpressure(self.backpressure.clone());
+        .with_backpressure(self.backpressure.clone())
+        .with_chunk_lock(self.chunk_lock.clone());
         match self.own_index() {
             Some(own) => stage.with_party(own, party),
             None => stage,
@@ -405,6 +409,7 @@ impl Parts {
             self.committee.clone(),
             self.checkpoints.clone(),
             &self.store,
+            self.chunk_lock.clone(),
             built,
         )
     }

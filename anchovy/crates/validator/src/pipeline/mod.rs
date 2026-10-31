@@ -9,6 +9,7 @@
 //! `state-hasher`, `aggregator`), wired together by `node`.
 
 pub mod backpressure;
+pub mod chunk_lock;
 pub mod items;
 pub mod keys;
 pub mod tables;

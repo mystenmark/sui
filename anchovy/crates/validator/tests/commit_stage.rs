@@ -29,6 +29,7 @@ use validator::consensus::decode::{CommittedTransaction, DecodedCommit};
 use validator::consensus::execution_time::{Key, SharedObservations};
 use validator::epoch::EpochParams;
 use validator::epoch_store::{ConsensusOutput, EpochStore};
+use validator::pipeline::chunk_lock::{ChunkLock, Cut};
 use validator::pipeline::items::{
     ExecutableTransaction, GateInput, GatedChunk, PendingCheckpoint, SystemKind,
 };
@@ -513,4 +514,25 @@ fn the_stage_emits_chunks_settlements_and_checkpoint_waits() {
     // A commit handled before emits nothing.
     assert_eq!(stage.process(commit(1, 2, 50, &users), &mut bump), None);
     assert!(outputs.gate.try_pop().is_none());
+}
+
+/// The stage claims each commit's chunks, cut or not, and tells the lock
+/// the last checkpoint it cut.
+#[test]
+fn the_stage_claims_its_chunks_and_reports_its_cuts() {
+    let mut bump = containers::Bump::default();
+    let epoch = epoch(4, 200);
+    let (stage, _outputs) = stage(&epoch);
+    let lock = Arc::new(ChunkLock::new(0, Cut { seq: 10, height: 0 }));
+    let mut stage = stage.with_chunk_lock(lock.clone());
+
+    // Chunks 1 and 2: the second would overflow the first's checkpoint,
+    // which is cut; it is claimed, but not cut before the interval passes.
+    stage.process(commit(1, 2, 50, &transactions(5, 0)), &mut bump);
+    assert_eq!(lock.cut(), Cut { seq: 11, height: 1 });
+    assert_eq!(lock.take(2, 3), 2);
+    lock.release(3);
+    // Chunk 3, cut with chunk 2 once the interval has passed.
+    stage.process(commit(2, 4, 300, &transactions(1, 1)), &mut bump);
+    assert_eq!(lock.cut(), Cut { seq: 12, height: 3 });
 }
