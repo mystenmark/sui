@@ -310,17 +310,7 @@ impl<'a> FullCheckpointContents<'a> {
         a: &mut A,
     ) -> Result<FullCheckpointContents<'a>> {
         r.enter()?;
-        let n = r.seq_len(<SenderSignedData>::MIN_WIRE_SIZE + TransactionEffects::MIN_WIRE_SIZE)?;
-        let mut transactions = a.slice(n)?;
-        for _ in 0..n {
-            r.enter()?;
-            transactions.push(ExecutionData {
-                transaction: SenderSignedData::parse_envelope(r, a)?,
-                effects: TransactionEffects::parse(r, a)?,
-            });
-            r.leave();
-        }
-        let transactions = transactions.finish();
+        let transactions = parse_execution_data(r, a)?;
         let user_signatures = parse_signature_lists(r, a)?;
         r.leave();
         Ok(FullCheckpointContents {
@@ -328,6 +318,130 @@ impl<'a> FullCheckpointContents<'a> {
             user_signatures,
         })
     }
+}
+
+/// `FullCheckpointContentsV2`: each signature with the alias version it
+/// was checked against, as `CheckpointContents::V2` records them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FullCheckpointContentsV2<'a> {
+    pub transactions: &'a [ExecutionData<'a>],
+    /// Not checked to be as long as `transactions`.
+    pub user_signatures: &'a [&'a [(GenericSignature<'a>, Option<u64>)]],
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VersionedFullCheckpointContents<'a> {
+    V1(FullCheckpointContents<'a>),
+    V2(FullCheckpointContentsV2<'a>),
+}
+
+impl<'a> VersionedFullCheckpointContents<'a> {
+    pub fn parse<A: Alloc<'a>>(
+        r: &mut Reader<'a>,
+        a: &mut A,
+    ) -> Result<VersionedFullCheckpointContents<'a>> {
+        match r.variant()? {
+            0 => Ok(VersionedFullCheckpointContents::V1(
+                FullCheckpointContents::parse(r, a)?,
+            )),
+            1 => {
+                r.enter()?;
+                let transactions = parse_execution_data(r, a)?;
+                let n = r.seq_len(1)?;
+                let mut lists = a.slice(n)?;
+                for _ in 0..n {
+                    // A signature's length and an option tag.
+                    let m = r.seq_len(1 + 1)?;
+                    let mut signatures = a.slice(m)?;
+                    for _ in 0..m {
+                        signatures.push((GenericSignature(r.byte_vec()?), r.option_u64()?));
+                    }
+                    lists.push(signatures.finish());
+                }
+                r.leave();
+                Ok(VersionedFullCheckpointContents::V2(
+                    FullCheckpointContentsV2 {
+                        transactions,
+                        user_signatures: lists.finish(),
+                    },
+                ))
+            }
+            tag => Err(ParseError::UnknownVariant {
+                ty: "VersionedFullCheckpointContents",
+                tag,
+            }),
+        }
+    }
+
+    pub fn transactions(&self) -> &'a [ExecutionData<'a>] {
+        match self {
+            VersionedFullCheckpointContents::V1(c) => c.transactions,
+            VersionedFullCheckpointContents::V2(c) => c.transactions,
+        }
+    }
+
+    /// The `CheckpointContents` these expand: each transaction's digest
+    /// and its effects', then its signatures. None if there is not one
+    /// signature list per transaction.
+    pub fn contents(&self, bump: &'a crate::fast::Bump) -> Option<crate::fast::Built<'a>> {
+        let transactions = self.transactions();
+        let digests =
+            |t: &ExecutionData<'_>| (*t.transaction.digest().digest(), *t.effects.digest.digest());
+        match self {
+            VersionedFullCheckpointContents::V1(c) => {
+                if c.user_signatures.len() != transactions.len() {
+                    return None;
+                }
+                let mut w = crate::fast::Writer::new_in(bump, 2 + transactions.len() * 69);
+                w.u8(0);
+                w.len_prefix(transactions.len());
+                for t in transactions {
+                    let (transaction, effects) = digests(t);
+                    w.digest(&transaction);
+                    w.digest(&effects);
+                }
+                w.len_prefix(c.user_signatures.len());
+                for signatures in c.user_signatures {
+                    w.len_prefix(signatures.len());
+                    for signature in *signatures {
+                        w.bytes(signature.0);
+                    }
+                }
+                Some(w.finish("CheckpointContents"))
+            }
+            VersionedFullCheckpointContents::V2(c) => {
+                if c.user_signatures.len() != transactions.len() {
+                    return None;
+                }
+                let mut contents = crate::fast::ContentsBuilder::new_in(bump, transactions.len());
+                for (t, signatures) in transactions.iter().zip(c.user_signatures) {
+                    let mut listed = containers::Vec::with_capacity_in(signatures.len(), bump);
+                    listed.extend(signatures.iter().map(|(s, alias)| (s.0, *alias)));
+                    let (transaction, effects) = digests(t);
+                    contents.push(transaction, effects, listed.leak());
+                }
+                Some(contents.finish())
+            }
+        }
+    }
+}
+
+/// `Vec<ExecutionData>`.
+fn parse_execution_data<'a, A: Alloc<'a>>(
+    r: &mut Reader<'a>,
+    a: &mut A,
+) -> Result<&'a [ExecutionData<'a>]> {
+    let n = r.seq_len(<SenderSignedData>::MIN_WIRE_SIZE + TransactionEffects::MIN_WIRE_SIZE)?;
+    let mut transactions = a.slice(n)?;
+    for _ in 0..n {
+        r.enter()?;
+        transactions.push(ExecutionData {
+            transaction: SenderSignedData::parse_envelope(r, a)?,
+            effects: TransactionEffects::parse(r, a)?,
+        });
+        r.leave();
+    }
+    Ok(transactions.finish())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
