@@ -56,7 +56,7 @@ uses only the approved crates.
   what it withdrew. Versions are now root versions, settled per chunk;
   `last_of_commit` went.
 - [x] The reference oracle (testing builds) rewrites coin reservations too.
-- [x] The composite test passes: 9 of 9 runs since the funds fix, 2 of them
+- [x] The composite test passes: 7 of 7 runs since the funds fix, 3 of them
   with the oracle.
 - [ ] Then: submitting through `LocalValidatorAggregatorProxy` with
   amplification, so anchovy's RPC takes a share of submissions directly;
