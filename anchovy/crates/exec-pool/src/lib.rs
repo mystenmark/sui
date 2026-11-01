@@ -4,6 +4,10 @@
 //! Executing transactions whose inputs are available, at the versions their
 //! ordinals resolve to (`docs/consensus_pipeline.md`, Execution).
 
+mod admission;
+
+pub use admission::ExecutionAdmission;
+
 use std::sync::Arc;
 
 use containers::Bump;
@@ -20,9 +24,9 @@ use validator::consensus::sequence::SharedAccess;
 use validator::epoch::EpochState;
 use validator::epoch_store::EpochStore;
 use validator::pipeline::items::{
-    EffectsWaitItem, EpochCloserInput, Executable, ExecutableTransaction, FundsCommand,
-    InputCommand, InputValue, ReservationStatus, ScheduledEntry, Settle, SettlementInput, Synced,
-    SystemKind, SystemTransaction,
+    AdmissionInput, EffectsWaitItem, EpochCloserInput, Executable, ExecutableTransaction,
+    FundsCommand, InputCommand, InputValue, ReservationStatus, ScheduledEntry, Settle,
+    SettlementInput, Synced, SystemKind, SystemTransaction,
 };
 use validator::pipeline::keys::{AccumulatorVersion, EffectsKey, InputKey, StreamId, TxDigest};
 use validator::pipeline::tables::{Generation, GenerationTable, UnsettledWithdrawals};
@@ -102,6 +106,9 @@ pub struct Executor {
     /// Withdrawals from accumulator accounts not yet settled: recorded here,
     /// read by execution.
     unsettled: Arc<UnsettledWithdrawals>,
+    /// Causal admission, told each index run, if it admits this executor's
+    /// work.
+    admission: Option<Queue<AdmissionInput>>,
     /// Scratch, per transaction: each shared access's generation.
     resolved: Vec<Generation>,
 }
@@ -136,8 +143,16 @@ impl Executor {
             effects,
             funds,
             unsettled: Arc::default(),
+            admission: None,
             resolved: Vec::new(),
         }
+    }
+
+    /// Tells `admission` of each transaction with a causal index once run.
+    #[must_use]
+    pub fn with_admission(mut self, admission: Queue<AdmissionInput>) -> Executor {
+        self.admission = Some(admission);
+        self
     }
 
     /// Records withdrawals in, and has execution read, `unsettled`, which
@@ -801,6 +816,12 @@ impl Processor for Executor {
             self.funds
                 .push(FundsCommand::Settle(deposits), "funds reserver");
         }
+        if let Some(admission) = &self.admission {
+            let retired: Vec<_> = ready.iter().filter_map(|e| e.causal).collect();
+            if !retired.is_empty() {
+                admission.push(AdmissionInput::Retired(retired), "admission");
+            }
+        }
         None
     }
 }
@@ -966,6 +987,7 @@ mod tests {
             },
             inputs: vec![],
             synced: None,
+            causal: None,
         }
     }
 

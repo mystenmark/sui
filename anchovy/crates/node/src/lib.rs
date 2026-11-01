@@ -50,6 +50,10 @@ use workqueue::{Activity, Queue, WorkerHandle};
 /// Each queue's capacity.
 pub const QUEUE: usize = 4096;
 
+/// Transactions the executors run at once by causal admission's limit; one
+/// more runs the causal watermark's transaction.
+pub const EXECUTORS: usize = 4;
+
 /// How far consensus may run ahead of committed checkpoints. The queues
 /// ahead of the executor hold about one item per chunk in flight, so the
 /// chunk limit keeps them under `QUEUE`; the transaction limit is the
@@ -296,6 +300,7 @@ impl Pipeline {
             cache: Arc::new(ConsensusTxCache::new()),
             generations: Arc::new(GenerationTable::new(epoch_store.clone())),
             unsettled: Arc::default(),
+            chunk_lengths: Arc::default(),
             chunks: Arc::new(ChunkTable::new()),
             chunk_lock: Arc::new(ChunkLock::new(
                 resumed_height,

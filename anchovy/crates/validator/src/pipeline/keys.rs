@@ -76,6 +76,16 @@ pub struct ChunkSettled(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CheckpointBuilt(pub u64);
 
+/// A chunk transaction's place in its epoch's causal order: its chunk's
+/// height, and its position among the chunk's transactions (settlements and
+/// the barrier have none). What a transaction can block on in execution is
+/// produced at a lower index, or by a settlement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CausalIndex {
+    pub height: u64,
+    pub position: u32,
+}
+
 /// The gate waiter's keys: what a chunk waits for before the randomness
 /// gate passes it on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

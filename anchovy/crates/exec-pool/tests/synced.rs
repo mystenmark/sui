@@ -47,6 +47,7 @@ fn certified(executed: &[(Vec<u8>, Vec<u8>)]) -> Vec<(Executable, Vec<InputKey>)
             let executable = synced::item::executable(
                 &t,
                 1,
+                None,
                 |_, _, _| unreachable!("no stream ended"),
                 &mut keys,
                 &mut packages,

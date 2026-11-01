@@ -213,6 +213,38 @@ impl execution::Unsettled for UnsettledWithdrawals {
     }
 }
 
+/// Each chunk's number of transactions with a causal index (its settlements
+/// and barrier have none), by height: what tells causal admission that a
+/// chunk's last index is followed by the next chunk's first. Written by
+/// whoever creates the chunk (the randomness gate, the synced scheduler, the
+/// epoch closer for the change-epoch transaction) before its transactions
+/// head for the executor; read by `ExecutionAdmission`, which prunes it.
+/// A chunk both paths run is registered by each, with one length.
+#[derive(Default)]
+pub struct ChunkLengths {
+    lengths: Mutex<BTreeMap<u64, u32>>,
+}
+
+impl ChunkLengths {
+    pub fn register(&self, height: u64, len: u32) {
+        let previous = lock(&self.lengths).insert(height, len);
+        debug_assert!(
+            previous.is_none_or(|previous| previous == len),
+            "chunk {height} registered with two lengths"
+        );
+    }
+
+    pub fn get(&self, height: u64) -> Option<u32> {
+        lock(&self.lengths).get(&height).copied()
+    }
+
+    /// Forgets the chunks below `height`.
+    pub fn prune_below(&self, height: u64) {
+        let mut lengths = lock(&self.lengths);
+        *lengths = lengths.split_off(&height);
+    }
+}
+
 /// Settled chunks by height, in memory: only checkpoints not yet built read
 /// them, so each is taken as its checkpoint's contents are built, and a
 /// replay settles them again. Written by `SettlementScheduler` (owner: the

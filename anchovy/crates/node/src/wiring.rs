@@ -11,7 +11,7 @@ use checkpoint::{
     EpochCloser, OutputAvailability, OutputCommitter, ProtocolKey, SummaryBuilder,
 };
 use consensus::TransactionClient;
-use exec_pool::{EffectsAvailability, EffectsRouter, Executor};
+use exec_pool::{EffectsAvailability, EffectsRouter, ExecutionAdmission, Executor};
 use execution::epoch_start::SystemObjects;
 use messages::transaction::DigestPending;
 use resolver::{InputAvailability, VersionResolver};
@@ -31,14 +31,14 @@ use validator::epoch_store::{ConsensusOutput as OutputWriter, EpochStore};
 use validator::pipeline::backpressure::Backpressure;
 use validator::pipeline::chunk_lock::ChunkLock;
 use validator::pipeline::items::{
-    BuiltCommand, BuiltWaits, CertifiedCheckpoint, CheckpointContentsBuilt, CheckpointEffects,
-    CheckpointSignature, Chunk, EffectsWaitItem, EpochCloserInput, Executable, FundsCommand,
-    GateCommand, GateWaits, GatedChunk, InputCommand, OutputCommand, OutputThrough, OutputWaits,
-    PendingCheckpoint, SettlementInput,
+    AdmissionInput, BuiltCommand, BuiltWaits, CertifiedCheckpoint, CheckpointContentsBuilt,
+    CheckpointEffects, CheckpointSignature, Chunk, EffectsWaitItem, EpochCloserInput, Executable,
+    FundsCommand, GateCommand, GateWaits, GatedChunk, InputCommand, OutputCommand, OutputThrough,
+    OutputWaits, PendingCheckpoint, SettlementInput,
 };
 use validator::pipeline::keys::{ChunkSettled, EffectsKey};
 use validator::pipeline::tables::{
-    CheckpointStore, ChunkTable, GenerationTable, UnsettledWithdrawals,
+    CheckpointStore, ChunkLengths, ChunkTable, GenerationTable, UnsettledWithdrawals,
 };
 use validator::processors::{Request, SignatureVerifier, TransactionValidator};
 use validator::randomness::{
@@ -49,7 +49,7 @@ use validator::submit::SubmitChecker;
 use waiter::{Command, WaiterProcessor};
 use workqueue::{Activity, Inbox, Processor, Queue, Sink, Worker, WorkerHandle};
 
-use crate::QUEUE;
+use crate::{EXECUTORS, QUEUE};
 
 /// The epoch's threads, a line each: the inbox its processor drains, the
 /// processor (with the queues it pushes to), and where its output goes.
@@ -66,7 +66,8 @@ pub(crate) fn spawn(
 ) -> Vec<WorkerHandle> {
     let w = Spawner { parts, queues: q.clone() };
     let commits = output.output_commits();
-    vec![
+    let admitted = i.executor.clone();
+    let mut handles = vec![
         // Submission.
         w.thread("submission")
             .run(i.transactions, |p, _| TransactionValidator::new(p.epoch.clone()),           into(&q.signatures, "signatures"))
@@ -84,8 +85,9 @@ pub(crate) fn spawn(
         w.one("dkg-party",         i.party,            |p, q| p.party(q.beacon),                                      drop),
         // Execution.
         w.one("resolver",          i.resolver,         |p, q| p.resolver(q.input_waits, q.funds),                     drop),
-        w.one("input-waiter",      i.input_waits,      |p, _| WaiterProcessor::new(p.input_availability()),           into(&q.executor, "executor")),
-        w.one("executor",          i.executor,         |p, q| p.executor(q.input_waits, q.effects_waits, q.funds),    drop),
+        w.one("input-waiter",      i.input_waits,      |p, _| WaiterProcessor::new(p.input_availability()),           admit(&q.admission)),
+        w.one("admission",         i.admission,        |p, q| p.admission(q.executor, q.settlement_executor),         drop),
+        w.one("settlement-executor", i.settlement_executor, |p, q| p.executor(q.input_waits, q.effects_waits, q.funds), drop),
         w.one("effects-waiter",    i.effects_waits,    |p, _| WaiterProcessor::new(p.effects_availability()),         EffectsRouter { settlement: q.settlement.clone(), epoch_closer: q.closer.clone(), synced: q.checkpoint_sync.clone() }),
         // Settlement and funds.
         w.one("settlement",        i.settlement,       |p, q| p.settlement(q.effects_waits, q.input_waits, q.checkpoint_waits, q.funds), drop),
@@ -105,7 +107,20 @@ pub(crate) fn spawn(
         w.one("checkpoint-server", i.checkpoint_queries, |p, _| CheckpointServer::new(p.store.clone()),         drop),
         // Following peers.
         w.one("synced",            i.checkpoint_sync,  Parts::synced,                                            drop),
-    ]
+    ];
+    // The limit's executors and one for the causal watermark's transaction.
+    for n in 0..=EXECUTORS {
+        handles.push(w.one(&format!("executor-{n}"), admitted.clone(), |p, q| {
+            p.executor(q.input_waits, q.effects_waits, q.funds).with_admission(q.admission)
+        }, drop));
+    }
+    handles
+}
+
+/// A sink sending each batch the input waiter releases to admission.
+fn admit(queue: &Queue<AdmissionInput>) -> impl FnMut(Vec<Executable>) + Send + use<> {
+    let queue = queue.clone();
+    move |ready| queue.push(AdmissionInput::Ready(ready), "admission")
 }
 
 /// Declares the epoch's queues by name and item: `Queues`, their sending
@@ -147,6 +162,8 @@ queues! {
     party: PartyInput,
     resolver: Chunk,
     executor: Vec<Executable>,
+    settlement_executor: Vec<Executable>,
+    admission: AdmissionInput,
     settlement: SettlementInput,
     funds: FundsCommand,
     contents: Vec<PendingCheckpoint>,
@@ -185,6 +202,8 @@ pub(crate) struct Parts {
     /// Shared by the executor, which records, and the committer, which
     /// releases.
     pub unsettled: Arc<UnsettledWithdrawals>,
+    /// Registered by each chunk's creator, read by causal admission.
+    pub chunk_lengths: Arc<ChunkLengths>,
     pub chunks: Arc<ChunkTable>,
     /// Shared by the commit stage and the synced scheduler.
     pub chunk_lock: Arc<ChunkLock>,
@@ -275,7 +294,12 @@ impl Parts {
     }
 
     fn gate(&self, resolver: Queue<Chunk>, settlement: Queue<SettlementInput>) -> RandomnessGate {
-        RandomnessGate::new(self.resumed_height + 1, resolver, settlement)
+        RandomnessGate::new(
+            self.resumed_height + 1,
+            self.chunk_lengths.clone(),
+            resolver,
+            settlement,
+        )
     }
 
     fn gate_availability(&self) -> GateAvailability {
@@ -305,6 +329,20 @@ impl Parts {
             store: self.store.clone(),
             generations: self.generations.clone(),
         }
+    }
+
+    fn admission(
+        &self,
+        executors: Queue<Vec<Executable>>,
+        settlements: Queue<Vec<Executable>>,
+    ) -> ExecutionAdmission {
+        ExecutionAdmission::new(
+            self.chunk_lengths.clone(),
+            EXECUTORS,
+            self.resumed_height,
+            executors,
+            settlements,
+        )
     }
 
     fn executor(
@@ -403,6 +441,7 @@ impl Parts {
             effects,
             hasher,
             summary,
+            self.chunk_lengths.clone(),
         )
     }
 
@@ -434,6 +473,7 @@ impl Parts {
             self.store.clone(),
             self.checkpoints.clone(),
             self.chunk_lock.clone(),
+            self.chunk_lengths.clone(),
             synced::Outputs {
                 built: q.built_waits,
                 inputs: q.input_waits,

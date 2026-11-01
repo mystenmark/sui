@@ -14,7 +14,7 @@ use messages::object::Owner;
 use messages::transaction::{CallArg, ObjectArg, Transaction, TransactionKind};
 use validator::checks;
 use validator::pipeline::items::{Executable, ExecutableTransaction, ScheduledEntry, Synced};
-use validator::pipeline::keys::{AccumulatorVersion, InputKey, StreamId};
+use validator::pipeline::keys::{AccumulatorVersion, CausalIndex, InputKey, StreamId};
 
 /// The executable for certified transaction `t`, of a chunk whose
 /// transactions read the accumulator root at `root_version`, with its input
@@ -27,6 +27,7 @@ use validator::pipeline::keys::{AccumulatorVersion, InputKey, StreamId};
 pub fn executable(
     t: &ExecutionData<'_>,
     root_version: u64,
+    causal: Option<CausalIndex>,
     deleter: impl Fn(&ObjectId, u64, &[TransactionDigest]) -> [u8; 32],
     keys: &mut Vec<InputKey>,
     packages: &mut Vec<ObjectId>,
@@ -126,5 +127,6 @@ pub fn executable(
             insufficient,
             writes,
         })),
+        causal,
     }
 }

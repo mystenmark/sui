@@ -502,6 +502,7 @@ fn executable(
         },
         inputs: Vec::new(),
         synced: None,
+        causal: None,
     };
     (executable, key)
 }

@@ -15,6 +15,7 @@ use crate::pipeline::items::{
     Chunk, ChunkSettlement, ExecutableTransaction, GatedChunk, ScheduledEntry, SettlementInput,
 };
 use crate::pipeline::keys::GateKey;
+use crate::pipeline::tables::ChunkLengths;
 
 /// The gate waiter's view of its keys: the chunk lock, and the random bytes
 /// the epoch store records.
@@ -48,6 +49,8 @@ pub struct RandomnessGate {
     released: BTreeMap<u64, GatedChunk>,
     /// The height of the next chunk to pass on.
     next: u64,
+    /// Where each chunk passed on is registered, for causal admission.
+    lengths: Arc<ChunkLengths>,
     chunks_out: workqueue::Queue<Chunk>,
     settlements_out: workqueue::Queue<SettlementInput>,
 }
@@ -56,12 +59,14 @@ impl RandomnessGate {
     /// A gate whose first chunk is at height `next`.
     pub fn new(
         next: u64,
+        lengths: Arc<ChunkLengths>,
         chunks: workqueue::Queue<Chunk>,
         settlements: workqueue::Queue<SettlementInput>,
     ) -> RandomnessGate {
         RandomnessGate {
             released: BTreeMap::new(),
             next,
+            lengths,
             chunks_out: chunks,
             settlements_out: settlements,
         }
@@ -118,6 +123,8 @@ impl Processor for RandomnessGate {
                     .collect(),
                 root,
             };
+            let len = u32::try_from(chunk.entries.len()).expect("fewer than 2^32 transactions");
+            self.lengths.register(chunk.height, len);
             self.chunks_out.push(chunk, "resolver");
             self.settlements_out
                 .push(SettlementInput::Chunk(settlement), "settlement");
@@ -174,7 +181,7 @@ mod tests {
         });
         let (chunks, chunks_out) = workqueue::queue(16);
         let (settlements, settlements_out) = workqueue::queue(16);
-        let mut gate = RandomnessGate::new(1, chunks, settlements);
+        let mut gate = RandomnessGate::new(1, Arc::default(), chunks, settlements);
         let mut run = |waits: &mut waiter::Waiter<_, _, _, _>| {
             let mut ready = Vec::new();
             waits.get_ready(&mut ready);

@@ -233,6 +233,18 @@ pub struct Executable {
     /// Set on a transaction of a certified checkpoint the synced scheduler
     /// runs; then `entry.shared` is empty and nothing was reserved.
     pub synced: Option<Box<Synced>>,
+    /// Its causal index; none for a settlement or a barrier, which never
+    /// block and bypass admission.
+    pub causal: Option<crate::pipeline::keys::CausalIndex>,
+}
+
+/// What causal admission takes: transactions ready to execute, from the
+/// input waiter, or the causal indices of transactions done, from the
+/// executors.
+#[derive(Debug)]
+pub enum AdmissionInput {
+    Ready(Vec<Executable>),
+    Retired(Vec<crate::pipeline::keys::CausalIndex>),
 }
 
 /// What a certified transaction's effects decide, in place of the consensus
