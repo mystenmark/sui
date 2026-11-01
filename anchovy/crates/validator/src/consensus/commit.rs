@@ -1485,8 +1485,20 @@ impl CommitStage {
             let size = max.min(total - start);
             let taken = size - if start == 0 { reserved } else { 0 };
             start += size;
-            let entries: Vec<_> = entries.by_ref().take(taken).collect();
+            let mut entries: Vec<_> = entries.by_ref().take(taken).collect();
             let position = decided.chunks.len();
+            // Each chunk's settlement writes the root exclusively: a read of
+            // it in the commit's `position`th chunk reads the generation the
+            // chunk before's barrier wrote, as the reference assigns it the
+            // root's next version.
+            if position > 0 {
+                for access in entries.iter_mut().flat_map(|e| e.shared.iter_mut()) {
+                    if access.id == messages::tx_index::SUI_ACCUMULATOR_ROOT_OBJECT_ID {
+                        access.ordinal.writes_before =
+                            u32::try_from(position).expect("fewer than 2^32 chunks");
+                    }
+                }
+            }
             let height = self.queue.next_height();
             let checkpoint_seq =
                 self.queue
