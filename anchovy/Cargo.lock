@@ -11178,6 +11178,7 @@ version = "0.1.0"
 dependencies = [
  "aggregator",
  "bcs",
+ "containers",
  "fastcrypto",
  "messages",
  "resolver",
