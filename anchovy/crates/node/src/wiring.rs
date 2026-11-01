@@ -239,7 +239,7 @@ impl Parts {
         checkpoint_waits: Queue<Command<ChunkSettled, PendingCheckpoint>>,
         output_waits: OutputWaits,
     ) -> CommitStage {
-        let stage = CommitStage::new(
+        CommitStage::new(
             self.epoch.params.clone(),
             self.start,
             output,
@@ -253,14 +253,10 @@ impl Parts {
             &self.epoch.params.config,
         ))
         .with_randomness(self.dkg.clone())
-        .with_beacon(beacon)
+        .with_beacon(beacon, self.own_index().map(|own| (own, party)))
         .with_backpressure(self.backpressure.clone())
         .with_chunk_lock(self.chunk_lock.clone())
-        .with_output_waits(output_waits);
-        match self.own_index() {
-            Some(own) => stage.with_party(own, party),
-            None => stage,
-        }
+        .with_output_waits(output_waits)
     }
 
     fn party(&self, collector: Queue<BeaconInput>) -> DkgParty {
