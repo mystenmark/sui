@@ -204,11 +204,7 @@ pub struct Executable {
     /// `FundsWithdrawStatus::Insufficient`). What it withdraws short of each
     /// is credited back.
     pub reserved: Vec<Reservation>,
-    pub height: u64,
     pub entry: ScheduledEntry,
-    /// Each shared access's generation 0 resolved to the earlier generation
-    /// it reads, where the resolver knew one: (stream, round, generation).
-    pub resolved_base: Vec<(StreamId, u32, u32)>,
     /// What each of its input waiter keys resolved to, by the key's position:
     /// filled in by the input waiter.
     pub inputs: Vec<Option<InputValue>>,

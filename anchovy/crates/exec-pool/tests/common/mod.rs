@@ -263,21 +263,34 @@ impl Node {
     pub fn executable(
         &self,
         transaction: VerifiedTransaction,
-        shared: Vec<SharedAccess>,
+        mut shared: Vec<SharedAccess>,
         resolved_base: Vec<(StreamId, u32, u32)>,
     ) -> Executable {
+        // As the commit handler links them.
+        for access in &mut shared {
+            let stream = StreamId {
+                id: access.id,
+                initial_shared_version: access.initial_shared_version,
+            };
+            if let Some(&(_, round, writes_before)) =
+                resolved_base.iter().find(|(s, ..)| *s == stream)
+            {
+                access.base = Some(SharedOrdinal {
+                    round,
+                    writes_before,
+                });
+            }
+        }
         let mut executable = Executable {
             version: AccumulatorVersion(1),
             root_version: 1,
             reserved: Vec::new(),
-            height: 0,
             entry: ScheduledEntry {
                 transaction: ExecutableTransaction::User(transaction),
                 shared,
                 origin: None,
                 cancelled: Vec::new(),
             },
-            resolved_base,
             inputs: Vec::new(),
             synced: None,
         };
@@ -412,13 +425,11 @@ pub fn keys(executable: &Executable) -> Vec<InputKey> {
                 round,
                 generation: writes_before,
             }
-        } else if let Some((_, round, generation)) =
-            executable.resolved_base.iter().find(|(s, ..)| *s == stream)
-        {
+        } else if let Some(base) = access.base {
             InputKey::Generation {
                 stream,
-                round: *round,
-                generation: *generation,
+                round: base.round,
+                generation: base.writes_before,
             }
         } else {
             InputKey::StreamLive(stream)

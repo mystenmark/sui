@@ -385,7 +385,6 @@ fn settles_a_chunk_end_to_end() {
             e.entry.shared[0].mutability,
             SharedObjectMutability::NonExclusiveWrite
         );
-        assert!(e.resolved_base.is_empty());
     }
     // No chunk before it: the root as the store holds it.
     assert_eq!(keys, vec![InputKey::StreamLive(stream())]);
@@ -540,7 +539,6 @@ fn chunks_settle_in_height_order_with_offsets_and_root_generations() {
             generation: 2
         }]
     );
-    assert_eq!(barrier.resolved_base, vec![(stream(), 3, 2)]);
     h.execute(&support::effects(
         system(barrier).digest.bytes,
         30,

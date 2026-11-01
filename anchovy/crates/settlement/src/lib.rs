@@ -527,15 +527,10 @@ fn executable(
             generation,
         },
     };
-    let resolved_base = match (root.ordinal.writes_before, base) {
-        (0, Some((round, generation))) => vec![(stream, round, generation)],
-        _ => Vec::new(),
-    };
     let executable = Executable {
         version: chunk.version,
         root_version: chunk.root_version,
         reserved: Vec::new(),
-        height: chunk.height,
         entry: ScheduledEntry {
             transaction: ExecutableTransaction::System(SystemTransaction {
                 kind,
@@ -546,7 +541,6 @@ fn executable(
             origin: None,
             cancelled: Vec::new(),
         },
-        resolved_base,
         inputs: Vec::new(),
         synced: None,
     };

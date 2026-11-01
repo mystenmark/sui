@@ -397,7 +397,6 @@ impl SyncedScheduler {
                         };
                     let executable = item::executable(
                         t,
-                        height,
                         root_version,
                         deleter,
                         &mut self.keys,
@@ -414,7 +413,6 @@ impl SyncedScheduler {
             let root_version = barrier_root_version(&transactions[settled - 1]) + 1;
             let executable = item::executable(
                 change_epoch,
-                last,
                 root_version,
                 |id: &ObjectId, version: u64, _: &[TransactionDigest]| {
                     panic!("the change-epoch transaction found {id:?}'s stream ended at {version}")

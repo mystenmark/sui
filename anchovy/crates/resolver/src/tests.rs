@@ -173,15 +173,15 @@ fn handler() -> (CommitHandler, tempfile::TempDir) {
     (handler, dir)
 }
 
-/// `entry`'s keys and resolved bases, its accesses linked by `handler`.
+/// `entry`'s keys, its accesses linked by `handler`.
 fn resolve(
     resolver: &mut VersionResolver,
     handler: &mut CommitHandler,
     mut entry: ScheduledEntry,
-) -> (Vec<InputKey>, Vec<(StreamId, u32, u32)>) {
+) -> Vec<InputKey> {
     handler.link(&mut entry.shared);
-    let base = resolver.resolve(&entry, &Digest::new(CHAIN), &containers::Bump::default());
-    (resolver.keys.clone(), base)
+    resolver.resolve(&entry, &Digest::new(CHAIN), &containers::Bump::default());
+    resolver.keys.clone()
 }
 
 #[test]
@@ -215,7 +215,7 @@ fn owned_receiving_package_and_gas_inputs_are_exact_keys() {
         ],
         gas,
     );
-    let (keys, base) = resolve(&mut resolver, &mut handler, entry);
+    let keys = resolve(&mut resolver, &mut handler, entry);
     let package = |id: ObjectID| InputKey::Package(ObjectId(id.into_bytes()));
     assert_eq!(
         keys,
@@ -228,7 +228,6 @@ fn owned_receiving_package_and_gas_inputs_are_exact_keys() {
             version(id(3), 2),
         ]
     );
-    assert!(base.is_empty());
 }
 
 #[test]
@@ -237,15 +236,14 @@ fn an_unseen_stream_read_or_written_non_exclusively_is_live() {
     let (mut handler, _dir) = handler();
     let s = stream(1);
     for mutability in [Immutable, NonExclusiveWrite] {
-        let (keys, base) = resolve(
+        let keys = resolve(
             &mut resolver,
             &mut handler,
             system(vec![access(s, mutability, 5, 0)]),
         );
         assert_eq!(keys, [InputKey::StreamLive(s)]);
-        assert!(base.is_empty());
     }
-    let (keys, _) = resolve(
+    let keys = resolve(
         &mut resolver,
         &mut handler,
         system(vec![access(s, Immutable, 6, 0)]),
@@ -260,30 +258,27 @@ fn a_later_round_waits_for_the_generation_zero_of_a_live_round() {
     let s = stream(1);
     // Round 5 reads the stream live, then writes it non-exclusively.
     for mutability in [Immutable, NonExclusiveWrite, Immutable] {
-        let (keys, base) = resolve(
+        let keys = resolve(
             &mut resolver,
             &mut handler,
             system(vec![access(s, mutability, 5, 0)]),
         );
         assert_eq!(keys, [InputKey::StreamLive(s)]);
-        assert!(base.is_empty());
     }
     // Round 6's writer must not run before them: it reads the generation 0
     // round 5's first execution records.
-    let (keys, base) = resolve(
+    let keys = resolve(
         &mut resolver,
         &mut handler,
         system(vec![access(s, Mutable, 6, 0)]),
     );
     assert_eq!(keys, [generation(s, 5, 0)]);
-    assert_eq!(base, [(s, 5, 0)]);
-    let (keys, base) = resolve(
+    let keys = resolve(
         &mut resolver,
         &mut handler,
         system(vec![access(s, Immutable, 7, 0)]),
     );
     assert_eq!(keys, [generation(s, 6, 1)]);
-    assert_eq!(base, [(s, 6, 1)]);
 
     let (store, _dir) = store(&[coin(ObjectID::new(s.id.0), 3)]);
     let (generations, _generations_dir) = generation_table();
@@ -317,13 +312,13 @@ fn a_live_write_in_a_round_moves_the_stream_past_generation_zero() {
         &mut handler,
         system(vec![access(s, Immutable, 5, 0)]),
     );
-    let (keys, _) = resolve(
+    let keys = resolve(
         &mut resolver,
         &mut handler,
         system(vec![access(s, Mutable, 5, 0)]),
     );
     assert_eq!(keys, [InputKey::StreamLive(s)]);
-    let (keys, _) = resolve(
+    let keys = resolve(
         &mut resolver,
         &mut handler,
         system(vec![access(s, Immutable, 6, 0)]),
@@ -344,15 +339,14 @@ fn exclusive_writes_chain_generations_within_a_round() {
         (Immutable, 2, generation(s, 5, 2)),
     ];
     for (mutability, k, expected) in steps {
-        let (keys, base) = resolve(
+        let keys = resolve(
             &mut resolver,
             &mut handler,
             system(vec![access(s, mutability, 5, k)]),
         );
         assert_eq!(keys, [expected]);
-        assert!(base.is_empty());
     }
-    let (keys, _) = resolve(
+    let keys = resolve(
         &mut resolver,
         &mut handler,
         system(vec![access(s, Immutable, 6, 0)]),
@@ -378,16 +372,15 @@ fn generation_zero_reads_the_last_generation_of_an_earlier_round() {
     // Round 4 only reads and writes non-exclusively: the stream stays at
     // round 3's last generation.
     for mutability in [Immutable, NonExclusiveWrite] {
-        let (keys, base) = resolve(
+        let keys = resolve(
             &mut resolver,
             &mut handler,
             system(vec![access(s, mutability, 4, 0)]),
         );
         assert_eq!(keys, [generation(s, 3, 2)]);
-        assert_eq!(base, [(s, 3, 2)]);
     }
     // Round 7's writer reads it too, alongside an unseen stream.
-    let (keys, base) = resolve(
+    let keys = resolve(
         &mut resolver,
         &mut handler,
         system(vec![
@@ -396,14 +389,12 @@ fn generation_zero_reads_the_last_generation_of_an_earlier_round() {
         ]),
     );
     assert_eq!(keys, [InputKey::StreamLive(other), generation(s, 3, 2)]);
-    assert_eq!(base, [(s, 3, 2)]);
-    let (keys, base) = resolve(
+    let keys = resolve(
         &mut resolver,
         &mut handler,
         system(vec![access(s, Immutable, 8, 0)]),
     );
     assert_eq!(keys, [generation(s, 7, 1)]);
-    assert_eq!(base, [(s, 7, 1)]);
 }
 
 #[test]
@@ -585,8 +576,6 @@ fn a_resolved_chunk_waits_in_the_input_waiter_until_its_keys_are_available() {
     waiter.get_ready(&mut ready);
     // The prologue reads the clock as the store holds it.
     assert_eq!(ready.len(), 1);
-    assert_eq!(ready[0].height, 4);
-    assert!(ready[0].resolved_base.is_empty());
     assert_eq!(ready[0].entry.shared[0].mutability, Mutable);
 
     store
@@ -653,14 +642,13 @@ fn a_resolved_chunk_waits_in_the_input_waiter_until_its_keys_are_available() {
         entries: vec![system(vec![access(clock, Mutable, 2, 0)])],
     };
     resolver.process(link(next), &mut workqueue::Bump::default());
-    let Some(Command::Wait(mut batch)) = inbox.try_pop() else {
+    let Some(Command::Wait(batch)) = inbox.try_pop() else {
         panic!("a wait");
     };
-    waiter.wait_for(&mut batch);
-    ready.clear();
-    waiter.get_ready(&mut ready);
-    assert_eq!(ready.len(), 1);
-    assert_eq!(ready[0].resolved_base, [(clock, 1, 1)]);
+    let [(_, keys)] = &batch.into_parts()[..] else {
+        panic!("one transaction");
+    };
+    assert_eq!(keys, &[generation(clock, 1, 1)]);
 }
 
 #[test]
@@ -872,7 +860,6 @@ fn a_withdrawing_transaction_waits_on_its_reservations_instead_of_its_inputs() {
     else {
         panic!("one withdrawing transaction");
     };
-    assert_eq!(spend.height, 4);
     assert_eq!(spend.version, AccumulatorVersion(7));
     assert_eq!(spend.reserved, expected);
     drop(waiter);

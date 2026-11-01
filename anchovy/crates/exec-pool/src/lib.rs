@@ -35,8 +35,9 @@ use workqueue::{Processor, PushError, Queue, Sink};
 /// records each generation it produced, then notifies.
 ///
 /// - **Resolving.** Generation `k > 0` of a round is the version its writer
-///   produced. Generation 0 is the earlier round's generation the resolver
-///   gave (`resolved_base`) or, for a stream it had none for, the version
+///   produced. Generation 0 is the earlier round's generation the commit
+///   handler linked it to (`SharedAccess::base`) or, for a stream it had none
+///   for, the version
 ///   the stream starts the epoch at (`Store::start_version`), recorded as
 ///   generation 0 of the round by the first transaction to read it. Invariant: the round's writer of generation 0
 ///   records it before it commits, so a reader finding no entry has seen no
@@ -938,7 +939,6 @@ mod tests {
                     version,
                 })
                 .collect(),
-            height: 0,
             entry: ScheduledEntry {
                 transaction: ExecutableTransaction::System(SystemTransaction {
                     kind: SystemKind::Barrier { height: 0 },
@@ -949,7 +949,6 @@ mod tests {
                 origin: None,
                 cancelled: Vec::new(),
             },
-            resolved_base: vec![],
             inputs: vec![],
             synced: None,
         }

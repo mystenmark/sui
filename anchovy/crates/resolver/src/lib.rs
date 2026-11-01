@@ -67,48 +67,33 @@ impl VersionResolver {
         }
     }
 
-    /// Leaves `entry`'s keys in `keys` and its withdrawals in `amounts`,
-    /// and returns the generations its generation-0 accesses resolve to.
-    fn resolve(
-        &mut self,
-        entry: &ScheduledEntry,
-        chain_identifier: &ChainIdentifier,
-        bump: &Bump,
-    ) -> Vec<(StreamId, u32, u32)> {
+    /// Leaves `entry`'s keys in `keys` and its withdrawals in `amounts`.
+    fn resolve(&mut self, entry: &ScheduledEntry, chain_identifier: &ChainIdentifier, bump: &Bump) {
         self.keys.clear();
         self.amounts.clear();
-        let mut resolved_base = Vec::new();
-        self.resolve_shared(&entry.shared, &mut resolved_base);
+        self.resolve_shared(&entry.shared);
         if let ExecutableTransaction::User(transaction) = &entry.transaction {
             let data = transaction.get().0.data();
             object_keys(data, &mut self.keys, &mut self.packages);
             funds_withdrawals(data, chain_identifier, &mut self.amounts, bump);
         }
-        resolved_base
     }
 
-    /// Pushes the keys of `shared`'s accesses to `keys`, with each
-    /// generation 0 the commit handler linked to an earlier round's
-    /// generation in `resolved_base`.
-    fn resolve_shared(
-        &mut self,
-        shared: &[SharedAccess],
-        resolved_base: &mut Vec<(StreamId, u32, u32)>,
-    ) {
+    /// Pushes the keys of `shared`'s accesses to `keys`: a generation 0 the
+    /// commit handler linked to an earlier round's generation waits for
+    /// that one.
+    fn resolve_shared(&mut self, shared: &[SharedAccess]) {
         for access in shared {
             let stream = StreamId {
                 id: access.id,
                 initial_shared_version: access.initial_shared_version,
             };
             let key = match (access.ordinal.writes_before, access.base) {
-                (0, Some(base)) => {
-                    resolved_base.push((stream, base.round, base.writes_before));
-                    InputKey::Generation {
-                        stream,
-                        round: base.round,
-                        generation: base.writes_before,
-                    }
-                }
+                (0, Some(base)) => InputKey::Generation {
+                    stream,
+                    round: base.round,
+                    generation: base.writes_before,
+                },
                 (0, None) => InputKey::StreamLive(stream),
                 (generation, _) => InputKey::Generation {
                     stream,
@@ -262,7 +247,6 @@ impl Processor for VersionResolver {
         let Chunk {
             version,
             root_version,
-            height,
             entries,
             ..
         } = chunk;
@@ -270,7 +254,7 @@ impl Processor for VersionResolver {
         let mut withdrawals = Vec::new();
         for entry in entries {
             let chain_identifier = self.epoch.chain_identifier;
-            let resolved_base = self.resolve(&entry, &chain_identifier, bump);
+            self.resolve(&entry, &chain_identifier, bump);
             let reserved: Vec<keys::Reservation> = self
                 .amounts
                 .drain(..)
@@ -295,9 +279,7 @@ impl Processor for VersionResolver {
                 version,
                 root_version,
                 reserved,
-                height,
                 entry,
-                resolved_base,
                 inputs: Vec::new(),
                 synced: None,
             };
