@@ -4,7 +4,7 @@
 //! Execution with anchovy's executor: the transaction's inputs loaded from the store as views,
 //! executed in an arena, and the outputs handed back as the store's commit.
 
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use containers::Bump;
 use exec_types::object::Object;
@@ -50,8 +50,9 @@ const MAX_PACKAGES: usize = 1024;
 
 /// Anchovy's executor for one epoch.
 pub struct NativeExecution {
-    /// Execution is serial, so the lock is uncontended.
-    state: std::sync::Mutex<State>,
+    /// States no execution holds: each concurrent execution takes one, or
+    /// builds one if none is free, and puts it back.
+    idle: std::sync::Mutex<Vec<State>>,
     /// Built once from `config`: the natives' costs are fixed for the epoch.
     natives_cost_table: natives::NativesCostTable,
     /// Packages a runtime may resolve before it is replaced.
@@ -65,11 +66,20 @@ pub struct NativeExecution {
     chain_identifier: [u8; 32],
 }
 
-/// What execution keeps between transactions.
+/// What an execution keeps between transactions.
 struct State {
     /// The transactions' arena, reset after each.
     arena: Bump,
     runtime: Runtime,
+}
+
+impl State {
+    fn new(config: &ProtocolConfig) -> Result<State> {
+        Ok(State {
+            arena: Bump::with_capacity(ARENA_CAPACITY),
+            runtime: Runtime::new(config)?,
+        })
+    }
 }
 
 /// A Move runtime, and the caches filled from it: replaced together.
@@ -107,10 +117,7 @@ impl NativeExecution {
         chain_identifier: [u8; 32],
     ) -> Result<NativeExecution> {
         Ok(NativeExecution {
-            state: std::sync::Mutex::new(State {
-                arena: Bump::with_capacity(ARENA_CAPACITY),
-                runtime: Runtime::new(&config)?,
-            }),
+            idle: std::sync::Mutex::new(vec![State::new(&config)?]),
             natives_cost_table: natives::NativesCostTable::from_protocol_config(&config),
             max_packages: MAX_PACKAGES,
             config,
@@ -172,8 +179,13 @@ impl NativeExecution {
         assigned_accumulator: Option<u64>,
         unsettled: &dyn Unsettled,
     ) -> Result<Outcome> {
-        let mut state = self.state.lock().expect("the state's lock is not poisoned");
-        let State { arena, runtime } = &mut *state;
+        let idle = || self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+        let taken = idle().pop();
+        let mut state = match taken {
+            Some(state) => state,
+            None => State::new(&self.config)?,
+        };
+        let State { arena, runtime } = &mut state;
         let outcome = self.execute_in(
             arena,
             runtime,
@@ -189,6 +201,7 @@ impl NativeExecution {
         if runtime.package_cache.len() > self.max_packages {
             *runtime = Runtime::new(&self.config).expect("a runtime builds as it did at the start");
         }
+        idle().push(state);
         outcome
     }
 
