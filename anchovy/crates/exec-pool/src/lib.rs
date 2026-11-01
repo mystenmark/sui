@@ -682,16 +682,24 @@ fn stream_of(access: &SharedAccess) -> StreamId {
 
 /// The generation of `stream` a transaction with `effects` produced, having
 /// read `read`: the version it wrote while the object stays in the stream;
-/// `Ended` if it deleted, wrapped or moved it out; what it read if its
-/// effects do not change it.
+/// `Ended` if it deleted, wrapped or moved it out, or wrote it ended (the
+/// reference moves an ended stream on to each writer's version, with a
+/// marker naming the writer); what it read if its effects do not change it.
 fn produced(
     effects: &messages::effects::TransactionEffectsV2<'_>,
     stream: StreamId,
     read: Generation,
     digest: TxDigest,
 ) -> Generation {
+    let ended = Generation::Ended {
+        version: effects.lamport_version,
+        transaction: digest.bytes,
+    };
     let Some(change) = effects.changed_objects.iter().find(|c| *c.id == stream.id) else {
-        return read;
+        return match read {
+            Generation::Ended { .. } => ended,
+            Generation::Version { .. } => read,
+        };
     };
     let isv = stream.initial_shared_version;
     match change.output_state {
@@ -706,10 +714,7 @@ fn produced(
                 digest: object_digest.bytes,
             }
         }
-        _ => Generation::Ended {
-            version: effects.lamport_version,
-            transaction: digest.bytes,
-        },
+        _ => ended,
     }
 }
 
