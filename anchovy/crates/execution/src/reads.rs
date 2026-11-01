@@ -19,6 +19,9 @@ pub struct StoreReads<'a> {
     bump: &'a Bump,
     store: &'a store::Store,
     kept: &'a Kept<messages::object::Object<'static>>,
+    /// Where an implicitly read system object not yet at its version is
+    /// waited for.
+    awaited: &'a dyn crate::Awaited,
 }
 
 fn storage_error(e: &store::Error) -> SuiError {
@@ -33,7 +36,20 @@ impl<'a> StoreReads<'a> {
         store: &'a store::Store,
         kept: &'a Kept<messages::object::Object<'static>>,
     ) -> StoreReads<'a> {
-        StoreReads { bump, store, kept }
+        StoreReads {
+            bump,
+            store,
+            kept,
+            awaited: &crate::NoneAwaited,
+        }
+    }
+
+    /// Waits on `awaited` for an implicitly read system object not yet at
+    /// the version a transaction requires.
+    #[must_use]
+    pub fn awaiting(mut self, awaited: &'a dyn crate::Awaited) -> StoreReads<'a> {
+        self.awaited = awaited;
+        self
     }
 
     fn keep(
@@ -94,6 +110,20 @@ impl<'a> ObjectStore<'a> for StoreReads<'a> {
         version: SequenceNumber,
     ) -> Option<Object<'a>> {
         self.object_at(object_id, version).ok().flatten()
+    }
+
+    /// The reference's: a version not yet written is waited for, as another
+    /// transaction's execution writes it.
+    fn load_implicitly_read_system_object(
+        &self,
+        object_id: &ObjectId,
+        version: SequenceNumber,
+    ) -> Option<Object<'a>> {
+        if let Some(object) = self.get_object_by_key(object_id, version) {
+            return Some(object);
+        }
+        self.awaited.wait(object_id, version);
+        self.get_object_by_key(object_id, version)
     }
 }
 

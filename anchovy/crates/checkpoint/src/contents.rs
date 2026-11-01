@@ -104,7 +104,22 @@ pub fn build(
             let listed = listed_signatures(transaction);
             let mut signatures =
                 containers::Vec::<UserSignature<'_>>::with_capacity_in(listed.len(), bump);
-            signatures.extend(listed.iter().map(|s| (s.0, None)));
+            // As the reference's `process_user_signatures`. Voting checked
+            // that a claim names only signatures the transaction has.
+            match &executed.aliases {
+                Some(claim) if config.fix_checkpoint_signature_mapping() => signatures.extend(
+                    claim
+                        .iter()
+                        .map(|&(i, version)| (listed[usize::from(i)].0, version)),
+                ),
+                Some(claim) => signatures.extend(
+                    listed
+                        .iter()
+                        .zip(claim)
+                        .map(|(s, &(_, version))| (s.0, version)),
+                ),
+                None => signatures.extend(listed.iter().map(|s| (s.0, None))),
+            }
             contents.push(
                 executed.digest.into(),
                 executed.effects_digest.into(),

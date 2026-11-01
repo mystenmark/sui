@@ -24,8 +24,8 @@ use validator::pipeline::items::{
     BuiltWaitItem, BuiltWaits, CertifiedCheckpoint, CheckpointEffects, EffectsWaitItem,
     ExecutedEffects, GateWaits, InputCommand,
 };
-use validator::pipeline::keys::{CheckpointBuilt, EffectsKey, GateKey, InputKey};
-use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore};
+use validator::pipeline::keys::{CausalIndex, CheckpointBuilt, EffectsKey, GateKey, InputKey};
+use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkLengths};
 use validator::randomness::BeaconInput;
 use validator::state_sync::{SyncRequest, SyncedInput, Wanted};
 use waiter::{Command, WaitBatch};
@@ -152,6 +152,8 @@ pub struct SyncedScheduler {
     store: Arc<store::Store>,
     checkpoints: Arc<CheckpointStore>,
     chunk_lock: Arc<ChunkLock>,
+    /// Where each chunk it splits is registered, for causal admission.
+    lengths: Arc<ChunkLengths>,
     outputs: Outputs,
     /// The last checkpoint verified, or committed, and its digest.
     last: (u64, Digest),
@@ -180,6 +182,7 @@ impl SyncedScheduler {
         store: Arc<store::Store>,
         checkpoints: Arc<CheckpointStore>,
         chunk_lock: Arc<ChunkLock>,
+        lengths: Arc<ChunkLengths>,
         outputs: Outputs,
     ) -> SyncedScheduler {
         let seq = checkpoints.last_committed();
@@ -200,6 +203,7 @@ impl SyncedScheduler {
             store,
             checkpoints,
             chunk_lock,
+            lengths,
             outputs,
             slow: VecDeque::new(),
             split_height: 0,
@@ -381,7 +385,19 @@ impl SyncedScheduler {
             let height = first + i as u64;
             if height > handled {
                 let root_version = barrier_root_version(&transactions[end - 1]);
-                for t in &transactions[start..end] {
+                let len = transactions[start..end]
+                    .iter()
+                    .filter(|t| !settles(t))
+                    .count();
+                self.lengths
+                    .register(height, u32::try_from(len).expect("fewer than 2^32"));
+                for (position, t) in transactions[start..end].iter().enumerate() {
+                    // The chunk's own transactions come first; its
+                    // settlements and barrier have no index.
+                    let causal = (!settles(t)).then(|| CausalIndex {
+                        height,
+                        position: u32::try_from(position).expect("fewer than 2^32"),
+                    });
                     let deleter =
                         |id: &ObjectId, version: u64, dependencies: &[TransactionDigest]| {
                             if !self.dependencies {
@@ -399,6 +415,7 @@ impl SyncedScheduler {
                     let executable = item::executable(
                         t,
                         root_version,
+                        causal,
                         deleter,
                         &mut self.keys,
                         &mut self.packages,
@@ -412,9 +429,14 @@ impl SyncedScheduler {
         // other writers. Whichever path runs it second finds it executed.
         if let Some(change_epoch) = transactions.get(settled) {
             let root_version = barrier_root_version(&transactions[settled - 1]) + 1;
+            self.lengths.register(last + 1, 1);
             let executable = item::executable(
                 change_epoch,
                 root_version,
+                Some(CausalIndex {
+                    height: last + 1,
+                    position: 0,
+                }),
                 |id: &ObjectId, version: u64, _: &[TransactionDigest]| {
                     panic!("the change-epoch transaction found {id:?}'s stream ended at {version}")
                 },
@@ -494,6 +516,7 @@ impl SyncedScheduler {
                 digest,
                 effects_digest: executed,
                 effects: t.effects.bytes.into(),
+                aliases: None,
             });
         }
         if !running.synced.is_empty() {
@@ -643,4 +666,13 @@ impl Processor for SyncedScheduler {
         }
         None
     }
+}
+
+/// Whether `t` is a settlement or a barrier: the only programmable system
+/// transactions in a chunk.
+fn settles(t: &ExecutionData<'_>) -> bool {
+    matches!(
+        t.transaction.data().kind(),
+        TransactionKind::ProgrammableSystemTransaction(_)
+    )
 }

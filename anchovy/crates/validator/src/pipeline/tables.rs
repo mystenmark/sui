@@ -143,6 +143,155 @@ impl GenerationTable {
     }
 }
 
+/// Net withdrawals from accumulator accounts by transactions executed but
+/// not yet settled, by (account, root version): what an object balance
+/// withdrawal is checked against beside the settled balance (the reference's
+/// `UnsettledObjectWithdrawals`). Written by `Executor` (owner: the exec-pool
+/// work) when a transaction executes, by either path; read by execution;
+/// released by `CheckpointCommitter` as each transaction's checkpoint
+/// commits, which settles it.
+///
+/// In memory only: a transaction whose outputs survive a crash committed
+/// with its checkpoint, so it is settled, and any other runs again and
+/// records again.
+#[derive(Default)]
+pub struct UnsettledWithdrawals {
+    inner: Mutex<Unsettled>,
+}
+
+#[derive(Default)]
+struct Unsettled {
+    /// Totals by (account, root version).
+    totals: HashMap<([u8; 32], u64), u128, foldhash::fast::RandomState>,
+    /// What each transaction recorded: its root version and withdrawals.
+    by_producer: HashMap<TxDigest, (u64, Vec<([u8; 32], u128)>), foldhash::fast::RandomState>,
+}
+
+impl UnsettledWithdrawals {
+    /// `producer`, reading the root at `version`, withdrew `withdrawals`
+    /// (account, net amount) from accumulator accounts.
+    pub fn record(&self, producer: TxDigest, version: u64, withdrawals: Vec<([u8; 32], u128)>) {
+        if withdrawals.is_empty() {
+            return;
+        }
+        let mut inner = lock(&self.inner);
+        for &(account, amount) in &withdrawals {
+            let total = inner.totals.entry((account, version)).or_default();
+            *total = total.checked_add(amount).expect("withdrawals fit in u128");
+        }
+        let previous = inner.by_producer.insert(producer, (version, withdrawals));
+        debug_assert!(previous.is_none(), "a transaction executes once");
+    }
+
+    /// `transactions` committed with their checkpoint: their withdrawals
+    /// are settled.
+    pub fn commit(&self, transactions: &[TxDigest]) {
+        let mut inner = lock(&self.inner);
+        for digest in transactions {
+            let Some((version, withdrawals)) = inner.by_producer.remove(digest) else {
+                continue;
+            };
+            for (account, amount) in withdrawals {
+                let key = (account, version);
+                let total = inner.totals.get_mut(&key).expect("recorded with it");
+                *total -= amount;
+                if *total == 0 {
+                    inner.totals.remove(&key);
+                }
+            }
+        }
+    }
+}
+
+impl execution::Unsettled for UnsettledWithdrawals {
+    fn withdrawn(&self, account: &messages::base::ObjectId, version: u64) -> u128 {
+        lock(&self.inner)
+            .totals
+            .get(&(account.0, version))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+/// The latest version of the accumulator root written: what execution
+/// waits on when a transaction reads the root at a version its chunk's
+/// predecessor's barrier has not written yet (an undeclared dependency).
+/// Written by `Executor` (owner: the exec-pool work) after a write of the
+/// root reaches the store; waited on during execution. Causal admission
+/// keeps a writer running, so a wait ends.
+pub struct RootVersions {
+    latest: Mutex<u64>,
+    written: std::sync::Condvar,
+}
+
+impl RootVersions {
+    /// The root is at `version` in the store.
+    pub fn new(version: u64) -> RootVersions {
+        RootVersions {
+            latest: Mutex::new(version),
+            written: std::sync::Condvar::new(),
+        }
+    }
+
+    /// The store has the root at `version`.
+    pub fn written(&self, version: u64) {
+        let mut latest = lock(&self.latest);
+        if version > *latest {
+            *latest = version;
+            self.written.notify_all();
+        }
+    }
+}
+
+impl execution::Awaited for RootVersions {
+    fn wait(&self, id: &messages::base::ObjectId, version: u64) {
+        assert_eq!(
+            *id,
+            messages::tx_index::SUI_ACCUMULATOR_ROOT_OBJECT_ID,
+            "only the accumulator root is read implicitly at a version"
+        );
+        let mut latest = lock(&self.latest);
+        while *latest < version {
+            latest = self
+                .written
+                .wait(latest)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+/// Each chunk's number of transactions with a causal index (its settlements
+/// and barrier have none), by height: what tells causal admission that a
+/// chunk's last index is followed by the next chunk's first. Written by
+/// whoever creates the chunk (the randomness gate, the synced scheduler, the
+/// epoch closer for the change-epoch transaction) before its transactions
+/// head for the executor; read by `ExecutionAdmission`, which prunes it.
+/// A chunk both paths run is registered by each, with one length.
+#[derive(Default)]
+pub struct ChunkLengths {
+    lengths: Mutex<BTreeMap<u64, u32>>,
+}
+
+impl ChunkLengths {
+    pub fn register(&self, height: u64, len: u32) {
+        let previous = lock(&self.lengths).insert(height, len);
+        debug_assert!(
+            previous.is_none_or(|previous| previous == len),
+            "chunk {height} registered with two lengths"
+        );
+    }
+
+    pub fn get(&self, height: u64) -> Option<u32> {
+        lock(&self.lengths).get(&height).copied()
+    }
+
+    /// Forgets the chunks below `height`.
+    pub fn prune_below(&self, height: u64) {
+        let mut lengths = lock(&self.lengths);
+        *lengths = lengths.split_off(&height);
+    }
+}
+
 /// Settled chunks by height, in memory: only checkpoints not yet built read
 /// them, so each is taken as its checkpoint's contents are built, and a
 /// replay settles them again. Written by `SettlementScheduler` (owner: the
@@ -321,5 +470,50 @@ impl CheckpointStore {
         self.committed.fetch_max(seq, Ordering::AcqRel);
         let mut built = lock(&self.built);
         *built = built.split_off(&seq);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use execution::Unsettled as _;
+    use messages::base::{Digest, Hashed, ObjectId};
+
+    use super::*;
+
+    #[test]
+    fn unsettled_withdrawals_add_up_by_version_until_their_checkpoint_commits() {
+        let table = UnsettledWithdrawals::default();
+        let digest = |n: u8| Hashed::computed(Digest::new([n; 32]));
+        let account = ObjectId([1; 32]);
+        table.record(digest(1), 5, vec![(account.0, 30)]);
+        table.record(digest(2), 5, vec![(account.0, 12)]);
+        table.record(digest(3), 6, vec![(account.0, 7)]);
+        assert_eq!(table.withdrawn(&account, 5), 42);
+        assert_eq!(table.withdrawn(&account, 6), 7);
+        assert_eq!(table.withdrawn(&ObjectId([2; 32]), 5), 0);
+
+        table.commit(&[digest(1), digest(9)]);
+        assert_eq!(table.withdrawn(&account, 5), 12);
+        table.commit(&[digest(2), digest(3)]);
+        assert_eq!(table.withdrawn(&account, 5), 0);
+        assert_eq!(table.withdrawn(&account, 6), 0);
+        assert!(lock(&table.inner).totals.is_empty());
+    }
+
+    #[test]
+    fn a_wait_for_a_root_version_ends_once_it_is_written() {
+        use execution::Awaited as _;
+        let roots = Arc::new(RootVersions::new(3));
+        let root = messages::tx_index::SUI_ACCUMULATOR_ROOT_OBJECT_ID;
+        roots.wait(&root, 3);
+        let waiter = {
+            let roots = roots.clone();
+            std::thread::spawn(move || roots.wait(&root, 5))
+        };
+        roots.written(4);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(!waiter.is_finished(), "version 4 is not 5");
+        roots.written(5);
+        waiter.join().unwrap();
     }
 }

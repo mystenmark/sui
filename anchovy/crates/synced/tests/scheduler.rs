@@ -178,6 +178,7 @@ impl Setup {
             store,
             checkpoints.clone(),
             lock.clone(),
+            Arc::default(),
             synced::Outputs {
                 built,
                 inputs: workqueue::queue(16).0,

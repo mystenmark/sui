@@ -40,7 +40,9 @@ an action taken once its keys hold. A processor may still order its own
 work (the state hasher folds roots in sequence), accumulate toward a
 threshold (the aggregator's quorum), or hold its input for a condition it
 is the documented home of (the funds reserver's balances). It never blocks
-its thread on another processor.
+its thread on another processor, with one exception, as the reference's:
+execution blocks on an undeclared dependency, the accumulator root a barrier
+writes, which causal admission makes safe (see Execution).
 
 Every arrow in the diagram is a queue, except store reads and writes. Every
 waiter has three kinds of edge:
@@ -259,7 +261,8 @@ The costs:
 
 ### 4. Execution
 
-`VersionResolver` → **input waiter** → `Executor` (several workers).
+`VersionResolver` → **input waiter** → `ExecutionAdmission` → `Executor`
+(the limit's workers, one more, and one for settlements).
 
 - **`VersionResolver`**, in commit order, turns each transaction's inputs
   into keys.
@@ -293,6 +296,24 @@ The costs:
 
   Because waits follow the ordinals, workers never conflict.
 
+- **Undeclared dependencies.** A transaction checking an object balance
+  withdrawal reads the accumulator root at its chunk's root version, which
+  the previous chunk's barrier writes: a dependency it does not declare.
+  Execution blocks until the version is written (`RootVersions`, which the
+  executors update after storing a root write).
+- **`ExecutionAdmission`** (the reference's causal admission, #27840) keeps
+  that from deadlocking. Each chunk transaction has a causal index (height,
+  position), and the chunk's creator registers its length (`ChunkLengths`),
+  so a chunk's last index is followed by the next chunk's first. With C the
+  first index not done, a transaction is admitted while fewer than the limit
+  are in flight, or if it is C, one at a time past the limit: everything it
+  can wait for is done, so it never blocks, and C advances. Settlements and
+  barriers have no index, never block, and run on a worker of their own.
+- **Unsettled withdrawals.** An object balance withdrawal is checked against
+  the settled balance at the root version less the net withdrawals of
+  earlier transactions not yet settled (`UnsettledWithdrawals`), which each
+  execution records and the checkpoint committer releases.
+
 ### 5. Settlement
 
 `SettlementScheduler`, one chunk at a time, in height order.
@@ -308,7 +329,7 @@ The costs:
    - write the chunk's ordered effects, settlements and barrier last, to the
      chunk table;
    - notify `ChunkSettled(height)` to the checkpoint waiter;
-   - after the last chunk of a commit, notify `Settled` to `FundsReserver`.
+   - notify `Settled` of the next version to `FundsReserver`.
 
 #### Funds reservation
 
@@ -320,10 +341,11 @@ never lets the reservations fulfilled against a balance sum to more than that
 balance, and it fulfils a reservation as soon as that is certain, without
 waiting for settlement.
 
-**Versions.** Accumulator versions are counted in commits. Version `v` is the
-accumulator state once every chunk of every commit before commit `v` has
-settled. Commit `v`'s transactions reserve against version `v`, and what they
-deposit and withdraw settles into version `v + 1`.
+**Versions.** Accumulator versions are the root's versions, one per chunk,
+as the reference assigns each chunk's transactions the root's next version.
+Version `v` is the accumulator state once every chunk before the chunk of
+version `v` has settled. That chunk's transactions reserve against version
+`v`, and what they deposit and withdraw settles into version `v + 1`.
 
 For one account, write:
 
@@ -412,16 +434,16 @@ on, so they change when outcomes are known, never what they are.
   `v`'s before any of `v + 1`'s. They are kept in arrival order (consensus
   order), so a reservation key `(account, r, v)` need not be unique.
 - **`Deposit(account, d, v)`** is sent by `Executor` once a transaction of
-  commit `v − 1` deposits `d`. If `v > σ`, then `D(v) += d`, raising `L` at
+  the chunk of version `v − 1` deposits `d`. If `v > σ`, then `D(v) += d`, raising `L` at
   `v` and at every later unsettled version. The rules are then reapplied
   there.
 - **`Credit(account, c, v)`** is sent by `Executor` once a fulfilled
-  transaction of commit `v` executes, for each account with `c = R − U > 0`.
+  transaction of the chunk of version `v` executes, for each account with `c = R − U > 0`.
   `FundsReserver` sends it to itself for each fulfilled reservation of a
   cancelled transaction. If `v ≥ σ`, then `C(v) += c`, raising `L` from
   `v + 1` on. The rules are then reapplied there.
 - **`Settled(balances, v)`**, with `v = σ + 1`, is sent by
-  `SettlementScheduler` after the last chunk of commit `v − 1` settles.
+  `SettlementScheduler` after the chunk of version `v − 1` settles.
   - It sets `σ = v` and `S(v)`: given for each account the settlement
     changed, and `S(v − 1)` for the others.
   - It applies the rules at `v` until `v`'s queue is empty; R1 or R2 always

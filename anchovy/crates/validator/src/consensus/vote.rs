@@ -30,7 +30,7 @@ use crate::consensus::cache::{BlockEntries, CachedTransaction, ConsensusTxCache}
 use crate::consensus::decode::{checkpoint_signature, claimed_immutable};
 use crate::consensus::execution_time::duration;
 use crate::epoch::EpochState;
-use crate::pipeline::items::{BuiltWaitItem, BuiltWaits};
+use crate::pipeline::items::{AliasVersions, BuiltWaitItem, BuiltWaits};
 use crate::pipeline::keys::CheckpointBuilt;
 
 /// The reference's `dkg_v1::DKG_MESSAGES_MAX_SIZE`.
@@ -184,8 +184,12 @@ impl BlockVoter {
                     {
                         rejects.push(*index as TransactionIndex);
                     }
-                    entries[*index] =
-                        Some(CachedTransaction::new(transaction, &claims.immutable, bump));
+                    entries[*index] = Some(CachedTransaction::new(
+                        transaction,
+                        &claims.immutable,
+                        claims.aliases.clone(),
+                        bump,
+                    ));
                 }
                 Err(_) => rejects.push(*index as TransactionIndex),
             }
@@ -315,6 +319,7 @@ impl Claims<'_> {
         let mut immutable = containers::Vec::with_capacity_in(self.immutable.len(), bump);
         immutable.extend_from_slice(self.immutable);
         CopiedClaims {
+            aliases: self.aliases_v2.map(<[_]>::to_vec),
             aliases_v2: self.aliases_v2.map(|a| ShortList::of(a.iter().copied())),
             aliases_v1: self
                 .aliases_v1
@@ -326,6 +331,8 @@ impl Claims<'_> {
 
 /// `Claims`, owned.
 struct CopiedClaims<'b> {
+    /// The aliases claim (V2), whole, for the commit handler.
+    aliases: Option<AliasVersions>,
     aliases_v2: Option<ShortList<(u8, Option<u64>)>>,
     aliases_v1: Option<ShortList<(SuiAddress, Option<u64>)>>,
     immutable: containers::Vec<'b, ObjectId>,

@@ -136,6 +136,7 @@ impl EpochState {
             epoch,
             epoch_start_timestamp_ms,
             reference_gas_price,
+            chain_identifier.bytes,
         )
         .expect("the executors support every protocol version anchovy does");
         EpochState {

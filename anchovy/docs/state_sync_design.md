@@ -181,9 +181,8 @@ certificate:
   that left the stream ended at that version: the one that took the
   object out, or a later writer. Where the protocol drops effects'
   dependencies, the name reaches no effects, and none is looked up;
-- the accumulator version, from the barrier settlement ending its chunk
-  (R4.4). It counts commits, so the chunks of a split commit share it,
-  even across checkpoints;
+- the chunk's root version, from the barrier ending its chunk (R4.4): one
+  per chunk, as the reference assigns it;
 - `Funds::Insufficient` if and only if the effects' status is
   `InsufficientFundsForWithdraw` (R4.5). The synced path cannot wait for
   the funds reserver without waiting for consensus.
@@ -271,7 +270,6 @@ node produced.
 - Archive fallback (R2.11), and peer scoring beyond trying the next peer
   (R2.8-R2.9).
 - Pushing certified checkpoints (R2.4).
-- Several executor workers.
 
 ## Tests
 

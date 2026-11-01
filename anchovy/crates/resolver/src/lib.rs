@@ -21,7 +21,7 @@ use validator::pipeline::items::{
     Chunk, Executable, ExecutableTransaction, FundsCommand, InputCommand, InputValue,
     ScheduledEntry, Withdrawal,
 };
-use validator::pipeline::keys::{self, InputKey};
+use validator::pipeline::keys::{self, CausalIndex, InputKey};
 use validator::pipeline::tables::{Generation, GenerationTable};
 use waiter::{Availability, Command, WaitBatch};
 use workqueue::{Processor, Queue};
@@ -222,12 +222,13 @@ impl Processor for VersionResolver {
         let Chunk {
             version,
             root_version,
+            height,
             entries,
             ..
         } = chunk;
         let mut batch = WaitBatch::with_capacity(entries.len(), entries.len() * 4);
         let mut withdrawals = Vec::new();
-        for entry in entries {
+        for (position, entry) in entries.into_iter().enumerate() {
             let chain_identifier = self.epoch.chain_identifier;
             self.resolve(&entry, &chain_identifier, bump);
             let reserved: Vec<keys::Reservation> = self
@@ -257,6 +258,10 @@ impl Processor for VersionResolver {
                 entry,
                 inputs: Vec::new(),
                 synced: None,
+                causal: Some(CausalIndex {
+                    height,
+                    position: u32::try_from(position).expect("fewer than 2^32 transactions"),
+                }),
             };
             batch.push(executable, self.keys.drain(..));
         }

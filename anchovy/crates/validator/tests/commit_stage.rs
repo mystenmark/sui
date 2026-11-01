@@ -233,11 +233,7 @@ fn summary(decided: &Decided) -> String {
             (c_.round, c_.height, c_.checkpoint_seq, entries)
         })
         .collect();
-    let settlements: Vec<_> = decided
-        .chunks
-        .iter()
-        .map(|c| (c.last_of_commit, c.root))
-        .collect();
+    let settlements: Vec<_> = decided.chunks.iter().map(|c| c.root).collect();
     let checkpoints: Vec<_> = decided
         .checkpoints
         .iter()
@@ -380,13 +376,12 @@ fn chunks_split_at_the_limit_and_checkpoints_follow_the_previous_epoch() {
     );
 
     // Settlement: the root read at the generation its place in the commit
-    // gives, the last chunk ending the commit.
+    // gives.
     for (position, chunk) in decided.chunks.iter().enumerate() {
         assert_eq!(chunk.root.id, messages::base::ObjectId::from_u16(0xacc));
         assert_eq!(chunk.root.initial_shared_version, ROOT_VERSION);
         assert_eq!(chunk.root.ordinal.round, 4);
         assert_eq!(chunk.root.ordinal.writes_before, position as u32);
-        assert_eq!(chunk.last_of_commit, position + 1 == decided.chunks.len());
     }
     // The user transactions keep where consensus put them.
     let origins: Vec<_> = decided
@@ -539,4 +534,47 @@ fn the_stage_claims_its_chunks_and_reports_its_cuts() {
     // Chunk 3, cut with chunk 2 once the interval has passed.
     stage.process(commit(2, 4, 300, &transactions(1, 1)), &mut bump);
     assert_eq!(lock.cut(), Cut { seq: 12, height: 3 });
+}
+
+/// A read of the accumulator root in a commit's later chunk reads what the
+/// chunk before's barrier wrote, as the reference assigns it the root's
+/// next version: generation `p` in the commit's `p`th chunk.
+#[test]
+fn a_read_of_the_root_reads_the_generation_its_chunk_follows() {
+    let bump = containers::Bump::default();
+    let epoch = epoch(3, 0);
+    let (mut stage, _outputs) = stage(&epoch);
+    let (sender, key): (SuiAddress, AccountKeyPair) = get_key_pair();
+    let readers: Vec<_> = (0..7)
+        .map(|_| {
+            let pt = ProgrammableTransaction {
+                inputs: vec![CallArg::Object(ObjectArg::SharedObject {
+                    id: sui_types::SUI_ACCUMULATOR_ROOT_OBJECT_ID,
+                    initial_shared_version: SequenceNumber::from_u64(ROOT_VERSION),
+                    mutability: SharedObjectMutability::Immutable,
+                })],
+                commands: vec![],
+            };
+            let data = TransactionData::new(
+                TransactionKind::ProgrammableTransaction(pt),
+                sender,
+                random_object_ref(),
+                1_000_000,
+                1000,
+            );
+            bcs::to_bytes(&Transaction::from_data_and_signer(data, vec![&key])).unwrap()
+        })
+        .collect();
+    let decided = stage.decide(commit(1, 4, 100, &readers), &bump).unwrap();
+    assert_eq!(decided.chunks.len(), 3);
+    for (position, chunk) in decided.chunks.iter().enumerate() {
+        for entry in &chunk.chunk.entries {
+            for access in &entry.shared {
+                assert_eq!(
+                    access.ordinal.writes_before, position as u32,
+                    "chunk {position}"
+                );
+            }
+        }
+    }
 }

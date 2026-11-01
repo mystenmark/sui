@@ -39,7 +39,9 @@ use validator::pipeline::backpressure::{Backpressure, Limits};
 use validator::pipeline::chunk_lock::{ChunkLock, Cut};
 use validator::pipeline::items::{CertifiedCheckpoint, EffectsWaitItem};
 use validator::pipeline::keys::EffectsKey;
-use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable, GenerationTable};
+use validator::pipeline::tables::{
+    BuiltCheckpoint, CheckpointStore, ChunkTable, GenerationTable, RootVersions,
+};
 use validator::processors::Request;
 use validator::randomness::BeaconInput;
 use validator::server::Consensus;
@@ -49,6 +51,10 @@ use workqueue::{Activity, Queue, WorkerHandle};
 
 /// Each queue's capacity.
 pub const QUEUE: usize = 4096;
+
+/// Transactions the executors run at once by causal admission's limit; one
+/// more runs the causal watermark's transaction.
+pub const EXECUTORS: usize = 4;
 
 /// How far consensus may run ahead of committed checkpoints. The queues
 /// ahead of the executor hold about one item per chunk in flight, so the
@@ -295,6 +301,14 @@ impl Pipeline {
             consensus: consensus.clone(),
             cache: Arc::new(ConsensusTxCache::new()),
             generations: Arc::new(GenerationTable::new(epoch_store.clone())),
+            unsettled: Arc::default(),
+            chunk_lengths: Arc::default(),
+            root_versions: Arc::new(RootVersions::new(
+                store
+                    .live(&messages::tx_index::SUI_ACCUMULATOR_ROOT_OBJECT_ID)
+                    .expect("the store reads")
+                    .map_or(0, |live| live.version),
+            )),
             chunks: Arc::new(ChunkTable::new()),
             chunk_lock: Arc::new(ChunkLock::new(
                 resumed_height,

@@ -4,10 +4,11 @@
 //! Execution with anchovy's executor: the transaction's inputs loaded from the store as views,
 //! executed in an arena, and the outputs handed back as the store's commit.
 
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use containers::Bump;
 use exec_types::object::Object;
+use exec_types::storage::RuntimeObjectResolver as _;
 use executor::data_store::cached_package_store::PackageCache;
 use executor::execution_engine::{ExecutionOutput, execute_transaction_to_effects, is_system_tx};
 use executor::execution_mode::Normal;
@@ -17,9 +18,15 @@ use executor::execution_params::{
 use executor::gas::SuiGasStatus;
 use executor::inputs::{ExecutionInputs, InputObjectKind, InputState, LoadedInput};
 use executor::static_programmable_transactions::type_cache::TypeCache;
-use executor::storage::EmptyUnsettledObjectFunds;
-use messages::base::{ObjectId, TransactionDigest};
-use messages::transaction::{DigestReady, HasDigest, Transaction, TransactionData, TxState};
+use executor::storage::UnsettledObjectFundsRead;
+use messages::arena::Ref;
+use messages::base::{ObjectId, SuiAddress, TransactionDigest};
+use messages::object::MoveObjectType;
+use messages::transaction::{
+    CallArg, DigestReady, FundsWithdrawalArg, HasDigest, ObjectArg, ProgrammableTransaction,
+    Reservation, Transaction, TransactionData, TransactionKind, TxState, WithdrawFrom,
+    WithdrawalTypeArg,
+};
 use messages::{Kept, Message};
 use move_vm_runtime::runtime::MoveRuntime;
 use sui_protocol_config::ProtocolConfig;
@@ -27,7 +34,7 @@ use sui_types::metrics::ExecutionMetrics;
 use validation::inputs::{InputKind, input_objects, receiving_objects};
 
 use crate::reads::StoreReads;
-use crate::{Error, Funds, Input, Outcome, Result};
+use crate::{Awaited, Error, Funds, Input, Outcome, Result, Unsettled};
 
 /// The arena's first chunk: most transactions fit in it.
 const ARENA_CAPACITY: usize = 1 << 20;
@@ -43,8 +50,9 @@ const MAX_PACKAGES: usize = 1024;
 
 /// Anchovy's executor for one epoch.
 pub struct NativeExecution {
-    /// Execution is serial, so the lock is uncontended.
-    state: std::sync::Mutex<State>,
+    /// States no execution holds: each concurrent execution takes one, or
+    /// builds one if none is free, and puts it back.
+    idle: std::sync::Mutex<Vec<State>>,
     /// Built once from `config`: the natives' costs are fixed for the epoch.
     natives_cost_table: natives::NativesCostTable,
     /// Packages a runtime may resolve before it is replaced.
@@ -54,13 +62,24 @@ pub struct NativeExecution {
     epoch: u64,
     epoch_start_timestamp_ms: u64,
     reference_gas_price: u64,
+    /// Coin reservations' ids are masked with it.
+    chain_identifier: [u8; 32],
 }
 
-/// What execution keeps between transactions.
+/// What an execution keeps between transactions.
 struct State {
     /// The transactions' arena, reset after each.
     arena: Bump,
     runtime: Runtime,
+}
+
+impl State {
+    fn new(config: &ProtocolConfig) -> Result<State> {
+        Ok(State {
+            arena: Bump::with_capacity(ARENA_CAPACITY),
+            runtime: Runtime::new(config)?,
+        })
+    }
 }
 
 /// A Move runtime, and the caches filled from it: replaced together.
@@ -95,12 +114,10 @@ impl NativeExecution {
         epoch: u64,
         epoch_start_timestamp_ms: u64,
         reference_gas_price: u64,
+        chain_identifier: [u8; 32],
     ) -> Result<NativeExecution> {
         Ok(NativeExecution {
-            state: std::sync::Mutex::new(State {
-                arena: Bump::with_capacity(ARENA_CAPACITY),
-                runtime: Runtime::new(&config)?,
-            }),
+            idle: std::sync::Mutex::new(vec![State::new(&config)?]),
             natives_cost_table: natives::NativesCostTable::from_protocol_config(&config),
             max_packages: MAX_PACKAGES,
             config,
@@ -108,6 +125,7 @@ impl NativeExecution {
             epoch,
             epoch_start_timestamp_ms,
             reference_gas_price,
+            chain_identifier,
         })
     }
 
@@ -137,7 +155,16 @@ impl NativeExecution {
         data: &TransactionData<'_, S>,
         transaction: &[u8],
     ) -> Result<Outcome> {
-        self.execute_at(store, data, transaction, &[], Funds::MaybeSufficient, None)
+        self.execute_at(
+            store,
+            data,
+            transaction,
+            &[],
+            Funds::MaybeSufficient,
+            None,
+            &crate::NoneUnsettled,
+            &crate::NoneAwaited,
+        )
     }
 
     /// `execute`, but with inputs, funds and the accumulator root's version as
@@ -151,9 +178,16 @@ impl NativeExecution {
         provided: &[(ObjectId, Input<'_>)],
         funds: Funds,
         assigned_accumulator: Option<u64>,
+        unsettled: &dyn Unsettled,
+        awaited: &dyn Awaited,
     ) -> Result<Outcome> {
-        let mut state = self.state.lock().expect("the state's lock is not poisoned");
-        let State { arena, runtime } = &mut *state;
+        let idle = || self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+        let taken = idle().pop();
+        let mut state = match taken {
+            Some(state) => state,
+            None => State::new(&self.config)?,
+        };
+        let State { arena, runtime } = &mut state;
         let outcome = self.execute_in(
             arena,
             runtime,
@@ -163,11 +197,14 @@ impl NativeExecution {
             provided,
             funds,
             assigned_accumulator,
+            unsettled,
+            awaited,
         );
         arena.reset();
         if runtime.package_cache.len() > self.max_packages {
             *runtime = Runtime::new(&self.config).expect("a runtime builds as it did at the start");
         }
+        idle().push(state);
         outcome
     }
 
@@ -182,9 +219,11 @@ impl NativeExecution {
         provided: &[(ObjectId, Input<'_>)],
         funds: Funds,
         assigned_accumulator: Option<u64>,
+        unsettled: &dyn Unsettled,
+        awaited: &dyn Awaited,
     ) -> Result<Outcome> {
         let kept = Kept::new();
-        let reads = StoreReads::new(bump, store, &kept);
+        let reads = StoreReads::new(bump, store, &kept).awaiting(awaited);
         let digest = *data.digest();
 
         let kinds = input_objects(data, bump).map_err(|e| Error::Native(format!("{e:?}")))?;
@@ -228,7 +267,22 @@ impl NativeExecution {
             None => ExecutionOrEarlyError::ok(None),
             Some(errors) => ExecutionOrEarlyError::failed(errors, None),
         };
+        // Skipped on an early error, as the reference's: the transaction
+        // fails anyway, and a reservation's field may be gone.
+        let (kind, rewritten) = if early.is_ok() {
+            rewrite_coin_reservations(
+                bump,
+                &reads,
+                *data.kind(),
+                data.sender(),
+                &self.chain_identifier,
+                assigned_accumulator,
+            )
+        } else {
+            (*data.kind(), None)
+        };
 
+        let unsettled = NativeUnsettled(unsettled);
         let ExecutionOutput {
             inner_store,
             effects,
@@ -237,11 +291,11 @@ impl NativeExecution {
             bump,
             &reads,
             &inputs,
-            &EmptyUnsettledObjectFunds,
+            &unsettled,
             gas_data,
             gas_status,
-            *data.kind(),
-            None,
+            kind,
+            rewritten,
             *data.sender(),
             *digest,
             &runtime.move_vm,
@@ -366,5 +420,93 @@ fn written(object: &Object<'_>) -> store::Written {
             .stored_bytes()
             .expect("written objects are sealed")
             .to_vec(),
+    }
+}
+
+/// The reference's `rewrite_transaction_for_coin_reservations`: each coin
+/// reservation input of a programmable transaction becomes a withdrawal of
+/// its amount from the sender's balance of the type its accumulator field
+/// holds, the field read as of the root's `version` (else its latest). Also
+/// which inputs were rewritten, if any was.
+///
+/// # Panics
+/// If a reservation does not name a balance field of the sender's: the
+/// reference expects a certified transaction's reservations to resolve.
+fn rewrite_coin_reservations<'a>(
+    bump: &'a Bump,
+    reads: &StoreReads<'a>,
+    kind: TransactionKind<'a>,
+    sender: &SuiAddress,
+    chain_identifier: &[u8; 32],
+    version: Option<u64>,
+) -> (TransactionKind<'a>, Option<&'a [bool]>) {
+    let reservation = |input: &CallArg<'a>| match *input {
+        CallArg::Object(ObjectArg::ImmOrOwnedObject(r)) if r.is_coin_reservation() => Some(r),
+        _ => None,
+    };
+    let TransactionKind::ProgrammableTransaction(pt) = kind else {
+        return (kind, None);
+    };
+    if !pt.inputs.iter().any(|input| reservation(input).is_some()) {
+        return (kind, None);
+    }
+    let mut inputs = containers::Vec::with_capacity_in(pt.inputs.len(), bump);
+    let mut rewritten = containers::Vec::with_capacity_in(pt.inputs.len(), bump);
+    for input in pt.inputs {
+        let Some(r) = reservation(input) else {
+            inputs.push(*input);
+            rewritten.push(false);
+            continue;
+        };
+        let field = ObjectId(std::array::from_fn(|i| r.id.0[i] ^ chain_identifier[i]));
+        let object = reads
+            .read_child_object(
+                &exec_types::base::SUI_ACCUMULATOR_ROOT_OBJECT_ID,
+                &field,
+                version.unwrap_or(u64::MAX),
+            )
+            .expect("the store reads")
+            .expect("a certified coin reservation names a field");
+        let field = object.try_as_move().expect("a field is a Move object");
+        let balance = match field.type_ {
+            MoveObjectType::SuiBalanceAccumulatorField => {
+                executor::accumulator_root::sui_type(bump)
+            }
+            MoveObjectType::BalanceAccumulatorField(balance) => balance,
+            _ => panic!("a certified coin reservation names a balance field"),
+        };
+        // `Field<AccumulatorKey, U128>`: the field's UID, then the key's owner.
+        assert!(
+            field.contents[32..64] == sender.0,
+            "a certified coin reservation is the sender's"
+        );
+        let amount = u64::from_le_bytes(r.digest.bytes[..8].try_into().expect("eight bytes"));
+        let withdrawal = containers::alloc(
+            bump,
+            FundsWithdrawalArg {
+                reservation: Reservation::MaxAmountU64(amount),
+                type_arg: WithdrawalTypeArg::Balance(balance),
+                withdraw_from: WithdrawFrom::Sender,
+            },
+        );
+        inputs.push(CallArg::FundsWithdrawal(Ref::new(withdrawal)));
+        rewritten.push(true);
+    }
+    let pt = ProgrammableTransaction {
+        inputs: inputs.leak(),
+        commands: pt.commands,
+    };
+    (
+        TransactionKind::ProgrammableTransaction(pt),
+        Some(rewritten.leak()),
+    )
+}
+
+/// `Unsettled`, as anchovy's executor reads it.
+struct NativeUnsettled<'u>(&'u dyn Unsettled);
+
+impl UnsettledObjectFundsRead for NativeUnsettled<'_> {
+    fn get_unsettled_object_withdraw(&self, account: &ObjectId, accumulator_version: u64) -> u128 {
+        self.0.withdrawn(account, accumulator_version)
     }
 }
