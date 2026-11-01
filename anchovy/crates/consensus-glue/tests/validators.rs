@@ -418,8 +418,8 @@ impl Network {
 }
 
 /// Submits `transaction` through `service`, then waits for its effects:
-/// whether they came, or its epoch ended first and it must be submitted
-/// again.
+/// whether they came, or its epoch ended or its block expired first and it
+/// must be submitted again.
 async fn submit_and_wait(service: &Validator, transaction: &Transaction) -> bool {
     let request = RawSubmitTxRequest {
         transactions: vec![bcs::to_bytes(transaction).unwrap().into()],
@@ -454,10 +454,12 @@ async fn submit_and_wait(service: &Validator, transaction: &Transaction) -> bool
         Err(status) if status.message() == "EpochEnded" => return false,
         Err(status) => panic!("{status:?}"),
     };
-    let RawValidatorTransactionStatus::Executed(_) = status.into_inner().inner.unwrap() else {
-        panic!("executed");
-    };
-    true
+    match status.into_inner().inner.unwrap() {
+        RawValidatorTransactionStatus::Executed(_) => true,
+        // Its block was garbage collected uncommitted, as under load.
+        RawValidatorTransactionStatus::Expired(_) => false,
+        status => panic!("not executed: {status:?}"),
+    }
 }
 
 impl Drop for Network {
