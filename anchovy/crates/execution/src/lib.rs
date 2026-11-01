@@ -99,6 +99,7 @@ impl Execution {
         epoch: u64,
         epoch_start_timestamp_ms: u64,
         reference_gas_price: u64,
+        chain_identifier: [u8; 32],
     ) -> Result<Execution> {
         let reference = Reference::new(
             protocol_version,
@@ -113,6 +114,7 @@ impl Execution {
             epoch,
             epoch_start_timestamp_ms,
             reference_gas_price,
+            chain_identifier,
         )?;
         Ok(Execution { native, reference })
     }

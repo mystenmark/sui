@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use containers::Bump;
 use exec_types::object::Object;
+use exec_types::storage::RuntimeObjectResolver as _;
 use executor::data_store::cached_package_store::PackageCache;
 use executor::execution_engine::{ExecutionOutput, execute_transaction_to_effects, is_system_tx};
 use executor::execution_mode::Normal;
@@ -18,8 +19,14 @@ use executor::gas::SuiGasStatus;
 use executor::inputs::{ExecutionInputs, InputObjectKind, InputState, LoadedInput};
 use executor::static_programmable_transactions::type_cache::TypeCache;
 use executor::storage::EmptyUnsettledObjectFunds;
-use messages::base::{ObjectId, TransactionDigest};
-use messages::transaction::{DigestReady, HasDigest, Transaction, TransactionData, TxState};
+use messages::arena::Ref;
+use messages::base::{ObjectId, SuiAddress, TransactionDigest};
+use messages::object::MoveObjectType;
+use messages::transaction::{
+    CallArg, DigestReady, FundsWithdrawalArg, HasDigest, ObjectArg, ProgrammableTransaction,
+    Reservation, Transaction, TransactionData, TransactionKind, TxState, WithdrawFrom,
+    WithdrawalTypeArg,
+};
 use messages::{Kept, Message};
 use move_vm_runtime::runtime::MoveRuntime;
 use sui_protocol_config::ProtocolConfig;
@@ -54,6 +61,8 @@ pub struct NativeExecution {
     epoch: u64,
     epoch_start_timestamp_ms: u64,
     reference_gas_price: u64,
+    /// Coin reservations' ids are masked with it.
+    chain_identifier: [u8; 32],
 }
 
 /// What execution keeps between transactions.
@@ -95,6 +104,7 @@ impl NativeExecution {
         epoch: u64,
         epoch_start_timestamp_ms: u64,
         reference_gas_price: u64,
+        chain_identifier: [u8; 32],
     ) -> Result<NativeExecution> {
         Ok(NativeExecution {
             state: std::sync::Mutex::new(State {
@@ -108,6 +118,7 @@ impl NativeExecution {
             epoch,
             epoch_start_timestamp_ms,
             reference_gas_price,
+            chain_identifier,
         })
     }
 
@@ -228,6 +239,20 @@ impl NativeExecution {
             None => ExecutionOrEarlyError::ok(None),
             Some(errors) => ExecutionOrEarlyError::failed(errors, None),
         };
+        // Skipped on an early error, as the reference's: the transaction
+        // fails anyway, and a reservation's field may be gone.
+        let (kind, rewritten) = if early.is_ok() {
+            rewrite_coin_reservations(
+                bump,
+                &reads,
+                *data.kind(),
+                data.sender(),
+                &self.chain_identifier,
+                assigned_accumulator,
+            )
+        } else {
+            (*data.kind(), None)
+        };
 
         let ExecutionOutput {
             inner_store,
@@ -240,8 +265,8 @@ impl NativeExecution {
             &EmptyUnsettledObjectFunds,
             gas_data,
             gas_status,
-            *data.kind(),
-            None,
+            kind,
+            rewritten,
             *data.sender(),
             *digest,
             &runtime.move_vm,
@@ -367,4 +392,83 @@ fn written(object: &Object<'_>) -> store::Written {
             .expect("written objects are sealed")
             .to_vec(),
     }
+}
+
+/// The reference's `rewrite_transaction_for_coin_reservations`: each coin
+/// reservation input of a programmable transaction becomes a withdrawal of
+/// its amount from the sender's balance of the type its accumulator field
+/// holds, the field read as of the root's `version` (else its latest). Also
+/// which inputs were rewritten, if any was.
+///
+/// # Panics
+/// If a reservation does not name a balance field of the sender's: the
+/// reference expects a certified transaction's reservations to resolve.
+fn rewrite_coin_reservations<'a>(
+    bump: &'a Bump,
+    reads: &StoreReads<'a>,
+    kind: TransactionKind<'a>,
+    sender: &SuiAddress,
+    chain_identifier: &[u8; 32],
+    version: Option<u64>,
+) -> (TransactionKind<'a>, Option<&'a [bool]>) {
+    let reservation = |input: &CallArg<'a>| match *input {
+        CallArg::Object(ObjectArg::ImmOrOwnedObject(r)) if r.is_coin_reservation() => Some(r),
+        _ => None,
+    };
+    let TransactionKind::ProgrammableTransaction(pt) = kind else {
+        return (kind, None);
+    };
+    if !pt.inputs.iter().any(|input| reservation(input).is_some()) {
+        return (kind, None);
+    }
+    let mut inputs = containers::Vec::with_capacity_in(pt.inputs.len(), bump);
+    let mut rewritten = containers::Vec::with_capacity_in(pt.inputs.len(), bump);
+    for input in pt.inputs {
+        let Some(r) = reservation(input) else {
+            inputs.push(*input);
+            rewritten.push(false);
+            continue;
+        };
+        let field = ObjectId(std::array::from_fn(|i| r.id.0[i] ^ chain_identifier[i]));
+        let object = reads
+            .read_child_object(
+                &exec_types::base::SUI_ACCUMULATOR_ROOT_OBJECT_ID,
+                &field,
+                version.unwrap_or(u64::MAX),
+            )
+            .expect("the store reads")
+            .expect("a certified coin reservation names a field");
+        let field = object.try_as_move().expect("a field is a Move object");
+        let balance = match field.type_ {
+            MoveObjectType::SuiBalanceAccumulatorField => {
+                executor::accumulator_root::sui_type(bump)
+            }
+            MoveObjectType::BalanceAccumulatorField(balance) => balance,
+            _ => panic!("a certified coin reservation names a balance field"),
+        };
+        // `Field<AccumulatorKey, U128>`: the field's UID, then the key's owner.
+        assert!(
+            field.contents[32..64] == sender.0,
+            "a certified coin reservation is the sender's"
+        );
+        let amount = u64::from_le_bytes(r.digest.bytes[..8].try_into().expect("eight bytes"));
+        let withdrawal = containers::alloc(
+            bump,
+            FundsWithdrawalArg {
+                reservation: Reservation::MaxAmountU64(amount),
+                type_arg: WithdrawalTypeArg::Balance(balance),
+                withdraw_from: WithdrawFrom::Sender,
+            },
+        );
+        inputs.push(CallArg::FundsWithdrawal(Ref::new(withdrawal)));
+        rewritten.push(true);
+    }
+    let pt = ProgrammableTransaction {
+        inputs: inputs.leak(),
+        commands: pt.commands,
+    };
+    (
+        TransactionKind::ProgrammableTransaction(pt),
+        Some(rewritten.leak()),
+    )
 }
