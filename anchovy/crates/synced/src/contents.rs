@@ -6,15 +6,13 @@
 //! lock).
 
 use messages::arena::BumpAlloc;
-use messages::base::{Digest, ObjectId};
+use messages::base::Digest;
 use messages::checkpoint::{ExecutionData, VersionedFullCheckpointContents};
 use messages::effects::VersionedEffects;
 use messages::fast::Bump;
 use messages::reader::Reader;
 use messages::transaction::TransactionKind;
-
-/// The accumulator root: each chunk's barrier, and only it, changes it.
-pub const ACCUMULATOR_ROOT: ObjectId = ObjectId::from_u16(0xacc);
+use messages::tx_index::SUI_ACCUMULATOR_ROOT_OBJECT_ID;
 
 /// Why fetched contents are not a certified checkpoint's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,7 +76,7 @@ pub fn chunk_ends<'b>(
         if effects
             .changed_objects
             .iter()
-            .any(|c| *c.id == ACCUMULATOR_ROOT)
+            .any(|c| *c.id == SUI_ACCUMULATOR_ROOT_OBJECT_ID)
         {
             ends.push(i + 1);
         }

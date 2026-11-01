@@ -925,10 +925,6 @@ fn dkg_failed_inputs(transaction: &VerifiedTransaction) -> Vec<CancelledInput> {
 /// The randomness state (`SUI_RANDOMNESS_STATE_OBJECT_ID`).
 const RANDOMNESS_STATE: messages::base::ObjectId = messages::base::ObjectId::from_u16(0x8);
 
-/// The accumulator root (`SUI_ACCUMULATOR_ROOT_OBJECT_ID`), which each
-/// chunk's settlement writes.
-const ACCUMULATOR_ROOT: messages::base::ObjectId = messages::base::ObjectId::from_u16(0xacc);
-
 /// The system state object, which the change-epoch transaction writes, and
 /// the version its sharing started at.
 const SYSTEM_STATE: messages::base::ObjectId = messages::base::ObjectId::from_u16(0x5);
@@ -1506,7 +1502,7 @@ impl CommitStage {
             let root_version = self.root_version;
             self.root_version += 1;
             let mut root = [SharedAccess {
-                id: ACCUMULATOR_ROOT,
+                id: messages::tx_index::SUI_ACCUMULATOR_ROOT_OBJECT_ID,
                 initial_shared_version: self.start.accumulator_root_initial_shared_version,
                 mutability: messages::transaction::SharedObjectMutability::Mutable,
                 ordinal: SharedOrdinal {

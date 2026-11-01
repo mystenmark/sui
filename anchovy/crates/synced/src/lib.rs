@@ -562,7 +562,7 @@ fn barrier_root_version(barrier: &ExecutionData<'_>) -> u64 {
     effects
         .changed_objects
         .iter()
-        .find(|c| *c.id == contents::ACCUMULATOR_ROOT)
+        .find(|c| *c.id == messages::tx_index::SUI_ACCUMULATOR_ROOT_OBJECT_ID)
         .and_then(|c| match c.input_state {
             ObjectIn::Exist { version, .. } => Some(version),
             ObjectIn::NotExist => None,

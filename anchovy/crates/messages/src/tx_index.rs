@@ -24,6 +24,8 @@ pub const SUI_CLOCK_OBJECT_ID: ObjectId = ObjectId::from_u16(0x6);
 pub const SUI_AUTHENTICATOR_STATE_OBJECT_ID: ObjectId = ObjectId::from_u16(0x7);
 pub const SUI_RANDOMNESS_STATE_OBJECT_ID: ObjectId = ObjectId::from_u16(0x8);
 pub const SUI_BRIDGE_OBJECT_ID: ObjectId = ObjectId::from_u16(0x9);
+/// Each settlement chunk's barrier, and only it, changes it.
+pub const SUI_ACCUMULATOR_ROOT_OBJECT_ID: ObjectId = ObjectId::from_u16(0xacc);
 
 const SUI_SYSTEM_STATE: SharedObjectArg = SharedObjectArg::new(
     SUI_SYSTEM_STATE_OBJECT_ID,

@@ -130,7 +130,7 @@ fn epoch_start(
             .expect("the store reads")
             .expect("the epoch's previous checkpoint is committed"),
     );
-    let root = messages::base::ObjectId::from_u16(0xacc);
+    let root = messages::tx_index::SUI_ACCUMULATOR_ROOT_OBJECT_ID;
     // Its initial shared version never changes, whatever the store holds.
     let messages::object::Owner::Shared {
         initial_shared_version,

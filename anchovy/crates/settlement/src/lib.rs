@@ -35,7 +35,8 @@ use waiter::{Command, WaitBatch};
 use workqueue::{Processor, Queue};
 
 use crate::funds::{Ledger, Ticket};
-use crate::settle::{ACCUMULATOR_ROOT, SettlementBuilder};
+use crate::settle::SettlementBuilder;
+use messages::tx_index::SUI_ACCUMULATOR_ROOT_OBJECT_ID;
 
 type Effects = Message<TransactionEffects<'static>>;
 
@@ -65,7 +66,7 @@ fn mutates_root(effects: &TransactionEffects<'_>) -> bool {
         return false;
     };
     v2.changed_objects.iter().any(|c| {
-        *c.id == ACCUMULATOR_ROOT
+        *c.id == SUI_ACCUMULATOR_ROOT_OBJECT_ID
             && matches!(c.input_state, ObjectIn::Exist { .. })
             && matches!(c.output_state, ObjectOut::ObjectWrite(..))
     })
