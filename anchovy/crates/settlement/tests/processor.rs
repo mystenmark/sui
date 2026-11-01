@@ -275,7 +275,7 @@ impl Harness {
             let digests: Vec<TxDigest> = sent.iter().map(|s| system(s).digest).collect();
             assert!(
                 waits.iter().any(|w| matches!(w,
-                    EffectsWaitItem::SettlementExecuted { height: h, digests: d }
+                    EffectsWaitItem::Settlement(SettlementInput::SettlementExecuted { height: h, digests: d })
                         if *h == height && *d == digests)),
                 "a wait for the settlements"
             );
@@ -355,7 +355,9 @@ fn settles_a_chunk_end_to_end() {
     // The first chunk seen starts from its own root version.
     assert_eq!(settles(&h.funds), [settled(1, ROOT_VERSION, &[], 0)]);
     let (waits, keys, _) = drain(&h.effects);
-    assert!(matches!(&waits[..], [EffectsWaitItem::ChunkExecuted(w)] if w.height == 10));
+    assert!(
+        matches!(&waits[..], [EffectsWaitItem::Settlement(SettlementInput::ChunkExecuted(w))] if w.height == 10)
+    );
     assert_eq!(
         keys,
         digests.iter().map(|d| EffectsKey(**d)).collect::<Vec<_>>()
@@ -391,7 +393,9 @@ fn settles_a_chunk_end_to_end() {
     let (waits, keys, _) = drain(&h.effects);
     assert!(matches!(
         &waits[..],
-        [EffectsWaitItem::SettlementExecuted { height: 10, .. }]
+        [EffectsWaitItem::Settlement(
+            SettlementInput::SettlementExecuted { height: 10, .. }
+        )]
     ));
     assert_eq!(keys.len(), expected.len());
 
@@ -424,7 +428,7 @@ fn settles_a_chunk_end_to_end() {
     );
     let (waits, keys, _) = drain(&h.effects);
     assert!(
-        matches!(&waits[..], [EffectsWaitItem::SettlementExecuted { height: 10, digests }]
+        matches!(&waits[..], [EffectsWaitItem::Settlement(SettlementInput::SettlementExecuted { height: 10, digests })]
         if digests == &[expected_barrier.digest])
     );
     assert_eq!(keys, vec![EffectsKey(*expected_barrier.digest)]);

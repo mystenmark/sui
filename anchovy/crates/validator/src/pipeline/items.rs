@@ -322,12 +322,10 @@ pub enum EffectsWaitItem {
     /// A wait for one transaction's effects, answered once they are in the
     /// store. The RPC handler's `wait_for_effects` → effects waiter → reply.
     Executed(tokio::sync::oneshot::Sender<()>),
-    /// A chunk's transactions executed. `SettlementScheduler` → effects
-    /// waiter → `SettlementScheduler`.
-    ChunkExecuted(ChunkSettlement),
-    /// A chunk's settlement and barrier transactions executed.
+    /// A chunk's transactions, or its settlement and barrier transactions,
+    /// executed (`SettlementInput::ChunkExecuted`, `SettlementExecuted`).
     /// `SettlementScheduler` → effects waiter → `SettlementScheduler`.
-    SettlementExecuted { height: u64, digests: Vec<TxDigest> },
+    Settlement(SettlementInput),
     /// The change-epoch transaction executed. `EpochCloser` → effects waiter
     /// → `EpochCloser`.
     ChangeEpochExecuted,

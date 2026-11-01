@@ -161,10 +161,12 @@ fn settlement_work_is_routed_to_the_settlement_scheduler() {
         synced: workqueue::queue(1).0,
     };
     let nine = messages::base::Hashed::of("TransactionData", &[9]);
-    router.send(vec![EffectsWaitItem::SettlementExecuted {
-        height: 3,
-        digests: vec![nine],
-    }]);
+    router.send(vec![EffectsWaitItem::Settlement(
+        SettlementInput::SettlementExecuted {
+            height: 3,
+            digests: vec![nine],
+        },
+    )]);
     let Some(SettlementInput::SettlementExecuted { height, digests }) = inbox.try_pop() else {
         panic!("routed to settlement");
     };

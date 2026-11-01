@@ -823,13 +823,7 @@ impl Sink<Vec<EffectsWaitItem>> for EffectsRouter {
                 EffectsWaitItem::Executed(reply) => {
                     let _ = reply.send(());
                 }
-                EffectsWaitItem::ChunkExecuted(chunk) => self
-                    .settlement
-                    .push(SettlementInput::ChunkExecuted(chunk), "settlement"),
-                EffectsWaitItem::SettlementExecuted { height, digests } => self.settlement.push(
-                    SettlementInput::SettlementExecuted { height, digests },
-                    "settlement",
-                ),
+                EffectsWaitItem::Settlement(input) => self.settlement.push(input, "settlement"),
                 EffectsWaitItem::ChangeEpochExecuted => self
                     .epoch_closer
                     .push(EpochCloserInput::ChangeEpochExecuted, "epoch closer"),

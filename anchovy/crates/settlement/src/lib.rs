@@ -131,8 +131,8 @@ enum Stage {
 ///   (once for the settlement transactions, once for the barrier).
 ///
 /// Outward:
-/// - effects waiter, wait for: `EffectsWaitItem::ChunkExecuted` keyed by the
-///   chunk's transactions, and `EffectsWaitItem::SettlementExecuted` keyed by
+/// - effects waiter, wait for: `SettlementInput::ChunkExecuted` keyed by the
+///   chunk's transactions, and `SettlementInput::SettlementExecuted` keyed by
 ///   its settlement transactions, then by its barrier;
 /// - input waiter, wait for: the settlement transactions, then the barrier
 ///   (`Executable`), keyed by the root's generation;
@@ -206,7 +206,10 @@ impl SettlementScheduler {
         let mut batch = WaitBatch::with_capacity(1, chunk.digests.len());
         let mut keys = containers::Vec::with_capacity_in(chunk.digests.len(), bump);
         keys.extend(chunk.digests.iter().map(|d| EffectsKey(**d)));
-        batch.push(EffectsWaitItem::ChunkExecuted(chunk), keys);
+        batch.push(
+            EffectsWaitItem::Settlement(SettlementInput::ChunkExecuted(chunk)),
+            keys,
+        );
         self.effects.push(Command::Wait(batch), "effects waiter");
     }
 
@@ -307,10 +310,10 @@ impl SettlementScheduler {
         }
         let mut waits = WaitBatch::with_capacity(1, settlements.len());
         waits.push(
-            EffectsWaitItem::SettlementExecuted {
+            EffectsWaitItem::Settlement(SettlementInput::SettlementExecuted {
                 height,
                 digests: settlements.clone(),
-            },
+            }),
             settlements.iter().map(|d| EffectsKey(**d)),
         );
         self.inputs
@@ -352,10 +355,10 @@ impl SettlementScheduler {
         transactions.push(executable, [key]);
         let mut waits = WaitBatch::with_capacity(1, 1);
         waits.push(
-            EffectsWaitItem::SettlementExecuted {
+            EffectsWaitItem::Settlement(SettlementInput::SettlementExecuted {
                 height,
                 digests: vec![barrier],
-            },
+            }),
             [EffectsKey(*barrier)],
         );
         self.inputs
