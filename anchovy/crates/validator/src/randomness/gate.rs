@@ -85,7 +85,6 @@ impl Processor for RandomnessGate {
             self.next += 1;
             let GatedChunk {
                 mut chunk,
-                last_of_commit,
                 root,
                 update,
                 bytes,
@@ -107,7 +106,6 @@ impl Processor for RandomnessGate {
             let settlement = ChunkSettlement {
                 version: chunk.version,
                 root_version: chunk.root_version,
-                last_of_commit,
                 round: chunk.round,
                 height: chunk.height,
                 checkpoint_seq: chunk.checkpoint_seq,
@@ -154,7 +152,6 @@ mod tests {
                 checkpoint_seq: 1,
                 entries: Vec::new(),
             },
-            last_of_commit: true,
             root: SharedAccess {
                 id: ObjectId([0xac; 32]),
                 initial_shared_version: 1,

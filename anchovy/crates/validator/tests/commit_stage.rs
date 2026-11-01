@@ -233,11 +233,7 @@ fn summary(decided: &Decided) -> String {
             (c_.round, c_.height, c_.checkpoint_seq, entries)
         })
         .collect();
-    let settlements: Vec<_> = decided
-        .chunks
-        .iter()
-        .map(|c| (c.last_of_commit, c.root))
-        .collect();
+    let settlements: Vec<_> = decided.chunks.iter().map(|c| c.root).collect();
     let checkpoints: Vec<_> = decided
         .checkpoints
         .iter()
@@ -380,13 +376,12 @@ fn chunks_split_at_the_limit_and_checkpoints_follow_the_previous_epoch() {
     );
 
     // Settlement: the root read at the generation its place in the commit
-    // gives, the last chunk ending the commit.
+    // gives.
     for (position, chunk) in decided.chunks.iter().enumerate() {
         assert_eq!(chunk.root.id, messages::base::ObjectId::from_u16(0xacc));
         assert_eq!(chunk.root.initial_shared_version, ROOT_VERSION);
         assert_eq!(chunk.root.ordinal.round, 4);
         assert_eq!(chunk.root.ordinal.writes_before, position as u32);
-        assert_eq!(chunk.last_of_commit, position + 1 == decided.chunks.len());
     }
     // The user transactions keep where consensus put them.
     let origins: Vec<_> = decided

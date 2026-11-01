@@ -143,8 +143,8 @@ enum Stage {
 /// - input waiter, wait for: the settlement transactions, then the barrier
 ///   (`Executable`), keyed by the root's generation;
 /// - checkpoint waiter, notify: `ChunkSettled(height)`;
-/// - `FundsReserver`: `Settle::Settled` of version `v + 1` once the last
-///   chunk of commit `v` settled, and of the first chunk's version, whose
+/// - `FundsReserver`: `Settle::Settled` of version `v + 1` once the chunk
+///   of version `v` settled, and of the first chunk's version, whose
 ///   accumulator state is the one in the store.
 ///
 /// Reads: the object store (effects, the first transaction, to tell a
@@ -157,7 +157,7 @@ pub struct SettlementScheduler {
     inputs: Queue<InputCommand>,
     checkpoints: Queue<Command<ChunkSettled, PendingCheckpoint>>,
     funds: Queue<FundsCommand>,
-    /// The accounts the settling commit's chunks changed so far.
+    /// The accounts the settling chunk changed.
     accounts: BTreeSet<ObjectId>,
     /// Chunks not settled yet, by height: the first is the one settling.
     pending: BTreeMap<u64, Stage>,
@@ -453,21 +453,19 @@ impl SettlementScheduler {
         // root before their effects were notified.
         self.accounts
             .extend(effects.iter().flat_map(|e| accounts(e.get())));
-        if chunk.last_of_commit {
-            let root_version = lamport_version(barrier.get());
-            let balances = std::mem::take(&mut self.accounts)
-                .into_iter()
-                .map(|account| (account, balance_at(&self.store, &account, root_version)))
-                .collect();
-            self.funds.push(
-                FundsCommand::Settle(vec![Settle::Settled {
-                    balances,
-                    version: AccumulatorVersion(chunk.version.0 + 1),
-                    root_version,
-                }]),
-                "funds reserver",
-            );
-        }
+        let root_version = lamport_version(barrier.get());
+        let balances = std::mem::take(&mut self.accounts)
+            .into_iter()
+            .map(|account| (account, balance_at(&self.store, &account, root_version)))
+            .collect();
+        self.funds.push(
+            FundsCommand::Settle(vec![Settle::Settled {
+                balances,
+                version: AccumulatorVersion(chunk.version.0 + 1),
+                root_version,
+            }]),
+            "funds reserver",
+        );
         self.offset = Some(match self.offset {
             Some((seq, settled)) if seq == chunk.checkpoint_seq => (seq, settled + count),
             _ => (chunk.checkpoint_seq, count),

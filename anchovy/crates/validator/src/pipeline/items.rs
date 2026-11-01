@@ -88,7 +88,8 @@ pub struct ScheduledEntry {
 /// `CommitHandler` → `VersionResolver`.
 #[derive(Debug)]
 pub struct Chunk {
-    /// The version the commit's transactions reserve funds against.
+    /// The version the chunk's transactions reserve funds against: its root
+    /// version, as the reference's accumulator version.
     pub version: AccumulatorVersion,
     /// The accumulator root's version the chunk's transactions are assigned
     /// (the reference's `SystemObjectVersions`): the one the previous
@@ -107,8 +108,6 @@ pub struct Chunk {
 #[derive(Debug)]
 pub struct GatedChunk {
     pub chunk: Chunk,
-    /// As `ChunkSettlement::last_of_commit`.
-    pub last_of_commit: bool,
     /// As `ChunkSettlement::root`.
     pub root: SharedAccess,
     /// The update heading the chunk, not yet in its entries.
@@ -145,12 +144,11 @@ pub struct PendingUpdate {
 /// What settling a chunk takes. Randomness gate → `SettlementScheduler`.
 #[derive(Debug, Clone)]
 pub struct ChunkSettlement {
-    /// The version the commit's transactions reserve funds against; settling
-    /// the commit's last chunk makes `version + 1`.
+    /// The version the chunk's transactions reserve funds against; settling
+    /// the chunk makes `version + 1`.
     pub version: AccumulatorVersion,
     /// As `Chunk::root_version`; the barrier writes `root_version + 1`.
     pub root_version: u64,
-    pub last_of_commit: bool,
     pub round: u32,
     pub height: u64,
     pub checkpoint_seq: u64,
@@ -216,7 +214,7 @@ pub struct EpochClose {
 /// `SettlementScheduler` → input waiter → `Executor`.
 #[derive(Debug)]
 pub struct Executable {
-    /// The version its commit reserves funds against.
+    /// The version it reserves funds against: its chunk's root version.
     pub version: AccumulatorVersion,
     /// As `Chunk::root_version`.
     pub root_version: u64,

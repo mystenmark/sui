@@ -1405,15 +1405,7 @@ impl CommitStage {
             dropped: containers::Vec::new_in(bump),
         };
         let mut flushed = containers::Vec::new_in(bump);
-        self.push_chunks(
-            prologue,
-            regular,
-            0,
-            chunk_count,
-            max,
-            &mut decided,
-            &mut flushed,
-        );
+        self.push_chunks(prologue, regular, 0, max, &mut decided, &mut flushed);
         // The epoch's last commit cuts its regular chunks into a checkpoint
         // of their own: its randomness chunks make the last.
         flushed.extend(if close.is_some() {
@@ -1424,15 +1416,7 @@ impl CommitStage {
         if let Some((entries, update)) = randomness {
             let first = decided.chunks.len();
             let reserved = usize::from(update.is_some());
-            self.push_chunks(
-                prologue,
-                entries,
-                reserved,
-                chunk_count,
-                max,
-                &mut decided,
-                &mut flushed,
-            );
+            self.push_chunks(prologue, entries, reserved, max, &mut decided, &mut flushed);
             decided.chunks[first].update = update;
         }
         if close.is_some() {
@@ -1452,7 +1436,7 @@ impl CommitStage {
                 .last_mut()
                 .expect("the last commit cuts the epoch's last checkpoint");
             last.close = Some(EpochClose {
-                version: AccumulatorVersion(u64::from(prologue.commit_index)),
+                version: AccumulatorVersion(self.root_version),
                 round: prologue.round,
                 root_version: self.root_version,
                 shared,
@@ -1467,13 +1451,12 @@ impl CommitStage {
 
     /// Lays `entries` out in chunks of at most `max`, the first with room
     /// left for `reserved` more, each taking the next height and its place
-    /// in the checkpoint queue. The commit has `chunk_count` chunks.
+    /// in the checkpoint queue.
     fn push_chunks<'b>(
         &mut self,
         prologue: &Prologue,
         entries: containers::Vec<'b, ScheduledEntry>,
         reserved: usize,
-        chunk_count: usize,
         max: usize,
         decided: &mut Decided<'b>,
         flushed: &mut containers::Vec<'_, Flushed>,
@@ -1503,8 +1486,10 @@ impl CommitStage {
             let checkpoint_seq =
                 self.queue
                     .push_chunk(height, size, prologue.timestamp_ms, max, flushed);
-            let version = AccumulatorVersion(u64::from(prologue.commit_index));
             let root_version = self.root_version;
+            // Each chunk's settlement settles a version, as the reference
+            // assigns each chunk the root's next version.
+            let version = AccumulatorVersion(root_version);
             self.root_version += 1;
             let mut root = [SharedAccess {
                 id: messages::tx_index::SUI_ACCUMULATOR_ROOT_OBJECT_ID,
@@ -1527,7 +1512,6 @@ impl CommitStage {
                     checkpoint_seq,
                     entries,
                 },
-                last_of_commit: position + 1 == chunk_count,
                 // One exclusive writer of the root per chunk, its barrier:
                 // the commit's `position`th chunk reads generation
                 // `position`.

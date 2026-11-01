@@ -54,17 +54,16 @@ fn stream() -> StreamId {
     }
 }
 
-/// Chunk `height` of commit `version`, in `round`, its last if `last`.
+/// Chunk `height` at accumulator `version`, in `round`.
 fn chunk(
     height: u64,
     (round, writes_before): (u32, u32),
-    (version, last): (u64, bool),
+    version: u64,
     digests: Vec<TxDigest>,
 ) -> ChunkSettlement {
     ChunkSettlement {
         version: AccumulatorVersion(version),
         root_version: ROOT_VERSION,
-        last_of_commit: last,
         round,
         height,
         checkpoint_seq: SEQ,
@@ -350,7 +349,7 @@ fn settles_a_chunk_end_to_end() {
     let mut h = Harness::new(8, 8);
     let effects = support::fixed_chunk();
     let digests = digests_of(&effects);
-    let c = chunk(10, (3, 0), (1, true), digests.clone());
+    let c = chunk(10, (3, 0), 1, digests.clone());
 
     h.process(SettlementInput::Chunk(c.clone()));
     // The first chunk seen starts from its own root version.
@@ -484,9 +483,9 @@ fn chunks_settle_in_height_order_with_offsets_and_root_generations() {
     ];
     let third = vec![support::effects(support::digest(60), 5, &[], vec![])];
     // Chunks 10 and 11 are one commit's, 12 the next's.
-    let c10 = chunk(10, (3, 0), (1, false), digests_of(&first));
-    let c11 = chunk(11, (3, 1), (1, true), digests_of(&second));
-    let mut c12 = chunk(12, (5, 0), (2, true), digests_of(&third));
+    let c10 = chunk(10, (3, 0), 1, digests_of(&first));
+    let c11 = chunk(11, (3, 1), 2, digests_of(&second));
+    let mut c12 = chunk(12, (5, 0), 3, digests_of(&third));
     // As the commit handler links it: to the root's last generation, of
     // round 3.
     c12.root.base = Some(SharedOrdinal {
@@ -559,13 +558,14 @@ fn chunks_settle_in_height_order_with_offsets_and_root_generations() {
         drain(&h.checkpoints).2,
         vec![ChunkSettled(11), ChunkSettled(12)]
     );
-    // One settlement per commit, once its last chunk settled, naming the
-    // accounts of all its chunks.
+    // One settlement per chunk, of its version, naming the accounts it
+    // changed.
     assert_eq!(
         settles(&h.funds),
         [
             settled(2, 21, &support::fixed_chunk_accounts(), 0),
-            settled(3, 30, &[], 0)
+            settled(3, 21, &[], 0),
+            settled(4, 30, &[], 0)
         ]
     );
     assert_eq!(h.chunks.get(12).unwrap().effects.len(), 2);
@@ -575,7 +575,7 @@ fn chunks_settle_in_height_order_with_offsets_and_root_generations() {
 fn the_chunk_table_is_written_before_the_checkpoint_waiter_is_notified() {
     let mut h = Harness::new(1, 8);
     let effects = support::fixed_chunk();
-    let c = chunk(10, (3, 0), (1, true), digests_of(&effects));
+    let c = chunk(10, (3, 0), 1, digests_of(&effects));
     h.process(SettlementInput::Chunk(c.clone()));
     for e in &effects {
         h.execute(e);
@@ -598,7 +598,7 @@ fn the_chunk_table_is_written_before_the_checkpoint_waiter_is_notified() {
 fn the_chunk_table_is_written_before_the_settlement_is_sent() {
     let mut h = Harness::new(8, 1);
     let effects = support::fixed_chunk();
-    let c = chunk(10, (3, 0), (1, true), digests_of(&effects));
+    let c = chunk(10, (3, 0), 1, digests_of(&effects));
     h.process(SettlementInput::Chunk(c.clone()));
     for e in &effects {
         h.execute(e);
@@ -620,7 +620,7 @@ fn settled_balances_are_read_at_the_barriers_version() {
     // later one (22), which must not be read.
     write(&h.store, accounts[0], 21, account_object(500));
     write(&h.store, accounts[0], 22, account_object(9));
-    let c = chunk(10, (3, 0), (1, true), digests_of(&effects));
+    let c = chunk(10, (3, 0), 1, digests_of(&effects));
     h.process(SettlementInput::Chunk(c.clone()));
     for e in &effects {
         h.execute(e);
