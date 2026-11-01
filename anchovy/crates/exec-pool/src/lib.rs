@@ -243,6 +243,9 @@ impl Executor {
 
         // 2. Its effects: stored, or from executing and committing it.
         let executed_already = stored.is_some();
+        if !executed_already {
+            self.check_fresh(entry, digest);
+        }
         let (effects, written) = match stored {
             Some(effects) => (effects, containers::Vec::new_in(bump)),
             None => self.execute_now(
@@ -380,6 +383,33 @@ impl Executor {
             unreachable!("execution produces V2 effects");
         };
         self.outputs(effects_v2, &written, resolved_keys);
+    }
+
+    /// What the consensus path decided for a transaction it runs fresh,
+    /// against what the synced path ran ahead: each consensus object it
+    /// writes must still be live at the version decided. Otherwise the
+    /// certified chain went on from that version without this transaction.
+    ///
+    /// # Panics
+    /// On a mismatch: the quorum, or this validator, deviated from the
+    /// protocol.
+    fn check_fresh(&self, entry: &ScheduledEntry, digest: TxDigest) {
+        for (access, generation) in entry.shared.iter().zip(&self.resolved) {
+            let Generation::Version { version, .. } = *generation else {
+                continue;
+            };
+            if access.mutability != SharedObjectMutability::Mutable {
+                continue;
+            }
+            let live = self.store.live(&access.id).expect("the store reads");
+            assert!(
+                live.as_ref().is_some_and(|l| l.version == version),
+                "deviation: transaction {digest:?} writes {:?} from version {version}, \
+                 which the certified chain left for {:?}",
+                access.id,
+                live.map(|l| l.version)
+            );
+        }
     }
 
     /// Pushes the keys of what `effects` wrote: each object at its version,

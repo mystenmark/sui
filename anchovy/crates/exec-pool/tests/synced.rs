@@ -162,3 +162,22 @@ fn a_decision_the_certified_effects_contradict_panics() {
     cancelled.entry.cancelled = vec![(shared.stream().id, u64::MAX - 1)];
     common::InputWaiter::new(&twin).run(&mut twin, vec![cancelled]);
 }
+
+/// The consensus path ordered a write of a shared object the quorum
+/// certified another write of, from the same version.
+#[test]
+#[should_panic(expected = "deviation: transaction")]
+fn a_fresh_write_behind_the_certified_chain_panics() {
+    let mut node = Node::new(3);
+    let mut twin = node.twin(3);
+    let (shared, share) = node.new_shared_by(0);
+    let write = node.increment(node.coin(1), shared);
+    let digests = [share, digest(&write)];
+    let executable = node.executable(write, vec![shared.access(true, 5, 0)], vec![]);
+    common::InputWaiter::new(&node).run(&mut node, vec![executable]);
+    common::InputWaiter::new(&twin).run_keyed(&mut twin, certified(&executed(&node, &digests)));
+
+    let other = twin.increment(twin.coin(2), shared);
+    let executable = twin.executable(other, vec![shared.access(true, 5, 0)], vec![]);
+    common::InputWaiter::new(&twin).run(&mut twin, vec![executable]);
+}
