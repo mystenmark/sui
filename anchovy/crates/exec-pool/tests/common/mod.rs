@@ -405,32 +405,12 @@ pub fn keys(executable: &Executable) -> Vec<InputKey> {
         unreachable!()
     };
     // Shared accesses first, as the resolver keys them.
-    let mut keys = Vec::new();
-    for access in &executable.entry.shared {
-        let stream = StreamId {
-            id: access.id,
-            initial_shared_version: access.initial_shared_version,
-        };
-        let SharedOrdinal {
-            round,
-            writes_before,
-        } = access.ordinal;
-        keys.push(if writes_before > 0 {
-            InputKey::Generation {
-                stream,
-                round,
-                generation: writes_before,
-            }
-        } else if let Some(base) = access.base {
-            InputKey::Generation {
-                stream,
-                round: base.round,
-                generation: base.writes_before,
-            }
-        } else {
-            InputKey::StreamLive(stream)
-        });
-    }
+    let mut keys: Vec<_> = executable
+        .entry
+        .shared
+        .iter()
+        .map(SharedAccess::input_key)
+        .collect();
     keys.extend(
         transaction
             .get()

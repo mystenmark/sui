@@ -21,7 +21,7 @@ use validator::pipeline::items::{
     Chunk, Executable, ExecutableTransaction, FundsCommand, InputCommand, InputValue,
     ScheduledEntry, Withdrawal,
 };
-use validator::pipeline::keys::{self, InputKey, StreamId};
+use validator::pipeline::keys::{self, InputKey};
 use validator::pipeline::tables::{Generation, GenerationTable};
 use waiter::{Availability, Command, WaitBatch};
 use workqueue::{Processor, PushError, Queue};
@@ -71,37 +71,12 @@ impl VersionResolver {
     fn resolve(&mut self, entry: &ScheduledEntry, chain_identifier: &ChainIdentifier, bump: &Bump) {
         self.keys.clear();
         self.amounts.clear();
-        self.resolve_shared(&entry.shared);
+        self.keys
+            .extend(entry.shared.iter().map(SharedAccess::input_key));
         if let ExecutableTransaction::User(transaction) = &entry.transaction {
             let data = transaction.get().0.data();
             object_keys(data, &mut self.keys, &mut self.packages);
             funds_withdrawals(data, chain_identifier, &mut self.amounts, bump);
-        }
-    }
-
-    /// Pushes the keys of `shared`'s accesses to `keys`: a generation 0 the
-    /// commit handler linked to an earlier round's generation waits for
-    /// that one.
-    fn resolve_shared(&mut self, shared: &[SharedAccess]) {
-        for access in shared {
-            let stream = StreamId {
-                id: access.id,
-                initial_shared_version: access.initial_shared_version,
-            };
-            let key = match (access.ordinal.writes_before, access.base) {
-                (0, Some(base)) => InputKey::Generation {
-                    stream,
-                    round: base.round,
-                    generation: base.writes_before,
-                },
-                (0, None) => InputKey::StreamLive(stream),
-                (generation, _) => InputKey::Generation {
-                    stream,
-                    round: access.ordinal.round,
-                    generation,
-                },
-            };
-            self.keys.push(key);
         }
     }
 }

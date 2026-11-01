@@ -16,6 +16,7 @@ use messages::transaction::{
 use sui_protocol_config::{ConsensusTransactionOrdering, ProtocolConfig};
 
 use crate::checks::VerifiedTransaction;
+use crate::pipeline::keys::{InputKey, StreamId};
 
 /// The clock (`SUI_CLOCK_OBJECT_ID`), which the commit prologue writes.
 const CLOCK: ObjectId = ObjectId::from_u16(0x6);
@@ -52,6 +53,34 @@ pub struct SharedAccess {
     /// stream live (first scheduled this epoch, or read live earlier this
     /// round). Unused at a later generation. Set by the commit handler.
     pub base: Option<SharedOrdinal>,
+}
+
+impl SharedAccess {
+    pub fn stream(&self) -> StreamId {
+        StreamId {
+            id: self.id,
+            initial_shared_version: self.initial_shared_version,
+        }
+    }
+
+    /// The input waiter key of the generation the access reads: its own at
+    /// a later generation; at generation 0, its base, or the stream live.
+    pub fn input_key(&self) -> InputKey {
+        let stream = self.stream();
+        match (self.ordinal.writes_before, self.base) {
+            (0, Some(base)) => InputKey::Generation {
+                stream,
+                round: base.round,
+                generation: base.writes_before,
+            },
+            (0, None) => InputKey::StreamLive(stream),
+            (generation, _) => InputKey::Generation {
+                stream,
+                round: self.ordinal.round,
+                generation,
+            },
+        }
+    }
 }
 
 /// What building a commit's consensus commit prologue takes.
