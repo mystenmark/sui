@@ -47,7 +47,9 @@ use sui_types::effects::{TransactionEffectsAPI as _, UnchangedConsensusKind};
 use sui_types::execution_status::{ExecutionErrorKind, ExecutionFailure, ExecutionStatus};
 use sui_types::gas_coin::{GAS, GasCoin};
 use sui_types::message_envelope::Message as _;
-use sui_types::messages_checkpoint::{CheckpointContents, CheckpointSummary};
+use sui_types::messages_checkpoint::{
+    CheckpointContents, CheckpointContentsView, CheckpointSummary,
+};
 use sui_types::messages_consensus::ConsensusTransaction;
 use sui_types::messages_grpc::SubmitTxRequest;
 use sui_types::object::{Object, Owner};
@@ -321,6 +323,20 @@ impl ForkReport {
                         .clone()
                 });
             writeln!(diff, "only anchovy lists {digest}: {transaction:#?}").unwrap();
+        }
+        // The same transactions alike: their order, or their signatures.
+        if let (CheckpointContentsView::V2(theirs), CheckpointContentsView::V2(ours)) =
+            (theirs.inner(), ours.inner())
+        {
+            for (i, (theirs, ours)) in theirs.iter().zip(ours).enumerate() {
+                if theirs != ours {
+                    writeln!(
+                        diff,
+                        "entry {i} differs\nsui: {theirs:#?}\nanchovy: {ours:#?}"
+                    )
+                    .unwrap();
+                }
+            }
         }
         diff
     }
@@ -1869,4 +1885,168 @@ fn a_certificate_that_consensus_contradicts_aborts() {
 
     network.anchovy.runner.held.store(false, Ordering::SeqCst);
     network.wait_for("the abort", |_| None::<()>);
+}
+
+/// The reference's composite workload, mixed as its simtest mixes it,
+/// submitted through a sui full node for a minute: anchovy certifies every
+/// checkpoint the quorum does, alike.
+#[test]
+#[ignore = "object funds withdrawals are not checked against unsettled withdrawals yet"]
+fn the_composite_workload_runs_alike() {
+    use std::str::FromStr as _;
+    use sui_benchmark::bank::BenchmarkBank;
+    use sui_benchmark::drivers::Interval;
+    use sui_benchmark::drivers::bench_driver::BenchDriver;
+    use sui_benchmark::drivers::driver::Driver as _;
+    use sui_benchmark::system_state_observer::SystemStateObserver;
+    use sui_benchmark::workloads::adversarial::AdversarialPayloadCfg;
+    use sui_benchmark::workloads::composite::*;
+    use sui_benchmark::workloads::expected_failure::ExpectedFailurePayloadCfg;
+    use sui_benchmark::workloads::workload::ExpectedFailureType;
+    use sui_benchmark::workloads::workload_configuration::{
+        WorkloadConfig, WorkloadConfiguration, WorkloadWeights,
+    };
+    use sui_benchmark::{BenchmarkProxyMetrics, FullNodeProxy, ValidatorProxy};
+
+    let mut network = Network::new();
+    let config = FullnodeConfigBuilder::new().build(&mut OsRng, &network.config);
+    let rpc_url = format!("http://{}", config.json_rpc_address);
+    let full_node = sui_swarm::memory::Node::new(config);
+    network.runtime.block_on(full_node.start()).unwrap();
+    // Its RPC answers once it has indexed a checkpoint.
+    let state = full_node.get_node_handle().unwrap().state();
+    network.wait_for("the full node to execute a checkpoint", |_| {
+        state
+            .get_checkpoint_store()
+            .get_highest_executed_checkpoint_seq_number()
+            .unwrap()
+            .filter(|executed| *executed >= 1)
+    });
+
+    let metrics = Arc::new(Mutex::new(CompositionMetrics::new()));
+    let composite = CompositeWorkloadConfig {
+        num_shared_counters: 2,
+        shared_counter_hotness: 0.95,
+        address_balance_amount: 1000,
+        address_balance_gas_probability: 0.2,
+        conflicting_transaction_probability: 0.1,
+        alias_tx_probability: 0.3,
+        metrics: Some(metrics.clone()),
+        ..Default::default()
+    }
+    .with_probability(SharedCounterIncrement::NAME, 0.2)
+    .with_probability(SharedCounterRead::NAME, 0.1)
+    .with_probability(RandomnessRead::NAME, 0.1)
+    .with_probability(AddressBalanceDeposit::NAME, 0.1)
+    .with_probability(AddressBalanceWithdraw::NAME, 0.1)
+    .with_probability(ObjectBalanceDeposit::NAME, 0.1)
+    .with_probability(ObjectBalanceWithdraw::NAME, 0.1)
+    .with_probability(TestCoinMint::NAME, 0.1)
+    .with_probability(TestCoinAddressDeposit::NAME, 0.1)
+    .with_probability(TestCoinAddressWithdraw::NAME, 0.05)
+    .with_probability(TestCoinObjectWithdraw::NAME, 0.05)
+    .with_probability(AddressBalanceOverdraw::NAME, 0.3)
+    .with_probability(AccumulatorBalanceRead::NAME, 0.3)
+    .with_probability(AuthenticatedEventEmit::NAME, 0.1)
+    .with_probability(CoinReservationWithdraw::NAME, 0.3);
+
+    let primary = (
+        network.coin(network.coins.len() - 1),
+        network.sender,
+        Arc::new(network.key.copy()),
+    );
+    let genesis = network.config.genesis.clone();
+    let stats = network.runtime.block_on(async move {
+        let registry = prometheus::Registry::new();
+        let proxy_metrics = BenchmarkProxyMetrics::new(&registry);
+        let proxy: Arc<dyn ValidatorProxy + Send + Sync> = Arc::new(
+            FullNodeProxy::from_url(&rpc_url, &genesis.committee(), &proxy_metrics)
+                .await
+                .unwrap(),
+        );
+        let bank = BenchmarkBank::new(proxy.clone(), vec![proxy.clone()], primary);
+        // Its first state has the reference gas price.
+        let mut observer = SystemStateObserver::new(proxy.clone());
+        observer.state.changed().await.unwrap();
+        let observer = Arc::new(observer);
+        let config = WorkloadConfig {
+            group: 0,
+            num_workers: 10,
+            num_transfer_accounts: 2,
+            weights: WorkloadWeights {
+                shared_counter: 0,
+                transfer_object: 0,
+                delegation: 0,
+                batch_payment: 0,
+                shared_deletion: 0,
+                adversarial: 0,
+                large_transaction: 0,
+                expected_failure: 0,
+                randomness: 0,
+                randomized_transaction: 0,
+                slow: 0,
+                party: 0,
+                conflicting_transfer: 0,
+                composite: 1,
+            },
+            adversarial_cfg: AdversarialPayloadCfg::from_str("0-1.0").unwrap(),
+            large_transaction_size_bytes: 100_000,
+            expected_failure_cfg: ExpectedFailurePayloadCfg {
+                failure_type: ExpectedFailureType::try_from(0).unwrap(),
+            },
+            batch_payment_size: 15,
+            shared_counter_hotness_factor: 50,
+            num_shared_counters: Some(1),
+            shared_counter_max_tip: 0,
+            shared_counter_gas_price_multiplier: 1.0,
+            num_contested_objects: 2,
+            randomized_transaction_concurrency: 4,
+            target_qps: 20,
+            in_flight_ratio: 2,
+            duration: Interval::from_str("unbounded").unwrap(),
+            composite_config: Some(composite),
+            deposit_target_addresses: vec![],
+            deposit_seed_sui: 0,
+        };
+        let builders =
+            WorkloadConfiguration::create_workload_builders(config, observer.clone()).await;
+        let workloads =
+            WorkloadConfiguration::build(builders, bank, observer.clone(), 100, BTreeMap::new())
+                .await
+                .unwrap();
+        let (stats, _) = BenchDriver::new(5, false)
+            .run(
+                vec![proxy.clone()],
+                vec![proxy],
+                workloads,
+                observer,
+                &registry,
+                false,
+                Interval::Time(Duration::from_secs(60)),
+            )
+            .await
+            .unwrap();
+        stats
+    });
+    tracing::info!(?stats, "composite workload done");
+
+    // Anchovy certifies whatever the quorum certified by now.
+    let last = network
+        .sui()
+        .get_checkpoint_store()
+        .get_highest_verified_checkpoint()
+        .unwrap()
+        .map(|c| *c.sequence_number())
+        .unwrap();
+    network.wait_for_certified(last);
+
+    let metrics = metrics.lock().unwrap();
+    let sum = metrics.sum_all();
+    tracing::info!(?sum, "composite metrics");
+    assert!(sum.success_count > 200, "{sum:?}");
+    assert!(sum.permanent_failure_count > 0, "{sum:?}");
+    assert!(sum.insufficient_funds_count > 0, "{sum:?}");
+    assert!(sum.cancellation_count > 0, "{sum:?}");
+    drop(full_node);
+    drop(network.runtime);
 }

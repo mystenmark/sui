@@ -1729,6 +1729,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "comfy-table"
+version = "6.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e959d788268e3bf9d35ace83e81b124190378e4c91c9067524675e33394b8ba"
+dependencies = [
+ "crossterm 0.26.1",
+ "strum 0.24.1",
+ "strum_macros 0.24.3",
+ "unicode-width 0.1.14",
+]
+
+[[package]]
 name = "compat"
 version = "0.1.0"
 dependencies = [
@@ -1741,8 +1753,10 @@ dependencies = [
  "messages",
  "move-core-types",
  "node",
+ "prometheus",
  "rand 0.8.8",
  "store",
+ "sui-benchmark",
  "sui-config",
  "sui-core",
  "sui-genesis-builder",
@@ -1756,6 +1770,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tonic 0.14.6",
+ "tracing",
  "validator",
  "workqueue",
 ]
@@ -2122,6 +2137,22 @@ name = "crossterm"
 version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e64e6c0fbe2c17357405f7c758c1ef960fce08bdfb2c03d88d2a18d7e09c4b67"
+dependencies = [
+ "bitflags 1.3.2",
+ "crossterm_winapi",
+ "libc",
+ "mio 0.8.11",
+ "parking_lot 0.12.5",
+ "signal-hook",
+ "signal-hook-mio",
+ "winapi",
+]
+
+[[package]]
+name = "crossterm"
+version = "0.26.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a84cda67535339806297f1b331d6dd6320470d2a0fe65381e79ee9e156dd3d13"
 dependencies = [
  "bitflags 1.3.2",
  "crossterm_winapi",
@@ -2829,6 +2860,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "duration-str"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9f037c488d179e21c87ef5fa9c331e8e62f5dddfa84618b41bb197da03edff1"
+dependencies = [
+ "chrono",
+ "nom 7.1.3",
+ "rust_decimal",
+ "serde",
+ "thiserror 1.0.69",
+ "time",
 ]
 
 [[package]]
@@ -8245,6 +8290,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust_decimal"
+version = "1.43.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7653272e75dcac41dc199fbea6f5797633994fafd339943c06c9af16bf29cd3a"
+dependencies = [
+ "arrayvec",
+ "num-traits",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9335,6 +9390,12 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "strum"
+version = "0.24.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "063e6045c0e62079840579a7e47a355ae92f60eb74daaf156fb1e84ba164e63f"
+
+[[package]]
+name = "strum"
 version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "290d54ea6f91c969195bdbcd7442c8c2a2ba87da8bf60a7ee86a235d4bc1e125"
@@ -9358,6 +9419,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
 dependencies = [
  "strum_macros 0.27.2",
+]
+
+[[package]]
+name = "strum_macros"
+version = "0.24.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e385be0d24f186b4ce2f9982191e7101bb737312ad61c1f2f984f34bcf85d59"
+dependencies = [
+ "heck 0.4.1",
+ "proc-macro2",
+ "quote",
+ "rustversion",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -9566,6 +9640,59 @@ dependencies = [
  "sui-types",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "sui-benchmark"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bcs",
+ "clap",
+ "comfy-table",
+ "consensus-config",
+ "derive_more 1.0.0",
+ "duration-str",
+ "futures",
+ "hdrhistogram",
+ "indicatif",
+ "itertools 0.13.0",
+ "move-core-types",
+ "mysten-common",
+ "mysten-metrics",
+ "prometheus",
+ "prost 0.14.4",
+ "rand 0.8.8",
+ "regex",
+ "serde",
+ "serde_json",
+ "strum 0.27.2",
+ "strum_macros 0.27.2",
+ "sui-config",
+ "sui-core",
+ "sui-framework",
+ "sui-framework-snapshot",
+ "sui-keys",
+ "sui-macros",
+ "sui-move-build",
+ "sui-network",
+ "sui-protocol-config",
+ "sui-rpc",
+ "sui-rpc-api",
+ "sui-simulator",
+ "sui-surfer",
+ "sui-swarm-config",
+ "sui-test-transaction-builder",
+ "sui-types",
+ "sysinfo",
+ "telemetry-subscribers",
+ "test-cluster",
+ "tokio",
+ "tokio-util 0.7.19",
+ "tracing",
+ "typed-store",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -10866,6 +10993,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "sui-surfer"
+version = "1.81.0"
+dependencies = [
+ "bcs",
+ "clap",
+ "futures",
+ "indexmap 2.14.2",
+ "move-binary-format",
+ "move-core-types",
+ "mysten-common",
+ "rand 0.8.8",
+ "sui-core",
+ "sui-move-build",
+ "sui-protocol-config",
+ "sui-swarm-config",
+ "sui-types",
+ "telemetry-subscribers",
+ "test-cluster",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sui-swarm"
 version = "0.0.0"
 dependencies = [
@@ -10924,6 +11074,21 @@ dependencies = [
  "serde",
  "sui-core",
  "tracing",
+]
+
+[[package]]
+name = "sui-test-transaction-builder"
+version = "0.1.0"
+dependencies = [
+ "bcs",
+ "move-core-types",
+ "rand 0.8.8",
+ "shared-crypto",
+ "sui-genesis-builder",
+ "sui-move-build",
+ "sui-rpc-api",
+ "sui-sdk",
+ "sui-types",
 ]
 
 [[package]]
@@ -11273,7 +11438,7 @@ dependencies = [
  "bytes-varint",
  "clap",
  "console-subscriber",
- "crossterm",
+ "crossterm 0.25.0",
  "futures",
  "once_cell",
  "opentelemetry",
@@ -11339,6 +11504,40 @@ name = "termtree"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
+
+[[package]]
+name = "test-cluster"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bcs",
+ "consensus-config",
+ "fastcrypto-zkp",
+ "futures",
+ "jsonrpsee",
+ "move-binary-format",
+ "move-core-types",
+ "mysten-common",
+ "prometheus",
+ "rand 0.8.8",
+ "sui-config",
+ "sui-core",
+ "sui-framework",
+ "sui-json-rpc-types",
+ "sui-keys",
+ "sui-node",
+ "sui-protocol-config",
+ "sui-rpc-api",
+ "sui-sdk",
+ "sui-simulator",
+ "sui-swarm",
+ "sui-swarm-config",
+ "sui-test-transaction-builder",
+ "sui-types",
+ "tokio",
+ "tonic 0.14.6",
+ "tracing",
+]
 
 [[package]]
 name = "textwrap"
