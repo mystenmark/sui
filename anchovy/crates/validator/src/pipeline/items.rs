@@ -12,8 +12,6 @@ use messages::Message;
 use messages::base::ObjectId;
 use messages::object::Object;
 
-use tokio::sync::oneshot;
-
 use crate::checks::VerifiedTransaction;
 use crate::consensus::execution_time::Key;
 use crate::consensus::sequence::SharedAccess;
@@ -86,15 +84,33 @@ pub struct Chunk {
 }
 
 /// A chunk and its settlement, on their way from `CommitStage` through the
-/// randomness gate, which holds a chunk headed by a randomness state update
-/// until the round's random bytes arrive, and every chunk after it.
+/// gate waiter, until the synced scheduler is not running the chunk and, if
+/// it is headed by a randomness state update, the round's bytes arrive; then
+/// to the randomness gate, which passes chunks on in height order.
 #[derive(Debug)]
 pub struct GatedChunk {
     pub chunk: Chunk,
     pub settlement: ChunkSettlement,
     /// The update heading the chunk, not yet in its entries or digests.
     pub update: Option<PendingUpdate>,
+    /// The update's round's random bytes (its signature's BCS), once
+    /// released.
+    pub bytes: Option<Vec<u8>>,
 }
+
+impl waiter::Receive<Option<Vec<u8>>> for GatedChunk {
+    fn receive(&mut self, _: usize, bytes: Option<Vec<u8>>) {
+        if bytes.is_some() {
+            self.bytes = bytes;
+        }
+    }
+}
+
+/// What the gate waiter takes.
+pub type GateCommand = waiter::Command<crate::pipeline::keys::GateKey, GatedChunk, Option<Vec<u8>>>;
+
+/// The gate waiter's queue.
+pub type GateWaits = workqueue::Queue<GateCommand>;
 
 /// A randomness state update waiting for its round's random bytes.
 #[derive(Debug, Clone, Copy)]
@@ -104,28 +120,6 @@ pub struct PendingUpdate {
     pub initial_shared_version: u64,
     /// Its write of the randomness state.
     pub shared: SharedAccess,
-}
-
-/// What the randomness gate takes.
-#[derive(Debug)]
-pub enum GateInput {
-    /// `CommitStage` → gate, in height order.
-    Chunk(GatedChunk),
-    /// A randomness round's random bytes (its signature's BCS), verified.
-    /// Signature processor → gate.
-    Bytes { round: u64, bytes: Vec<u8> },
-    /// Which round the gate waits for, if any, and the checkpoint its update
-    /// goes into. The p2p endpoint → gate, to fetch rounds peers stopped
-    /// pushing.
-    Waiting(oneshot::Sender<Option<(u64, u64)>>),
-    /// The synced scheduler released chunks in the chunk lock. Synced
-    /// scheduler → gate.
-    Released,
-}
-
-/// A full queue drops the question: the asker asks again.
-impl workqueue::Refuse for GateInput {
-    fn refuse(self, _: workqueue::Refusal) {}
 }
 
 /// What settling a chunk takes. `CommitHandler` → `SettlementScheduler`.

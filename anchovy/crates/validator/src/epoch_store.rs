@@ -234,6 +234,16 @@ impl EpochStore {
             .collect()
     }
 
+    /// The random bytes of round `round`, if recorded.
+    ///
+    /// # Panics
+    /// If the database cannot be read.
+    pub fn round_bytes(&self, round: u64) -> Option<Vec<u8>> {
+        self.db
+            .get(Space::RandomnessBytes, &round.to_be_bytes())
+            .expect("the epoch's database reads")
+    }
+
     /// Checkpoint `seq`, built here, as the builder wrote it.
     ///
     /// # Panics

@@ -47,12 +47,12 @@ use crate::epoch_store::ConsensusOutput;
 use crate::pipeline::backpressure::Backpressure;
 use crate::pipeline::chunk_lock::{ChunkLock, Cut};
 use crate::pipeline::items::{
-    Chunk, ChunkSettlement, EpochClose, ExecutableTransaction, GateInput, GatedChunk,
+    Chunk, ChunkSettlement, EpochClose, ExecutableTransaction, GateWaits, GatedChunk,
     OutputThrough, OutputWaits, PendingCheckpoint, PendingUpdate, ScheduledEntry, SystemKind,
     SystemTransaction,
 };
 use crate::pipeline::keys::{
-    AccumulatorVersion, CheckpointProgress, ChunkSettled, StreamId, TxDigest,
+    AccumulatorVersion, CheckpointProgress, ChunkSettled, GateKey, StreamId, TxDigest,
 };
 use crate::randomness::{BeaconInput, PartyInput};
 
@@ -1048,9 +1048,10 @@ pub struct Decided<'b> {
 /// - `CommitDecoder`: `DecodedRequest`.
 ///
 /// Outward:
-/// - randomness gate, in height order: each chunk's transactions and its
-///   settlement work (`GatedChunk`), for `VersionResolver` and
-///   `SettlementScheduler`;
+/// - gate waiter, wait for: each chunk's transactions and its settlement
+///   work (`GatedChunk`), for the randomness gate, keyed by `ChunkFree` of
+///   its height and, if headed by a randomness state update, `RoundBytes`
+///   of its round;
 /// - `SignatureCollector`: the group key, once DKG completes;
 /// - checkpoint waiter, wait for: each `PendingCheckpoint`, keyed by
 ///   `ChunkSettled` of each of its chunks;
@@ -1079,7 +1080,7 @@ pub struct CommitStage {
     /// barrier, its root's one exclusive writer and with the root its only
     /// input, writes the next version.
     root_version: u64,
-    gate_out: workqueue::Queue<GateInput>,
+    gate_out: GateWaits,
     checkpoints_out: workqueue::Queue<waiter::Command<ChunkSettled, PendingCheckpoint>>,
     statuses: Arc<ConsensusTxStatusCache>,
     backpressure: Option<Arc<Backpressure>>,
@@ -1100,7 +1101,7 @@ impl CommitStage {
         epoch: Arc<EpochParams>,
         start: EpochStart,
         output: ConsensusOutput,
-        gate: workqueue::Queue<GateInput>,
+        gate: GateWaits,
         checkpoints: workqueue::Queue<waiter::Command<ChunkSettled, PendingCheckpoint>>,
         statuses: Arc<ConsensusTxStatusCache>,
         committee: Vec<([u8; 96], u64)>,
@@ -1603,23 +1604,31 @@ impl CommitStage {
             checkpoints,
             dropped: _,
         } = decided;
+        let mut gated = waiter::WaitBatch::with_capacity(chunks.len(), chunks.len() + 1);
         for (chunk, settlement) in chunks.into_iter().zip(settlements) {
-            let update = update.filter(|(height, _)| *height == chunk.height);
+            let update = update
+                .filter(|(height, _)| *height == chunk.height)
+                .map(|(_, update)| update);
             if let Some(backpressure) = &self.backpressure {
                 backpressure.scheduled(
                     chunk.height,
                     chunk.entries.len() + usize::from(update.is_some()),
                 );
             }
-            push(
-                &self.gate_out,
-                GateInput::Chunk(GatedChunk {
+            let keys = std::iter::once(GateKey::ChunkFree(chunk.height))
+                .chain(update.map(|u| GateKey::RoundBytes(u.round)));
+            gated.push(
+                GatedChunk {
                     chunk,
                     settlement,
-                    update: update.map(|(_, update)| update),
-                }),
-                "randomness gate",
+                    update,
+                    bytes: None,
+                },
+                keys,
             );
+        }
+        if !gated.is_empty() {
+            push(&self.gate_out, waiter::Command::Wait(gated), "gate waiter");
         }
         if !checkpoints.is_empty() {
             let keys = checkpoints.iter().map(|c| c.heights.len()).sum();

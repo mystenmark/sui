@@ -15,7 +15,8 @@ use workqueue::{Processor, Refusal, Refuse};
 
 use crate::consensus::dkg::{DkgSetup, GroupKey};
 use crate::epoch_store::EpochStore;
-use crate::pipeline::items::GateInput;
+use crate::pipeline::items::GateWaits;
+use crate::pipeline::keys::GateKey;
 use crate::randomness::signature_message;
 
 /// How far past the lowest round without bytes a pushed signature may be:
@@ -85,7 +86,8 @@ impl Refuse for BeaconInput {
 /// - p2p endpoint: what to push (`BeaconInput::Outgoing`).
 ///
 /// Outward:
-/// - `RandomnessGate`: each round's bytes (`GateInput::Bytes`).
+/// - gate waiter, resolve: `RoundBytes` of each round, to its bytes, once
+///   recorded in the epoch store.
 ///
 /// Writes: each round's bytes, to the epoch store, before they go out.
 pub struct SignatureCollector {
@@ -107,7 +109,7 @@ pub struct SignatureCollector {
     requested: BTreeSet<u64>,
     /// What this member pushes, by round.
     outgoing: BTreeMap<u64, SendSignaturesRequest>,
-    gate: workqueue::Queue<GateInput>,
+    gate: GateWaits,
 }
 
 impl SignatureCollector {
@@ -118,7 +120,7 @@ impl SignatureCollector {
         setup: Arc<DkgSetup>,
         own: Option<u16>,
         store: EpochStore,
-        gate: workqueue::Queue<GateInput>,
+        gate: GateWaits,
     ) -> SignatureCollector {
         let mut collector = SignatureCollector {
             epoch,
@@ -292,10 +294,10 @@ impl SignatureCollector {
         let bytes = bcs::to_bytes(sig).expect("a signature serializes");
         self.store.put_randomness_bytes(round, &bytes);
         self.mark_done(round);
-        if let Err(workqueue::PushError::Full(_)) =
-            self.gate.try_push(GateInput::Bytes { round, bytes })
-        {
-            panic!("the randomness gate refused bytes");
+        if let Err(workqueue::PushError::Full(_)) = self.gate.try_push(waiter::Command::Resolve(
+            vec![(GateKey::RoundBytes(round), Some(bytes))],
+        )) {
+            panic!("the gate waiter refused bytes");
         }
     }
 }

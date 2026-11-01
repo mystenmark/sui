@@ -31,9 +31,9 @@ use validator::epoch::EpochParams;
 use validator::epoch_store::{ConsensusOutput, EpochStore};
 use validator::pipeline::chunk_lock::{ChunkLock, Cut};
 use validator::pipeline::items::{
-    ExecutableTransaction, GateInput, GatedChunk, PendingCheckpoint, SystemKind,
+    ExecutableTransaction, GateCommand, GatedChunk, PendingCheckpoint, SystemKind,
 };
-use validator::pipeline::keys::ChunkSettled;
+use validator::pipeline::keys::{ChunkSettled, GateKey};
 use workqueue::{Inbox, Processor};
 
 const ROOT_VERSION: u64 = 5;
@@ -65,7 +65,7 @@ fn epoch(max_transactions: u64, min_interval_ms: u64) -> Arc<EpochParams> {
 }
 
 struct Outputs {
-    gate: Inbox<GateInput>,
+    gate: Inbox<GateCommand>,
     checkpoints: Inbox<waiter::Command<ChunkSettled, PendingCheckpoint>>,
     /// The epoch store the stage writes, unless the test keeps it.
     dir: Option<tempfile::TempDir>,
@@ -478,17 +478,24 @@ fn the_stage_emits_chunks_settlements_and_checkpoint_waits() {
 
     let mut chunks = Vec::new();
     let mut settled = Vec::new();
-    while let Some(input) = outputs.gate.try_pop() {
-        let GateInput::Chunk(GatedChunk {
-            chunk,
-            settlement,
-            update: None,
-        }) = input
-        else {
-            panic!("chunks without randomness");
+    while let Some(command) = outputs.gate.try_pop() {
+        let waiter::Command::Wait(batch) = command else {
+            panic!("chunks wait in the gate waiter");
         };
-        chunks.push((chunk.height, chunk.checkpoint_seq, chunk.entries.len()));
-        settled.push((settlement.height, settlement.digests.len()));
+        for (gated, keys) in batch.into_parts() {
+            let GatedChunk {
+                chunk,
+                settlement,
+                update: None,
+                ..
+            } = gated
+            else {
+                panic!("chunks without randomness");
+            };
+            assert_eq!(keys, vec![GateKey::ChunkFree(chunk.height)]);
+            chunks.push((chunk.height, chunk.checkpoint_seq, chunk.entries.len()));
+            settled.push((settlement.height, settlement.digests.len()));
+        }
     }
     assert_eq!(chunks, vec![(1, 11, 4), (2, 12, 2)]);
     assert_eq!(settled, vec![(1, 4), (2, 2)]);

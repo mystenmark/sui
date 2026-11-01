@@ -22,9 +22,9 @@ use tracing::warn;
 use validator::pipeline::chunk_lock::ChunkLock;
 use validator::pipeline::items::{
     BuiltWaitItem, BuiltWaits, CertifiedCheckpoint, CheckpointEffects, EffectsWaitItem,
-    ExecutedEffects, GateInput, InputCommand,
+    ExecutedEffects, GateWaits, InputCommand,
 };
-use validator::pipeline::keys::{CheckpointBuilt, EffectsKey, InputKey};
+use validator::pipeline::keys::{CheckpointBuilt, EffectsKey, GateKey, InputKey};
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore};
 use validator::randomness::BeaconInput;
 use validator::state_sync::{SyncRequest, SyncedInput, Wanted};
@@ -92,7 +92,7 @@ pub struct Outputs {
     pub hasher: Queue<CheckpointEffects>,
     pub committer: Queue<Vec<CertifiedCheckpoint>>,
     pub beacon: Queue<BeaconInput>,
-    pub gate: Queue<GateInput>,
+    pub gate: GateWaits,
 }
 
 /// Verifies certified summaries fetched from peers, in sequence order, each
@@ -136,8 +136,8 @@ pub struct Outputs {
 ///   transaction's `EffectsKey`;
 /// - `SignatureCollector`: the random bytes of each randomness state update
 ///   in the checkpoints it splits (`BeaconInput::Certified`);
-/// - randomness gate: `GateInput::Released`, after releasing chunks in the
-///   chunk lock;
+/// - gate waiter, resolve: `ChunkFree` of each chunk it ran, after
+///   releasing it in the chunk lock;
 /// - `StateHasher`: `CheckpointEffects` of each checkpoint it commits;
 /// - `CheckpointCommitter`: each checkpoint it commits.
 ///
@@ -501,10 +501,15 @@ impl SyncedScheduler {
             });
         }
         if !running.synced.is_empty() {
-            for height in running.synced {
+            for height in running.synced.clone() {
                 self.chunk_lock.release(height);
             }
-            push(&self.outputs.gate, GateInput::Released, "randomness gate");
+            let free = running.synced.map(|h| (GateKey::ChunkFree(h), None));
+            push(
+                &self.outputs.gate,
+                Command::Resolve(free.collect()),
+                "gate waiter",
+            );
         }
 
         let summary = CertifiedCheckpointSummary::parse(

@@ -1,100 +1,99 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use containers::Bump;
+use waiter::Availability;
 use workqueue::Processor;
 
 use crate::consensus::commit::randomness_state_update_transaction;
+use crate::epoch_store::EpochStore;
 use crate::pipeline::chunk_lock::ChunkLock;
 use crate::pipeline::items::{
-    Chunk, ExecutableTransaction, GateInput, GatedChunk, ScheduledEntry, SettlementInput,
+    Chunk, ExecutableTransaction, GatedChunk, ScheduledEntry, SettlementInput,
 };
+use crate::pipeline::keys::GateKey;
 
-/// Passes chunks from `CommitStage` on in height order, holding a chunk,
-/// and every chunk after it, until:
-/// - if headed by a randomness state update, its round's random bytes
-///   arrive; then it puts the update at the chunk's head;
-/// - if the synced scheduler is running the chunk's transactions from its
-///   certified checkpoint, the chunk lock no longer holds it.
+/// The gate waiter's view of its keys: the chunk lock, and the random bytes
+/// the epoch store records.
+pub struct GateAvailability {
+    pub chunk_lock: Arc<ChunkLock>,
+    pub epoch_store: EpochStore,
+}
+
+impl Availability<GateKey, Option<Vec<u8>>> for GateAvailability {
+    fn check(&mut self, keys: &[GateKey], found: &mut Vec<Option<Option<Vec<u8>>>>) {
+        found.clear();
+        found.extend(keys.iter().map(|key| match *key {
+            GateKey::ChunkFree(height) => (!self.chunk_lock.held(height)).then_some(None),
+            GateKey::RoundBytes(round) => self.epoch_store.round_bytes(round).map(Some),
+        }));
+    }
+}
+
+/// Passes chunks the gate waiter released on in height order, with a
+/// randomness state update put at its chunk's head. A later chunk could not
+/// go ahead: funds reservations follow consensus order.
 ///
-/// A later chunk could not go ahead: funds reservations follow consensus
-/// order.
-///
-/// Inward:
-/// - `CommitStage`: each chunk (`GateInput::Chunk`), in height order;
-/// - `SignatureCollector`: each round's bytes (`GateInput::Bytes`), durable
-///   in the epoch store first;
-/// - `SyncedScheduler`: chunks released in the chunk lock
-///   (`GateInput::Released`), after it releases them there;
-/// - p2p endpoint: which round it waits for (`GateInput::Waiting`).
+/// Inward: gate waiter, ready: `Vec<GatedChunk>`.
 ///
 /// Outward:
 /// - `VersionResolver`: each chunk's transactions (`Chunk`);
 /// - `SettlementScheduler`: each chunk's settlement work
 ///   (`SettlementInput::Chunk`).
 pub struct RandomnessGate {
-    held: VecDeque<GatedChunk>,
-    /// Bytes arrived for rounds not released yet, by round.
-    bytes: BTreeMap<u64, Vec<u8>>,
-    /// Shared with the synced scheduler, if any.
-    chunk_lock: Option<Arc<ChunkLock>>,
+    /// Released chunks not passed on yet, by height.
+    released: BTreeMap<u64, GatedChunk>,
+    /// The height of the next chunk to pass on.
+    next: u64,
     chunks_out: workqueue::Queue<Chunk>,
     settlements_out: workqueue::Queue<SettlementInput>,
 }
 
 impl RandomnessGate {
-    /// A gate with the bytes of the rounds `recorded` already.
+    /// A gate whose first chunk is at height `next`.
     pub fn new(
-        recorded: Vec<(u64, Vec<u8>)>,
+        next: u64,
         chunks: workqueue::Queue<Chunk>,
         settlements: workqueue::Queue<SettlementInput>,
     ) -> RandomnessGate {
         RandomnessGate {
-            held: VecDeque::new(),
-            bytes: recorded.into_iter().collect(),
-            chunk_lock: None,
+            released: BTreeMap::new(),
+            next,
             chunks_out: chunks,
             settlements_out: settlements,
         }
     }
+}
 
-    /// Holds each chunk the synced scheduler runs, through `lock`.
-    #[must_use]
-    pub fn with_chunk_lock(mut self, lock: Arc<ChunkLock>) -> RandomnessGate {
-        self.chunk_lock = Some(lock);
-        self
+/// Inside the pipeline a full queue is a sizing bug; a closed one means the
+/// pipeline is shutting down.
+fn push<T>(queue: &workqueue::Queue<T>, item: T, name: &str) {
+    if let Err(workqueue::PushError::Full(_)) = queue.try_push(item) {
+        panic!("the {name} queue refused work");
     }
+}
 
-    fn release(&mut self) {
-        while let Some(front) = self.held.front() {
-            if self
-                .chunk_lock
-                .as_ref()
-                .is_some_and(|lock| lock.held(front.chunk.height))
-            {
-                return;
-            }
-            let bytes = match &front.update {
-                Some(update) => match self.bytes.remove(&update.round) {
-                    Some(bytes) => {
-                        // Rounds are released in order: earlier ones' bytes,
-                        // recorded before a restart, are not needed.
-                        self.bytes = self.bytes.split_off(&update.round);
-                        Some(bytes)
-                    }
-                    None => return,
-                },
-                None => None,
-            };
+impl Processor for RandomnessGate {
+    type Input = Vec<GatedChunk>;
+    type Output = ();
+
+    fn process(&mut self, released: Vec<GatedChunk>, _: &mut Bump) -> Option<()> {
+        for gated in released {
+            self.released.insert(gated.chunk.height, gated);
+        }
+        while let Some(gated) = self.released.remove(&self.next) {
+            self.next += 1;
             let GatedChunk {
                 mut chunk,
                 mut settlement,
                 update,
-            } = self.held.pop_front().expect("a front");
-            if let (Some(update), Some(bytes)) = (update, bytes) {
+                bytes,
+            } = gated;
+            if let Some(update) = update {
+                let bytes = bytes.expect("released with its round's bytes");
                 let system = randomness_state_update_transaction(&update, bytes);
                 settlement.digests.insert(0, system.digest);
                 chunk.entries.insert(
@@ -114,39 +113,6 @@ impl RandomnessGate {
                 "settlement",
             );
         }
-    }
-}
-
-/// Inside the pipeline a full queue is a sizing bug; a closed one means the
-/// pipeline is shutting down.
-fn push<T>(queue: &workqueue::Queue<T>, item: T, name: &str) {
-    if let Err(workqueue::PushError::Full(_)) = queue.try_push(item) {
-        panic!("the {name} queue refused work");
-    }
-}
-
-impl Processor for RandomnessGate {
-    type Input = GateInput;
-    type Output = ();
-
-    fn process(&mut self, input: GateInput, _: &mut Bump) -> Option<()> {
-        match input {
-            GateInput::Chunk(chunk) => self.held.push_back(chunk),
-            GateInput::Bytes { round, bytes } => {
-                self.bytes.insert(round, bytes);
-            }
-            GateInput::Released => {}
-            GateInput::Waiting(answer) => {
-                let waiting = self.held.front().and_then(|front| {
-                    let update = front.update.as_ref()?;
-                    (!self.bytes.contains_key(&update.round))
-                        .then_some((update.round, front.chunk.checkpoint_seq))
-                });
-                let _ = answer.send(waiting);
-                return None;
-            }
-        }
-        self.release();
         None
     }
 }
@@ -159,10 +125,20 @@ mod tests {
     use super::*;
     use crate::consensus::sequence::{SharedAccess, SharedOrdinal};
     use crate::pipeline::chunk_lock::Cut;
-    use crate::pipeline::items::ChunkSettlement;
+    use crate::pipeline::items::{ChunkSettlement, PendingUpdate};
     use crate::pipeline::keys::AccumulatorVersion;
 
-    fn gated(height: u64) -> GatedChunk {
+    fn gated(height: u64, update: Option<PendingUpdate>) -> GatedChunk {
+        let root = SharedAccess {
+            id: ObjectId([0xac; 32]),
+            initial_shared_version: 1,
+            mutability: SharedObjectMutability::Mutable,
+            ordinal: SharedOrdinal {
+                round: 1,
+                writes_before: 0,
+            },
+            base: None,
+        };
         GatedChunk {
             chunk: Chunk {
                 version: AccumulatorVersion(1),
@@ -180,46 +156,68 @@ mod tests {
                 height,
                 checkpoint_seq: 1,
                 digests: Vec::new(),
-                root: SharedAccess {
-                    id: ObjectId([0xac; 32]),
-                    initial_shared_version: 1,
-                    mutability: SharedObjectMutability::Mutable,
-                    ordinal: SharedOrdinal {
-                        round: 1,
-                        writes_before: 0,
-                    },
-                    base: None,
-                },
+                root,
             },
-            update: None,
+            update,
+            bytes: None,
         }
     }
 
     #[test]
-    fn a_chunk_the_synced_scheduler_runs_waits_until_released() {
+    fn a_chunk_waits_for_the_synced_scheduler_and_its_round_and_holds_those_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let (epoch_store, _, _) = EpochStore::open(dir.path(), 0);
         let lock = Arc::new(ChunkLock::new(0, Cut { seq: 0, height: 0 }));
+        let mut waits = waiter::Waiter::new(GateAvailability {
+            chunk_lock: lock.clone(),
+            epoch_store: epoch_store.clone(),
+        });
         let (chunks, chunks_out) = workqueue::queue(16);
         let (settlements, _settlements_out) = workqueue::queue(16);
-        let mut gate =
-            RandomnessGate::new(Vec::new(), chunks, settlements).with_chunk_lock(lock.clone());
-        let mut run = |input| gate.process(input, &mut Bump::default());
-        let heights = || {
+        let mut gate = RandomnessGate::new(1, chunks, settlements);
+        let mut run = |waits: &mut waiter::Waiter<_, _, _, _>| {
+            let mut ready = Vec::new();
+            waits.get_ready(&mut ready);
+            gate.process(ready, &mut Bump::default());
             std::iter::from_fn(|| chunks_out.try_pop())
-                .map(|c| c.height)
+                .map(|c| (c.height, c.entries.len()))
                 .collect::<Vec<_>>()
         };
 
         // The synced scheduler took chunk 2 before the commit stage claimed
-        // it.
+        // it; chunk 3 is headed by round 7's update.
         lock.take(2, 2);
-        lock.claim(3, Cut { seq: 1, height: 3 });
-        for height in 1..=3 {
-            run(GateInput::Chunk(gated(height)));
+        lock.claim(4, Cut { seq: 1, height: 4 });
+        let update = PendingUpdate {
+            epoch: 0,
+            round: 7,
+            initial_shared_version: 1,
+            shared: gated(0, None).settlement.root,
+        };
+        let mut batch = waiter::WaitBatch::new();
+        for height in 1..=4 {
+            let update = (height == 3).then_some(update);
+            let keys = std::iter::once(GateKey::ChunkFree(height))
+                .chain(update.map(|u| GateKey::RoundBytes(u.round)));
+            batch.push(gated(height, update), keys);
         }
-        assert_eq!(heights(), vec![1], "chunk 3 waits behind chunk 2");
+        waits.wait_for(&mut batch);
+        assert_eq!(
+            run(&mut waits),
+            vec![(1, 0)],
+            "the rest wait behind chunk 2"
+        );
 
         lock.release(2);
-        run(GateInput::Released);
-        assert_eq!(heights(), vec![2, 3]);
+        waits.resolve([(GateKey::ChunkFree(2), None)]);
+        assert_eq!(
+            run(&mut waits),
+            vec![(2, 0)],
+            "chunk 4 waits behind round 7"
+        );
+
+        epoch_store.put_randomness_bytes(7, &[1; 96]);
+        waits.resolve([(GateKey::RoundBytes(7), Some(vec![1; 96]))]);
+        assert_eq!(run(&mut waits), vec![(3, 1), (4, 0)]);
     }
 }

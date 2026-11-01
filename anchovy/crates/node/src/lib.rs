@@ -37,7 +37,7 @@ use validator::epoch::EpochState;
 use validator::epoch_store::{BuilderOutput, ConsensusOutput as OutputWriter, EpochStore};
 use validator::pipeline::backpressure::{Backpressure, Limits};
 use validator::pipeline::chunk_lock::{ChunkLock, Cut};
-use validator::pipeline::items::{CertifiedCheckpoint, EffectsWaitItem, GateInput};
+use validator::pipeline::items::{CertifiedCheckpoint, EffectsWaitItem};
 use validator::pipeline::keys::EffectsKey;
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable, GenerationTable};
 use validator::processors::Request;
@@ -75,7 +75,6 @@ pub struct Pipeline {
     pub effects: Queue<Command<EffectsKey, EffectsWaitItem>>,
     /// From peers: the random beacon's signatures.
     pub beacon: Queue<BeaconInput>,
-    randomness_gate: Queue<GateInput>,
     checkpoint_queries: Queue<validator::state_sync::Request>,
     checkpoint_sync: Queue<validator::state_sync::SyncedInput>,
     /// Each member's network key and p2p address, by committee index.
@@ -283,6 +282,7 @@ impl Pipeline {
             &epoch.params.chain_identifier.bytes,
             epoch.params.epoch,
         ));
+        let resumed_height = resumed.map_or(0, |r| r.height);
         let parts = Arc::new(Parts {
             dkg,
             store: store.clone(),
@@ -297,12 +297,13 @@ impl Pipeline {
             generations: Arc::new(GenerationTable::new(epoch_store.clone())),
             chunks: Arc::new(ChunkTable::new()),
             chunk_lock: Arc::new(ChunkLock::new(
-                resumed.map_or(0, |r| r.height),
+                resumed_height,
                 Cut {
                     seq: resumed.map_or(record.previous_checkpoint, |r| r.next_seq - 1),
-                    height: resumed.map_or(0, |r| r.height),
+                    height: resumed_height,
                 },
             )),
+            resumed_height,
             checkpoints,
             statuses: Arc::new(ConsensusTxStatusCache::new()),
             state_hashes,
@@ -344,7 +345,6 @@ impl Pipeline {
             commits: queues.commits,
             effects: queues.effects_waits,
             beacon: queues.beacon,
-            randomness_gate: queues.gate,
             checkpoint_queries: queues.checkpoint_queries,
             checkpoint_sync: queues.checkpoint_sync,
             network_keys: record.committee.iter().map(|m| m.network_key).collect(),
@@ -392,7 +392,6 @@ impl Pipeline {
             beacon: self.beacon.clone(),
             network_keys: self.network_keys.clone(),
             p2p_addresses: self.p2p_addresses.clone(),
-            randomness_gate: self.randomness_gate.clone(),
             checkpoint_queries: self.checkpoint_queries.clone(),
             checkpoint_sync: self.checkpoint_sync.clone(),
         })

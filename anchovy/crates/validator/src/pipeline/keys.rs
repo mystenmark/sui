@@ -76,6 +76,18 @@ pub struct ChunkSettled(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CheckpointBuilt(pub u64);
 
+/// The gate waiter's keys: what a chunk waits for before the randomness
+/// gate passes it on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GateKey {
+    /// The synced scheduler is not running the chunk at `height`. Available
+    /// once the chunk lock does not hold it.
+    ChunkFree(u64),
+    /// Randomness round `round`'s random bytes, its value. Available once
+    /// the epoch store records them.
+    RoundBytes(u64),
+}
+
 /// The output waiter's keys: what consensus output waits for before it is
 /// written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
