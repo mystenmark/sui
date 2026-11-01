@@ -61,13 +61,6 @@ fn certificate(seq: u64, summary: &[u8]) -> CertifiedCheckpoint {
     }
 }
 
-fn certified(seq: u64, summary: &[u8]) -> BuiltWaitItem {
-    BuiltWaitItem::Certified {
-        certified: certificate(seq, summary),
-        local: None,
-    }
-}
-
 fn synced(seq: u64, summary: &[u8]) -> BuiltWaitItem {
     BuiltWaitItem::Synced {
         certified: certificate(seq, summary),
@@ -196,7 +189,6 @@ fn items_wait_for_their_checkpoint_then_go_where_their_kind_goes() {
     s.wait(next(4), 3);
     s.wait(signature(3), 3);
     s.wait(signature(4), 4);
-    s.wait(certified(3, &summary(3, 0)), 3);
     assert_eq!(s.routed(), (vec![], vec![]));
 
     s.build(built(3, &summary(3, 0)));
@@ -208,18 +200,9 @@ fn items_wait_for_their_checkpoint_then_go_where_their_kind_goes() {
 }
 
 #[test]
-#[should_panic(expected = "fork: certified checkpoint 3")]
-fn a_certified_checkpoint_other_than_the_local_one_is_a_fork() {
-    let mut s = Setup::new();
-    s.wait(certified(3, &summary(3, 1)), 3);
-    s.build(built(3, &summary(3, 0)));
-}
-
-#[test]
 fn a_synced_checkpoint_is_committed_once_built_alike() {
     let mut s = Setup::new();
     s.wait(synced(3, &summary(3, 0)), 3);
-    s.wait(certified(3, &summary(3, 0)), 3);
     assert_eq!(s.committed(), Vec::<u64>::new());
 
     s.build(built(3, &summary(3, 0)));

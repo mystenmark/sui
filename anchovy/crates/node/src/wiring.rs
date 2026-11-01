@@ -95,7 +95,7 @@ pub(crate) fn spawn(
         w.one("built-waiter",      i.built_waits,      |p, _| WaiterProcessor::new(p.built_availability()),           BuiltRouter { epoch_closer: q.closer.clone(), aggregator: q.aggregator.clone(), committer: q.committer.clone() }),
         w.one("epoch-closer",      i.closer,           |p, q| p.epoch_closer(q.resolver, q.effects_waits, q.hasher, q.summary), drop),
         w.one("summary",           i.summary,          |p, q| p.summary(q.built_waits, q.output_waits),               drop),
-        w.one("aggregator",        i.aggregator,       move |p, q| p.aggregator(state_sync, q.built_waits),           into(&q.committer, "committer")),
+        w.one("aggregator",        i.aggregator,       move |p, _| p.aggregator(state_sync),                          into(&q.committer, "committer")),
         w.one("committer",         i.committer,        move |p, q| p.committer(q.output_waits, ended),                drop),
         w.one("output-waiter",     i.output_waits,     |p, _| WaiterProcessor::new(p.output_availability()),          into(&q.outputs, "output committer")),
         w.one("output-committer",  i.outputs,          move |_, _| OutputCommitter::new(commits),                     drop),
@@ -415,18 +415,13 @@ impl Parts {
         )
     }
 
-    fn aggregator(
-        &self,
-        state_sync: Queue<CertifiedCheckpoint>,
-        built: BuiltWaits,
-    ) -> CheckpointAggregator {
+    fn aggregator(&self, state_sync: Queue<CertifiedCheckpoint>) -> CheckpointAggregator {
         CheckpointAggregator::new(
             self.committee.clone(),
             self.checkpoints.clone(),
             self.next_to_certify,
             state_sync,
         )
-        .with_fork_checks(built)
         .with_backpressure(self.backpressure.clone())
     }
 

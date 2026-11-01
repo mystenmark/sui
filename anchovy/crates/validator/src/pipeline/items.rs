@@ -436,12 +436,6 @@ pub enum BuiltWaitItem {
     /// A signature, waiting for the summary it signs. `BlockVoter` and
     /// `CommitDecoder` → built waiter → `CheckpointAggregator`.
     Signature(CheckpointSignature),
-    /// A certified checkpoint, waiting for the local one to compare it
-    /// with. `CheckpointAggregator` → built waiter → fork check.
-    Certified {
-        certified: CertifiedCheckpoint,
-        local: Option<Arc<BuiltCheckpoint>>,
-    },
     /// A certified checkpoint fetched from peers, waiting for the local one
     /// to compare it with, then to be committed. `SyncedScheduler` → built
     /// waiter → fork check → `CheckpointCommitter`.
@@ -453,7 +447,7 @@ pub enum BuiltWaitItem {
 
 impl waiter::Receive<Arc<BuiltCheckpoint>> for BuiltWaitItem {
     fn receive(&mut self, _: usize, built: Arc<BuiltCheckpoint>) {
-        if let BuiltWaitItem::Certified { local, .. } | BuiltWaitItem::Synced { local, .. } = self {
+        if let BuiltWaitItem::Synced { local, .. } = self {
             *local = Some(built);
         }
     }

@@ -38,9 +38,9 @@ impl Availability<CheckpointBuilt, Arc<BuiltCheckpoint>> for BuiltAvailability {
 
 /// Where the built waiter's ready items go, by kind: contents whose previous
 /// checkpoint is built, to `EpochCloser`; signatures, to
-/// `CheckpointAggregator`; certified checkpoints, to the fork check, here,
-/// and those fetched from peers then to `CheckpointCommitter`. Runs on the
-/// built waiter's thread.
+/// `CheckpointAggregator`; certified checkpoints fetched from peers, to the
+/// fork check, here, then to `CheckpointCommitter`. Runs on the built
+/// waiter's thread.
 ///
 /// Inward: built waiter, ready: `Vec<BuiltWaitItem>`.
 /// Outward: `EpochCloser`: `EpochCloserInput::Built`;
@@ -59,10 +59,6 @@ impl Sink<Vec<BuiltWaitItem>> for BuiltRouter {
             match item {
                 BuiltWaitItem::Next(built) => next.push(built),
                 BuiltWaitItem::Signature(signature) => signatures.push(signature),
-                BuiltWaitItem::Certified { certified, local } => check_fork(
-                    &certified,
-                    &local.expect("released once the local checkpoint resolved"),
-                ),
                 BuiltWaitItem::Synced { certified, local } => {
                     check_fork(
                         &certified,

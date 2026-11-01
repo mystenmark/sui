@@ -18,12 +18,8 @@ use messages::checkpoint::CertifiedCheckpointSummary;
 use roaring::RoaringBitmap;
 use tracing::{error, warn};
 use validator::pipeline::backpressure::Backpressure;
-use validator::pipeline::items::{
-    BuiltWaitItem, BuiltWaits, CertifiedCheckpoint, CheckpointSignature,
-};
-use validator::pipeline::keys::CheckpointBuilt;
+use validator::pipeline::items::{CertifiedCheckpoint, CheckpointSignature};
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore};
-use waiter::{Command, WaitBatch};
 use workqueue::{Processor, Queue};
 
 /// Voting power, as sui's committee counts it.
@@ -519,17 +515,15 @@ impl Pending {
 ///
 /// Outward:
 /// - state sync (black box): `CertifiedCheckpoint`;
-/// - built waiter, wait for: `BuiltWaitItem::Certified`, keyed by
-///   `CheckpointBuilt(seq)`, for the fork check;
 /// - `CheckpointCommitter`: `Vec<CertifiedCheckpoint>`, in sequence order.
+///
+/// No fork check: a certificate is only ever made over the local summary.
 ///
 /// Reads: the checkpoint store. Writes: backpressure's certified watermark.
 pub struct CheckpointAggregator {
     committee: Arc<Committee>,
     checkpoints: Arc<CheckpointStore>,
     state_sync: Queue<CertifiedCheckpoint>,
-    /// Where certified checkpoints wait to be checked for a fork, once wired.
-    fork_checks: Option<BuiltWaits>,
     /// Told of each checkpoint certified, once wired.
     backpressure: Option<Arc<Backpressure>>,
     /// The checkpoint to certify next; every earlier one is certified.
@@ -549,19 +543,11 @@ impl CheckpointAggregator {
             committee,
             checkpoints,
             state_sync,
-            fork_checks: None,
             backpressure: None,
             next,
             pending: BTreeMap::new(),
             scratch: Vec::new(),
         }
-    }
-
-    /// Sends each checkpoint certified to be checked against the local one.
-    #[must_use]
-    pub fn with_fork_checks(mut self, built: BuiltWaits) -> CheckpointAggregator {
-        self.fork_checks = Some(built);
-        self
     }
 
     /// Tells `backpressure` of each checkpoint certified.
@@ -637,21 +623,6 @@ impl CheckpointAggregator {
             }
             if self.state_sync.try_push(checkpoint.clone()).is_err() {
                 warn!(seq, "state sync refused a certified checkpoint");
-            }
-            if let Some(built) = &self.fork_checks {
-                let mut wait = WaitBatch::with_capacity(1, 1);
-                wait.push(
-                    BuiltWaitItem::Certified {
-                        certified: checkpoint.clone(),
-                        local: None,
-                    },
-                    [CheckpointBuilt(seq)],
-                );
-                // Inside the pipeline a full queue is a sizing bug; a closed
-                // one means the pipeline is shutting down.
-                if let Err(workqueue::PushError::Full(_)) = built.try_push(Command::Wait(wait)) {
-                    panic!("the built waiter refused a certified checkpoint");
-                }
             }
             certified.push(checkpoint);
         }
