@@ -176,8 +176,10 @@ certificate:
   as an exact `ObjectVersion` wait in the input waiter. It never touches
   the generation table. A cancelled transaction's marker versions come
   through as `Input::Cancelled`. A stream-ended object comes through as
-  `Input::Ended`, whose deleting transaction is the one among the effects'
-  dependencies that deleted it at that version;
+  `Input::Ended`, naming the transaction among the effects' dependencies
+  that left the stream ended at that version: the one that took the
+  object out, or a later writer. Where the protocol drops effects'
+  dependencies, the name reaches no effects, and none is looked up;
 - the accumulator version, from the barrier settlement ending its chunk
   (R4.4). It counts commits, so the chunks of a split commit share it,
   even across checkpoints;
@@ -216,6 +218,11 @@ checks the stored effects against what the consensus path decided:
   `InsufficientFundsForWithdraw`;
 - for a barrier, the root's input version, against the chunk's root
   version, which counts chunks.
+
+A transaction it runs fresh must write each consensus object from its
+live version. Otherwise the certified chain went on from that version
+without it: a commit the consensus path decides otherwise than the quorum
+did, such as a prologue over other transactions.
 
 Then it records generations and funds settlements from the effects, as it
 does now. With the verdict checked, `Settle::Deposit` and `Settle::Credit`
@@ -275,8 +282,8 @@ node produced.
 - **Lagging:** anchovy's consensus is delayed while the synced path runs
   ahead within an epoch, with funds withdrawals near their balances. The
   consensus path catches up, checks every transaction, and agrees.
-- **Deviation:** a certified checkpoint whose effects disagree with the
-  consensus path's funds verdict, or its versions, panics once consensus
-  reaches it.
+- **Deviation:** anchovy's consensus leaves out a transaction the quorum
+  certified, which the synced path ran. Once the consensus path reaches
+  that commit, it decides it otherwise and aborts.
 - **Unit:** versions, accumulator versions and verdicts derived from
   certified effects, against checkpoints the compat network certified.

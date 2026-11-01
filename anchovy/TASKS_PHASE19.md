@@ -89,7 +89,16 @@ executor, the chunk lock, a fast path):
     cancellation markers, the funds verdict unless cancelled.
   - [x] Compat: a lagging consensus (`Lagging` holds anchovy's commits).
   - [x] Compat: catching up an epoch's end (consensus held across it).
-  - [ ] Compat: deviation.
+  - [x] Compat: deviation (`Lagging` omits a certified transaction as
+    rejected; the child process aborts). Found that the consensus path
+    never noticed a commit it decides otherwise when the transaction it
+    runs is fresh: `check_fresh` now requires each consensus object it
+    writes to be live at the version decided.
+  - [x] Compat: stream-ended inputs, synced and consensus. Found two
+    bugs: an ended stream's later writer moves it on to its own version
+    (the consensus path forked on the next reader); and protocol 138
+    drops effects' dependencies off mainnet, so the synced path names no
+    stream ender there.
   - [x] Consensus output is written once its checkpoints are committed
     and built here: the output waiter on `CheckpointProgress`, then
     `OutputCommitter`. Before, a synced commit wrote output of commits
@@ -98,7 +107,9 @@ executor, the chunk lock, a fast path):
   - [x] The chunk lock's claim no longer blocks the commit stage: the
     randomness gate holds a chunk the synced scheduler runs until told it
     is released.
-  - Known gaps: stream-ended inputs on the synced path are untested.
+  - Known gaps: a writer of an ended stream named as a dependency
+    (mainnet only) is untested in compat. Anchovy's RPC rejects a
+    transaction whose shared input was deleted; sui's accepts it.
 
 ## Left out / later
 

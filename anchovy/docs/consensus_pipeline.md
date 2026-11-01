@@ -244,9 +244,11 @@ Ordinals defer that to execution, which simplifies three things:
   the reference, a transaction may be assigned version `v` of an object an
   earlier transaction deleted, and `(id, v)` never appears. So deletion
   writes `ConsensusStreamEnded` markers, smeared at the deleter's version for
-  every stream it touched, and input loading looks for them. Here the
-  deleting writer still produces its generation, recorded as "stream ended",
-  and its readers resolve to that.
+  every stream it touched, and input loading looks for them. Every later
+  exclusive writer is still assigned the next version, and marks the stream
+  ended there. Here the deleting writer still produces its generation,
+  recorded as "stream ended", and so does each later writer, at its own
+  version; readers resolve to the last.
 - **The accumulator root needs no lookups.** The root is a stream with one
   exclusive writer per chunk, so a chunk's root generation follows from its
   height.
