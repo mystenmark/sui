@@ -69,6 +69,7 @@ fn chunk(
         height,
         checkpoint_seq: SEQ,
         digests,
+        aliases: Vec::new(),
         root: SharedAccess {
             id: ObjectId(support::ROOT),
             initial_shared_version: ISV,

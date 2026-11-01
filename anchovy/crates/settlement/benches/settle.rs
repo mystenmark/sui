@@ -231,6 +231,7 @@ fn bench_process(size: usize, effects: &[Vec<u8>]) {
             height,
             checkpoint_seq: height,
             digests: digests.clone(),
+            aliases: Vec::new(),
             root: SharedAccess {
                 id: ObjectId(support::ROOT),
                 initial_shared_version: ISV,

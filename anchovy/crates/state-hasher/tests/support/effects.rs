@@ -147,6 +147,7 @@ pub fn transaction(
         digest: messages::base::Hashed::of("TransactionData", &rng.bytes()),
         effects_digest: messages::base::Hashed::of("TransactionEffects", built.bytes),
         effects: Arc::from(built.bytes),
+        aliases: None,
     }
 }
 

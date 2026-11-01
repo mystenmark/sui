@@ -94,6 +94,7 @@ impl Processor for RandomnessGate {
                         transaction: ExecutableTransaction::System(system),
                         shared: vec![update.shared],
                         origin: None,
+                        aliases: None,
                         cancelled: Vec::new(),
                     },
                 );
@@ -109,6 +110,11 @@ impl Processor for RandomnessGate {
                     .entries
                     .iter()
                     .map(|e| e.transaction.digest())
+                    .collect(),
+                aliases: chunk
+                    .entries
+                    .iter()
+                    .filter_map(|e| Some((e.transaction.digest(), e.aliases.clone()?)))
                     .collect(),
                 root,
             };

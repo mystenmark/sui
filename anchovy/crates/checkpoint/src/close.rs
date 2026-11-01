@@ -144,6 +144,7 @@ impl EpochCloser {
                     transaction: ExecutableTransaction::System(transaction),
                     shared: close.shared,
                     origin: None,
+                    aliases: None,
                     cancelled: Vec::new(),
                 }],
             },
@@ -405,6 +406,7 @@ impl EpochCloser {
             digest,
             effects_digest: *effects.digest(),
             effects: effects.wire_bytes().into(),
+            aliases: None,
         }
     }
 

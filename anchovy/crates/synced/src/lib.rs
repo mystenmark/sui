@@ -494,6 +494,7 @@ impl SyncedScheduler {
                 digest,
                 effects_digest: executed,
                 effects: t.effects.bytes.into(),
+                aliases: None,
             });
         }
         if !running.synced.is_empty() {

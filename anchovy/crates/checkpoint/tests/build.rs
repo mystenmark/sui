@@ -94,6 +94,7 @@ impl Mainnet {
                 digest: *t.transaction.digest(),
                 effects_digest: t.effects.digest,
                 effects: Arc::from(t.effects.bytes),
+                aliases: None,
             })
             .collect()
     }

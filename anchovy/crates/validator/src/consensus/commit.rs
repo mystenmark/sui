@@ -49,8 +49,8 @@ use crate::epoch_store::ConsensusOutput;
 use crate::pipeline::backpressure::Backpressure;
 use crate::pipeline::chunk_lock::{ChunkLock, Cut};
 use crate::pipeline::items::{
-    Chunk, EpochClose, ExecutableTransaction, GateWaits, GatedChunk, OutputThrough, OutputWaits,
-    PendingCheckpoint, PendingUpdate, ScheduledEntry, SystemKind, SystemTransaction,
+    AliasVersions, Chunk, EpochClose, ExecutableTransaction, GateWaits, GatedChunk, OutputThrough,
+    OutputWaits, PendingCheckpoint, PendingUpdate, ScheduledEntry, SystemKind, SystemTransaction,
 };
 use crate::pipeline::keys::{
     AccumulatorVersion, CheckpointProgress, ChunkSettled, GateKey, StreamId, TxDigest,
@@ -77,6 +77,8 @@ pub struct HandledCommit<'b> {
     pub schedule: Schedule<'b>,
     /// Each scheduled user transaction's block and position, by digest.
     pub origins: containers::MessageMap<'b, Hashed, (BlockRef, TransactionIndex)>,
+    /// The aliases claim of each scheduled user transaction that has one.
+    pub aliases: containers::MessageMap<'b, Hashed, AliasVersions>,
     /// Transactions processed in earlier commits, or earlier in this one.
     pub duplicates: containers::Vec<'b, (BlockRef, TransactionIndex, TxDigest)>,
     /// Transactions deferred to a later round, in schedule order.
@@ -502,6 +504,7 @@ impl CommitHandler {
             index,
             transaction,
             owned,
+            aliases,
         } in commit.transactions
         {
             let digest = *transaction.get().0.digest();
@@ -524,15 +527,16 @@ impl CommitHandler {
                 continue;
             }
             taken.extend(owned.iter().map(|r| (*r, digest)));
-            locked.push((block, index, transaction));
+            locked.push((block, index, transaction, aliases));
         }
 
         // 3. Deduplicate against the transactions processed before, this
         //    handler's own record: `deduplicate_consensus_txns`.
         let mut accepted = containers::Vec::with_capacity_in(locked.len(), bump);
         let mut origins = containers::message_map(bump, locked.len());
+        let mut claims = containers::message_map(bump, locked.len());
         let mut duplicates = containers::Vec::new_in(bump);
-        for (block, index, transaction) in locked {
+        for (block, index, transaction, aliases) in locked {
             let digest = *transaction.get().0.digest();
             if self.output.is_processed(&digest) {
                 duplicates.push((block, index, digest));
@@ -540,6 +544,9 @@ impl CommitHandler {
             }
             self.output.set_processed(digest);
             origins.insert(digest, (block, index));
+            if let Some(aliases) = aliases {
+                claims.insert(digest, aliases);
+            }
             accepted.push(transaction);
         }
 
@@ -583,6 +590,9 @@ impl CommitHandler {
                 let hashed = *deferred.transaction.get().0.digest();
                 previously_deferred.insert(hashed, key);
                 origins.insert(hashed, deferred.origin);
+                if let Some(aliases) = deferred.aliases {
+                    claims.insert(hashed, aliases);
+                }
                 transactions.push(deferred.transaction);
             }
         }
@@ -653,6 +663,7 @@ impl CommitHandler {
                 .or_insert_with(|| containers::Vec::new_in(bump))
                 .push(Deferred {
                     origin,
+                    aliases: claims.remove(&hashed),
                     transaction,
                 });
         }
@@ -698,6 +709,7 @@ impl CommitHandler {
             commit_index: commit.commit_index,
             schedule,
             origins,
+            aliases: claims,
             duplicates,
             deferred: deferred_here,
             dropped,
@@ -1216,6 +1228,7 @@ impl CommitStage {
         let HandledCommit {
             mut schedule,
             origins,
+            mut aliases,
             dropped,
             state_digest,
             final_commit,
@@ -1258,10 +1271,10 @@ impl CommitStage {
         let mut entries = containers::Vec::with_capacity_in(transactions.len(), bump);
         let mut update = None;
         for (i, scheduled) in transactions.into_iter().enumerate() {
-            let (transaction, origin) = match scheduled {
+            let (transaction, origin, claim) = match scheduled {
                 Scheduled::Prologue(_) => {
                     let system = prologue_transaction.take().expect("one prologue");
-                    (ExecutableTransaction::System(system), None)
+                    (ExecutableTransaction::System(system), None, None)
                 }
                 Scheduled::AuthenticatorStateUpdate(keys) => {
                     let system = authenticator_state_update_transaction(
@@ -1271,7 +1284,7 @@ impl CommitStage {
                             .expect("the authenticator state exists"),
                         keys,
                     );
-                    (ExecutableTransaction::System(system), None)
+                    (ExecutableTransaction::System(system), None, None)
                 }
                 Scheduled::RandomnessStateUpdate(randomness) => {
                     update = Some(PendingUpdate {
@@ -1283,15 +1296,24 @@ impl CommitStage {
                     continue;
                 }
                 Scheduled::User(transaction) => {
-                    let origin = origins[transaction.get().0.digest()];
-                    (ExecutableTransaction::User(transaction), Some(origin))
+                    let digest = *transaction.get().0.digest();
+                    let origin = origins[&digest];
+                    let claim = aliases.remove(&digest);
+                    (
+                        ExecutableTransaction::User(transaction),
+                        Some(origin),
+                        claim,
+                    )
                 }
                 Scheduled::Cancelled(transaction, inputs) => {
-                    let origin = origins[transaction.get().0.digest()];
+                    let digest = *transaction.get().0.digest();
+                    let origin = origins[&digest];
+                    let claim = aliases.remove(&digest);
                     entries.push(ScheduledEntry {
                         transaction: ExecutableTransaction::User(transaction),
                         shared: Vec::new(),
                         origin: Some(origin),
+                        aliases: claim,
                         cancelled: inputs
                             .iter()
                             .map(|input| (input.id, input.marker))
@@ -1304,6 +1326,7 @@ impl CommitStage {
                 transaction,
                 shared: schedule.accesses(i).to_vec(),
                 origin,
+                aliases: claim,
                 cancelled: Vec::new(),
             });
         }

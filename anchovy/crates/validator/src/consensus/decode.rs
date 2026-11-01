@@ -26,7 +26,7 @@ use crate::consensus::dkg::{DkgPayload, DkgSetup, DkgTraffic};
 use crate::consensus::execution_time::{Key, SharedObservations, duration};
 use crate::consensus::jwk::JwkVote;
 use crate::epoch::EpochParams;
-use crate::pipeline::items::{BuiltWaitItem, BuiltWaits, CheckpointSignature};
+use crate::pipeline::items::{AliasVersions, BuiltWaitItem, BuiltWaits, CheckpointSignature};
 use crate::pipeline::keys::CheckpointBuilt;
 
 /// A commit to decode, from the epoch's consensus.
@@ -79,11 +79,13 @@ pub struct CommittedTransaction {
     pub transaction: VerifiedTransaction,
     /// The owned inputs it locks (see `owned_inputs_to_lock`).
     pub owned: OwnedInputs,
+    /// Its submitter's aliases claim (V2), if any.
+    pub aliases: Option<AliasVersions>,
 }
 
 impl CommittedTransaction {
     /// `transaction`, at `index` in `block`, whose submitter claimed the
-    /// inputs `immutable` immutable.
+    /// inputs `immutable` immutable, and no aliases.
     pub fn new(
         block: BlockRef,
         index: TransactionIndex,
@@ -97,6 +99,7 @@ impl CommittedTransaction {
             index,
             transaction,
             owned,
+            aliases: None,
         }
     }
 }
@@ -122,6 +125,15 @@ pub fn owned_inputs_to_lock(
             _ => None,
         })
         .collect())
+}
+
+/// The first `AddressAliasesV2` claim, as the reference's
+/// `TransactionWithClaims::aliases` finds it.
+pub fn claimed_aliases<'a>(claims: &[TransactionClaim<'a>]) -> Option<&'a [(u8, Option<u64>)]> {
+    claims.iter().find_map(|c| match c {
+        TransactionClaim::AddressAliasesV2(aliases) => Some(*aliases),
+        _ => None,
+    })
 }
 
 /// The first `ImmutableInputObjects` claim, as the reference's
@@ -240,16 +252,16 @@ impl CommitDecoder {
                     .as_mut()
                     .and_then(|entries| entries.get_mut(usize::from(index)))
                     .and_then(Option::take);
-                let (transaction, owned) = if let Some(entry) = entry {
+                let entry = if let Some(entry) = entry {
                     decoded.cache_hits += 1;
-                    (entry.transaction, entry.owned)
+                    entry
                 } else {
                     // Not voted on here, rejected here, or not a user
                     // transaction.
                     match decode_transaction(bytes, bump) {
                         Decoded::User(entry) => {
                             decoded.cache_misses += 1;
-                            (entry.transaction, entry.owned)
+                            entry
                         }
                         Decoded::CheckpointSignature(signature) => {
                             if self.signatures.is_some() {
@@ -287,8 +299,9 @@ impl CommitDecoder {
                 decoded.transactions.push(CommittedTransaction {
                     block: block.reference,
                     index,
-                    transaction,
-                    owned,
+                    transaction: entry.transaction,
+                    owned: entry.owned,
+                    aliases: entry.aliases,
                 });
             }
         }
@@ -386,10 +399,11 @@ fn decode_transaction(bytes: Vec<u8>, bump: &Bump) -> Decoded {
     if let Some(signature) = checkpoint_signature(&transaction) {
         return Decoded::CheckpointSignature(signature);
     }
-    let immutable = match transaction.get().kind() {
-        ConsensusTransactionKind::UserTransactionV2(user) => {
-            containers::vec_from_slice(bump, claimed_immutable(user.claims()))
-        }
+    let (immutable, aliases) = match transaction.get().kind() {
+        ConsensusTransactionKind::UserTransactionV2(user) => (
+            containers::vec_from_slice(bump, claimed_immutable(user.claims())),
+            claimed_aliases(user.claims()).map(<[_]>::to_vec),
+        ),
         ConsensusTransactionKind::ExecutionTimeObservation(observation) => {
             return Decoded::Observations(SharedObservations {
                 author: 0,
@@ -427,7 +441,12 @@ fn decode_transaction(bytes: Vec<u8>, bump: &Bump) -> Decoded {
             .into_user_transaction()
             .expect("a user transaction"),
     );
-    Decoded::User(CachedTransaction::new(transaction, &immutable, bump))
+    Decoded::User(CachedTransaction::new(
+        transaction,
+        &immutable,
+        aliases,
+        bump,
+    ))
 }
 
 impl Processor for CommitDecoder {

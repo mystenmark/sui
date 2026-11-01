@@ -23,7 +23,7 @@ use messages::object::Data;
 use messages::transaction::{SharedObjectMutability, TransactionKind};
 use validator::consensus::sequence::SharedAccess;
 use validator::epoch::EpochParams;
-use validator::pipeline::items::ChunkSettlement;
+use validator::pipeline::items::{AliasVersions, ChunkSettlement};
 use validator::pipeline::items::{
     EffectsWaitItem, Executable, ExecutableTransaction, ExecutedEffects, FundsCommand,
     InputCommand, InputValue, PendingCheckpoint, ReservationStatus, ScheduledEntry, Settle,
@@ -72,17 +72,23 @@ fn mutates_root(effects: &TransactionEffects<'_>) -> bool {
     })
 }
 
-fn to_executed(effects: &Effects) -> ExecutedEffects {
+/// `effects`, with its transaction's claim among the chunk's `aliases`.
+fn to_executed(effects: &Effects, aliases: &[(TxDigest, AliasVersions)]) -> ExecutedEffects {
     let view = effects.get();
     let digest = match &view.version {
         VersionedEffects::V1(v1) => *v1.transaction_digest,
         VersionedEffects::V2(v2) => *v2.transaction_digest,
     };
+    // The executor that wrote the effects named the digest it computed.
+    let digest = Hashed::computed(digest);
     ExecutedEffects {
-        // The executor that wrote the effects named the digest it computed.
-        digest: Hashed::computed(digest),
+        digest,
         effects_digest: *effects.digest(),
         effects: Arc::from(effects.wire_bytes()),
+        aliases: aliases
+            .iter()
+            .find(|(d, _)| *d == digest)
+            .map(|(_, a)| a.clone()),
     }
 }
 
@@ -431,7 +437,7 @@ impl SettlementScheduler {
             .iter()
             .chain(settlements)
             .chain([barrier])
-            .map(to_executed)
+            .map(|e| to_executed(e, &chunk.aliases))
             .collect();
         let count = all.len() as u64;
         self.chunks.insert(SettledChunk {
@@ -491,6 +497,7 @@ fn executable(
             }),
             shared: vec![SharedAccess { mutability, ..root }],
             origin: None,
+            aliases: None,
             cancelled: Vec::new(),
         },
         inputs: Vec::new(),

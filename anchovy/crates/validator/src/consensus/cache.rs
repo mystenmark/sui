@@ -12,6 +12,7 @@ use ::consensus::BlockRef;
 
 use crate::checks::VerifiedTransaction;
 use crate::consensus::decode::{OwnedInputs, owned_inputs_to_lock};
+use crate::pipeline::items::AliasVersions;
 
 /// A block's decoded transactions, by index: a user transaction whose
 /// validity and signatures were checked, or `None` for any other.
@@ -22,18 +23,24 @@ pub type BlockEntries = Vec<Option<CachedTransaction>>;
 pub struct CachedTransaction {
     pub transaction: VerifiedTransaction,
     pub owned: OwnedInputs,
+    pub aliases: Option<AliasVersions>,
 }
 
 impl CachedTransaction {
     /// `transaction`, whose submitter claimed the inputs `immutable`
-    /// immutable.
+    /// immutable, and `aliases`, if it claimed them.
     pub fn new(
         transaction: VerifiedTransaction,
         immutable: &[messages::base::ObjectId],
+        aliases: Option<AliasVersions>,
         bump: &containers::Bump,
     ) -> CachedTransaction {
         let owned = owned_inputs_to_lock(&transaction, immutable, bump);
-        CachedTransaction { transaction, owned }
+        CachedTransaction {
+            transaction,
+            owned,
+            aliases,
+        }
     }
 }
 

@@ -918,6 +918,7 @@ mod tests {
                 }),
                 shared: vec![],
                 origin: None,
+                aliases: None,
                 cancelled: Vec::new(),
             },
             inputs: vec![],

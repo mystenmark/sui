@@ -64,6 +64,12 @@ pub enum SystemKind {
     RandomnessStateUpdate { round: u64 },
 }
 
+/// Each required signer's signature index, and the version of its
+/// `AddressAliases` object the signature was verified under: a user
+/// transaction's aliases claim (the reference's `aliases()`). Checkpoint
+/// contents list the signatures so.
+pub type AliasVersions = Vec<(u8, Option<u64>)>;
+
 /// A scheduled transaction with its shared accesses and, for a user
 /// transaction, where consensus put it.
 #[derive(Debug)]
@@ -71,6 +77,8 @@ pub struct ScheduledEntry {
     pub transaction: ExecutableTransaction,
     pub shared: Vec<SharedAccess>,
     pub origin: Option<(BlockRef, TransactionIndex)>,
+    /// A user transaction's aliases claim, if its submitter made one.
+    pub aliases: Option<AliasVersions>,
     /// A transaction cancelled for congestion: each consensus object input
     /// and the marker version it reads as instead (then `shared` is empty).
     pub cancelled: Vec<(ObjectId, u64)>,
@@ -148,6 +156,8 @@ pub struct ChunkSettlement {
     pub checkpoint_seq: u64,
     /// The chunk's transactions' digests, in schedule order.
     pub digests: Vec<TxDigest>,
+    /// The aliases claims of the chunk's transactions that have one.
+    pub aliases: Vec<(TxDigest, AliasVersions)>,
     /// The accumulator root generation the chunk's settlement reads: its
     /// settlements write it non-exclusively, its barrier exclusively.
     pub root: SharedAccess,
@@ -342,6 +352,8 @@ pub struct ExecutedEffects {
     pub effects_digest: TxDigest,
     /// `TransactionEffects` BCS.
     pub effects: Arc<[u8]>,
+    /// The transaction's aliases claim, for checkpoint contents.
+    pub aliases: Option<AliasVersions>,
 }
 
 /// A settled chunk: its effects in checkpoint order (causal order, the
