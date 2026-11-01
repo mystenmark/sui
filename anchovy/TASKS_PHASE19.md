@@ -109,7 +109,9 @@ executor, the chunk lock, a fast path):
     is released.
   - Known gaps: a writer of an ended stream named as a dependency
     (mainnet only) is untested in compat. Anchovy's RPC rejects a
-    transaction whose shared input was deleted; sui's accepts it.
+    transaction whose shared input was deleted, where sui's accepts it:
+    intended, since accepting them was only needed under consistent
+    broadcast locking. Execution still handles them from other validators.
 
 ## Left out / later
 
