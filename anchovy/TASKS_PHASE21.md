@@ -35,37 +35,29 @@ uses only the approved crates.
   inputs into withdrawals, so linkage analysis looked up the masked id as an
   object. The rewrite now happens as the reference's: the field is read at
   the commit's accumulator version, and the owner must be the sender.
-- [ ] Fork 3, object funds:
-  - At 138 off mainnet (`check_object_funds_withdraw_in_execution`), an
-    object balance withdrawal is checked in execution against the settled
-    balance at the chunk's root version, less the net withdrawals of earlier
-    transactions not yet settled. Anchovy passes an empty view, so it allows
-    withdrawals sui rejects, and a later settlement underflows.
-  - A transaction can also read the root at its version before the previous
-    chunk's barrier has written it (an undeclared dependency).
-  - Design, as sui's current one (#27840, read on its `main`):
-    - **Unsettled withdrawals.** An in-memory table of net withdrawals by
-      (account, root version), recorded when a transaction executes, by
-      either path, and released when its checkpoint commits. It needs no
-      persistence: whatever survives a crash was settled.
-    - **Blocking.** Execution blocks on the root at its version until a
-      barrier writes it.
-    - **Causal admission.** Each chunk transaction gets index (height, i);
-      settlements and barriers get none and bypass admission. Whoever creates
-      a chunk (the gate, or a synced split) registers its length before its
-      transactions can reach the executor, so the consecutive successor is
-      known: (h, len-1) is followed by (h+1, 0). The epoch's change-epoch
-      transaction is a one-transaction unit at the last height + 1.
-      Admission takes a transaction when fewer than K are in flight, or when
-      its index is the watermark's successor (at most one over the limit),
-      on K+1 executor workers. The chunk lock already gives each chunk one
-      source, which is sui's accumulator-version deduplication.
-  - Steps:
-    - [ ] the unsettled withdrawals table;
-    - [ ] execution state per worker (today one arena and runtime behind a
-      lock);
-    - [ ] causal admission and the executor pool;
-    - [ ] blocking on the root's version.
+- [x] Fork 3, object funds:
+  - At 138 off mainnet, sui checks object balance withdrawals in execution:
+    against the settled balance at the chunk's root version, less the net
+    withdrawals of earlier transactions not yet settled.
+  - Built as sui's current design (#27840, read on its `main`):
+    - [x] the unsettled withdrawals table, recorded on execution and
+      released at checkpoint commit;
+    - [x] native execution state per concurrent execution;
+    - [x] causal admission and the executor pool: (height, position) indices
+      with registered chunk lengths; settlements and barriers on a worker of
+      their own;
+    - [x] execution blocks on the root's version (`RootVersions`).
+- [x] Fork 4, root reads: a declared read of the accumulator root in a
+  commit's later chunk read the first chunk's generation. Sui assigns the
+  root's next version, which each chunk's settlement advances.
+- [x] Fork 5, funds versions: anchovy reserved and settled funds per commit.
+  Sui does it per chunk (its accumulator version is the root's), so a split
+  commit's later chunk saw an earlier chunk's reserved maximum instead of
+  what it withdrew. Versions are now root versions, settled per chunk;
+  `last_of_commit` went.
+- [x] The reference oracle (testing builds) rewrites coin reservations too.
+- [x] The composite test passes: 9 of 9 runs since the funds fix, 2 of them
+  with the oracle.
 - [ ] Then: submitting through `LocalValidatorAggregatorProxy` with
   amplification, so anchovy's RPC takes a share of submissions directly;
   epoch changes under load.
@@ -81,6 +73,6 @@ uses only the approved crates.
   139-141 change execution (forwarding addresses, vector natives,
   references in PTBs, shuffled commit blocks, batched settlements). Catching
   up is the next phase; compat networks start at the highest version.
-- The reference oracle in `Execution::execute_at` (testing builds) doesn't
-  rewrite coin reservations, so it would disagree with anchovy's executor on
-  such transactions.
+- Sui's own writeback cache sometimes fails its consistency check on the
+  accumulator root under the composite workload, at our base: a node's
+  execution task panics. Anchovy is unaffected and the test still passes.
