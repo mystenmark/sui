@@ -12,7 +12,7 @@
 //! owned input an earlier one locked, and schedules the rest (`sequence`:
 //! the prologue, the protocol's order, shared-object ordinals).
 //! `CommitStage` lays the schedule out in chunks and checkpoints for the
-//! pipeline. Congestion control is not here yet.
+//! pipeline.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -1928,8 +1928,9 @@ fn indirect_state_digest(estimates_us: impl IntoIterator<Item = u64>) -> [u8; 32
 }
 
 /// `prologue`'s `ConsensusCommitPrologueV4`, as the reference's
-/// `create_consensus_commit_prologue_transaction`: no cancelled transactions,
-/// and `additional_state_digest` over the commits through this one.
+/// `create_consensus_commit_prologue_transaction`, listing the commit's
+/// `cancelled` transactions, and `additional_state_digest` over the commits
+/// through this one.
 pub fn prologue_transaction(
     prologue: &Prologue,
     additional_state_digest: &[u8; 32],

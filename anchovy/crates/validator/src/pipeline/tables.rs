@@ -185,8 +185,7 @@ pub struct BuiltCheckpoint {
     /// The epoch's rolling gas cost: computation, storage, rebate,
     /// non-refundable.
     pub epoch_rolling_gas: [u64; 4],
-    /// Its last chunk's height, and its timestamp: where a restart's chunks
-    /// and checkpoint intervals continue from.
+    /// Its last chunk's height.
     pub last_height: u64,
     pub timestamp_ms: u64,
     /// Whether it is the epoch's last checkpoint.

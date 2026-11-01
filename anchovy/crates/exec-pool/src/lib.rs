@@ -70,8 +70,7 @@ use workqueue::{Processor, PushError, Queue, Sink};
 /// `get_or_record` keeps generation 0 consistent if several run.
 ///
 /// Each transaction runs with its chunk's accumulator root version
-/// (`Executable::root_version`), as the reference assigns it. Not yet:
-/// cancelled transactions do not exist yet.
+/// (`Executable::root_version`), as the reference assigns it.
 ///
 /// Inward:
 /// - input waiter, ready: `Vec<Executable>`.
@@ -864,7 +863,6 @@ impl Sink<Vec<EffectsWaitItem>> for EffectsRouter {
     }
 }
 
-/// The executed transaction's results, read back from the store.
 #[cfg(test)]
 mod tests {
     use messages::base::ObjectId;
