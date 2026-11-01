@@ -1,78 +1,83 @@
 # Phase 20: simplification audit
 
-An audit after phase 19, to remove complexity left by trial and error, and
-check that the waiter pattern is used where it should be. The candidates
-below were checked against the code. Nothing has been changed yet.
+An audit after phase 19, to remove complexity left by trial and error and
+to check that the waiter pattern is used where it should be. The
+candidates were checked against the code before being changed.
 
 ## Waiter pattern
 
-- [ ] **The randomness gate checks a table the synced scheduler owns.**
-  `RandomnessGate::release` reads `ChunkLock::held`, and
-  `GateInput::Released` is a wake-up signal with no data. Proposal: chunks
-  pass through a waiter on `ChunkFree(height)` (available when the lock
-  doesn't hold the chunk; announced by the synced scheduler on release)
-  and `RoundBytes(round)` (announced by the signature collector). The gate
-  then only puts chunks back in height order and inserts the update.
-  `Released`, the gate's `chunk_lock`, and its private bytes table go away.
-- [ ] **The aggregator's fork-check wait is a no-op.** It certifies the
-  local summary, so `BuiltWaitItem::Certified`'s `check_fork` can never
-  fail. Merge it with `Synced`: one `Certified` item, fork-checked and then
-  sent to the committer, so the aggregator stops sending to the committer
-  directly.
-- [ ] Borderline, keep unless asked:
-  - backpressure's parked oneshots: an either/or condition that mirrors
-    the reference;
+- [x] **The gate waiter.** Chunks wait on `GateKey::ChunkFree(height)`,
+  available once the chunk lock doesn't hold the chunk and resolved by the
+  synced scheduler after it releases it. A chunk headed by a randomness
+  update also waits on `RoundBytes(round)`, available once the epoch store
+  records the bytes and resolved by the signature collector. The gate now
+  only puts chunks back in height order and inserts the update. Removed:
+  `GateInput` (`Released`, `Bytes`, `Waiting`), the gate's chunk-lock check
+  and bytes table, and the p2p stuck-round fetcher, which the synced
+  scheduler's verified round feeding covers.
+- [x] **The aggregator's fork check is removed.** It was a no-op: the
+  certificate is made over the local summary. Synced checkpoints keep
+  theirs.
+- Borderline, kept:
+  - backpressure's parked oneshots: an either/or condition that mirrors the
+    reference;
   - the epoch closer's `closing` handshake with the state hasher;
-  - p2p polling the gate for a stuck round;
   - `submit_blocking` on consensus's lane.
 
 ## Dead or leftover
 
-- [ ] The perpetual `state_sync` queue: production drains it and throws it
-  away ("No state sync yet"). Tests use it to see what anchovy certified.
-  They need another probe.
-- [ ] The p2p stuck-round fetcher (`fetch_missing`, `GateInput::Waiting`)
-  overlaps the synced scheduler's verified round feeding. Uncertain: it's
-  the only backstop for a round outside the collector's window. Remove only
-  if the compat restart and lagging tests pass without it.
-- [ ] `Executable.resolved_base` and `Executable.height` are never read
-  outside tests.
-- [ ] `checks::InputsChecked`, `check_inputs` and `InputsCheckedTransaction`
-  have had no callers since `InputChecker` was removed.
-- [ ] `Store::clear_uncommitted` and `write_through` are test-only, and so
-  are several `HandledCommit` stats fields.
-- [ ] Stale comments and docs: "congestion control is not here yet",
-  "cancelled transactions do not exist yet", "No state sync yet", and
-  `consensus_pipeline.md`'s "Not covered yet" and `InputChecker`
-  references.
+- [x] `Executable.resolved_base` and `height`: never read outside tests. The
+  resolver bench recorded generations at a version it didn't store (broken
+  since phase 19); now fixed, with new numbers.
+- [x] `checks::InputsChecked` and `check_inputs`; the stale `InputChecker`
+  mentions.
+- [x] Stale comments and docs, including `consensus_pipeline.md`'s "Not
+  covered yet".
+- Kept: the perpetual certified-checkpoint queue. It is the tests' only view
+  of what anchovy's own aggregator certified: compat's agreement checks and
+  the consensus-glue epoch chain. Its comment in `main.rs` now says so.
+- Kept: `Store::clear_uncommitted` and `write_through`, and `HandledCommit`'s
+  stats fields, all test-only. They cost nothing in production, and gating
+  them would add feature plumbing across crates.
 
 ## Duplication
 
-- [ ] `Chunk` and `ChunkSettlement` repeat five fields, and a `digests`
-  vector runs in parallel with `entries` from `decide` to the gate. The gate
-  could build the settlement from the chunk.
-- [ ] Synced contents are verified again (the digest recomputed) in
-  `split`, `executed` and, per ended-stream input, `deleter`. Parse
-  verified bytes without the check.
-- [ ] The change-epoch case in `synced::split` repeats the chunk loop.
-- [ ] Settlement's `Pending.base` copies `chunk.root.base`. The
-  `SharedAccess` → `InputKey` mapping is written in two crates.
-- [ ] The beacon takes two paths: the group key goes separately from
-  `BeaconEvent`, restore and per-commit DKG handling are separate, and
-  `handle_dkg` decodes bytes `Dkg::handle` just encoded.
-- [ ] The commit handler builds its estimator twice (`new`, then
-  `with_stored_observations`). The last commit index is tracked in three
-  places.
-- [ ] The `push` helper is copied six times; it should become one in
-  `workqueue`.
-- [ ] Builder `Option`s that production always sets (`chunk_lock`,
-  `backpressure`, `fork_checks`, `epoch_closer`) exist only so tests can
-  leave them out.
-- [ ] Hand-written tuple codecs (`CommitRecord`, `BuiltCheckpoint`,
-  generation values) could derive serde, with the same BCS bytes.
-- [ ] `ObjectId::from_u16(0xacc)` is defined five times.
-
-## Rule violations found on the way
-
-- [ ] `synced::contents::chunk_ends` and `item::executable` build std
-  `Vec` temporaries; per the PRD these should come from the arena.
+- [x] The gate builds each chunk's `ChunkSettlement` from the chunk.
+  `GatedChunk` carries `last_of_commit`, `root` and the update. The commit
+  stage no longer threads a digests vector beside the entries, and two lint
+  suppressions went with it.
+- [x] Synced contents are verified once, on fetch, and parsed after that.
+  Chunk ends come from the arena.
+- [x] `SharedAccess::input_key` is the single mapping from a shared access to
+  its key, used by the resolver, settlement and the exec-pool tests.
+  Settlement no longer keeps a copy of the base.
+- [x] The beacon: the group key is a `BeaconEvent`, emitted on completion and
+  on restore. `with_beacon(beacon, party)` replaces `with_beacon` and
+  `with_party`. `key_sent`, `send_group_key` and `dkg_status` are removed.
+- [x] `Queue::push` replaces six copies of the `push` helper and a dozen
+  inline full-queue panics.
+- [x] `CommitRecord`, `BuiltCheckpoint` and generation values derive their
+  BCS encoding, with the same bytes as before.
+- [x] The accumulator root's id is defined once, in `messages::tx_index`.
+  The executor family keeps its own, as ported code.
+- [x] `EffectsWaitItem::Settlement(SettlementInput)` replaces two variants
+  that mirrored it.
+- [x] A commit after certificates close clears its observations, JWK votes
+  and capabilities once, instead of four checks.
+- Not done:
+  - **The change-epoch case in `synced::split`.** Its panicking deleter
+    states that change-epoch never reads an ended stream; folding it into
+    the chunk loop would lose that.
+  - **The commit handler builds its estimator twice at start-up.** Passing
+    stored observations to `new` would touch every constructor call for
+    about five lines.
+  - **The last commit index is tracked in three places.** The handler's own
+    skip is relied on by its tests.
+  - **Builder `Option`s that production always sets.** Requiring them would
+    push constructors past the argument limit, and each costs only one
+    branch.
+  - **`Executable` as an enum of consensus and synced items.** A medium
+    change across four crates, worth doing only alongside other changes
+    there.
+  - **Two low-value items:** `FundsReserver.owners`, and the epoch closer
+    seeing every built checkpoint.
