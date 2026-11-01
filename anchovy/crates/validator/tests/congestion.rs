@@ -280,7 +280,7 @@ fn the_prologue_lists_cancelled_transactions() {
     let decided = stage
         .decide(commit(1, 1, &[&first, &second]), &bump)
         .unwrap();
-    let entries = &decided.chunks[0].entries;
+    let entries = &decided.chunks[0].chunk.entries;
     let ExecutableTransaction::System(prologue) = &entries[0].transaction else {
         panic!("the prologue first");
     };

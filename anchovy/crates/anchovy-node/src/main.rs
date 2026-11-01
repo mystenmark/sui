@@ -30,7 +30,8 @@ fn main() -> anyhow::Result<()> {
     let running = anchovy_node::start(&config, &runtime)?;
     tracing::info!(address = %config.network_address, "anchovy is running");
     runtime.block_on(async {
-        // No state sync yet: certified checkpoints are let go.
+        // The certified checkpoints this node's aggregator makes are a
+        // probe for tests; serving peers reads the store.
         let mut drain = tokio::time::interval(Duration::from_secs(1));
         let mut node = running.node;
         loop {

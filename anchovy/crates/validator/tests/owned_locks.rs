@@ -671,7 +671,7 @@ fn the_stage_leaves_dropped_transactions_out_of_its_chunks() {
         decided
             .chunks
             .iter()
-            .flat_map(|c| &c.entries)
+            .flat_map(|c| &c.chunk.entries)
             .filter_map(|e| match &e.transaction {
                 ExecutableTransaction::User(t) => Some(digest_of(t)),
                 ExecutableTransaction::System(_) => None,
@@ -685,12 +685,6 @@ fn the_stage_leaves_dropped_transactions_out_of_its_chunks() {
     assert!(users(&decided).is_empty());
     let next = stage.decide(commit(2, &[]), &bump).unwrap();
     assert_eq!(users(&next), vec![digest(&first)]);
-    assert!(
-        decided
-            .settlements
-            .iter()
-            .all(|s| !s.digests.contains(&digest(&second)))
-    );
     assert_eq!(decided.dropped.len(), 1);
     assert_eq!(decided.dropped[0].2, digest(&second));
 }

@@ -265,7 +265,7 @@ fn outputs(
 fn the_collector_signs_and_aggregates_with_its_shares() {
     use fastcrypto_tbls::tbls::ThresholdBls;
     use fastcrypto_tbls::types::ThresholdBls12381MinSig;
-    use validator::pipeline::items::GateInput;
+    use validator::pipeline::keys::GateKey;
     use validator::randomness::{
         BeaconInput, SendSignaturesRequest, SignatureCollector, signature_message,
     };
@@ -324,7 +324,10 @@ fn the_collector_signs_and_aggregates_with_its_shares() {
             taken,
         },
     );
-    let Some(GateInput::Bytes { round: 0, bytes }) = gate_inbox.try_pop() else {
+    let Some(waiter::Command::Resolve(mut resolved)) = gate_inbox.try_pop() else {
+        panic!("round 0's bytes");
+    };
+    let Some((GateKey::RoundBytes(0), Some(bytes))) = resolved.pop() else {
         panic!("round 0's bytes");
     };
     let sig: fastcrypto::groups::bls12381::G1Element = bcs::from_bytes(&bytes).unwrap();

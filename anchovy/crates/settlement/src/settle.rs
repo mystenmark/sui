@@ -24,11 +24,10 @@ use messages::effects::{
     AccumulatorOperation, AccumulatorValue, IdOperation, ObjectOut, TransactionEffects,
     VersionedEffects,
 };
+use messages::tx_index::SUI_ACCUMULATOR_ROOT_OBJECT_ID;
 use messages::type_tag::TypeTag as TypeTagView;
 use serde::Serialize;
 
-/// `SUI_ACCUMULATOR_ROOT_OBJECT_ID`.
-pub const ACCUMULATOR_ROOT: ObjectId = ObjectId::from_u16(0xacc);
 /// `SUI_FRAMEWORK_ADDRESS`.
 const FRAMEWORK: [u8; 32] = ObjectId::from_u16(0x2).0;
 const SETTLEMENT_MODULE: &str = "accumulator_settlement";
@@ -92,7 +91,7 @@ impl Ptb {
     fn new(mutability: SharedObjectMutability, initial_shared_version: u64) -> Ptb {
         Ptb {
             inputs: vec![CallArg::Object(ObjectArg::SharedObject {
-                id: ObjectIdB(AccountAddress(ACCUMULATOR_ROOT.0)),
+                id: ObjectIdB(AccountAddress(SUI_ACCUMULATOR_ROOT_OBJECT_ID.0)),
                 initial_shared_version: SequenceNumber(initial_shared_version),
                 mutability,
             })],

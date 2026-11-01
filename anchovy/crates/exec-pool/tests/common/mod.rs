@@ -263,21 +263,30 @@ impl Node {
     pub fn executable(
         &self,
         transaction: VerifiedTransaction,
-        shared: Vec<SharedAccess>,
+        mut shared: Vec<SharedAccess>,
         resolved_base: Vec<(StreamId, u32, u32)>,
     ) -> Executable {
+        // As the commit handler links them.
+        for (stream, round, writes_before) in resolved_base {
+            if let Some(access) = shared.iter_mut().find(|a| {
+                a.id == stream.id && a.initial_shared_version == stream.initial_shared_version
+            }) {
+                access.base = Some(SharedOrdinal {
+                    round,
+                    writes_before,
+                });
+            }
+        }
         let mut executable = Executable {
             version: AccumulatorVersion(1),
             root_version: 1,
             reserved: Vec::new(),
-            height: 0,
             entry: ScheduledEntry {
                 transaction: ExecutableTransaction::User(transaction),
                 shared,
                 origin: None,
                 cancelled: Vec::new(),
             },
-            resolved_base,
             inputs: Vec::new(),
             synced: None,
         };
@@ -396,34 +405,12 @@ pub fn keys(executable: &Executable) -> Vec<InputKey> {
         unreachable!()
     };
     // Shared accesses first, as the resolver keys them.
-    let mut keys = Vec::new();
-    for access in &executable.entry.shared {
-        let stream = StreamId {
-            id: access.id,
-            initial_shared_version: access.initial_shared_version,
-        };
-        let SharedOrdinal {
-            round,
-            writes_before,
-        } = access.ordinal;
-        keys.push(if writes_before > 0 {
-            InputKey::Generation {
-                stream,
-                round,
-                generation: writes_before,
-            }
-        } else if let Some((_, round, generation)) =
-            executable.resolved_base.iter().find(|(s, ..)| *s == stream)
-        {
-            InputKey::Generation {
-                stream,
-                round: *round,
-                generation: *generation,
-            }
-        } else {
-            InputKey::StreamLive(stream)
-        });
-    }
+    let mut keys: Vec<_> = executable
+        .entry
+        .shared
+        .iter()
+        .map(SharedAccess::input_key)
+        .collect();
     keys.extend(
         transaction
             .get()

@@ -16,9 +16,9 @@ use validator::checks;
 use validator::pipeline::items::{Executable, ExecutableTransaction, ScheduledEntry, Synced};
 use validator::pipeline::keys::{AccumulatorVersion, InputKey, StreamId};
 
-/// The executable for certified transaction `t` of the chunk at `height`,
-/// whose transactions read the accumulator root at `root_version`, with its
-/// input keys left in `keys` (`packages` is scratch).
+/// The executable for certified transaction `t`, of a chunk whose
+/// transactions read the accumulator root at `root_version`, with its input
+/// keys left in `keys` (`packages` is scratch).
 ///
 /// Its consensus objects come at the input versions its effects record
 /// (R4.3): those it declares, if a user transaction, else all of them.
@@ -26,7 +26,6 @@ use validator::pipeline::keys::{AccumulatorVersion, InputKey, StreamId};
 /// consensus object's stream at a version.
 pub fn executable(
     t: &ExecutionData<'_>,
-    height: u64,
     root_version: u64,
     deleter: impl Fn(&ObjectId, u64, &[TransactionDigest]) -> [u8; 32],
     keys: &mut Vec<InputKey>,
@@ -113,14 +112,12 @@ pub fn executable(
         version: AccumulatorVersion(0),
         root_version,
         reserved: Vec::new(),
-        height,
         entry: ScheduledEntry {
             transaction: ExecutableTransaction::User(checks::certified(transaction)),
             shared: Vec::new(),
             origin: None,
             cancelled,
         },
-        resolved_base: Vec::new(),
         inputs: Vec::new(),
         synced: Some(Box::new(Synced {
             effects: t.effects.digest,

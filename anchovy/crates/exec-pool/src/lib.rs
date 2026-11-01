@@ -28,15 +28,16 @@ use validator::pipeline::keys::{AccumulatorVersion, EffectsKey, InputKey, Stream
 use validator::pipeline::tables::{Generation, GenerationTable};
 use validator::state_sync::SyncedInput;
 use waiter::{Availability, Command};
-use workqueue::{Processor, PushError, Queue, Sink};
+use workqueue::{Processor, Queue, Sink};
 
 /// Executes ready transactions. Resolves each shared access to an exact
 /// version from the generation table, executes, commits the outputs,
 /// records each generation it produced, then notifies.
 ///
 /// - **Resolving.** Generation `k > 0` of a round is the version its writer
-///   produced. Generation 0 is the earlier round's generation the resolver
-///   gave (`resolved_base`) or, for a stream it had none for, the version
+///   produced. Generation 0 is the earlier round's generation the commit
+///   handler linked it to (`SharedAccess::base`) or, for a stream it had none
+///   for, the version
 ///   the stream starts the epoch at (`Store::start_version`), recorded as
 ///   generation 0 of the round by the first transaction to read it. Invariant: the round's writer of generation 0
 ///   records it before it commits, so a reader finding no entry has seen no
@@ -69,8 +70,7 @@ use workqueue::{Processor, PushError, Queue, Sink};
 /// `get_or_record` keeps generation 0 consistent if several run.
 ///
 /// Each transaction runs with its chunk's accumulator root version
-/// (`Executable::root_version`), as the reference assigns it. Not yet:
-/// cancelled transactions do not exist yet.
+/// (`Executable::root_version`), as the reference assigns it.
 ///
 /// Inward:
 /// - input waiter, ready: `Vec<Executable>`.
@@ -748,14 +748,6 @@ fn produced(
     }
 }
 
-/// Pushes `item` to a queue inside the pipeline, where a full queue is a
-/// sizing bug; a closed one means the pipeline is shutting down.
-fn push<T>(queue: &Queue<T>, item: T, name: &str) {
-    if let Err(PushError::Full(_)) = queue.try_push(item) {
-        panic!("the {name} queue refused work");
-    }
-}
-
 impl Processor for Executor {
     type Input = Vec<Executable>;
     type Output = ();
@@ -775,25 +767,16 @@ impl Processor for Executor {
         }
         // Everything is committed and recorded: now the keys are visible.
         if !resolved_keys.is_empty() {
-            push(
-                &self.inputs,
-                Command::Resolve(resolved_keys),
-                "input waiter",
-            );
+            self.inputs
+                .push(Command::Resolve(resolved_keys), "input waiter");
         }
         if !effects_keys.is_empty() {
-            push(
-                &self.effects,
-                Command::notify(effects_keys),
-                "effects waiter",
-            );
+            self.effects
+                .push(Command::notify(effects_keys), "effects waiter");
         }
         if !deposits.is_empty() {
-            push(
-                &self.funds,
-                FundsCommand::Settle(deposits),
-                "funds reserver",
-            );
+            self.funds
+                .push(FundsCommand::Settle(deposits), "funds reserver");
         }
         None
     }
@@ -840,30 +823,19 @@ impl Sink<Vec<EffectsWaitItem>> for EffectsRouter {
                 EffectsWaitItem::Executed(reply) => {
                     let _ = reply.send(());
                 }
-                EffectsWaitItem::ChunkExecuted(chunk) => push(
-                    &self.settlement,
-                    SettlementInput::ChunkExecuted(chunk),
-                    "settlement",
-                ),
-                EffectsWaitItem::SettlementExecuted { height, digests } => push(
-                    &self.settlement,
-                    SettlementInput::SettlementExecuted { height, digests },
-                    "settlement",
-                ),
-                EffectsWaitItem::ChangeEpochExecuted => push(
-                    &self.epoch_closer,
-                    EpochCloserInput::ChangeEpochExecuted,
-                    "epoch closer",
-                ),
+                EffectsWaitItem::Settlement(input) => self.settlement.push(input, "settlement"),
+                EffectsWaitItem::ChangeEpochExecuted => self
+                    .epoch_closer
+                    .push(EpochCloserInput::ChangeEpochExecuted, "epoch closer"),
                 EffectsWaitItem::SyncedExecuted(seq) => {
-                    push(&self.synced, SyncedInput::Executed(seq), "synced scheduler");
+                    self.synced
+                        .push(SyncedInput::Executed(seq), "synced scheduler");
                 }
             }
         }
     }
 }
 
-/// The executed transaction's results, read back from the store.
 #[cfg(test)]
 mod tests {
     use messages::base::ObjectId;
@@ -938,7 +910,6 @@ mod tests {
                     version,
                 })
                 .collect(),
-            height: 0,
             entry: ScheduledEntry {
                 transaction: ExecutableTransaction::System(SystemTransaction {
                     kind: SystemKind::Barrier { height: 0 },
@@ -949,7 +920,6 @@ mod tests {
                 origin: None,
                 cancelled: Vec::new(),
             },
-            resolved_base: vec![],
             inputs: vec![],
             synced: None,
         }

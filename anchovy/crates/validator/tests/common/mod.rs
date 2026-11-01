@@ -250,7 +250,6 @@ pub fn current(
     let (client, normal, priority) = consensus::TransactionClient::new(16);
     let (effects, effects_inbox) = workqueue::queue(16);
     let (beacon, beacon_inbox) = workqueue::queue(16);
-    let (randomness_gate, gate_inbox) = workqueue::queue(16);
     let (checkpoint_queries, queries_inbox) = workqueue::queue(16);
     let (checkpoint_sync, sync_inbox) = workqueue::queue(16);
     let current = CurrentEpoch::new();
@@ -266,7 +265,6 @@ pub fn current(
         beacon,
         network_keys: Vec::new(),
         p2p_addresses: Vec::new(),
-        randomness_gate,
         checkpoint_queries,
         checkpoint_sync,
     }));
@@ -277,7 +275,6 @@ pub fn current(
             priority,
             effects_inbox,
             beacon_inbox,
-            gate_inbox,
             queries_inbox,
             sync_inbox,
         ),

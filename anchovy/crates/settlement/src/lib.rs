@@ -29,25 +29,16 @@ use validator::pipeline::items::{
     InputCommand, InputValue, PendingCheckpoint, ReservationStatus, ScheduledEntry, Settle,
     SettledChunk, SettlementInput, SystemKind, SystemTransaction, Withdrawal,
 };
-use validator::pipeline::keys::{
-    AccumulatorVersion, ChunkSettled, EffectsKey, InputKey, StreamId, TxDigest,
-};
+use validator::pipeline::keys::{AccumulatorVersion, ChunkSettled, EffectsKey, InputKey, TxDigest};
 use validator::pipeline::tables::ChunkTable;
 use waiter::{Command, WaitBatch};
 use workqueue::{Processor, Queue};
 
 use crate::funds::{Ledger, Ticket};
-use crate::settle::{ACCUMULATOR_ROOT, SettlementBuilder};
+use crate::settle::SettlementBuilder;
+use messages::tx_index::SUI_ACCUMULATOR_ROOT_OBJECT_ID;
 
 type Effects = Message<TransactionEffects<'static>>;
-
-/// A full queue is a sizing bug; a closed one means the pipeline is shutting
-/// down.
-fn push<W>(queue: &Queue<W>, item: W, to: &str) {
-    if let Err(workqueue::PushError::Full(_)) = queue.try_push(item) {
-        panic!("the {to} queue refused work");
-    }
-}
 
 /// The executed effects of `digest`, which its waiter released: this
 /// validator's own.
@@ -75,7 +66,7 @@ fn mutates_root(effects: &TransactionEffects<'_>) -> bool {
         return false;
     };
     v2.changed_objects.iter().any(|c| {
-        *c.id == ACCUMULATOR_ROOT
+        *c.id == SUI_ACCUMULATOR_ROOT_OBJECT_ID
             && matches!(c.input_state, ObjectIn::Exist { .. })
             && matches!(c.output_state, ObjectOut::ObjectWrite(..))
     })
@@ -120,13 +111,6 @@ enum Stage {
     },
 }
 
-struct Pending {
-    /// For a chunk reading the root's generation 0 of its round: the
-    /// previous chunk's barrier generation, (round, generation).
-    base: Option<(u32, u32)>,
-    stage: Stage,
-}
-
 /// One chunk at a time, in height order: waits for the chunk's effects,
 /// orders them causally (the prologue first, as checkpoints order them),
 /// builds the settlement transactions (accumulator root, non-exclusive
@@ -147,8 +131,8 @@ struct Pending {
 ///   (once for the settlement transactions, once for the barrier).
 ///
 /// Outward:
-/// - effects waiter, wait for: `EffectsWaitItem::ChunkExecuted` keyed by the
-///   chunk's transactions, and `EffectsWaitItem::SettlementExecuted` keyed by
+/// - effects waiter, wait for: `SettlementInput::ChunkExecuted` keyed by the
+///   chunk's transactions, and `SettlementInput::SettlementExecuted` keyed by
 ///   its settlement transactions, then by its barrier;
 /// - input waiter, wait for: the settlement transactions, then the barrier
 ///   (`Executable`), keyed by the root's generation;
@@ -170,7 +154,7 @@ pub struct SettlementScheduler {
     /// The accounts the settling commit's chunks changed so far.
     accounts: BTreeSet<ObjectId>,
     /// Chunks not settled yet, by height: the first is the one settling.
-    pending: BTreeMap<u64, Pending>,
+    pending: BTreeMap<u64, Stage>,
     /// Whether a chunk was seen: the first tells the funds reserver what is
     /// settled.
     started: bool,
@@ -209,8 +193,7 @@ impl SettlementScheduler {
             self.started = true;
             // Every chunk before the first one seen settled before this
             // run: the epoch's start.
-            push(
-                &self.funds,
+            self.funds.push(
                 FundsCommand::Settle(vec![Settle::Settled {
                     balances: Vec::new(),
                     version: chunk.version,
@@ -219,24 +202,15 @@ impl SettlementScheduler {
                 "funds reserver",
             );
         }
-        // The commit handler links a round's first chunk to the root's last
-        // generation in an earlier round.
-        let base = match (chunk.root.ordinal.writes_before, chunk.root.base) {
-            (0, Some(base)) => Some((base.round, base.writes_before)),
-            _ => None,
-        };
-        self.pending.insert(
-            chunk.height,
-            Pending {
-                base,
-                stage: Stage::Executing,
-            },
-        );
+        self.pending.insert(chunk.height, Stage::Executing);
         let mut batch = WaitBatch::with_capacity(1, chunk.digests.len());
         let mut keys = containers::Vec::with_capacity_in(chunk.digests.len(), bump);
         keys.extend(chunk.digests.iter().map(|d| EffectsKey(**d)));
-        batch.push(EffectsWaitItem::ChunkExecuted(chunk), keys);
-        push(&self.effects, Command::Wait(batch), "effects waiter");
+        batch.push(
+            EffectsWaitItem::Settlement(SettlementInput::ChunkExecuted(chunk)),
+            keys,
+        );
+        self.effects.push(Command::Wait(batch), "effects waiter");
     }
 
     fn chunk_executed(&mut self, chunk: ChunkSettlement, bump: &mut Bump) {
@@ -257,11 +231,11 @@ impl SettlementScheduler {
                 .map(|&i| slots[i].take().expect("a permutation"))
                 .collect()
         };
-        let pending = self
+        let stage = self
             .pending
             .get_mut(&chunk.height)
             .expect("a chunk executes after it is seen");
-        pending.stage = Stage::Ordered { chunk, effects };
+        *stage = Stage::Ordered { chunk, effects };
         self.advance(bump);
     }
 
@@ -290,13 +264,12 @@ impl SettlementScheduler {
         let Some(mut entry) = self.pending.first_entry() else {
             return;
         };
-        if !matches!(entry.get().stage, Stage::Ordered { .. }) {
+        if !matches!(entry.get(), Stage::Ordered { .. }) {
             return;
         }
         let height = *entry.key();
-        let base = entry.get().base;
         let Stage::Ordered { chunk, effects } =
-            std::mem::replace(&mut entry.get_mut().stage, Stage::Executing)
+            std::mem::replace(entry.get_mut(), Stage::Executing)
         else {
             unreachable!()
         };
@@ -315,7 +288,7 @@ impl SettlementScheduler {
             height,
         );
         if kinds.is_empty() {
-            self.send_barrier(height, base, chunk, effects, Vec::new());
+            self.send_barrier(height, chunk, effects, Vec::new());
             return;
         }
         let mut transactions = WaitBatch::with_capacity(kinds.len(), kinds.len());
@@ -329,7 +302,6 @@ impl SettlementScheduler {
             };
             let (executable, key) = executable(
                 &chunk,
-                base,
                 kind,
                 built,
                 SharedObjectMutability::NonExclusiveWrite,
@@ -338,18 +310,19 @@ impl SettlementScheduler {
         }
         let mut waits = WaitBatch::with_capacity(1, settlements.len());
         waits.push(
-            EffectsWaitItem::SettlementExecuted {
+            EffectsWaitItem::Settlement(SettlementInput::SettlementExecuted {
                 height,
                 digests: settlements.clone(),
-            },
+            }),
             settlements.iter().map(|d| EffectsKey(**d)),
         );
-        push(&self.inputs, Command::Wait(transactions), "input waiter");
-        push(&self.effects, Command::Wait(waits), "effects waiter");
-        self.pending
+        self.inputs
+            .push(Command::Wait(transactions), "input waiter");
+        self.effects.push(Command::Wait(waits), "effects waiter");
+        *self
+            .pending
             .get_mut(&height)
-            .expect("the settling chunk is pending")
-            .stage = Stage::Settling {
+            .expect("the settling chunk is pending") = Stage::Settling {
             chunk,
             effects,
             settlements,
@@ -359,7 +332,6 @@ impl SettlementScheduler {
     fn send_barrier(
         &mut self,
         height: u64,
-        base: Option<(u32, u32)>,
         chunk: ChunkSettlement,
         effects: Vec<Effects>,
         settlements: Vec<Effects>,
@@ -375,7 +347,6 @@ impl SettlementScheduler {
         let barrier = built.digest;
         let (executable, key) = executable(
             &chunk,
-            base,
             SystemKind::Barrier { height },
             built,
             SharedObjectMutability::Mutable,
@@ -384,18 +355,19 @@ impl SettlementScheduler {
         transactions.push(executable, [key]);
         let mut waits = WaitBatch::with_capacity(1, 1);
         waits.push(
-            EffectsWaitItem::SettlementExecuted {
+            EffectsWaitItem::Settlement(SettlementInput::SettlementExecuted {
                 height,
                 digests: vec![barrier],
-            },
+            }),
             [EffectsKey(*barrier)],
         );
-        push(&self.inputs, Command::Wait(transactions), "input waiter");
-        push(&self.effects, Command::Wait(waits), "effects waiter");
-        self.pending
+        self.inputs
+            .push(Command::Wait(transactions), "input waiter");
+        self.effects.push(Command::Wait(waits), "effects waiter");
+        *self
+            .pending
             .get_mut(&height)
-            .expect("the settling chunk is pending")
-            .stage = Stage::Barrier {
+            .expect("the settling chunk is pending") = Stage::Barrier {
             chunk,
             effects,
             settlements,
@@ -409,8 +381,7 @@ impl SettlementScheduler {
             .first_entry()
             .expect("settlement effects for a pending chunk");
         assert_eq!(*entry.key(), height, "only the first chunk settles");
-        let base = entry.get().base;
-        match std::mem::replace(&mut entry.get_mut().stage, Stage::Executing) {
+        match std::mem::replace(entry.get_mut(), Stage::Executing) {
             Stage::Settling {
                 chunk,
                 effects,
@@ -419,7 +390,7 @@ impl SettlementScheduler {
                 assert_eq!(digests, settlements, "the settlements waited for");
                 let settlements: Vec<Effects> =
                     digests.iter().map(|d| executed(&self.store, d)).collect();
-                self.send_barrier(height, base, chunk, effects, settlements);
+                self.send_barrier(height, chunk, effects, settlements);
             }
             Stage::Barrier {
                 chunk,
@@ -468,8 +439,7 @@ impl SettlementScheduler {
             checkpoint_seq: chunk.checkpoint_seq,
             effects: all,
         });
-        push(
-            &self.checkpoints,
+        self.checkpoints.push(
             Command::notify(vec![ChunkSettled(chunk.height)]),
             "checkpoint waiter",
         );
@@ -483,8 +453,7 @@ impl SettlementScheduler {
                 .into_iter()
                 .map(|account| (account, balance_at(&self.store, &account, root_version)))
                 .collect();
-            push(
-                &self.funds,
+            self.funds.push(
                 FundsCommand::Settle(vec![Settle::Settled {
                     balances,
                     version: AccumulatorVersion(chunk.version.0 + 1),
@@ -504,38 +473,16 @@ impl SettlementScheduler {
 /// root generation it reads.
 fn executable(
     chunk: &ChunkSettlement,
-    base: Option<(u32, u32)>,
     kind: SystemKind,
     built: settle::Built,
     mutability: SharedObjectMutability,
 ) -> (Executable, InputKey) {
     let root = chunk.root;
-    let stream = StreamId {
-        id: root.id,
-        initial_shared_version: root.initial_shared_version,
-    };
-    let key = match (root.ordinal.writes_before, base) {
-        (0, None) => InputKey::StreamLive(stream),
-        (0, Some((round, generation))) => InputKey::Generation {
-            stream,
-            round,
-            generation,
-        },
-        (generation, _) => InputKey::Generation {
-            stream,
-            round: root.ordinal.round,
-            generation,
-        },
-    };
-    let resolved_base = match (root.ordinal.writes_before, base) {
-        (0, Some((round, generation))) => vec![(stream, round, generation)],
-        _ => Vec::new(),
-    };
+    let key = root.input_key();
     let executable = Executable {
         version: chunk.version,
         root_version: chunk.root_version,
         reserved: Vec::new(),
-        height: chunk.height,
         entry: ScheduledEntry {
             transaction: ExecutableTransaction::System(SystemTransaction {
                 kind,
@@ -546,7 +493,6 @@ fn executable(
             origin: None,
             cancelled: Vec::new(),
         },
-        resolved_base,
         inputs: Vec::new(),
         synced: None,
     };
@@ -776,7 +722,7 @@ impl FundsReserver {
             }
         }
         if !released.is_empty() {
-            push(&self.inputs, Command::Resolve(released), "input waiter");
+            self.inputs.push(Command::Resolve(released), "input waiter");
         }
     }
 }

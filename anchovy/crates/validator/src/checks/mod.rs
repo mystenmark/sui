@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The checks a transaction's type records, and the only code that records
-//! them. A transaction reaches [`Valid`] only through [`validate`],
-//! [`Verified`] only through [`SignatureChecks::verify`], and
-//! [`InputsChecked`] only through [`check_inputs`]: their witnesses cannot
-//! be made anywhere else. What a `Message<Transaction<'static, Verified>>`
+//! them. A transaction reaches [`Valid`] only through [`validate`], and
+//! [`Verified`] only through [`SignatureChecks::verify`] (or, committed by
+//! consensus, [`sequenced_by_consensus`] and [`certified`]): their witnesses
+//! cannot be made anywhere else. What a `Message<Transaction<'static, Verified>>`
 //! promises rests on this module and its signature cache.
 //!
 //! ```compile_fail,E0423
@@ -50,19 +50,6 @@ pub struct Valid;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Verified;
 
-/// Verified, and its input objects passed the stateful checks against the
-/// store (`validation::inputs::check`): what execution takes.
-///
-/// ```compile_fail,E0308
-/// use validator::checks::{InputsCheckedTransaction, VerifiedTransaction};
-/// fn execute(_: InputsCheckedTransaction) {}
-/// fn skip_input_checks(transaction: VerifiedTransaction) {
-///     execute(transaction);
-/// }
-/// ```
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct InputsChecked;
-
 /// What relabels a transaction into state `S`. Its field is private: only
 /// this module makes one, after the check `S` stands for.
 pub struct Witness<S>(PhantomData<S>);
@@ -79,16 +66,9 @@ impl Attested for Verified {
     type Witness = Witness<Verified>;
 }
 
-impl TxState for InputsChecked {}
-impl HasDigest for InputsChecked {}
-impl Attested for InputsChecked {
-    type Witness = Witness<InputsChecked>;
-}
-
 pub type Unchecked = Message<Transaction<'static, DigestPending>>;
 pub type ValidTransaction = Message<Transaction<'static, Valid>>;
 pub type VerifiedTransaction = Message<Transaction<'static, Verified>>;
-pub type InputsCheckedTransaction = Message<Transaction<'static, InputsChecked>>;
 
 /// Validates each transaction in order until one fails, then hashes those
 /// before it: they come back `Valid`, with the failure. `bump` is reset for
@@ -291,24 +271,6 @@ impl SignatureChecks {
     }
 }
 
-/// Checks a verified transaction's inputs against the store's live
-/// objects. Nothing is locked: until voting exists, another transaction
-/// may consume an input before this one executes.
-pub fn check_inputs(
-    epoch: &EpochState,
-    store: &store::Store,
-    transaction: VerifiedTransaction,
-    bump: &Bump,
-) -> Result<InputsCheckedTransaction, validation::Error> {
-    validation::inputs::check(
-        &transaction.get().0,
-        &epoch.context(),
-        &StoreObjects(store),
-        bump,
-    )?;
-    Ok(transaction.relabel(&Witness(PhantomData)))
-}
-
 /// A transaction consensus committed that this validator did not verify:
 /// its signatures are taken as verified, as the reference's
 /// `VerifiedExecutableTransaction::new_from_consensus` takes them. A quorum
@@ -318,8 +280,9 @@ pub fn sequenced_by_consensus(transaction: Unchecked) -> VerifiedTransaction {
     transaction.with_digest().relabel(&Witness(PhantomData))
 }
 
-/// `check_inputs`, keeping the transaction: voting checks the inputs of a
-/// transaction it caches either way.
+/// Checks a verified transaction's inputs against the store's live
+/// objects (`validation::inputs::check`), keeping the transaction: voting
+/// checks the inputs of a transaction it caches either way.
 pub fn inputs_pass(
     epoch: &EpochState,
     store: &store::Store,

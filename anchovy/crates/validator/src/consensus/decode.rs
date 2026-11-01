@@ -296,13 +296,7 @@ impl CommitDecoder {
         if let Some(queue) = &self.signatures
             && !signatures.is_empty()
         {
-            // Inside the pipeline a full queue is a sizing bug, not load to
-            // shed; a closed one means the pipeline is shutting down.
-            if let Err(workqueue::PushError::Full(_)) =
-                queue.try_push(waiter::Command::Wait(signatures))
-            {
-                panic!("the built waiter refused checkpoint signatures");
-            }
+            queue.push(waiter::Command::Wait(signatures), "built waiter");
         }
 
         let gc_depth = self.epoch.config.gc_depth();

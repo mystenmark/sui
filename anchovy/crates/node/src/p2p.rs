@@ -11,13 +11,9 @@
 //!
 //! It follows the certified chain from the running epoch's committee: what
 //! they have certified past what this validator has goes to the epoch's
-//! synced scheduler (`synced`), which verifies it.
-//!
-//! Peers stop pushing a round once they certify it, so a round that
-//! completed while this validator was down never arrives. For those, it
-//! fetches the round's checkpoint from a connected peer through sui's state
-//! sync service and takes the update's bytes, which the collector verifies
-//! as any full signature.
+//! synced scheduler (`synced`), which verifies it. Peers stop pushing a
+//! round once they certify it, so the synced scheduler also takes the bytes
+//! of rounds this validator missed from the certified checkpoints.
 
 use std::convert::Infallible;
 use std::io::Read;
@@ -31,14 +27,11 @@ use std::time::Duration;
 
 use anemo::{Network, PeerId, Request, Response, Router};
 use bytes::Bytes;
-use fastcrypto::groups::bls12381::G1Element;
 use messages::base::Digest;
 use sui_types::digests::{CheckpointContentsDigest, CheckpointDigest};
-use sui_types::messages_checkpoint::{CertifiedCheckpointSummary, VersionedFullCheckpointContents};
-use sui_types::transaction::{TransactionDataAPI as _, TransactionKind};
+use sui_types::messages_checkpoint::CertifiedCheckpointSummary;
 use tokio::sync::oneshot;
 use validator::current::CurrentEpoch;
-use validator::pipeline::items::GateInput;
 use validator::randomness::{BeaconInput, SendSignaturesRequest};
 use validator::state_sync::{self, Query, SyncRequest, SyncedInput, Wanted};
 use workqueue::Queue;
@@ -58,14 +51,12 @@ const SYNC_INTERVAL: Duration = Duration::from_secs(5);
 /// How many summaries are fetched before they are handed over.
 const SYNC_BATCH: u64 = 16;
 
-/// How often the gate is asked which round it waits for. A round waited
-/// for at two asks in a row is fetched: pushes come within moments.
-const ASK_INTERVAL: Duration = Duration::from_secs(1);
+/// How long a call on a peer may take.
+const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The p2p endpoint: serves until dropped.
 pub struct P2p {
     pub network: Network,
-    fetcher: tokio::task::JoinHandle<()>,
     pusher: tokio::task::JoinHandle<()>,
     follower: tokio::task::JoinHandle<()>,
 }
@@ -78,7 +69,6 @@ impl P2p {
     }
 
     fn abort(&self) {
-        self.fetcher.abort();
         self.pusher.abort();
         self.follower.abort();
     }
@@ -167,12 +157,10 @@ pub fn start(
         .private_key(network_key)
         .config(config)
         .start(router)?;
-    let fetcher = tokio::spawn(fetch_missing(network.clone(), current.clone()));
     let pusher = tokio::spawn(push_signatures(network.clone(), current.clone()));
     let follower = tokio::spawn(follow_chain(network.clone(), current));
     Ok(P2p {
         network,
-        fetcher,
         pusher,
         follower,
     })
@@ -454,100 +442,12 @@ fn anemo_address(multiaddr: &str) -> Option<(String, u16)> {
     Some((host.to_owned(), port.parse().ok()?))
 }
 
-/// Asks the running epoch's gate which round it waits for; a round waited
-/// for at two asks in a row is fetched from a connected member.
-async fn fetch_missing(network: Network, current: CurrentEpoch) {
-    let mut last = None;
-    let mut interval = tokio::time::interval(ASK_INTERVAL);
-    loop {
-        interval.tick().await;
-        let Some(epoch) = current.now() else {
-            continue;
-        };
-        let (answer, waiting) = oneshot::channel();
-        if epoch
-            .randomness_gate
-            .try_push(GateInput::Waiting(answer))
-            .is_err()
-        {
-            continue;
-        }
-        let Ok(waiting) = waiting.await else {
-            continue;
-        };
-        let stuck = waiting.filter(|w| last == Some(*w));
-        last = waiting;
-        let Some((round, seq)) = stuck else {
-            continue;
-        };
-        for peer in network.peers() {
-            let Some(party) = epoch.network_keys.iter().position(|key| *key == peer.0) else {
-                continue;
-            };
-            let Some(sig) = fetch_round(&network, peer, epoch.epoch.params.epoch, round, seq).await
-            else {
-                continue;
-            };
-            let (taken, answer) = oneshot::channel();
-            let input = BeaconInput::Signatures {
-                party: u16::try_from(party).expect("fewer than 2^16 members"),
-                request: SendSignaturesRequest {
-                    epoch: epoch.epoch.params.epoch,
-                    round,
-                    partial_sigs: Vec::new(),
-                    sig: Some(sig),
-                },
-                taken,
-            };
-            if epoch.beacon.try_push(input).is_ok() {
-                let _ = answer.await;
-            }
-            break;
-        }
-    }
-}
-
 /// sui's `GetCheckpointSummaryRequest`.
 #[derive(serde::Serialize, serde::Deserialize)]
 enum GetCheckpointSummaryRequest {
     Latest,
     ByDigest(CheckpointDigest),
     BySequenceNumber(u64),
-}
-
-/// The signature in round `round`'s update, as `peer` has checkpoint `seq`,
-/// if it has it certified. Unverified: the collector verifies it.
-async fn fetch_round(
-    network: &Network,
-    peer: PeerId,
-    epoch: u64,
-    round: u64,
-    seq: u64,
-) -> Option<G1Element> {
-    let summary: Option<CertifiedCheckpointSummary> = call(
-        network,
-        peer,
-        "/sui.StateSync/GetCheckpointSummary",
-        GetCheckpointSummaryRequest::BySequenceNumber(seq),
-    )
-    .await?;
-    let contents: Option<VersionedFullCheckpointContents> = call(
-        network,
-        peer,
-        "/sui.StateSync/GetCheckpointContentsV2",
-        summary?.content_digest,
-    )
-    .await?;
-    contents?.iter().find_map(|data| {
-        let TransactionKind::RandomnessStateUpdate(update) =
-            data.transaction.data().transaction_data().kind()
-        else {
-            return None;
-        };
-        (update.epoch == epoch && update.randomness_round.0 == round)
-            .then(|| bcs::from_bytes(&update.random_bytes).ok())
-            .flatten()
-    })
 }
 
 /// A unary call of `route` on `peer`; none if it fails.
@@ -571,7 +471,7 @@ async fn call_raw<T: serde::Serialize>(
     let body = SnappyEncoder(PhantomData).encode(request).ok()?;
     let mut request = Request::new(body);
     *request.route_mut() = route.into();
-    let response = tokio::time::timeout(ASK_INTERVAL * 10, peer.rpc(request))
+    let response = tokio::time::timeout(CALL_TIMEOUT, peer.rpc(request))
         .await
         .ok()?
         .ok()?;

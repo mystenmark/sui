@@ -39,8 +39,8 @@ processor's progress waits in a waiter on keys, so each processor reads as
 an action taken once its keys hold. A processor may still order its own
 work (the state hasher folds roots in sequence), accumulate toward a
 threshold (the aggregator's quorum), or hold its input for a condition it
-is the documented home of (the randomness gate). It never blocks its
-thread on another processor.
+is the documented home of (the funds reserver's balances). It never blocks
+its thread on another processor.
 
 Every arrow in the diagram is a queue, except store reads and writes. Every
 waiter has three kinds of edge:
@@ -170,9 +170,6 @@ As in the reference, a client submits, then waits.
 
 The waiter API has no "either of two keys": the race is the async
 handler's.
-
-Without consensus (the binary today), `InputChecker` and
-`TransactionExecutor` execute submissions directly.
 
 ### 2. Voting (built)
 
@@ -448,8 +445,7 @@ transactions to learn their digests: it reads the chunk table.
 
 **Checkpoint waiter** → `ContentsBuilder` → **built waiter** →
 `EpochCloser` → `SummaryBuilder`; signatures → consensus → **built
-waiter** → `CheckpointAggregator` → state sync, and → **built waiter** →
-fork check.
+waiter** → `CheckpointAggregator` → `CheckpointCommitter`.
 
 Building a checkpoint is split at its first need for the previous one.
 
@@ -473,8 +469,7 @@ Building a checkpoint is split at its first need for the previous one.
 
    It writes the checkpoint store, then:
    - resolves `CheckpointBuilt(seq)` in the built waiter to the checkpoint
-     built, releasing `seq + 1`, the signatures over it, and its
-     certificate's fork check;
+     built, releasing `seq + 1` and the signatures over it;
    - signs, and submits the signature to consensus.
 4. **`StateHasher`** computes each checkpoint's ECMH as its effects arrive.
    Only folding it into the running root waits for the previous root.
@@ -483,8 +478,9 @@ Building a checkpoint is split at its first need for the previous one.
    - Signatures for a checkpoint not built here yet wait in the built
      waiter on `CheckpointBuilt(seq)`.
    - At quorum on the local digest, it hands the certified checkpoint to
-     state sync and the committer, and waits it in the built waiter, to be
-     compared with the local one: a difference is a fork, and panics.
+     the committer. A certificate is only ever made over the local summary,
+     so it needs no fork check; one fetched from peers does
+     (`docs/state_sync_design.md`).
 
 The built waiter routes each ready item by kind (`BuiltRouter`), as the
 effects waiter does.
@@ -499,8 +495,10 @@ effects waiter does.
 | input | `Reserved(digest)` | `VersionResolver` | `FundsReserver` | never: resolved only after its wait is queued |
 | effects | `Effects(digest)` | RPC submission, `SettlementScheduler` | `Executor` | executed effects in the store |
 | (`FundsReserver`) | `Reservation(account, amount, v)`, resolving `Fulfilled` or `Cancelled` | `VersionResolver` | `Settle::Deposit` and `Settle::Credit` from `Executor`, `Settle::Settled` from `SettlementScheduler` | the rules of "Funds reservation" |
+| gate | `GateKey::ChunkFree(height)` | `CommitStage` (chunk) | `SyncedScheduler` | the chunk lock does not hold it |
+| gate | `GateKey::RoundBytes(round)`, resolving the bytes | `CommitStage` (randomness chunk) | `SignatureCollector` | the epoch store records them |
 | checkpoint | `ChunkSettled(height)` | `CommitHandler` (pending checkpoint) | `SettlementScheduler` | chunk table has it |
-| built | `CheckpointBuilt(seq)`, resolving the checkpoint built | `ContentsBuilder`, `BlockVoter`, `CommitDecoder`, `CheckpointAggregator` | `SummaryBuilder` | checkpoint store has it, or committed it |
+| built | `CheckpointBuilt(seq)`, resolving the checkpoint built | `ContentsBuilder`, `BlockVoter`, `CommitDecoder`, `SyncedScheduler` | `SummaryBuilder` | checkpoint store has it, or committed it |
 | output | `CheckpointProgress::BuiltHere(seq)` | `CommitStage` (consensus output) | `SummaryBuilder` | the consensus path built through `seq` in this run |
 | output | `CheckpointProgress::Committed(seq)` | `CommitStage` (consensus output) | `CheckpointCommitter` | checkpoint store committed through `seq` |
 
@@ -542,11 +540,7 @@ its object.
 
 ## Not covered yet
 
-- End of epoch: end of publish, advance epoch, and reconfiguration.
-- Randomness (DKG, randomness state updates).
-- Congestion control (deferral, cancellation).
-- JWKs and capabilities.
-- State sync and the checkpoint executor for full nodes.
+- Running as a full node (`docs/state_sync_design.md`).
 
 ## Implementation order
 
