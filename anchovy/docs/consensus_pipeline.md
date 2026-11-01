@@ -171,9 +171,6 @@ As in the reference, a client submits, then waits.
 The waiter API has no "either of two keys": the race is the async
 handler's.
 
-Without consensus (the binary today), `InputChecker` and
-`TransactionExecutor` execute submissions directly.
-
 ### 2. Voting (built)
 
 Consensus → `BlockVoter` (several workers) → votes back to consensus.
@@ -543,11 +540,7 @@ its object.
 
 ## Not covered yet
 
-- End of epoch: end of publish, advance epoch, and reconfiguration.
-- Randomness (DKG, randomness state updates).
-- Congestion control (deferral, cancellation).
-- JWKs and capabilities.
-- State sync and the checkpoint executor for full nodes.
+- Running as a full node (`docs/state_sync_design.md`).
 
 ## Implementation order
 
