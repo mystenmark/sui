@@ -101,15 +101,16 @@ That costs replay, not correctness.
 The update's bytes are not known when the commit is decided. Its digest
 is part of its chunk and its settlement.
 
-- **Randomness gate.** A new processor between `CommitStage` and the
-  resolver and settlement queues. It forwards chunks and settlements in
-  height order. At a randomness chunk headed by an update, it waits for
-  the round's signature, builds the update (R5.5), fills in its entry and
-  its digest, and goes on. Chunks behind it wait, as the reference's
-  checkpoint builder waits (R5.8). This costs latency for a round's
-  signature. Releasing later chunks past it would need the resolver's
-  funds reservations, which follow consensus order, to accept a gap. Not
-  worth it now.
+- **Randomness gate.** Each chunk waits in the gate waiter, a randomness
+  chunk headed by an update also on its round's bytes (`RoundBytes`,
+  available once the epoch store records them). The gate, between the
+  waiter and the resolver and settlement queues, forwards chunks and
+  settlements in height order, building the update (R5.5) and filling in
+  its entry and digest. Chunks behind a waiting one wait, as the
+  reference's checkpoint builder waits (R5.8). This costs latency for a
+  round's signature. Releasing later chunks past it would need the
+  resolver's funds reservations, which follow consensus order, to accept a
+  gap. Not worth it now.
 - **Signatures.** An anemo server on the validator's p2p address, under
   its network key, with server name `sui-{chain_id}`. It serves one route,
   `sui.Randomness/SendSignatures` (R5.3), and answers others as
@@ -118,22 +119,18 @@ is part of its chunk and its settlement.
   `vss_pk.c0()`. Partial signatures are aggregated per round: verified
   against `vss_pk` per peer, combined at t' weight (R5.2). The result is
   `bcs(sig)`.
-- **Store.** Each round's bytes go into the epoch store before they are
-  released to the gate. Peers stop pushing a round once it is certified,
+- **Store.** Each round's bytes go into the epoch store before
+  `RoundBytes` is resolved. Peers stop pushing a round once it is certified,
   so a restart must find the bytes locally (R5.5, gap 7). Signatures that
   arrive before DKG completes locally, or for rounds not reserved yet, are
   kept, up to a window of 50 rounds past the last released one (R5.2).
 - **Peers.** Sui validators push only after their own DKG completes, to
   their committee's p2p addresses (R5.3), so anchovy dials nobody in 18a.
 - **Rounds missed.** Peers stop pushing a round once they certify it, so a
-  round that completed while anchovy was down never arrives: after any
-  restart, rounds certified meanwhile are lost. The p2p endpoint asks the
-  gate, every second, which round it waits for and which checkpoint the
-  update goes into (a queue entry with a oneshot). A round waited for at two
-  asks in a row is fetched from a connected member through sui's state sync
-  service (`GetCheckpointSummary`, then `GetCheckpointContentsV2`). The
-  update's bytes go to the collector as a full signature, verified against
-  `c0` like any other. The members are connected already: they push to it.
+  round that completed while anchovy was down never arrives. The synced
+  scheduler takes those rounds' bytes from the certified checkpoints that
+  carry their updates (`docs/state_sync_design.md`), and the collector
+  verifies them against `c0` like any other signature.
 
 ## 6. Taking part (phase 18b)
 

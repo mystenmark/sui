@@ -39,8 +39,8 @@ processor's progress waits in a waiter on keys, so each processor reads as
 an action taken once its keys hold. A processor may still order its own
 work (the state hasher folds roots in sequence), accumulate toward a
 threshold (the aggregator's quorum), or hold its input for a condition it
-is the documented home of (the randomness gate). It never blocks its
-thread on another processor.
+is the documented home of (the funds reserver's balances). It never blocks
+its thread on another processor.
 
 Every arrow in the diagram is a queue, except store reads and writes. Every
 waiter has three kinds of edge:
