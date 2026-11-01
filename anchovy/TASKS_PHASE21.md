@@ -38,17 +38,34 @@ uses only the approved crates.
 - [ ] Fork 3, object funds:
   - At 138 off mainnet (`check_object_funds_withdraw_in_execution`), an
     object balance withdrawal is checked in execution against the settled
-    balance less the net withdrawals of earlier transactions not yet
-    settled (`UnsettledObjectWithdrawals`).
-  - Anchovy passes an empty view, so it allows withdrawals sui rejects; a
-    later settlement underflows.
-  - Plan: a shared table of unsettled net withdrawals by (account,
-    accumulator version), recorded after each successful execution from
-    its effects (and from stored effects when a transaction is found
-    executed already, as generations are), read by the executor, and
-    pruned when a checkpoint commits. Execution order within a commit is
-    already deterministic: two withdrawals from one account conflict on its
-    owning object.
+    balance at the chunk's root version, less the net withdrawals of earlier
+    transactions not yet settled. Anchovy passes an empty view, so it allows
+    withdrawals sui rejects, and a later settlement underflows.
+  - A transaction can also read the root at its version before the previous
+    chunk's barrier has written it (an undeclared dependency).
+  - Design, as sui's current one (#27840, read on its `main`):
+    - **Unsettled withdrawals.** An in-memory table of net withdrawals by
+      (account, root version), recorded when a transaction executes, by
+      either path, and released when its checkpoint commits. It needs no
+      persistence: whatever survives a crash was settled.
+    - **Blocking.** Execution blocks on the root at its version until a
+      barrier writes it.
+    - **Causal admission.** Each chunk transaction gets index (height, i);
+      settlements and barriers get none and bypass admission. Whoever creates
+      a chunk (the gate, or a synced split) registers its length before its
+      transactions can reach the executor, so the consecutive successor is
+      known: (h, len-1) is followed by (h+1, 0). The epoch's change-epoch
+      transaction is a one-transaction unit at the last height + 1.
+      Admission takes a transaction when fewer than K are in flight, or when
+      its index is the watermark's successor (at most one over the limit),
+      on K+1 executor workers. The chunk lock already gives each chunk one
+      source, which is sui's accumulator-version deduplication.
+  - Steps:
+    - [ ] the unsettled withdrawals table;
+    - [ ] execution state per worker (today one arena and runtime behind a
+      lock);
+    - [ ] causal admission and the executor pool;
+    - [ ] blocking on the root's version.
 - [ ] Then: submitting through `LocalValidatorAggregatorProxy` with
   amplification, so anchovy's RPC takes a share of submissions directly;
   epoch changes under load.
@@ -59,3 +76,11 @@ uses only the approved crates.
   claims and expects no aliases, so it votes against a transaction whose
   sender has aliases, and rejects one signed by an alias. Its stake can't
   block either. Execution and checkpoints follow the quorum's claims.
+- A rebase onto sui `main` (at protocol 141) breaks the build: anchovy's
+  ported natives use gas algebra and fastcrypto APIs that changed. Protocols
+  139-141 change execution (forwarding addresses, vector natives,
+  references in PTBs, shuffled commit blocks, batched settlements). Catching
+  up is the next phase; compat networks start at the highest version.
+- The reference oracle in `Execution::execute_at` (testing builds) doesn't
+  rewrite coin reservations, so it would disagree with anchovy's executor on
+  such transactions.
