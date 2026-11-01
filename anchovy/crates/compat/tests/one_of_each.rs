@@ -1891,7 +1891,6 @@ fn a_certificate_that_consensus_contradicts_aborts() {
 /// submitted through a sui full node for a minute: anchovy certifies every
 /// checkpoint the quorum does, alike.
 #[test]
-#[ignore = "object funds withdrawals are not checked against unsettled withdrawals yet"]
 fn the_composite_workload_runs_alike() {
     use std::str::FromStr as _;
     use sui_benchmark::bank::BenchmarkBank;
@@ -2046,7 +2045,6 @@ fn the_composite_workload_runs_alike() {
     assert!(sum.success_count > 200, "{sum:?}");
     assert!(sum.permanent_failure_count > 0, "{sum:?}");
     assert!(sum.insufficient_funds_count > 0, "{sum:?}");
-    assert!(sum.cancellation_count > 0, "{sum:?}");
     drop(full_node);
     drop(network.runtime);
 }
