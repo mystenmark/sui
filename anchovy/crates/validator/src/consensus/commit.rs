@@ -18,7 +18,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ::consensus::{BlockRef, TransactionIndex};
+use ::consensus::{BlockRef, PING_TRANSACTION_INDEX, TransactionIndex};
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest as _};
 use containers::Bump;
@@ -45,11 +45,15 @@ use crate::consensus::status::{ConsensusTxStatus, ConsensusTxStatusCache};
 use crate::epoch::EpochParams;
 use crate::epoch_store::ConsensusOutput;
 use crate::pipeline::backpressure::Backpressure;
+use crate::pipeline::chunk_lock::{ChunkLock, Cut};
 use crate::pipeline::items::{
     Chunk, ChunkSettlement, EpochClose, ExecutableTransaction, GateInput, GatedChunk,
-    PendingCheckpoint, PendingUpdate, ScheduledEntry, SystemKind, SystemTransaction,
+    OutputThrough, OutputWaits, PendingCheckpoint, PendingUpdate, ScheduledEntry, SystemKind,
+    SystemTransaction,
 };
-use crate::pipeline::keys::{AccumulatorVersion, ChunkSettled, StreamId, TxDigest};
+use crate::pipeline::keys::{
+    AccumulatorVersion, CheckpointProgress, ChunkSettled, StreamId, TxDigest,
+};
 use crate::randomness::{BeaconInput, PartyInput};
 
 /// Why a committed transaction was dropped.
@@ -438,8 +442,8 @@ impl CommitHandler {
 
     /// Ends the commit just handled, with what `CommitStage` decided of it:
     /// see `ConsensusOutput::finish_commit`.
-    pub fn finish(&mut self, record: &CommitRecord, height: u64, drained: bool) {
-        self.output.finish_commit(record.encode(), height, drained);
+    pub fn finish(&mut self, record: &CommitRecord) -> u64 {
+        self.output.finish_commit(record.encode())
     }
 
     /// Decides `commit`, or nothing if it was handled before. It takes only
@@ -1049,7 +1053,10 @@ pub struct Decided<'b> {
 ///   `SettlementScheduler`;
 /// - `SignatureCollector`: the group key, once DKG completes;
 /// - checkpoint waiter, wait for: each `PendingCheckpoint`, keyed by
-///   `ChunkSettled` of each of its chunks.
+///   `ChunkSettled` of each of its chunks;
+/// - output waiter, wait for: `OutputThrough` after each commit that leaves
+///   no chunk waiting for a checkpoint, keyed by `CheckpointProgress` of the
+///   last checkpoint cut.
 ///
 /// Writes: the consensus status cache, each committed transaction's status
 /// by its position, and the committed leader round. Written, never read: the
@@ -1082,6 +1089,10 @@ pub struct CommitStage {
     key_sent: bool,
     /// This member's DKG party, if it is a member.
     party: Option<workqueue::Queue<PartyInput>>,
+    /// Shared with the synced scheduler, if any.
+    chunk_lock: Option<Arc<ChunkLock>>,
+    /// Where each commit's output waits to be written, once wired.
+    output_waits: Option<OutputWaits>,
 }
 
 impl CommitStage {
@@ -1130,6 +1141,8 @@ impl CommitStage {
             beacon: None,
             key_sent: false,
             party: None,
+            chunk_lock: None,
+            output_waits: None,
         }
     }
 
@@ -1210,6 +1223,22 @@ impl CommitStage {
         self.handler = self
             .handler
             .with_stored_observations(&self.epoch.config, stored);
+        self
+    }
+
+    /// Claims each commit's chunks from the synced scheduler through
+    /// `lock` before emitting them.
+    #[must_use]
+    pub fn with_chunk_lock(mut self, lock: Arc<ChunkLock>) -> CommitStage {
+        self.chunk_lock = Some(lock);
+        self
+    }
+
+    /// Sends each commit's output to wait in `waits` until it can be
+    /// written.
+    #[must_use]
+    pub fn with_output_waits(mut self, waits: OutputWaits) -> CommitStage {
+        self.output_waits = Some(waits);
         self
     }
 
@@ -1645,8 +1674,16 @@ impl CommitStage {
         let rejected = std::mem::take(&mut commit.rejected);
         let mut positions = containers::Vec::with_capacity_in(commit.transactions.len(), bump);
         positions.extend(commit.transactions.iter().map(|t| (t.block, t.index)));
+        let blocks = std::mem::take(&mut commit.blocks);
         let commit_index = commit.commit_index;
         let decided = self.decide(commit, bump)?;
+        let cut = Cut {
+            seq: self.queue.next_seq - 1,
+            height: self.queue.cut_height,
+        };
+        if let Some(lock) = &self.chunk_lock {
+            lock.claim(self.queue.height, cut);
+        }
         let record = CommitRecord {
             commit_index,
             leader_round,
@@ -1657,8 +1694,8 @@ impl CommitStage {
             closed: self.closed,
             certs_closed: self.handler.certs_closed(),
         };
-        self.handler
-            .finish(&record, self.queue.height, self.queue.pending.is_empty());
+        let finished = self.handler.finish(&record);
+        self.wait_output(finished, cut.seq);
         // What became of each transaction, for its submitter: dropped, or
         // finalized (scheduled, or a duplicate of one that was).
         let mut dropped = containers::hash_set(bump, decided.dropped.len());
@@ -1674,7 +1711,13 @@ impl CommitStage {
                         ConsensusTxStatus::Finalized
                     };
                     (b, i, status)
-                })),
+                }))
+                // A ping waits for its block's commit.
+                .chain(
+                    blocks
+                        .into_iter()
+                        .map(|b| (b, PING_TRANSACTION_INDEX, ConsensusTxStatus::Finalized)),
+                ),
             bump,
         );
         self.emit(decided, bump);
@@ -1683,6 +1726,34 @@ impl CommitStage {
         self.send_beacon_events(events);
         self.statuses.update_leader_round(leader_round);
         Some(())
+    }
+}
+
+impl CommitStage {
+    /// Waits the output of the first `finished` commits to be written once
+    /// the checkpoints through `cut`, the last cut, are built here and
+    /// committed. Only after a commit that leaves no chunk waiting for a
+    /// checkpoint: a later commit's chunks are in checkpoints only a replay
+    /// from such a commit rebuilds (the reference's `1ad56a6b81`).
+    fn wait_output(&self, finished: u64, cut: u64) {
+        let Some(waits) = &self.output_waits else {
+            return;
+        };
+        if !self.queue.pending.is_empty() {
+            return;
+        }
+        let mut wait = waiter::WaitBatch::with_capacity(1, 2);
+        // Commits before the epoch's first checkpoint have no chunks.
+        let keys = (cut > self.start.previous_checkpoint).then_some([
+            CheckpointProgress::BuiltHere(cut),
+            CheckpointProgress::Committed(cut),
+        ]);
+        wait.push(OutputThrough(finished), keys.into_iter().flatten());
+        // Inside the pipeline a full queue is a sizing bug; a closed one
+        // means the pipeline is shutting down.
+        if let Err(workqueue::PushError::Full(_)) = waits.try_push(waiter::Command::Wait(wait)) {
+            panic!("the output waiter refused a commit's output");
+        }
     }
 }
 
@@ -1706,6 +1777,8 @@ struct CheckpointQueue {
     pending_transactions: usize,
     height: u64,
     next_seq: u64,
+    /// The last chunk height in the last checkpoint cut.
+    cut_height: u64,
 }
 
 impl CheckpointQueue {
@@ -1719,6 +1792,7 @@ impl CheckpointQueue {
             pending_transactions: 0,
             height: 0,
             next_seq: previous_checkpoint + 1,
+            cut_height: 0,
         }
     }
 
@@ -1731,6 +1805,7 @@ impl CheckpointQueue {
             pending_transactions: 0,
             height,
             next_seq,
+            cut_height: height,
         }
     }
 
@@ -1778,6 +1853,7 @@ impl CheckpointQueue {
             timestamp_ms: self.pending_timestamp,
         };
         self.last_built_timestamp = self.pending_timestamp;
+        self.cut_height = *flushed.heights.last().expect("a checkpoint has chunks");
         self.pending_transactions = 0;
         self.next_seq += 1;
         Some(flushed)

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use aggregator::{CheckpointAggregator, Committee};
 use checkpoint::{
     BuiltAvailability, BuiltRouter, CheckpointCommitter, ChunkAvailability, ContentsBuilder,
-    EpochCloser, ProtocolKey, SummaryBuilder,
+    EpochCloser, OutputAvailability, OutputCommitter, ProtocolKey, SummaryBuilder,
 };
 use consensus::TransactionClient;
 use exec_pool::{EffectsAvailability, EffectsRouter, Executor};
@@ -17,6 +17,7 @@ use messages::transaction::DigestPending;
 use resolver::{InputAvailability, VersionResolver};
 use settlement::{FundsReserver, SettlementScheduler};
 use state_hasher::{StateHasher, StateHashes};
+use synced::SyncedScheduler;
 use tokio::sync::watch;
 use validator::checks::{Valid, Verified};
 use validator::consensus::cache::ConsensusTxCache;
@@ -26,12 +27,14 @@ use validator::consensus::dkg::DkgSetup;
 use validator::consensus::status::ConsensusTxStatusCache;
 use validator::consensus::vote::{BlockVoter, VoteRequest};
 use validator::epoch::EpochState;
-use validator::epoch_store::{CommittedCheckpoints, ConsensusOutput as OutputWriter, EpochStore};
+use validator::epoch_store::{ConsensusOutput as OutputWriter, EpochStore};
 use validator::pipeline::backpressure::Backpressure;
+use validator::pipeline::chunk_lock::ChunkLock;
 use validator::pipeline::items::{
     BuiltCommand, BuiltWaits, CertifiedCheckpoint, CheckpointContentsBuilt, CheckpointEffects,
     CheckpointSignature, Chunk, EffectsWaitItem, EpochCloserInput, Executable, FundsCommand,
-    GateInput, InputCommand, PendingCheckpoint, SettlementInput,
+    GateInput, InputCommand, OutputCommand, OutputThrough, OutputWaits, PendingCheckpoint,
+    SettlementInput,
 };
 use validator::pipeline::keys::{ChunkSettled, EffectsKey};
 use validator::pipeline::tables::{CheckpointStore, ChunkTable, GenerationTable};
@@ -39,6 +42,7 @@ use validator::processors::{Request, SignatureVerifier, TransactionValidator};
 use validator::randomness::{
     BeaconInput, DkgParty, PartyInput, RandomnessGate, SignatureCollector,
 };
+use validator::state_sync::{self, CheckpointServer};
 use validator::submit::SubmitChecker;
 use waiter::{Command, WaiterProcessor};
 use workqueue::{Activity, Inbox, Processor, Queue, Sink, Worker, WorkerHandle};
@@ -59,7 +63,7 @@ pub(crate) fn spawn(
     ended: watch::Sender<Option<u64>>,
 ) -> Vec<WorkerHandle> {
     let w = Spawner { parts, queues: q.clone() };
-    let committed = output.committed_checkpoints();
+    let commits = output.output_commits();
     vec![
         // Submission.
         w.thread("submission")
@@ -70,7 +74,7 @@ pub(crate) fn spawn(
         // Consensus.
         w.one("voting",            i.votes,            |p, q| p.voter(q.built_waits),                                  drop),
         w.one("commit-decode",     i.commits,          |p, q| p.decoder(q.built_waits),                                into(&q.handler, "handler")),
-        w.one("commit-handler",    i.handler,          move |p, q| p.commit_stage(output, q.gate, q.beacon, q.party, q.checkpoint_waits), drop),
+        w.one("commit-handler",    i.handler,          move |p, q| p.commit_stage(output, q.gate, q.beacon, q.party, q.checkpoint_waits, q.output_waits), drop),
         // The random beacon.
         w.one("randomness-gate",   i.gate,             |p, q| p.gate(q.resolver, q.settlement),                       drop),
         w.one("beacon",            i.beacon,           |p, q| p.collector(q.gate),                                    drop),
@@ -79,7 +83,7 @@ pub(crate) fn spawn(
         w.one("resolver",          i.resolver,         |p, q| p.resolver(q.input_waits, q.funds),                     drop),
         w.one("input-waiter",      i.input_waits,      |p, _| WaiterProcessor::new(p.input_availability()),           into(&q.executor, "executor")),
         w.one("executor",          i.executor,         |p, q| p.executor(q.input_waits, q.effects_waits, q.funds),    drop),
-        w.one("effects-waiter",    i.effects_waits,    |p, _| WaiterProcessor::new(p.effects_availability()),         EffectsRouter { settlement: q.settlement.clone(), epoch_closer: q.closer.clone() }),
+        w.one("effects-waiter",    i.effects_waits,    |p, _| WaiterProcessor::new(p.effects_availability()),         EffectsRouter { settlement: q.settlement.clone(), epoch_closer: q.closer.clone(), synced: q.checkpoint_sync.clone() }),
         // Settlement and funds.
         w.one("settlement",        i.settlement,       |p, q| p.settlement(q.effects_waits, q.input_waits, q.checkpoint_waits, q.funds), drop),
         w.one("funds",             i.funds,            |p, q| p.funds(q.input_waits),                                 drop),
@@ -87,11 +91,17 @@ pub(crate) fn spawn(
         w.one("checkpoint-waiter", i.checkpoint_waits, |p, _| WaiterProcessor::new(p.chunk_availability()),           into(&q.contents, "contents")),
         w.one("contents",          i.contents,         |p, q| p.contents(q.hasher, q.built_waits),                    drop),
         w.one("state-hasher",      i.hasher,           |p, q| p.state_hasher(q.closer),                               drop),
-        w.one("built-waiter",      i.built_waits,      |p, _| WaiterProcessor::new(p.built_availability()),           BuiltRouter { epoch_closer: q.closer.clone(), aggregator: q.aggregator.clone() }),
+        w.one("built-waiter",      i.built_waits,      |p, _| WaiterProcessor::new(p.built_availability()),           BuiltRouter { epoch_closer: q.closer.clone(), aggregator: q.aggregator.clone(), committer: q.committer.clone() }),
         w.one("epoch-closer",      i.closer,           |p, q| p.epoch_closer(q.resolver, q.effects_waits, q.hasher, q.summary), drop),
-        w.one("summary",           i.summary,          |p, q| p.summary(q.built_waits),                               drop),
+        w.one("summary",           i.summary,          |p, q| p.summary(q.built_waits, q.output_waits),               drop),
         w.one("aggregator",        i.aggregator,       move |p, q| p.aggregator(state_sync, q.built_waits),           into(&q.committer, "committer")),
-        w.one("committer",         i.committer,        move |p, _| p.committer(committed, ended),                     drop),
+        w.one("committer",         i.committer,        move |p, q| p.committer(q.output_waits, ended),                drop),
+        w.one("output-waiter",     i.output_waits,     |p, _| WaiterProcessor::new(p.output_availability()),          into(&q.outputs, "output committer")),
+        w.one("output-committer",  i.outputs,          move |_, _| OutputCommitter::new(commits),                     drop),
+        // Serving peers.
+        w.one("checkpoint-server", i.checkpoint_queries, |p, _| CheckpointServer::new(p.store.clone()),         drop),
+        // Following peers.
+        w.one("synced",            i.checkpoint_sync,  Parts::synced,                                            drop),
     ]
 }
 
@@ -124,6 +134,8 @@ queues! {
     votes: VoteRequest,
     commits: CommitRequest,
     beacon: BeaconInput,
+    checkpoint_queries: state_sync::Request,
+    checkpoint_sync: state_sync::SyncedInput,
     // Between processors.
     signatures: Request<Valid>,
     submit: Request<Verified>,
@@ -140,11 +152,13 @@ queues! {
     summary: Vec<CheckpointContentsBuilt>,
     aggregator: Vec<CheckpointSignature>,
     committer: Vec<CertifiedCheckpoint>,
+    outputs: Vec<OutputThrough>,
     // Into waiters.
     input_waits: InputCommand,
     effects_waits: Command<EffectsKey, EffectsWaitItem>,
     checkpoint_waits: Command<ChunkSettled, PendingCheckpoint>,
     built_waits: BuiltCommand,
+    output_waits: OutputCommand,
 }
 
 /// What the epoch's processors are built from, besides their queues: the
@@ -165,6 +179,8 @@ pub(crate) struct Parts {
     pub cache: Arc<ConsensusTxCache>,
     pub generations: Arc<GenerationTable>,
     pub chunks: Arc<ChunkTable>,
+    /// Shared by the commit stage and the synced scheduler.
+    pub chunk_lock: Arc<ChunkLock>,
     pub checkpoints: Arc<CheckpointStore>,
     pub statuses: Arc<ConsensusTxStatusCache>,
     pub state_hashes: Arc<StateHashes>,
@@ -216,6 +232,7 @@ impl Parts {
         beacon: Queue<BeaconInput>,
         party: Queue<PartyInput>,
         checkpoint_waits: Queue<Command<ChunkSettled, PendingCheckpoint>>,
+        output_waits: OutputWaits,
     ) -> CommitStage {
         let stage = CommitStage::new(
             self.epoch.params.clone(),
@@ -232,7 +249,9 @@ impl Parts {
         ))
         .with_randomness(self.dkg.clone())
         .with_beacon(beacon)
-        .with_backpressure(self.backpressure.clone());
+        .with_backpressure(self.backpressure.clone())
+        .with_chunk_lock(self.chunk_lock.clone())
+        .with_output_waits(output_waits);
         match self.own_index() {
             Some(own) => stage.with_party(own, party),
             None => stage,
@@ -251,6 +270,7 @@ impl Parts {
 
     fn gate(&self, resolver: Queue<Chunk>, settlement: Queue<SettlementInput>) -> RandomnessGate {
         RandomnessGate::new(self.epoch_store.randomness_bytes(), resolver, settlement)
+            .with_chunk_lock(self.chunk_lock.clone())
     }
 
     fn collector(&self, gate: Queue<GateInput>) -> SignatureCollector {
@@ -348,6 +368,12 @@ impl Parts {
         }
     }
 
+    fn output_availability(&self) -> OutputAvailability {
+        OutputAvailability {
+            checkpoints: self.checkpoints.clone(),
+        }
+    }
+
     fn epoch_closer(
         &self,
         resolver: Queue<Chunk>,
@@ -367,13 +393,14 @@ impl Parts {
         )
     }
 
-    fn summary(&self, built: BuiltWaits) -> SummaryBuilder {
+    fn summary(&self, built: BuiltWaits, outputs: OutputWaits) -> SummaryBuilder {
         SummaryBuilder::new(
             self.epoch.params.clone(),
             self.checkpoints.clone(),
             self.key.clone(),
             built,
             self.consensus.clone(),
+            outputs,
         )
     }
 
@@ -392,17 +419,35 @@ impl Parts {
         .with_backpressure(self.backpressure.clone())
     }
 
+    fn synced(&self, q: Queues) -> SyncedScheduler {
+        SyncedScheduler::new(
+            self.committee.clone(),
+            !self.epoch.params.config.disable_effects_tx_dependencies(),
+            self.store.clone(),
+            self.checkpoints.clone(),
+            self.chunk_lock.clone(),
+            synced::Outputs {
+                built: q.built_waits,
+                inputs: q.input_waits,
+                effects: q.effects_waits,
+                hasher: q.hasher,
+                committer: q.committer,
+                beacon: q.beacon,
+                gate: q.gate,
+            },
+        )
+    }
+
     fn committer(
         &self,
-        committed: CommittedCheckpoints,
+        outputs: OutputWaits,
         ended: watch::Sender<Option<u64>>,
     ) -> CheckpointCommitter {
         CheckpointCommitter::new(
             self.store.clone(),
             self.checkpoints.clone(),
-            self.chunks.clone(),
             self.generations.clone(),
-            committed,
+            outputs,
             self.backpressure.clone(),
             ended,
         )

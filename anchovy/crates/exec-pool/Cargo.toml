@@ -22,6 +22,7 @@ move-core-types.workspace = true
 sui-protocol-config.workspace = true
 resolver.workspace = true
 sui-types.workspace = true
+synced.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 

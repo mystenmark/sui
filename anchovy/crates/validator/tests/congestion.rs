@@ -124,6 +124,7 @@ fn commit(index: u32, round: u32, transactions: &[&VerifiedTransaction]) -> Deco
         leader: block,
         timestamp_ms: 1000 * u64::from(round),
         digest: [index as u8; 32],
+        blocks: vec![block],
         transactions: transactions
             .iter()
             .enumerate()

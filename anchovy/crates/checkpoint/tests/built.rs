@@ -27,7 +27,7 @@ fn built(seq: u64, summary: &[u8]) -> BuiltCheckpoint {
         epoch_rolling_gas: [0; 4],
         last_height: seq,
         timestamp_ms: 0,
-        root_state: None,
+        ends_epoch: false,
     }
 }
 
@@ -50,16 +50,27 @@ fn summary(seq: u64, timestamp_ms: u64) -> Vec<u8> {
 
 /// `summary` as certified: its bytes, then a quorum signature's (epoch,
 /// signature, signer bitmap), whose contents the check never reads.
-fn certified(seq: u64, summary: &[u8]) -> BuiltWaitItem {
+fn certificate(seq: u64, summary: &[u8]) -> CertifiedCheckpoint {
     let mut bytes = summary.to_vec();
     bytes.extend_from_slice(&0u64.to_le_bytes());
     bytes.extend_from_slice(&[0xee; 48]);
     bytes.push(0);
+    CertifiedCheckpoint {
+        seq,
+        summary: bytes.into(),
+    }
+}
+
+fn certified(seq: u64, summary: &[u8]) -> BuiltWaitItem {
     BuiltWaitItem::Certified {
-        certified: CertifiedCheckpoint {
-            seq,
-            summary: bytes.into(),
-        },
+        certified: certificate(seq, summary),
+        local: None,
+    }
+}
+
+fn synced(seq: u64, summary: &[u8]) -> BuiltWaitItem {
+    BuiltWaitItem::Synced {
+        certified: certificate(seq, summary),
         local: None,
     }
 }
@@ -98,6 +109,7 @@ struct Setup {
     router: BuiltRouter,
     closer: Inbox<EpochCloserInput>,
     aggregator: Inbox<Vec<CheckpointSignature>>,
+    committer: Inbox<Vec<CertifiedCheckpoint>>,
     checkpoints: Arc<CheckpointStore>,
     _dir: tempfile::TempDir,
 }
@@ -110,6 +122,7 @@ impl Setup {
         let checkpoints = Arc::new(CheckpointStore::new(objects, 0, epoch_store, builder));
         let (epoch_closer, closer) = workqueue::queue(16);
         let (aggregator_queue, aggregator) = workqueue::queue(16);
+        let (committer_queue, committer) = workqueue::queue(16);
         Setup {
             waiter: WaiterProcessor::new(BuiltAvailability {
                 checkpoints: checkpoints.clone(),
@@ -117,9 +130,11 @@ impl Setup {
             router: BuiltRouter {
                 epoch_closer,
                 aggregator: aggregator_queue,
+                committer: committer_queue,
             },
             closer,
             aggregator,
+            committer,
             checkpoints,
             _dir: dir,
         }
@@ -164,6 +179,15 @@ impl Setup {
             .collect();
         (next, signatures)
     }
+
+    /// The sequence numbers of the certified checkpoints sent to the
+    /// committer so far.
+    fn committed(&self) -> Vec<u64> {
+        std::iter::from_fn(|| self.committer.try_pop())
+            .flatten()
+            .map(|c| c.seq)
+            .collect()
+    }
 }
 
 #[test]
@@ -188,5 +212,24 @@ fn items_wait_for_their_checkpoint_then_go_where_their_kind_goes() {
 fn a_certified_checkpoint_other_than_the_local_one_is_a_fork() {
     let mut s = Setup::new();
     s.wait(certified(3, &summary(3, 1)), 3);
+    s.build(built(3, &summary(3, 0)));
+}
+
+#[test]
+fn a_synced_checkpoint_is_committed_once_built_alike() {
+    let mut s = Setup::new();
+    s.wait(synced(3, &summary(3, 0)), 3);
+    s.wait(certified(3, &summary(3, 0)), 3);
+    assert_eq!(s.committed(), Vec::<u64>::new());
+
+    s.build(built(3, &summary(3, 0)));
+    assert_eq!(s.committed(), vec![3]);
+}
+
+#[test]
+#[should_panic(expected = "fork: certified checkpoint 3")]
+fn a_synced_checkpoint_other_than_the_local_one_is_a_fork() {
+    let mut s = Setup::new();
+    s.wait(synced(3, &summary(3, 1)), 3);
     s.build(built(3, &summary(3, 0)));
 }

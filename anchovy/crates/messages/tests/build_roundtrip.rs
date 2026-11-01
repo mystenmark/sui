@@ -16,7 +16,7 @@ use messages::build::{
 };
 use messages::checkpoint::{
     CertifiedCheckpointSummary, CheckpointContents, CheckpointData, CheckpointSummary,
-    FullCheckpointContents,
+    FullCheckpointContents, VersionedFullCheckpointContents,
 };
 use messages::effects::{ChangeKind, TransactionEffects, TransactionEvents, VersionedEffects};
 use messages::object::Data as ViewData;
@@ -1267,6 +1267,94 @@ fn full_checkpoint_contents() {
     for t in message.get().transactions {
         check_executed(&t.transaction, &t.effects);
     }
+}
+
+/// `VersionedFullCheckpointContents`, either version, expands to the
+/// `CheckpointContents` with its transactions' and effects' digests.
+#[test]
+fn versioned_full_checkpoint_contents_expand_to_their_contents() {
+    let transactions: Vec<_> = executed()
+        .into_iter()
+        .map(|(transaction, effects)| ck::ExecutionData {
+            transaction,
+            effects,
+        })
+        .collect();
+    let digests: Vec<_> = transactions
+        .iter()
+        .map(|t| {
+            let bytes = bcs::to_bytes(&t.transaction).unwrap();
+            let transaction = Message::<SenderSignedData>::parse(bytes).unwrap();
+            let effects =
+                Message::<TransactionEffects>::parse(bcs::to_bytes(&t.effects).unwrap()).unwrap();
+            ck::ExecutionDigests {
+                transaction: base::TransactionDigest(base::Digest(
+                    transaction.get().digest().bytes,
+                )),
+                effects: base::TransactionEffectsDigest(base::Digest(effects.get().digest.bytes)),
+            }
+        })
+        .collect();
+    let [first, second] = signatures().try_into().unwrap();
+    let with_aliases = vec![
+        vec![(first, Some(base::SequenceNumber(4))), (second, None)],
+        vec![],
+    ];
+
+    let v1 = ck::FullCheckpointContents {
+        transactions: transactions.clone(),
+        user_signatures: vec![signatures(), vec![]],
+    };
+    let mut v1_bytes = vec![0];
+    v1_bytes.extend(bcs::to_bytes(&v1).unwrap());
+    let v1_contents = ck::CheckpointContents::V1(ck::CheckpointContentsV1 {
+        transactions: digests.clone(),
+        user_signatures: v1.user_signatures.clone(),
+    });
+
+    let mut v2_bytes = vec![1];
+    v2_bytes.extend(bcs::to_bytes(&(&transactions, &with_aliases)).unwrap());
+    let v2_contents = ck::CheckpointContents::V2(ck::CheckpointContentsV2 {
+        transactions: digests
+            .iter()
+            .zip(with_aliases)
+            .map(
+                |(digest, user_signatures)| ck::CheckpointTransactionContents {
+                    digest: *digest,
+                    user_signatures,
+                },
+            )
+            .collect(),
+    });
+
+    for (bytes, contents) in [(v1_bytes, v1_contents), (v2_bytes, v2_contents)] {
+        let bump = messages::fast::Bump::default();
+        let mut r = messages::reader::Reader::new(&bytes);
+        let full =
+            VersionedFullCheckpointContents::parse(&mut r, &mut messages::arena::BumpAlloc(&bump))
+                .unwrap();
+        r.finish().unwrap();
+        assert_eq!(full.transactions().len(), 2);
+        let built = full.contents(&bump).unwrap();
+        let expected = bcs::to_bytes(&contents).unwrap();
+        assert_eq!(built.bytes, expected.as_slice());
+        expect_digest("CheckpointContents", &expected, built.digest);
+    }
+
+    // One signature list short.
+    let short = ck::FullCheckpointContents {
+        transactions,
+        user_signatures: vec![signatures()],
+    };
+    let mut bytes = vec![0];
+    bytes.extend(bcs::to_bytes(&short).unwrap());
+    let bump = messages::fast::Bump::default();
+    let full = VersionedFullCheckpointContents::parse(
+        &mut messages::reader::Reader::new(&bytes),
+        &mut messages::arena::BumpAlloc(&bump),
+    )
+    .unwrap();
+    assert!(full.contents(&bump).is_none());
 }
 
 #[test]

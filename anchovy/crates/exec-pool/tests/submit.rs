@@ -103,6 +103,7 @@ fn a_transaction_is_readied_for_consensus_and_its_wait_woken_once_executed() {
     let mut router = EffectsRouter {
         settlement,
         epoch_closer: workqueue::queue(1).0,
+        synced: workqueue::queue(1).0,
     };
     let mut waiter = WaiterProcessor::new(EffectsAvailability {
         store: node.store.clone(),
@@ -157,6 +158,7 @@ fn settlement_work_is_routed_to_the_settlement_scheduler() {
     let mut router = EffectsRouter {
         settlement,
         epoch_closer: workqueue::queue(1).0,
+        synced: workqueue::queue(1).0,
     };
     let nine = messages::base::Hashed::of("TransactionData", &[9]);
     router.send(vec![EffectsWaitItem::SettlementExecuted {

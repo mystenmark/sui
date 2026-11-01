@@ -110,13 +110,20 @@ fn a_chain_of_shared_writes_executes_across_generations_and_rounds() {
     );
     assert_eq!(read_at(d, id), c.lamport_version().value());
 
-    // D ended the stream; E, writing it, keeps it ended.
+    // D ended the stream; E, writing it, moves it on, ended, to its own
+    // version.
     let ended = Generation::Ended {
         version: d.lamport_version().value(),
         transaction: digests[4].bytes,
     };
     assert_eq!(node.generations.get(stream, 12, 1), Some(ended));
-    assert_eq!(node.generations.get(stream, 13, 1), Some(ended));
+    assert_eq!(
+        node.generations.get(stream, 13, 1),
+        Some(Generation::Ended {
+            version: e.lamport_version().value(),
+            transaction: digests[5].bytes,
+        })
+    );
     assert!(node.live(id).is_none(), "deleted");
     assert!(
         e.unchanged_consensus_objects().contains(&(

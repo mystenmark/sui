@@ -23,7 +23,7 @@ use node::{ConsensusOutput, Pipeline};
 use sui_protocol_config::Chain;
 use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
 use sui_types::crypto::{AccountKeyPair, AuthorityPublicKeyBytes, get_key_pair};
-use sui_types::digests::TransactionDigest;
+use sui_types::digests::{TransactionDigest, TransactionEffectsDigest};
 use sui_types::effects::{TransactionEffects, TransactionEffectsAPI};
 use sui_types::execution_status::{ExecutionErrorKind, ExecutionStatus};
 use sui_types::gas_coin::{GAS, GasCoin};
@@ -49,7 +49,7 @@ use validator::epoch::EpochState;
 use validator::pipeline::items::CertifiedCheckpoint;
 use validator::pipeline::tables::BuiltCheckpoint;
 use validator::proto::{
-    RawSubmitTxRequest, RawValidatorSubmitStatus, RawValidatorTransactionStatus,
+    PingType, RawSubmitTxRequest, RawValidatorSubmitStatus, RawValidatorTransactionStatus,
     RawWaitForEffectsRequest, SubmitTxType,
 };
 use validator::service::validator_server::Validator as _;
@@ -160,6 +160,7 @@ impl Network {
         node::epoch::genesis(
             &store,
             &genesis.checkpoint,
+            genesis.certified.clone(),
             genesis.objects.iter().map(|o| o.digest().into_inner()),
         );
         let keys = genesis::validator_keys();
@@ -526,7 +527,12 @@ impl Network {
             .chain(announced)
         {
             let first = transactions.len() as u16;
-            let indices = (first..first + guard.transactions.len() as u16).collect();
+            // An empty submission is a ping, as consensus-core acknowledges it.
+            let indices = if guard.transactions.is_empty() {
+                vec![consensus::PING_TRANSACTION_INDEX]
+            } else {
+                (first..first + guard.transactions.len() as u16).collect()
+            };
             transactions.extend(guard.transactions);
             let (status, receiver) = oneshot::channel();
             let _ = guard
@@ -902,7 +908,7 @@ fn the_epoch_ends_with_a_checkpoint_closing_it() {
         network.sui_committee.voting_rights
     );
     let committed = network.committed(last);
-    let root = state_hasher::decode(committed.root_state.as_ref().unwrap());
+    let root = network.pipeline().state_hashes.root(last).unwrap();
     assert_eq!(
         end.epoch_commitments,
         vec![CheckpointCommitment::ECMHLiveObjectSetDigest(
@@ -1073,33 +1079,37 @@ async fn wait(
 
 /// Whether `guard` is the pipeline's DKG message or confirmation.
 fn is_dkg(guard: &TransactionsGuard) -> bool {
-    guard.transactions.iter().all(|bytes| {
-        messages::Message::<messages::consensus::ConsensusTransaction<'static>>::parse(
-            bytes.clone(),
-        )
-        .is_ok_and(|t| {
-            matches!(
-                t.get().kind(),
-                messages::consensus::ConsensusTransactionKind::RandomnessDkgMessage(_)
-                    | messages::consensus::ConsensusTransactionKind::RandomnessDkgConfirmation(_)
+    !guard.transactions.is_empty()
+        && guard.transactions.iter().all(|bytes| {
+            messages::Message::<messages::consensus::ConsensusTransaction<'static>>::parse(
+                bytes.clone(),
             )
+            .is_ok_and(|t| {
+                matches!(
+                    t.get().kind(),
+                    messages::consensus::ConsensusTransactionKind::RandomnessDkgMessage(_)
+                        | messages::consensus::ConsensusTransactionKind::RandomnessDkgConfirmation(
+                            _
+                        )
+                )
+            })
         })
-    })
 }
 
 /// Whether `guard` is the pipeline's capability notification.
 fn is_capability_notification(guard: &TransactionsGuard) -> bool {
-    guard.transactions.iter().all(|bytes| {
-        messages::Message::<messages::consensus::ConsensusTransaction<'static>>::parse(
-            bytes.clone(),
-        )
-        .is_ok_and(|t| {
-            matches!(
-                t.get().kind(),
-                messages::consensus::ConsensusTransactionKind::CapabilityNotificationV2(_)
+    !guard.transactions.is_empty()
+        && guard.transactions.iter().all(|bytes| {
+            messages::Message::<messages::consensus::ConsensusTransaction<'static>>::parse(
+                bytes.clone(),
             )
+            .is_ok_and(|t| {
+                matches!(
+                    t.get().kind(),
+                    messages::consensus::ConsensusTransactionKind::CapabilityNotificationV2(_)
+                )
+            })
         })
-    })
 }
 
 /// Plays consensus for submissions made on another task: once something is
@@ -1177,6 +1187,58 @@ async fn a_submission_is_answered_with_its_position_then_its_effects() {
     assert!(matches!(again[..], [RawValidatorSubmitStatus::Executed(_)]));
     network.certify(seq);
     network.assert_checkpointed(seq, &[&transfer]);
+    assert_no_panics();
+}
+
+/// A ping is answered with the position of the block it went into, then,
+/// once that block commits, as executed with no effects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ping_is_answered_once_its_block_commits() {
+    let mut network = Network::new(1);
+    let service = Arc::new(network.service());
+    let pinging = tokio::spawn({
+        let service = service.clone();
+        async move {
+            let request = RawSubmitTxRequest {
+                transactions: vec![],
+                submit_type: SubmitTxType::Ping as i32,
+            };
+            let response = service
+                .submit_transaction(tonic::Request::new(request))
+                .await
+                .unwrap();
+            let results = response.into_inner().results;
+            assert_eq!(results.len(), 1);
+            let position = submitted(results[0].inner.as_ref().unwrap());
+            let request = RawWaitForEffectsRequest {
+                transaction_digest: None,
+                consensus_position: Some(position.to_bcs().into()),
+                include_details: true,
+                ping_type: Some(PingType::Consensus as i32),
+            };
+            let response = service
+                .wait_for_effects(tonic::Request::new(request))
+                .await
+                .unwrap();
+            (position, response.into_inner().inner.unwrap())
+        }
+    });
+    let seq = commit_submitted(&mut network);
+    let (position, status) = tokio::time::timeout(TIMEOUT, pinging)
+        .await
+        .expect("answered")
+        .unwrap();
+    assert_eq!(u64::from(position.block.round), seq);
+    assert_eq!(position.index, consensus::PING_TRANSACTION_INDEX);
+    let RawValidatorTransactionStatus::Executed(executed) = status else {
+        panic!("executed: {status:?}");
+    };
+    assert_eq!(
+        executed.effects_digest,
+        bcs::to_bytes(&TransactionEffectsDigest::ZERO).unwrap()
+    );
+    let details = executed.details.unwrap();
+    bcs::from_bytes::<TransactionEffects>(&details.effects).unwrap();
     assert_no_panics();
 }
 

@@ -182,6 +182,7 @@ fn commit(index: u32, transactions: &[Claimed<'_>]) -> DecodedCommit {
         leader: block,
         timestamp_ms: 1000 * u64::from(index),
         digest: [index as u8; 32],
+        blocks: vec![block],
         transactions: transactions
             .iter()
             .enumerate()
@@ -306,7 +307,7 @@ fn a_deferred_transaction_outlives_a_restart() {
     let second = sender.transaction(random_object_ref(), &[object]);
     let dir = tempfile::tempdir().unwrap();
     let (_, output, _) = EpochStore::open(dir.path(), 0);
-    let committed = output.committed_checkpoints();
+    let commits = output.output_commits();
     let mut handler = new_handler(output);
     let decided = handler
         .handle(&epoch, commit(1, &[(&first, &[]), (&second, &[])]), &bump)
@@ -323,9 +324,9 @@ fn a_deferred_transaction_outlives_a_restart() {
         closed: false,
         certs_closed: false,
     };
-    handler.finish(&record, 1, true);
-    committed.committed_through(1);
-    drop((handler, committed));
+    let finished = handler.finish(&record);
+    commits.write_through(finished);
+    drop((handler, commits));
 
     let (_, output, _) = EpochStore::open(dir.path(), 0);
     let mut handler = CommitHandler::new(output, 1, vec![([0; 96], 10_000)], &epoch.config, None);
@@ -382,7 +383,7 @@ fn a_key_a_quorum_voted_for_is_added_by_the_next_commit_across_a_restart() {
     };
     let dir = tempfile::tempdir().unwrap();
     let (_, output, _) = EpochStore::open(dir.path(), 0);
-    let committed = output.committed_checkpoints();
+    let commits = output.output_commits();
     let mut first = handler(output);
     // "a" becomes active in commit 1; "b" has one vote of two.
     let decided = first
@@ -403,9 +404,9 @@ fn a_key_a_quorum_voted_for_is_added_by_the_next_commit_across_a_restart() {
         closed: false,
         certs_closed: false,
     };
-    first.finish(&record, 1, true);
-    committed.committed_through(1);
-    drop((first, committed));
+    let finished = first.finish(&record);
+    commits.write_through(finished);
+    drop((first, commits));
 
     // Restarted: commit 2 adds "a", and a second vote makes "b" active,
     // which commit 3 adds.

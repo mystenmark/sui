@@ -133,37 +133,35 @@ fn object(n: u8) -> ObjectRef {
 }
 
 /// One commit's output: `digest` processed, holding `object`'s lock, `s`
-/// at `last`, then ended with record `[record]`.
+/// at `last`, then ended with record `[record]`. Returns how many commits
+/// have finished in this run.
 fn commit(
     output: &mut ConsensusOutput,
     record: u8,
     digest: u8,
     lock: Option<u8>,
     (s, last): (u8, (u32, u32)),
-    height: u64,
-    drained: bool,
-) {
+) -> u64 {
     output.set_processed(tx(digest));
     if let Some(n) = lock {
         output.set_lock(object(n), tx(digest));
     }
     output.set_stream(stream(s), last);
-    output.finish_commit(vec![record], height, drained);
+    output.finish_commit(vec![record])
 }
 
-/// Each commit's output is read back at once, and written once its
-/// checkpoints have committed, through the last commit that left no chunk
-/// waiting: a restart finds only what was written, and the last record.
+/// Each commit's output is read back at once, and written only when told,
+/// through the commit named: a restart finds only what was written, and the
+/// last record.
 #[test]
-fn consensus_output_is_written_once_its_checkpoints_commit() {
+fn consensus_output_is_written_through_the_commit_named() {
     let dir = tempfile::tempdir().unwrap();
     {
         let (_, mut output, _) = EpochStore::open(dir.path(), 0);
-        let committed = output.committed_checkpoints();
-        commit(&mut output, 1, 1, Some(1), (1, (1, 1)), 10, true);
-        // Not drained: a chunk of commit 2 waits for a checkpoint.
-        commit(&mut output, 2, 2, Some(2), (1, (2, 1)), 11, false);
-        commit(&mut output, 3, 3, None, (2, (3, 1)), 12, true);
+        let commits = output.output_commits();
+        assert_eq!(commit(&mut output, 1, 1, Some(1), (1, (1, 1))), 1);
+        assert_eq!(commit(&mut output, 2, 2, Some(2), (1, (2, 1))), 2);
+        assert_eq!(commit(&mut output, 3, 3, None, (2, (3, 1))), 3);
         for n in 1..=3 {
             assert!(output.is_processed(&tx(n)));
         }
@@ -171,14 +169,15 @@ fn consensus_output_is_written_once_its_checkpoints_commit() {
         assert_eq!(output.stream(&stream(1)), Some((2, 1)));
         assert_eq!(output.record(), None);
 
-        // Through height 11: commit 1 is written, commit 2 not, as it left
-        // a chunk waiting.
-        committed.committed_through(11);
+        commits.write_through(1);
         assert_eq!(output.record(), Some(vec![1]));
         // Stream 1, written by commit 1 and again by commit 2, reads as
         // commit 2 left it.
         assert_eq!(output.stream(&stream(1)), Some((2, 1)));
         assert!(output.is_processed(&tx(2)));
+        // Written already.
+        commits.write_through(1);
+        assert_eq!(output.record(), Some(vec![1]));
     }
     {
         // A restart finds commit 1's output only.
@@ -191,12 +190,10 @@ fn consensus_output_is_written_once_its_checkpoints_commit() {
         assert_eq!(output.stream(&stream(1)), Some((1, 1)));
         assert_eq!(output.stream(&stream(2)), None);
 
-        // Replayed, and committed through height 12: both written, as
-        // commit 3 drained the queue.
-        let committed = output.committed_checkpoints();
-        commit(&mut output, 2, 2, Some(2), (1, (2, 1)), 11, false);
-        commit(&mut output, 3, 3, None, (2, (3, 1)), 12, true);
-        committed.committed_through(12);
+        // Replayed, counted from this run's start: both written at once.
+        assert_eq!(commit(&mut output, 2, 2, Some(2), (1, (2, 1))), 1);
+        assert_eq!(commit(&mut output, 3, 3, None, (2, (3, 1))), 2);
+        output.output_commits().write_through(2);
         assert_eq!(output.record(), Some(vec![3]));
     }
     let (_, output, _) = EpochStore::open(dir.path(), 0);
@@ -204,18 +201,4 @@ fn consensus_output_is_written_once_its_checkpoints_commit() {
     assert_eq!(output.lock_holder(&object(2)), Some(tx(2)));
     assert_eq!(output.stream(&stream(1)), Some((2, 1)));
     assert_eq!(output.stream(&stream(2)), Some((3, 1)));
-}
-
-/// After a restart, a commit at or below the committed checkpoints is
-/// written as soon as it ends, as the reference flushes when output is
-/// pushed.
-#[test]
-fn replayed_output_below_the_committed_checkpoints_is_written_at_once() {
-    let dir = tempfile::tempdir().unwrap();
-    let (_, mut output, _) = EpochStore::open(dir.path(), 0);
-    output.committed_checkpoints().committed_through(20);
-    commit(&mut output, 1, 1, None, (1, (1, 1)), 15, true);
-    assert_eq!(output.record(), Some(vec![1]));
-    commit(&mut output, 2, 2, None, (1, (2, 1)), 25, true);
-    assert_eq!(output.record(), Some(vec![1]));
 }

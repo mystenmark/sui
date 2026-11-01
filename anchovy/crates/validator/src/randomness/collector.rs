@@ -57,6 +57,10 @@ pub enum BeaconInput {
     /// What this member pushes to its peers now. The p2p endpoint →
     /// collector.
     Outgoing(oneshot::Sender<Vec<SendSignaturesRequest>>),
+    /// A round's full signature as a certified checkpoint's randomness
+    /// state update holds it: its random bytes. `SyncedScheduler` →
+    /// collector.
+    Certified { round: u64, bytes: Vec<u8> },
 }
 
 /// A full queue drops the push; peers push again until the round is
@@ -77,6 +81,7 @@ impl Refuse for BeaconInput {
 ///   reserved (`BeaconInput::Round`);
 /// - `DkgParty`: this member's shares (`BeaconInput::Shares`);
 /// - randomness service: pushed signatures (`BeaconInput::Signatures`);
+/// - `SyncedScheduler`: certified rounds' bytes (`BeaconInput::Certified`);
 /// - p2p endpoint: what to push (`BeaconInput::Outgoing`).
 ///
 /// Outward:
@@ -130,7 +135,19 @@ impl SignatureCollector {
             gate,
             store,
         };
-        for (round, _) in collector.store.randomness_bytes() {
+        // Recent rounds are pushed again: a peer may have needed this
+        // member's signature for one completed just before a restart.
+        for (round, bytes) in collector.store.randomness_bytes() {
+            let sig = bcs::from_bytes(&bytes).expect("stored bytes are a signature");
+            collector.outgoing.insert(
+                round,
+                SendSignaturesRequest {
+                    epoch,
+                    round,
+                    partial_sigs: Vec::new(),
+                    sig: Some(sig),
+                },
+            );
             collector.mark_done(round);
         }
         collector
@@ -320,6 +337,19 @@ impl Processor for SignatureCollector {
             } => {
                 self.receive(party, request);
                 let _ = taken.send(());
+            }
+            BeaconInput::Certified { round, bytes } => {
+                if let Ok(sig) = bcs::from_bytes(&bytes) {
+                    let request = SendSignaturesRequest {
+                        epoch: self.epoch,
+                        round,
+                        partial_sigs: Vec::new(),
+                        sig: Some(sig),
+                    };
+                    // No member's: a full signature is verified alike,
+                    // whoever sent it.
+                    self.receive(u16::MAX, request);
+                }
             }
         }
         None

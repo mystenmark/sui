@@ -14,6 +14,7 @@ pub mod processors;
 pub mod proto;
 pub mod randomness;
 pub mod server;
+pub mod state_sync;
 pub mod submit;
 pub mod tls;
 
@@ -29,12 +30,12 @@ pub mod service {
 /// whichever epoch `current` runs.
 pub async fn serve(
     listener: tokio::net::TcpListener,
-    key: &tls::NetworkKey,
+    key: tls::NetworkKey,
     current: current::CurrentEpoch,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
     tonic::transport::Server::builder()
         .add_service(Validator::over(current).into_service())
-        .serve_with_incoming_shutdown(tls::incoming(listener, tls::server_config(key)), shutdown)
+        .serve_with_incoming_shutdown(tls::incoming(listener, tls::server_config(&key)), shutdown)
         .await
 }

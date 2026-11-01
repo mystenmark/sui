@@ -12,6 +12,7 @@ publish = false
 [dev-dependencies]
 bcs.workspace = true
 checkpoint.workspace = true
+consensus.workspace = true
 consensus-glue.workspace = true
 execution.workspace = true
 fastcrypto.workspace = true

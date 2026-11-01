@@ -10,6 +10,7 @@ mod close;
 mod commit;
 pub mod contents;
 mod key;
+mod output;
 pub mod summary;
 
 use std::sync::Arc;
@@ -25,9 +26,9 @@ use messages::transaction::SenderSignedData;
 use validator::epoch::EpochParams;
 use validator::pipeline::items::{
     BuiltWaitItem, BuiltWaits, CheckpointContentsBuilt, CheckpointEffects, ExecutedEffects,
-    LastOfEpoch, PendingCheckpoint,
+    LastOfEpoch, OutputWaits, PendingCheckpoint,
 };
-use validator::pipeline::keys::{CheckpointBuilt, ChunkSettled};
+use validator::pipeline::keys::{CheckpointBuilt, CheckpointProgress, ChunkSettled};
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable};
 use waiter::{Availability, Command, WaitBatch};
 use workqueue::{Processor, Queue};
@@ -36,6 +37,7 @@ pub use built::{BuiltAvailability, BuiltRouter, check_fork};
 pub use close::EpochCloser;
 pub use commit::CheckpointCommitter;
 pub use key::ProtocolKey;
+pub use output::{OutputAvailability, OutputCommitter};
 
 /// Pushes `item` to `queue`. Inside the pipeline a full queue is a sizing
 /// bug, not load to shed; a closed one means the pipeline is shutting down.
@@ -65,7 +67,8 @@ fn push<T>(queue: &Queue<T>, item: T, name: &str) {
 /// - built waiter, wait for: `BuiltWaitItem::Next`, keyed by
 ///   `CheckpointBuilt(seq - 1)`.
 ///
-/// Reads: the chunk table; the object store's transactions, for their
+/// Takes: each chunk of the checkpoints it builds, from the chunk table.
+/// Reads: the object store's transactions, for their
 /// signatures (stored with their effects, so present for every settled
 /// chunk).
 pub struct ContentsBuilder {
@@ -103,9 +106,10 @@ impl ContentsBuilder {
     ) -> (CheckpointContentsBuilt, Vec<ExecutedEffects>) {
         let mut effects = Vec::new();
         for &height in &pending.heights {
+            // A chunk is in one checkpoint, built once.
             let chunk = self
                 .chunks
-                .get(height)
+                .take(height)
                 .expect("a ready checkpoint's chunks are in the chunk table");
             effects.extend(chunk.effects.iter().cloned());
         }
@@ -172,7 +176,7 @@ impl Processor for ContentsBuilder {
                     CheckpointEffects {
                         seq,
                         effects,
-                        last_of_epoch: false,
+                        closing: false,
                     },
                     "hasher",
                 );
@@ -199,6 +203,7 @@ impl Processor for ContentsBuilder {
 /// Outward:
 /// - built waiter, resolve: `CheckpointBuilt(seq)`, to the checkpoint built,
 ///   releasing `seq + 1`, its signatures and its certificate's fork check;
+/// - output waiter, notify: `CheckpointProgress::BuiltHere(seq)`;
 /// - consensus (black box): its checkpoint signature, at high priority.
 ///
 /// Reads and writes: the checkpoint store.
@@ -208,6 +213,7 @@ pub struct SummaryBuilder {
     key: Arc<ProtocolKey>,
     built: BuiltWaits,
     consensus: TransactionClient,
+    outputs: OutputWaits,
 }
 
 impl SummaryBuilder {
@@ -217,6 +223,7 @@ impl SummaryBuilder {
         key: Arc<ProtocolKey>,
         built: BuiltWaits,
         consensus: TransactionClient,
+        outputs: OutputWaits,
     ) -> SummaryBuilder {
         SummaryBuilder {
             epoch,
@@ -224,6 +231,7 @@ impl SummaryBuilder {
             key,
             built,
             consensus,
+            outputs,
         }
     }
 }
@@ -263,16 +271,18 @@ impl Processor for SummaryBuilder {
                     .last()
                     .expect("a checkpoint has chunks"),
                 timestamp_ms: built.pending.timestamp_ms,
-                root_state: match &built.last {
-                    Some(LastOfEpoch::Closed(end)) => Some(end.root_state.clone()),
-                    _ => None,
-                },
+                ends_epoch: built.last.is_some(),
             };
             let checkpoint = self.checkpoints.insert_built(checkpoint);
             resolved.push((CheckpointBuilt(seq), checkpoint));
         }
         // Every summary is in the checkpoint store: resolve.
+        let built_here = resolved
+            .iter()
+            .map(|(CheckpointBuilt(seq), _)| CheckpointProgress::BuiltHere(*seq))
+            .collect::<Vec<_>>();
         push(&self.built, Command::Resolve(resolved), "built waiter");
+        push(&self.outputs, Command::notify(built_here), "output waiter");
         for signature in signatures {
             // Where it is included is not needed: the built waiter waits for
             // whatever signatures consensus commits. Failing only as

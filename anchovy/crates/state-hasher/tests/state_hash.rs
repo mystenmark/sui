@@ -118,7 +118,7 @@ fn roots_fold_in_order() {
             processor
                 .process(
                     CheckpointEffects {
-                        last_of_epoch: false,
+                        closing: false,
                         seq,
                         effects: effects.clone()
                     },
@@ -159,7 +159,7 @@ fn roots_fold_in_order_whatever_the_arrival_order() {
         let seq = first + i as u64;
         processor.process(
             CheckpointEffects {
-                last_of_epoch: false,
+                closing: false,
                 seq,
                 effects: checkpoints[i].clone(),
             },
@@ -184,17 +184,46 @@ fn roots_fold_in_order_whatever_the_arrival_order() {
     assert_eq!(hashes.root(first - 1), None);
 }
 
+/// Hashed again, as by both front ends, a checkpoint must hash alike, and
+/// folds once: before its root is folded, or after.
 #[test]
-#[should_panic(expected = "hashed twice")]
-fn a_checkpoint_hashed_twice_panics() {
+fn a_checkpoint_hashed_again_alike_folds_once() {
+    let mut rng = Rng(0x5eed_5eed_0000_0001);
+    let checkpoints = checkpoints(&mut rng, 2);
+    let expected = reference_roots(&GlobalStateHash::default(), &checkpoints);
     let (hashes, _dir) = state_hashes();
-    let mut processor = StateHasher::new(hashes, 0, StateHash::default());
-    for _ in 0..2 {
+    let mut processor = StateHasher::new(hashes.clone(), 0, StateHash::default());
+    let mut hash = |seq: u64| {
         processor.process(
             CheckpointEffects {
-                last_of_epoch: false,
+                closing: false,
+                seq,
+                effects: checkpoints[seq as usize].clone(),
+            },
+            &mut workqueue::Bump::default(),
+        );
+    };
+    // Pending, then folded.
+    for seq in [1, 1, 0, 0, 1] {
+        hash(seq);
+    }
+    assert_eq!(hashes.root(1).as_ref(), Some(&expected[1]));
+    assert_eq!(hashes.latest_root(), Some((1, expected[1].clone())));
+}
+
+#[test]
+#[should_panic(expected = "fork: checkpoint 3 hashed differently")]
+fn a_checkpoint_hashed_again_differently_panics() {
+    let mut rng = Rng(0x5eed_5eed_0000_0002);
+    let checkpoints = checkpoints(&mut rng, 2);
+    let (hashes, _dir) = state_hashes();
+    let mut processor = StateHasher::new(hashes, 0, StateHash::default());
+    for effects in checkpoints {
+        processor.process(
+            CheckpointEffects {
+                closing: false,
                 seq: 3,
-                effects: vec![],
+                effects,
             },
             &mut workqueue::Bump::default(),
         );

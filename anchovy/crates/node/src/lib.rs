@@ -36,6 +36,7 @@ use validator::current::EpochHandle;
 use validator::epoch::EpochState;
 use validator::epoch_store::{BuilderOutput, ConsensusOutput as OutputWriter, EpochStore};
 use validator::pipeline::backpressure::{Backpressure, Limits};
+use validator::pipeline::chunk_lock::{ChunkLock, Cut};
 use validator::pipeline::items::{CertifiedCheckpoint, EffectsWaitItem, GateInput};
 use validator::pipeline::keys::EffectsKey;
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable, GenerationTable};
@@ -75,6 +76,8 @@ pub struct Pipeline {
     /// From peers: the random beacon's signatures.
     pub beacon: Queue<BeaconInput>,
     randomness_gate: Queue<GateInput>,
+    checkpoint_queries: Queue<validator::state_sync::Request>,
+    checkpoint_sync: Queue<validator::state_sync::SyncedInput>,
     /// Each member's network key and p2p address, by committee index.
     network_keys: Vec<[u8; 32]>,
     p2p_addresses: Vec<String>,
@@ -175,7 +178,7 @@ fn announce_capabilities(
         *protocol_key.public(),
         epoch.params.chain,
         &epoch.params.config,
-        execution::upgrade::supported_protocol_versions(),
+        execution::upgrade::supported_protocol_versions(epoch.params.chain),
         system_objects.accumulator_root.is_some(),
     );
     let consensus = consensus.clone();
@@ -228,9 +231,8 @@ impl Pipeline {
         ));
         let next_to_certify = committed_seq + 1;
 
-        // Where the epoch resumes: after the last commit its consensus
-        // output was written through, else from its start, before any of its
-        // chunks: heights count from 1 each epoch.
+        // The last chunk of the last checkpoint committed, 0 if none this
+        // epoch: heights count from 1 each epoch.
         let committed_height = if committed_seq > record.previous_checkpoint {
             BuiltCheckpoint::decode(
                 &store
@@ -242,9 +244,6 @@ impl Pipeline {
         } else {
             0
         };
-        consensus_output
-            .committed_checkpoints()
-            .committed_through(committed_height);
         builder_output.delete_state_hashes_above(committed_seq);
         let resumed = consensus_output
             .record()
@@ -297,10 +296,21 @@ impl Pipeline {
             cache: Arc::new(ConsensusTxCache::new()),
             generations: Arc::new(GenerationTable::new(epoch_store.clone())),
             chunks: Arc::new(ChunkTable::new()),
+            chunk_lock: Arc::new(ChunkLock::new(
+                resumed.map_or(0, |r| r.height),
+                Cut {
+                    seq: resumed.map_or(record.previous_checkpoint, |r| r.next_seq - 1),
+                    height: resumed.map_or(0, |r| r.height),
+                },
+            )),
             checkpoints,
             statuses: Arc::new(ConsensusTxStatusCache::new()),
             state_hashes,
-            backpressure: Arc::new(Backpressure::new(BACKPRESSURE, committed_seq)),
+            backpressure: Arc::new(Backpressure::new(
+                BACKPRESSURE,
+                committed_seq,
+                committed_height,
+            )),
             start,
             next_to_certify,
             first_hashed,
@@ -335,6 +345,8 @@ impl Pipeline {
             effects: queues.effects_waits,
             beacon: queues.beacon,
             randomness_gate: queues.gate,
+            checkpoint_queries: queues.checkpoint_queries,
+            checkpoint_sync: queues.checkpoint_sync,
             network_keys: record.committee.iter().map(|m| m.network_key).collect(),
             p2p_addresses: record
                 .committee
@@ -381,6 +393,8 @@ impl Pipeline {
             network_keys: self.network_keys.clone(),
             p2p_addresses: self.p2p_addresses.clone(),
             randomness_gate: self.randomness_gate.clone(),
+            checkpoint_queries: self.checkpoint_queries.clone(),
+            checkpoint_sync: self.checkpoint_sync.clone(),
         })
     }
 }

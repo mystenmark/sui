@@ -332,4 +332,13 @@ fn the_collector_signs_and_aggregates_with_its_shares() {
     let pushed = outgoing(&mut collector);
     assert_eq!(pushed[0].sig, Some(sig));
     assert!(pushed[0].partial_sigs.is_empty());
+
+    // Restarted, it pushes the signature again: a peer may still need it.
+    drop(collector);
+    let (store, _, _) = validator::epoch_store::EpochStore::open(dir.path(), 1);
+    let (gate, _gate_inbox) = workqueue::queue(16);
+    let mut collector = SignatureCollector::new(1, network.setup.clone(), Some(0), store, gate);
+    let pushed = outgoing(&mut collector);
+    assert_eq!(pushed.len(), 1);
+    assert_eq!((pushed[0].round, pushed[0].sig), (0, Some(sig)));
 }

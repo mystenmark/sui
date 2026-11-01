@@ -222,16 +222,18 @@ fn committed_effects(store: &store::Store, seq: u64, bump: &mut Bump) -> Vec<Exe
 /// changed object's digest, remove each old one's), then folds it into the
 /// running root once the previous root is folded.
 ///
-/// Checkpoints may arrive in any order. The previous root is this
+/// Checkpoints may arrive in any order, and again: a checkpoint hashed
+/// again must hash alike. The previous root is this
 /// processor's own state, so the wait for it is the `pending` map: a
 /// checkpoint's hash is kept there until every earlier one is folded.
 ///
 /// Inward:
-/// - `ContentsBuilder`, or `EpochCloser` for the epoch's last checkpoint:
-///   `CheckpointEffects`.
+/// - `ContentsBuilder`, or `EpochCloser` for the epoch's last checkpoint,
+///   and `SyncedScheduler`: `CheckpointEffects`.
 ///
 /// Outward:
-/// - `EpochCloser`: the root after the epoch's last checkpoint, once folded.
+/// - `EpochCloser`: the root after the epoch's last checkpoint, once folded
+///   and the closer has sent its effects.
 ///
 /// Writes `StateHashes`, which the checkpoint executor reads.
 ///
@@ -243,8 +245,8 @@ pub struct StateHasher {
     /// The next checkpoint to fold, and the root before it.
     next: u64,
     root: StateHash,
-    /// Computed, but some earlier checkpoint is not; whether each is its
-    /// epoch's last.
+    /// Computed, but some earlier checkpoint is not; whether each is
+    /// closing the epoch.
     pending: BTreeMap<u64, (StateHash, bool)>,
 }
 
@@ -277,30 +279,48 @@ impl Processor for StateHasher {
 
     fn process(&mut self, effects: CheckpointEffects, bump: &mut Bump) -> Option<()> {
         let seq = effects.seq;
-        assert!(
-            seq >= self.next && !self.pending.contains_key(&seq),
-            "checkpoint {seq} hashed twice"
-        );
         let hash = accumulate(&effects.effects, bump);
+        // Both front ends hash a checkpoint the synced scheduler commits
+        // before this validator builds it. The closer waits for the root
+        // whichever came first.
+        if seq < self.next || self.pending.contains_key(&seq) {
+            assert!(
+                self.hashes.checkpoint(seq).as_ref() == Some(&hash),
+                "fork: checkpoint {seq} hashed differently"
+            );
+            if effects.closing {
+                match self.pending.get_mut(&seq) {
+                    Some((_, closing)) => *closing = true,
+                    None => self.tell_closer(&self.hashes.root(seq).expect("folded")),
+                }
+            }
+            return None;
+        }
         self.hashes.insert_checkpoint(seq, &hash);
-        self.pending.insert(seq, (hash, effects.last_of_epoch));
-        while let Some((hash, last_of_epoch)) = self.pending.remove(&self.next) {
+        self.pending.insert(seq, (hash, effects.closing));
+        while let Some((hash, closing)) = self.pending.remove(&self.next) {
             self.root.union(&hash);
             self.hashes.insert_root(self.next, self.root.clone());
             self.next += 1;
-            if last_of_epoch {
-                let closer = self
-                    .epoch_closer
-                    .as_ref()
-                    .expect("an epoch's last checkpoint has a closer to tell");
-                // A closed queue means the pipeline is shutting down.
-                if let Err(workqueue::PushError::Full(_)) =
-                    closer.try_push(EpochCloserInput::Root(encode(&self.root)))
-                {
-                    panic!("the epoch closer refused the epoch's root");
-                }
+            if closing {
+                self.tell_closer(&self.root);
             }
         }
         None
+    }
+}
+
+impl StateHasher {
+    fn tell_closer(&self, root: &StateHash) {
+        let closer = self
+            .epoch_closer
+            .as_ref()
+            .expect("an epoch's last checkpoint has a closer to tell");
+        // A closed queue means the pipeline is shutting down.
+        if let Err(workqueue::PushError::Full(_)) =
+            closer.try_push(EpochCloserInput::Root(encode(root)))
+        {
+            panic!("the epoch closer refused the epoch's root");
+        }
     }
 }

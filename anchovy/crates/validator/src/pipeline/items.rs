@@ -118,6 +118,9 @@ pub enum GateInput {
     /// goes into. The p2p endpoint → gate, to fetch rounds peers stopped
     /// pushing.
     Waiting(oneshot::Sender<Option<(u64, u64)>>),
+    /// The synced scheduler released chunks in the chunk lock. Synced
+    /// scheduler → gate.
+    Released,
 }
 
 /// A full queue drops the question: the asker asks again.
@@ -215,6 +218,28 @@ pub struct Executable {
     /// What each of its input waiter keys resolved to, by the key's position:
     /// filled in by the input waiter.
     pub inputs: Vec<Option<InputValue>>,
+    /// Set on a transaction of a certified checkpoint the synced scheduler
+    /// runs; then `entry.shared` is empty and nothing was reserved.
+    pub synced: Option<Box<Synced>>,
+}
+
+/// What a certified transaction's effects decide, in place of the consensus
+/// path's decisions (`docs/state_sync_design.md`, Synced items). Its
+/// consensus objects at their input versions are among its keys, as
+/// `ObjectVersion`; a cancelled one's markers are in `entry.cancelled`.
+#[derive(Debug)]
+pub struct Synced {
+    /// The certified effects digest, which its effects must have.
+    pub effects: TxDigest,
+    /// Each consensus object input whose stream had ended: its id, the
+    /// version it ended at, and the transaction that ended it.
+    pub ended: Vec<(ObjectId, u64, [u8; 32])>,
+    /// Its funds withdrawals were insufficient (R4.5).
+    pub insufficient: bool,
+    /// Each consensus object it writes and its input version and digest:
+    /// where the epoch's version assignment starts it, if nothing in the
+    /// epoch touched it before.
+    pub writes: Vec<(StreamId, u64, messages::base::Digest)>,
 }
 
 /// What the input waiter takes: transactions waiting on their inputs, and
@@ -304,6 +329,9 @@ pub enum EffectsWaitItem {
     /// The change-epoch transaction executed. `EpochCloser` → effects waiter
     /// → `EpochCloser`.
     ChangeEpochExecuted,
+    /// Every transaction of certified checkpoint `seq` executed.
+    /// `SyncedScheduler` → effects waiter → `SyncedScheduler`.
+    SyncedExecuted(u64),
 }
 
 /// A transaction's executed effects, as the chunk table and checkpointing
@@ -332,8 +360,8 @@ pub struct SettledChunk {
 pub struct CheckpointEffects {
     pub seq: u64,
     pub effects: Vec<ExecutedEffects>,
-    /// The epoch's last checkpoint: its root goes to `EpochCloser`.
-    pub last_of_epoch: bool,
+    /// From `EpochCloser`, closing the epoch: the root after it goes back.
+    pub closing: bool,
 }
 
 /// A checkpoint's contents, built without the previous checkpoint.
@@ -389,10 +417,8 @@ pub struct EndOfEpoch {
     /// Each member's protocol key and voting power, in committee order.
     pub next_committee: Vec<([u8; 96], u64)>,
     pub next_protocol_version: u64,
-    /// The live object set's ECMH after the checkpoint (`StateHash` BCS),
-    /// which the next epoch's root continues from.
-    pub root_state: Vec<u8>,
-    /// Its digest, the epoch's commitment, when the protocol commits it.
+    /// The digest of the live object set's ECMH after the checkpoint, the
+    /// epoch's commitment, when the protocol commits it.
     pub root_state_digest: Option<[u8; 32]>,
 }
 
@@ -422,11 +448,18 @@ pub enum BuiltWaitItem {
         certified: CertifiedCheckpoint,
         local: Option<Arc<BuiltCheckpoint>>,
     },
+    /// A certified checkpoint fetched from peers, waiting for the local one
+    /// to compare it with, then to be committed. `SyncedScheduler` → built
+    /// waiter → fork check → `CheckpointCommitter`.
+    Synced {
+        certified: CertifiedCheckpoint,
+        local: Option<Arc<BuiltCheckpoint>>,
+    },
 }
 
 impl waiter::Receive<Arc<BuiltCheckpoint>> for BuiltWaitItem {
     fn receive(&mut self, _: usize, built: Arc<BuiltCheckpoint>) {
-        if let BuiltWaitItem::Certified { local, .. } = self {
+        if let BuiltWaitItem::Certified { local, .. } | BuiltWaitItem::Synced { local, .. } = self {
             *local = Some(built);
         }
     }
@@ -439,8 +472,21 @@ pub type BuiltCommand =
 /// The built waiter's queue.
 pub type BuiltWaits = workqueue::Queue<BuiltCommand>;
 
+/// Consensus output through the `n`th commit finished, written once its
+/// checkpoints are built here and committed. `CommitStage` → output waiter
+/// → `OutputCommitter`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputThrough(pub u64);
+
+pub type OutputCommand = waiter::Command<crate::pipeline::keys::CheckpointProgress, OutputThrough>;
+
+/// The output waiter's queue.
+pub type OutputWaits = workqueue::Queue<OutputCommand>;
+
 /// A certified checkpoint. `CheckpointAggregator` → state sync, and →
-/// `CheckpointCommitter`, in sequence order.
+/// `CheckpointCommitter`, in sequence order; or fetched from peers,
+/// `SyncedScheduler` → built waiter → `CheckpointCommitter`, in sequence
+/// order.
 #[derive(Debug, Clone)]
 pub struct CertifiedCheckpoint {
     pub seq: u64,
