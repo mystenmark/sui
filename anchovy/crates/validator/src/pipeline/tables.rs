@@ -21,7 +21,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// One generation of a shared-object stream: the version the generation's
 /// writer produced, or the stream's end.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Generation {
     /// The object at this version and digest.
     Version { version: u64, digest: [u8; 32] },
@@ -173,7 +173,7 @@ impl ChunkTable {
 }
 
 /// A checkpoint this validator built.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BuiltCheckpoint {
     pub seq: u64,
     /// `CheckpointSummary` BCS and digest.
@@ -207,45 +207,13 @@ impl BuiltCheckpoint {
 
     /// As the object store keeps it (`Store::commit_checkpoint`).
     pub fn encode(&self) -> Vec<u8> {
-        bcs::to_bytes(&(
-            self.seq,
-            &self.summary,
-            self.digest,
-            &self.contents,
-            self.network_total_transactions,
-            self.epoch_rolling_gas,
-            self.last_height,
-            self.timestamp_ms,
-            self.ends_epoch,
-        ))
-        .expect("a checkpoint encodes")
+        bcs::to_bytes(self).expect("a checkpoint encodes")
     }
 
     /// # Panics
     /// If `bytes` is not what `encode` wrote.
     pub fn decode(bytes: &[u8]) -> BuiltCheckpoint {
-        let (
-            seq,
-            summary,
-            digest,
-            contents,
-            network_total_transactions,
-            epoch_rolling_gas,
-            last_height,
-            timestamp_ms,
-            ends_epoch,
-        ) = bcs::from_bytes(bytes).expect("a stored checkpoint decodes");
-        BuiltCheckpoint {
-            seq,
-            summary,
-            digest,
-            contents,
-            network_total_transactions,
-            epoch_rolling_gas,
-            last_height,
-            timestamp_ms,
-            ends_epoch,
-        }
+        bcs::from_bytes(bytes).expect("a stored checkpoint decodes")
     }
 }
 

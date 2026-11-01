@@ -935,7 +935,7 @@ const SYSTEM_STATE_INITIAL_SHARED_VERSION: u64 = 1;
 /// once the checkpoints covering it have committed, and only after a commit
 /// that leaves no chunk waiting for a checkpoint: so it is all of the
 /// stage's state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommitRecord {
     pub commit_index: u32,
     pub leader_round: u32,
@@ -953,42 +953,13 @@ pub struct CommitRecord {
 
 impl CommitRecord {
     pub fn encode(&self) -> Vec<u8> {
-        bcs::to_bytes(&(
-            self.commit_index,
-            self.leader_round,
-            self.height,
-            self.next_seq,
-            self.last_built_timestamp,
-            self.root_version,
-            self.closed,
-            self.certs_closed,
-        ))
-        .expect("a record encodes")
+        bcs::to_bytes(self).expect("a record encodes")
     }
 
     /// # Panics
     /// If `bytes` is not what `encode` wrote.
     pub fn decode(bytes: &[u8]) -> CommitRecord {
-        let (
-            commit_index,
-            leader_round,
-            height,
-            next_seq,
-            last_built_timestamp,
-            root_version,
-            closed,
-            certs_closed,
-        ) = bcs::from_bytes(bytes).expect("a stored record decodes");
-        CommitRecord {
-            commit_index,
-            leader_round,
-            height,
-            next_seq,
-            last_built_timestamp,
-            root_version,
-            closed,
-            certs_closed,
-        }
+        bcs::from_bytes(bytes).expect("a stored record decodes")
     }
 }
 

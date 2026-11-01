@@ -154,21 +154,11 @@ impl EpochStore {
     /// If the database cannot be written.
     pub fn put_generations(&self, generations: &[(StreamId, u32, u32, Generation)]) {
         let mut batch = self.db.batch();
-        for &(stream, round, generation, value) in generations {
-            let (tag, version, bytes) = match value {
-                Generation::Version { version, digest } => (0, version, digest),
-                Generation::Ended {
-                    version,
-                    transaction,
-                } => (1, version, transaction),
-            };
-            let mut encoded = vec![tag];
-            encoded.extend_from_slice(&version.to_le_bytes());
-            encoded.extend_from_slice(&bytes);
+        for (stream, round, generation, value) in generations {
             batch.put(
                 Space::Generations,
-                generation_key(&stream, round, generation).to_vec(),
-                encoded,
+                generation_key(stream, *round, *generation).to_vec(),
+                bcs::to_bytes(value).expect("a generation encodes"),
             );
         }
         batch.commit().expect("the epoch's database writes");
@@ -186,18 +176,7 @@ impl EpochStore {
                 &generation_key(stream, round, generation),
             )
             .expect("the epoch's database reads")?;
-        let version = u64::from_le_bytes(v[1..9].try_into().expect("8 bytes"));
-        let bytes: [u8; 32] = v[9..].try_into().expect("32 bytes");
-        Some(match v[0] {
-            0 => Generation::Version {
-                version,
-                digest: bytes,
-            },
-            _ => Generation::Ended {
-                version,
-                transaction: bytes,
-            },
-        })
+        Some(bcs::from_bytes(&v).expect("a stored generation decodes"))
     }
 
     /// Records the random bytes of randomness round `round`, durably: peers
