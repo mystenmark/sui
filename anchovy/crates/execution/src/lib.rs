@@ -153,7 +153,8 @@ impl Execution {
             epoch,
             epoch_start_timestamp_ms,
             reference_gas_price,
-        )?;
+        )?
+        .with_chain_identifier(chain_identifier);
         let native = native::NativeExecution::new(
             reference.config.clone(),
             reference.metrics.clone(),
@@ -235,6 +236,8 @@ pub struct Reference {
     epoch: u64,
     epoch_start_timestamp_ms: u64,
     rgp: u64,
+    /// Coin reservations' ids are masked with it.
+    chain_identifier: [u8; 32],
 }
 
 /// What executing a transaction produced: its effects, as BCS, and what
@@ -312,7 +315,15 @@ impl Reference {
             epoch,
             epoch_start_timestamp_ms,
             rgp: reference_gas_price,
+            chain_identifier: [0; 32],
         })
+    }
+
+    /// Whose coin reservations' ids are masked with `chain_identifier`.
+    #[must_use]
+    pub fn with_chain_identifier(mut self, chain_identifier: [u8; 32]) -> Reference {
+        self.chain_identifier = chain_identifier;
+        self
     }
 
     pub fn protocol_config(&self) -> &ProtocolConfig {
@@ -394,6 +405,20 @@ impl Reference {
             None => ExecutionOrEarlyError::ok(None),
             Some(errors) => ExecutionOrEarlyError::failed(errors, None),
         };
+        // As the reference's `rewrite_transaction_for_coin_reservations`,
+        // skipped on an early error.
+        let mut kind = data.kind().clone();
+        let rewritten = if early.is_ok() {
+            rewrite_coin_reservations(
+                &view,
+                self.chain_identifier,
+                data.sender(),
+                &mut kind,
+                accumulator_version.map(|v| v.version),
+            )?
+        } else {
+            None
+        };
         let (store_out, _, effects, _, _) = self.executor.execute_transaction_to_effects(
             &view,
             &self.config,
@@ -407,8 +432,8 @@ impl Reference {
             &ReferenceUnsettled(unsettled),
             data.gas_data().clone(),
             gas_status,
-            data.kind().clone(),
-            None,
+            kind,
+            rewritten,
             data.sender(),
             digest,
             &mut None,
@@ -648,4 +673,48 @@ fn removed(effects: &TransactionEffects) -> Vec<store::Removed> {
 
 fn digest_of(digest: TransactionDigest) -> messages::base::Digest {
     messages::base::Digest::new(digest.into_inner())
+}
+
+/// Each coin reservation input of `kind` rewritten into a withdrawal from
+/// `sender`'s balance, as of the root at `accumulator_version`: sui-core's
+/// `rewrite_transaction_for_coin_reservations`. Which inputs were
+/// rewritten, if any reservation was.
+fn rewrite_coin_reservations(
+    view: &StoreView<'_>,
+    chain_identifier: [u8; 32],
+    sender: sui_types::base_types::SuiAddress,
+    kind: &mut sui_types::transaction::TransactionKind,
+    accumulator_version: Option<sui_types::base_types::SequenceNumber>,
+) -> Result<Option<Vec<bool>>> {
+    use sui_types::coin_reservation::{
+        BorrowedCoinReservationResolver, CoinReservationResolverTrait as _,
+        ParsedObjectRefWithdrawal,
+    };
+    use sui_types::transaction::{CallArg, ObjectArg, TransactionKind};
+    let TransactionKind::ProgrammableTransaction(pt) = kind else {
+        return Ok(None);
+    };
+    let chain = sui_types::digests::ChainIdentifier::from(
+        sui_types::digests::CheckpointDigest::new(chain_identifier),
+    );
+    if pt.coin_reservation_obj_refs().count() == 0 {
+        return Ok(None);
+    }
+    let resolver = BorrowedCoinReservationResolver::new(view);
+    let mut rewritten = Vec::with_capacity(pt.inputs.len());
+    for input in &mut pt.inputs {
+        if let CallArg::Object(ObjectArg::ImmOrOwnedObject(object_ref)) = input
+            && let Some(parsed) = ParsedObjectRefWithdrawal::parse(object_ref, chain)
+        {
+            *input = CallArg::FundsWithdrawal(resolver.resolve_funds_withdrawal(
+                sender,
+                parsed,
+                accumulator_version,
+            )?);
+            rewritten.push(true);
+        } else {
+            rewritten.push(false);
+        }
+    }
+    Ok(Some(rewritten))
 }
