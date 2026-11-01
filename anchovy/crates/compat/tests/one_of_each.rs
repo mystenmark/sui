@@ -1914,9 +1914,9 @@ fn the_composite_workload_runs_alike() {
     let full_node = sui_swarm::memory::Node::new(config);
     network.runtime.block_on(full_node.start()).unwrap();
     // Its RPC answers once it has indexed a checkpoint.
-    let state = full_node.get_node_handle().unwrap().state();
+    let full_node_state = full_node.get_node_handle().unwrap().state();
     network.wait_for("the full node to execute a checkpoint", |_| {
-        state
+        full_node_state
             .get_checkpoint_store()
             .get_highest_executed_checkpoint_seq_number()
             .unwrap()
@@ -1956,7 +1956,7 @@ fn the_composite_workload_runs_alike() {
         Arc::new(network.key.copy()),
     );
     let genesis = network.config.genesis.clone();
-    let stats = network.runtime.block_on(async move {
+    let bench = network.runtime.block_on(async move {
         let registry = prometheus::Registry::new();
         let proxy_metrics = BenchmarkProxyMetrics::new(&registry);
         let proxy: Arc<dyn ValidatorProxy + Send + Sync> = Arc::new(
@@ -2014,7 +2014,7 @@ fn the_composite_workload_runs_alike() {
             WorkloadConfiguration::build(builders, bank, observer.clone(), 100, BTreeMap::new())
                 .await
                 .unwrap();
-        let (stats, _) = BenchDriver::new(5, false)
+        let (bench, _) = BenchDriver::new(5, false)
             .run(
                 vec![proxy.clone()],
                 vec![proxy],
@@ -2022,13 +2022,13 @@ fn the_composite_workload_runs_alike() {
                 observer,
                 &registry,
                 false,
-                Interval::Time(Duration::from_secs(60)),
+                Interval::Time(Duration::from_mins(1)),
             )
             .await
             .unwrap();
-        stats
+        bench
     });
-    tracing::info!(?stats, "composite workload done");
+    tracing::info!(?bench, "composite workload done");
 
     // Anchovy certifies whatever the quorum certified by now.
     let last = network
