@@ -3,8 +3,8 @@
 
 //! The random beacon, past what the commit handler decides: this member's
 //! part in DKG (`DkgParty`); each randomness round's signatures, signed,
-//! collected and verified (`SignatureCollector`); and the gate that holds a
-//! round's randomness state update until its bytes arrive
+//! collected and verified (`SignatureCollector`); and the gate that passes
+//! chunks on in height order once the gate waiter has their round's bytes
 //! (`RandomnessGate`). `docs/randomness_design.md`.
 
 mod collector;
@@ -12,7 +12,7 @@ mod gate;
 mod party;
 
 pub use collector::{BeaconInput, SendSignaturesRequest, SignatureCollector};
-pub use gate::RandomnessGate;
+pub use gate::{GateAvailability, RandomnessGate};
 pub use party::{DkgParty, PartyInput};
 
 /// The message a randomness round's signature signs: the reference's

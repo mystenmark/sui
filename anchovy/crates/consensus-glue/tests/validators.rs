@@ -458,7 +458,7 @@ async fn submit_and_wait(service: &Validator, transaction: &Transaction) -> bool
         RawValidatorTransactionStatus::Executed(_) => true,
         // Its block was garbage collected uncommitted, as under load.
         RawValidatorTransactionStatus::Expired(_) => false,
-        status => panic!("not executed: {status:?}"),
+        status @ RawValidatorTransactionStatus::Rejected(_) => panic!("not executed: {status:?}"),
     }
 }
 

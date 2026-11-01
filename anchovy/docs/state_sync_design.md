@@ -102,8 +102,9 @@ Per epoch, a table holds:
 
 **Consensus.** Handling a commit claims its chunks, exactly: they are
 complete once it is handled. The claim never waits. A claimed chunk that
-`synced` holds waits in the randomness gate, with every chunk after it,
-until the synced scheduler removes it from `synced` and tells the gate.
+`synced` holds waits in the gate waiter on `ChunkFree` of its height, and
+the randomness gate holds every chunk after it, until the synced scheduler
+removes it from `synced` and resolves the key.
 
 **Synced**, for checkpoint K:
 
@@ -125,8 +126,8 @@ transaction follows its last barrier, outside every chunk, so the slow
 path runs it after the chunks, at the input versions its effects give;
 those order it after the epoch's other writers.
 
-The randomness gate holds a chunk headed by a randomness state update, and
-every chunk after it, until the round's bytes arrive, which may never
+A chunk headed by a randomness state update waits for its round's bytes,
+and the randomness gate holds every chunk after it, until they arrive, which may never
 happen once the quorum has moved on. So the synced scheduler gives the
 signature collector the bytes in each split checkpoint's randomness state
 updates, which it verifies against the epoch's DKG public key. A cut

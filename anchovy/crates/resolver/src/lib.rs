@@ -21,10 +21,10 @@ use validator::pipeline::items::{
     Chunk, Executable, ExecutableTransaction, FundsCommand, InputCommand, InputValue,
     ScheduledEntry, Withdrawal,
 };
-use validator::pipeline::keys::{self, InputKey, StreamId};
+use validator::pipeline::keys::{self, InputKey};
 use validator::pipeline::tables::{Generation, GenerationTable};
 use waiter::{Availability, Command, WaitBatch};
-use workqueue::{Processor, PushError, Queue};
+use workqueue::{Processor, Queue};
 
 /// Turns each scheduled transaction's inputs into input waiter keys:
 /// `ObjectVersion` for owned, immutable and receiving objects; `Package` for
@@ -67,56 +67,16 @@ impl VersionResolver {
         }
     }
 
-    /// Leaves `entry`'s keys in `keys` and its withdrawals in `amounts`,
-    /// and returns the generations its generation-0 accesses resolve to.
-    fn resolve(
-        &mut self,
-        entry: &ScheduledEntry,
-        chain_identifier: &ChainIdentifier,
-        bump: &Bump,
-    ) -> Vec<(StreamId, u32, u32)> {
+    /// Leaves `entry`'s keys in `keys` and its withdrawals in `amounts`.
+    fn resolve(&mut self, entry: &ScheduledEntry, chain_identifier: &ChainIdentifier, bump: &Bump) {
         self.keys.clear();
         self.amounts.clear();
-        let mut resolved_base = Vec::new();
-        self.resolve_shared(&entry.shared, &mut resolved_base);
+        self.keys
+            .extend(entry.shared.iter().map(SharedAccess::input_key));
         if let ExecutableTransaction::User(transaction) = &entry.transaction {
             let data = transaction.get().0.data();
             object_keys(data, &mut self.keys, &mut self.packages);
             funds_withdrawals(data, chain_identifier, &mut self.amounts, bump);
-        }
-        resolved_base
-    }
-
-    /// Pushes the keys of `shared`'s accesses to `keys`, with each
-    /// generation 0 the commit handler linked to an earlier round's
-    /// generation in `resolved_base`.
-    fn resolve_shared(
-        &mut self,
-        shared: &[SharedAccess],
-        resolved_base: &mut Vec<(StreamId, u32, u32)>,
-    ) {
-        for access in shared {
-            let stream = StreamId {
-                id: access.id,
-                initial_shared_version: access.initial_shared_version,
-            };
-            let key = match (access.ordinal.writes_before, access.base) {
-                (0, Some(base)) => {
-                    resolved_base.push((stream, base.round, base.writes_before));
-                    InputKey::Generation {
-                        stream,
-                        round: base.round,
-                        generation: base.writes_before,
-                    }
-                }
-                (0, None) => InputKey::StreamLive(stream),
-                (generation, _) => InputKey::Generation {
-                    stream,
-                    round: access.ordinal.round,
-                    generation,
-                },
-            };
-            self.keys.push(key);
         }
     }
 }
@@ -262,7 +222,6 @@ impl Processor for VersionResolver {
         let Chunk {
             version,
             root_version,
-            height,
             entries,
             ..
         } = chunk;
@@ -270,7 +229,7 @@ impl Processor for VersionResolver {
         let mut withdrawals = Vec::new();
         for entry in entries {
             let chain_identifier = self.epoch.chain_identifier;
-            let resolved_base = self.resolve(&entry, &chain_identifier, bump);
+            self.resolve(&entry, &chain_identifier, bump);
             let reserved: Vec<keys::Reservation> = self
                 .amounts
                 .drain(..)
@@ -295,27 +254,18 @@ impl Processor for VersionResolver {
                 version,
                 root_version,
                 reserved,
-                height,
                 entry,
-                resolved_base,
                 inputs: Vec::new(),
                 synced: None,
             };
             batch.push(executable, self.keys.drain(..));
         }
-        // Inside the pipeline a full queue is a sizing bug, not load to shed;
-        // a closed one means the pipeline is shutting down.
-        if !batch.is_empty()
-            && let Err(PushError::Full(_)) = self.inputs.try_push(Command::Wait(batch))
-        {
-            panic!("the input waiter's queue refused work");
+        if !batch.is_empty() {
+            self.inputs.push(Command::Wait(batch), "input waiter");
         }
-        if !withdrawals.is_empty()
-            && let Err(PushError::Full(_)) = self
-                .withdrawals
-                .try_push(FundsCommand::Reserve(withdrawals))
-        {
-            panic!("the funds reserver's queue refused work");
+        if !withdrawals.is_empty() {
+            self.withdrawals
+                .push(FundsCommand::Reserve(withdrawals), "funds reserver");
         }
         None
     }

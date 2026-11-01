@@ -47,7 +47,6 @@ use validator::consensus::commit::{CommitStage, EpochStart};
 use validator::consensus::decode::{CommittedTransaction, DecodedCommit};
 use validator::epoch::EpochParams;
 use validator::epoch_store::{ConsensusOutput, EpochStore};
-use validator::pipeline::items::GateInput;
 use workqueue::Processor;
 
 struct Counting;
@@ -226,8 +225,12 @@ fn main() {
                 let allocated = ALLOCATIONS.load(Ordering::Relaxed) - before;
                 bump.reset();
                 let mut emitted = 0;
-                while let Some(GateInput::Chunk(gated)) = gate_inbox.try_pop() {
-                    emitted += gated.chunk.entries.len();
+                while let Some(waiter::Command::Wait(batch)) = gate_inbox.try_pop() {
+                    emitted += batch
+                        .into_parts()
+                        .iter()
+                        .map(|(gated, _)| gated.chunk.entries.len())
+                        .sum::<usize>();
                 }
                 while checkpoint_inbox.try_pop().is_some() {}
                 assert_eq!(emitted, commit_size + 1);

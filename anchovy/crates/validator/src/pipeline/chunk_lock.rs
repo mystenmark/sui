@@ -5,8 +5,8 @@
 //! "The chunk lock"): the commit stage, for the chunks of the commits it
 //! handles; the synced scheduler, for chunks of certified checkpoints past
 //! them. The two never run one chunk at once: a chunk of the commit stage's
-//! that the synced scheduler holds waits in the randomness gate until
-//! released.
+//! waits in the gate waiter on `GateKey::ChunkFree` until the synced
+//! scheduler releases it.
 
 use std::collections::BTreeSet;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -81,8 +81,8 @@ impl ChunkLock {
         handled
     }
 
-    /// The synced scheduler has run the chunk at `height`. The randomness
-    /// gate is told after: it may hold the chunk.
+    /// The synced scheduler has run the chunk at `height`. `ChunkFree` is
+    /// resolved after, so a wait that checked before still wakes.
     pub fn release(&self, height: u64) {
         let removed = self.state().synced.remove(&height);
         debug_assert!(removed, "chunk {height} was taken");

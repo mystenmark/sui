@@ -93,14 +93,10 @@ impl CheckpointCommitter {
         if built.ends_epoch {
             self.ended.send_replace(Some(seq));
         }
-        // Inside the pipeline a full queue is a sizing bug; a closed one
-        // means the pipeline is shutting down.
-        if let Err(workqueue::PushError::Full(_)) = self
-            .outputs
-            .try_push(Command::notify([CheckpointProgress::Committed(seq)]))
-        {
-            panic!("the output waiter refused a committed checkpoint");
-        }
+        self.outputs.push(
+            Command::notify([CheckpointProgress::Committed(seq)]),
+            "output waiter",
+        );
     }
 }
 

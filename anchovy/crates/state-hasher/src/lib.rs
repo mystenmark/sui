@@ -316,11 +316,6 @@ impl StateHasher {
             .epoch_closer
             .as_ref()
             .expect("an epoch's last checkpoint has a closer to tell");
-        // A closed queue means the pipeline is shutting down.
-        if let Err(workqueue::PushError::Full(_)) =
-            closer.try_push(EpochCloserInput::Root(encode(root)))
-        {
-            panic!("the epoch closer refused the epoch's root");
-        }
+        closer.push(EpochCloserInput::Root(encode(root)), "epoch closer");
     }
 }

@@ -164,10 +164,9 @@ impl Processor for DkgParty {
                 // that survived.
                 if let Ok(output) = self.party.complete(used, &confirmations, &mut rng)
                     && let Some(shares) = output.shares
-                    && let Err(workqueue::PushError::Full(_)) =
-                        self.collector.try_push(BeaconInput::Shares(shares))
                 {
-                    panic!("the signature collector refused shares");
+                    self.collector
+                        .push(BeaconInput::Shares(shares), "signature collector");
                 }
             }
             PartyInput::Started {

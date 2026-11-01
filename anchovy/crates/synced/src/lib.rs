@@ -22,14 +22,14 @@ use tracing::warn;
 use validator::pipeline::chunk_lock::ChunkLock;
 use validator::pipeline::items::{
     BuiltWaitItem, BuiltWaits, CertifiedCheckpoint, CheckpointEffects, EffectsWaitItem,
-    ExecutedEffects, GateInput, InputCommand,
+    ExecutedEffects, GateWaits, InputCommand,
 };
-use validator::pipeline::keys::{CheckpointBuilt, EffectsKey, InputKey};
+use validator::pipeline::keys::{CheckpointBuilt, EffectsKey, GateKey, InputKey};
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore};
 use validator::randomness::BeaconInput;
 use validator::state_sync::{SyncRequest, SyncedInput, Wanted};
 use waiter::{Command, WaitBatch};
-use workqueue::{Bump, Processor, PushError, Queue};
+use workqueue::{Bump, Processor, Queue};
 
 /// How far past the last committed checkpoint summaries are taken: each
 /// waits in memory until committed.
@@ -77,7 +77,7 @@ struct Slow {
 /// A checkpoint split, until its transactions have executed.
 struct Running {
     certified: CertifiedCheckpoint,
-    contents_digest: Digest,
+    /// Verified.
     contents: Vec<u8>,
     /// The chunk heights it took from the commit stage.
     synced: RangeInclusive<u64>,
@@ -92,7 +92,7 @@ pub struct Outputs {
     pub hasher: Queue<CheckpointEffects>,
     pub committer: Queue<Vec<CertifiedCheckpoint>>,
     pub beacon: Queue<BeaconInput>,
-    pub gate: Queue<GateInput>,
+    pub gate: GateWaits,
 }
 
 /// Verifies certified summaries fetched from peers, in sequence order, each
@@ -136,8 +136,8 @@ pub struct Outputs {
 ///   transaction's `EffectsKey`;
 /// - `SignatureCollector`: the random bytes of each randomness state update
 ///   in the checkpoints it splits (`BeaconInput::Certified`);
-/// - randomness gate: `GateInput::Released`, after releasing chunks in the
-///   chunk lock;
+/// - gate waiter, resolve: `ChunkFree` of each chunk it ran, after
+///   releasing it in the chunk lock;
 /// - `StateHasher`: `CheckpointEffects` of each checkpoint it commits;
 /// - `CheckpointCommitter`: each checkpoint it commits.
 ///
@@ -295,7 +295,9 @@ impl SyncedScheduler {
             }
         }
         if !waits.is_empty() {
-            push(&self.outputs.built, Command::Wait(waits), "built waiter");
+            self.outputs
+                .built
+                .push(Command::Wait(waits), "built waiter");
         }
 
         for (seq, bytes) in request.contents {
@@ -358,10 +360,9 @@ impl SyncedScheduler {
     /// transaction of the checkpoint to execute.
     fn split(&mut self, slow: Slow, bump: &Bump) {
         let bytes = slow.contents.expect("fetched");
-        let contents =
-            contents::verify(&bytes, &slow.contents_digest, bump).expect("verified as fetched");
+        let contents = contents::parse(&bytes, bump);
         let transactions = contents.transactions();
-        let ends = contents::chunk_ends(transactions);
+        let ends = contents::chunk_ends(transactions, bump);
         let settled = *ends.last().expect("a checkpoint has chunks");
         assert_eq!(
             settled < transactions.len(),
@@ -397,7 +398,6 @@ impl SyncedScheduler {
                         };
                     let executable = item::executable(
                         t,
-                        height,
                         root_version,
                         deleter,
                         &mut self.keys,
@@ -414,7 +414,6 @@ impl SyncedScheduler {
             let root_version = barrier_root_version(&transactions[settled - 1]) + 1;
             let executable = item::executable(
                 change_epoch,
-                last,
                 root_version,
                 |id: &ObjectId, version: u64, _: &[TransactionDigest]| {
                     panic!("the change-epoch transaction found {id:?}'s stream ended at {version}")
@@ -425,7 +424,9 @@ impl SyncedScheduler {
             runs.push(executable, self.keys.drain(..));
         }
         if !runs.is_empty() {
-            push(&self.outputs.inputs, Command::Wait(runs), "input waiter");
+            self.outputs
+                .inputs
+                .push(Command::Wait(runs), "input waiter");
         }
         let seq = slow.certified.seq;
         let mut executed = WaitBatch::with_capacity(1, transactions.len());
@@ -435,16 +436,13 @@ impl SyncedScheduler {
                 .iter()
                 .map(|t| EffectsKey(*t.transaction.digest().digest())),
         );
-        push(
-            &self.outputs.effects,
-            Command::Wait(executed),
-            "effects waiter",
-        );
+        self.outputs
+            .effects
+            .push(Command::Wait(executed), "effects waiter");
         self.running.insert(
             seq,
             Running {
                 certified: slow.certified,
-                contents_digest: slow.contents_digest,
                 contents: bytes,
                 synced: (handled + 1).max(first)..=last,
                 last_height: last,
@@ -460,8 +458,7 @@ impl SyncedScheduler {
         for t in transactions {
             if let TransactionKind::RandomnessStateUpdate(update) = t.transaction.data().kind() {
                 let update = update.get();
-                push(
-                    &self.outputs.beacon,
+                self.outputs.beacon.push(
                     BeaconInput::Certified {
                         round: update.randomness_round,
                         bytes: update.random_bytes.to_vec(),
@@ -480,8 +477,7 @@ impl SyncedScheduler {
     /// validator, or the quorum, forked.
     fn executed(&mut self, seq: u64, bump: &Bump) {
         let running = self.running.remove(&seq).expect("a checkpoint it ran");
-        let contents = contents::verify(&running.contents, &running.contents_digest, bump)
-            .expect("verified as fetched");
+        let contents = contents::parse(&running.contents, bump);
         let mut effects = Vec::with_capacity(contents.transactions().len());
         for t in contents.transactions() {
             let digest = *t.transaction.digest();
@@ -501,10 +497,13 @@ impl SyncedScheduler {
             });
         }
         if !running.synced.is_empty() {
-            for height in running.synced {
+            for height in running.synced.clone() {
                 self.chunk_lock.release(height);
             }
-            push(&self.outputs.gate, GateInput::Released, "randomness gate");
+            let free = running.synced.map(|h| (GateKey::ChunkFree(h), None));
+            self.outputs
+                .gate
+                .push(Command::Resolve(free.collect()), "gate waiter");
         }
 
         let summary = CertifiedCheckpointSummary::parse(
@@ -518,7 +517,11 @@ impl SyncedScheduler {
             seq,
             summary: summary.bytes.to_vec(),
             digest: summary.digest.bytes,
-            contents: contents.contents.bytes.to_vec(),
+            contents: contents
+                .contents(bump)
+                .expect("verified as fetched")
+                .bytes
+                .to_vec(),
             network_total_transactions: summary.network_total_transactions,
             epoch_rolling_gas: [
                 gas.computation_cost,
@@ -530,8 +533,7 @@ impl SyncedScheduler {
             timestamp_ms: summary.timestamp_ms,
             ends_epoch: summary.end_of_epoch_data.is_some(),
         });
-        push(
-            &self.outputs.hasher,
+        self.outputs.hasher.push(
             CheckpointEffects {
                 seq,
                 effects,
@@ -539,11 +541,9 @@ impl SyncedScheduler {
             },
             "state hasher",
         );
-        push(
-            &self.outputs.committer,
-            vec![running.certified],
-            "committer",
-        );
+        self.outputs
+            .committer
+            .push(vec![running.certified], "committer");
     }
 }
 
@@ -562,7 +562,7 @@ fn barrier_root_version(barrier: &ExecutionData<'_>) -> u64 {
     effects
         .changed_objects
         .iter()
-        .find(|c| *c.id == contents::ACCUMULATOR_ROOT)
+        .find(|c| *c.id == messages::tx_index::SUI_ACCUMULATOR_ROOT_OBJECT_ID)
         .and_then(|c| match c.input_state {
             ObjectIn::Exist { version, .. } => Some(version),
             ObjectIn::NotExist => None,
@@ -595,8 +595,7 @@ fn deleter(
     }
     let bump = Bump::default();
     for r in running.values() {
-        let contents =
-            contents::verify(&r.contents, &r.contents_digest, &bump).expect("verified as fetched");
+        let contents = contents::parse(&r.contents, &bump);
         if let Some(t) = contents.transactions().iter().find(|t| ended(t)) {
             return t.transaction.digest().bytes;
         }
@@ -631,14 +630,6 @@ fn ended_at(effects: &TransactionEffectsV2<'_>, id: &ObjectId, version: u64) -> 
             || effects.unchanged_consensus_objects.iter().any(|(o, kind)| {
                 *o == id && matches!(kind, UnchangedConsensusKind::MutateConsensusStreamEnded(_))
             }))
-}
-
-/// Inside the pipeline a full queue is a sizing bug; a closed one means the
-/// pipeline is shutting down.
-fn push<T>(queue: &Queue<T>, item: T, name: &str) {
-    if let Err(PushError::Full(_)) = queue.try_push(item) {
-        panic!("the {name} queue refused synced work");
-    }
 }
 
 impl Processor for SyncedScheduler {

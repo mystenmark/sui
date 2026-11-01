@@ -11,7 +11,6 @@ use tokio::sync::watch;
 use workqueue::Queue;
 
 use crate::epoch::EpochState;
-use crate::pipeline::items::GateInput;
 use crate::processors;
 use crate::randomness::BeaconInput;
 use crate::server::Consensus;
@@ -31,8 +30,6 @@ pub struct EpochHandle {
     /// Each member's p2p address (a multiaddr), by committee index: where
     /// this member pushes its signatures.
     pub p2p_addresses: Vec<String>,
-    /// The randomness gate, asked which round it waits for.
-    pub randomness_gate: Queue<GateInput>,
     /// The checkpoint server, asked by peers' state sync.
     pub checkpoint_queries: Queue<crate::state_sync::Request>,
     /// The synced scheduler, handed the certified checkpoints fetched from

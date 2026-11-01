@@ -31,9 +31,9 @@ use validator::epoch::EpochParams;
 use validator::epoch_store::{ConsensusOutput, EpochStore};
 use validator::pipeline::chunk_lock::{ChunkLock, Cut};
 use validator::pipeline::items::{
-    ExecutableTransaction, GateInput, GatedChunk, PendingCheckpoint, SystemKind,
+    ExecutableTransaction, GateCommand, GatedChunk, PendingCheckpoint, SystemKind,
 };
-use validator::pipeline::keys::ChunkSettled;
+use validator::pipeline::keys::{ChunkSettled, GateKey};
 use workqueue::{Inbox, Processor};
 
 const ROOT_VERSION: u64 = 5;
@@ -65,7 +65,7 @@ fn epoch(max_transactions: u64, min_interval_ms: u64) -> Arc<EpochParams> {
 }
 
 struct Outputs {
-    gate: Inbox<GateInput>,
+    gate: Inbox<GateCommand>,
     checkpoints: Inbox<waiter::Command<ChunkSettled, PendingCheckpoint>>,
     /// The epoch store the stage writes, unless the test keeps it.
     dir: Option<tempfile::TempDir>,
@@ -218,6 +218,7 @@ fn summary(decided: &Decided) -> String {
         .iter()
         .map(|c| {
             let entries: Vec<_> = c
+                .chunk
                 .entries
                 .iter()
                 .map(|e| {
@@ -228,13 +229,14 @@ fn summary(decided: &Decided) -> String {
                     (digest_of(&e.transaction), bytes, &e.shared, e.origin)
                 })
                 .collect();
-            (c.round, c.height, c.checkpoint_seq, entries)
+            let c_ = &c.chunk;
+            (c_.round, c_.height, c_.checkpoint_seq, entries)
         })
         .collect();
     let settlements: Vec<_> = decided
-        .settlements
+        .chunks
         .iter()
-        .map(|s| (s.round, s.height, s.checkpoint_seq, &s.digests, s.root))
+        .map(|c| (c.last_of_commit, c.root))
         .collect();
     let checkpoints: Vec<_> = decided
         .checkpoints
@@ -294,7 +296,7 @@ fn prologue_after(observed: bool, restart: bool, split: &[u8]) -> Hashed {
     let decided = stage
         .decide(commit(2, 4, 2_000, &[split.to_vec()]), &bump)
         .unwrap();
-    digest_of(&decided.chunks[0].entries[0].transaction)
+    digest_of(&decided.chunks[0].chunk.entries[0].transaction)
 }
 
 #[test]
@@ -323,7 +325,8 @@ fn the_prologue_is_sui_s_byte_for_byte() {
         }
         window.push_back(timestamp);
 
-        let ExecutableTransaction::System(prologue) = &decided.chunks[0].entries[0].transaction
+        let ExecutableTransaction::System(prologue) =
+            &decided.chunks[0].chunk.entries[0].transaction
         else {
             panic!("the prologue comes first");
         };
@@ -350,13 +353,21 @@ fn chunks_split_at_the_limit_and_checkpoints_follow_the_previous_epoch() {
     let decided = stage.decide(commit(1, 4, 100, &users), &bump).unwrap();
 
     // The prologue and 7 transactions: chunks of 3, 3 and 2.
-    let sizes: Vec<_> = decided.chunks.iter().map(|c| c.entries.len()).collect();
+    let sizes: Vec<_> = decided
+        .chunks
+        .iter()
+        .map(|c| c.chunk.entries.len())
+        .collect();
     assert_eq!(sizes, vec![3, 3, 2]);
-    let heights: Vec<_> = decided.chunks.iter().map(|c| c.height).collect();
+    let heights: Vec<_> = decided.chunks.iter().map(|c| c.chunk.height).collect();
     assert_eq!(heights, vec![1, 2, 3]);
     // A full chunk leaves no room in its checkpoint: one checkpoint each,
     // after the previous epoch's last, 10.
-    let seqs: Vec<_> = decided.chunks.iter().map(|c| c.checkpoint_seq).collect();
+    let seqs: Vec<_> = decided
+        .chunks
+        .iter()
+        .map(|c| c.chunk.checkpoint_seq)
+        .collect();
     assert_eq!(seqs, vec![11, 12, 13]);
     let checkpoints: Vec<_> = decided
         .checkpoints
@@ -368,34 +379,20 @@ fn chunks_split_at_the_limit_and_checkpoints_follow_the_previous_epoch() {
         vec![(11, vec![1], 100), (12, vec![2], 100), (13, vec![3], 100)]
     );
 
-    // Settlement: the chunk's digests in order, and the root read at the
-    // generation its place in the commit gives.
-    assert_eq!(decided.settlements.len(), decided.chunks.len());
+    // Settlement: the root read at the generation its place in the commit
+    // gives, the last chunk ending the commit.
     for (position, chunk) in decided.chunks.iter().enumerate() {
-        let settlement = &decided.settlements[position];
-        let digests: Vec<_> = chunk
-            .entries
-            .iter()
-            .map(|e| digest_of(&e.transaction))
-            .collect();
-        assert_eq!(settlement.digests, digests);
-        assert_eq!(
-            (settlement.height, settlement.checkpoint_seq),
-            (chunk.height, chunk.checkpoint_seq)
-        );
-        assert_eq!(
-            settlement.root.id,
-            messages::base::ObjectId::from_u16(0xacc)
-        );
-        assert_eq!(settlement.root.initial_shared_version, ROOT_VERSION);
-        assert_eq!(settlement.root.ordinal.round, 4);
-        assert_eq!(settlement.root.ordinal.writes_before, position as u32);
+        assert_eq!(chunk.root.id, messages::base::ObjectId::from_u16(0xacc));
+        assert_eq!(chunk.root.initial_shared_version, ROOT_VERSION);
+        assert_eq!(chunk.root.ordinal.round, 4);
+        assert_eq!(chunk.root.ordinal.writes_before, position as u32);
+        assert_eq!(chunk.last_of_commit, position + 1 == decided.chunks.len());
     }
     // The user transactions keep where consensus put them.
     let origins: Vec<_> = decided
         .chunks
         .iter()
-        .flat_map(|c| &c.entries)
+        .flat_map(|c| &c.chunk.entries)
         .map(|e| e.origin.map(|(_, index)| index))
         .collect();
     assert_eq!(origins[0], None);
@@ -404,7 +401,10 @@ fn chunks_split_at_the_limit_and_checkpoints_follow_the_previous_epoch() {
     // Heights and sequence numbers carry on into the next commit.
     let decided = stage.decide(commit(2, 6, 200, &[]), &bump).unwrap();
     assert_eq!(
-        (decided.chunks[0].height, decided.chunks[0].checkpoint_seq),
+        (
+            decided.chunks[0].chunk.height,
+            decided.chunks[0].chunk.checkpoint_seq
+        ),
         (4, 14)
     );
     assert_eq!(decided.checkpoints[0].heights, vec![4]);
@@ -423,7 +423,7 @@ fn commits_share_a_checkpoint_until_the_interval_passes() {
             .unwrap();
         assert_eq!(decided.chunks.len(), 1);
         assert_eq!(
-            decided.chunks[0].checkpoint_seq,
+            decided.chunks[0].chunk.checkpoint_seq,
             if i < 4 { 11 } else { 12 }
         );
         cut.extend(
@@ -477,21 +477,24 @@ fn the_stage_emits_chunks_settlements_and_checkpoint_waits() {
     assert_eq!(stage.process(commit(1, 2, 50, &users), &mut bump), Some(()));
 
     let mut chunks = Vec::new();
-    let mut settled = Vec::new();
-    while let Some(input) = outputs.gate.try_pop() {
-        let GateInput::Chunk(GatedChunk {
-            chunk,
-            settlement,
-            update: None,
-        }) = input
-        else {
-            panic!("chunks without randomness");
+    while let Some(command) = outputs.gate.try_pop() {
+        let waiter::Command::Wait(batch) = command else {
+            panic!("chunks wait in the gate waiter");
         };
-        chunks.push((chunk.height, chunk.checkpoint_seq, chunk.entries.len()));
-        settled.push((settlement.height, settlement.digests.len()));
+        for (gated, keys) in batch.into_parts() {
+            let GatedChunk {
+                chunk,
+                update: None,
+                ..
+            } = gated
+            else {
+                panic!("chunks without randomness");
+            };
+            assert_eq!(keys, vec![GateKey::ChunkFree(chunk.height)]);
+            chunks.push((chunk.height, chunk.checkpoint_seq, chunk.entries.len()));
+        }
     }
     assert_eq!(chunks, vec![(1, 11, 4), (2, 12, 2)]);
-    assert_eq!(settled, vec![(1, 4), (2, 2)]);
 
     // The pending checkpoints wait for their chunks' `ChunkSettled`.
     let mut waiter = waiter::WaiterProcessor::new(|_: &ChunkSettled| false);

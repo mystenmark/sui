@@ -149,8 +149,7 @@ impl Processor for TransactionValidator {
 /// these transactions, ends here. What it emits is wholly verified.
 ///
 /// Inward: `TransactionValidator`: `Request<Valid>`.
-/// Outward: `SubmitChecker` (in the pipeline) or `InputChecker` (today's
-/// direct path): `Request<Verified>`.
+/// Outward: `SubmitChecker`: `Request<Verified>`.
 pub struct SignatureVerifier {
     checks: SignatureChecks,
 }

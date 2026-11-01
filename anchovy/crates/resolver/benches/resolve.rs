@@ -14,22 +14,20 @@
 //!
 //! ```text
 //! chunk  objects  ns/tx  allocs/tx
-//! 100    10        81.1        0.1
-//! 100    100000   102.8        0.8
-//! 1000   10        67.4        0.0
-//! 1000   100000   106.3        0.8
+//! 100    10        59.1        0.0
+//! 100    100000    68.9        0.0
+//! 1000   10        46.7        0.0
+//! 1000   100000    57.7        0.0
 //! batch  ns/key  allocs/key
-//! 100     160.0         2.9
-//! 1000    148.9         2.8
+//! 100     253.2         5.0
+//! 1000    255.4         4.9
 //! ```
 //!
-//! An allocation per transaction is its `resolved_base`, when it has one:
-//! with many objects, most of a transaction's streams were last seen in an
-//! earlier round, read live or written. No transaction withdraws funds, so
-//! none computes withdrawal amounts.
+//! No transaction withdraws funds, so none computes withdrawal amounts.
 //!
-//! The check's allocations are the store's: each `ObjectVersion` reads and
-//! parses the object, each `Package` reads its live entry.
+//! The check's allocations are the store's: each `ObjectVersion`, and each
+//! recorded `Generation`, reads and parses the object, each `Package` reads
+//! its live entry.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::HashMap;
@@ -289,8 +287,9 @@ fn availability(rng: &mut Rng) {
             stream(n),
             1,
             1,
+            // The version stored above: a generation's object is read with it.
             Generation::Version {
-                version: 2,
+                version: 1,
                 digest: [0; 32],
             },
             hashed(0),

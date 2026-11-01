@@ -209,11 +209,7 @@ impl BlockVoter {
         if batch.is_empty() {
             return;
         }
-        // Inside the pipeline a full queue is a sizing bug, not load to
-        // shed; a closed one means the pipeline is shutting down.
-        if let Err(workqueue::PushError::Full(_)) = queue.try_push(Command::Wait(batch)) {
-            panic!("the built waiter refused checkpoint signatures");
-        }
+        queue.push(Command::Wait(batch), "built waiter");
     }
 
     /// The checks after signatures: the alias claim, then

@@ -33,14 +33,14 @@ use validator::pipeline::chunk_lock::ChunkLock;
 use validator::pipeline::items::{
     BuiltCommand, BuiltWaits, CertifiedCheckpoint, CheckpointContentsBuilt, CheckpointEffects,
     CheckpointSignature, Chunk, EffectsWaitItem, EpochCloserInput, Executable, FundsCommand,
-    GateInput, InputCommand, OutputCommand, OutputThrough, OutputWaits, PendingCheckpoint,
-    SettlementInput,
+    GateCommand, GateWaits, GatedChunk, InputCommand, OutputCommand, OutputThrough, OutputWaits,
+    PendingCheckpoint, SettlementInput,
 };
 use validator::pipeline::keys::{ChunkSettled, EffectsKey};
 use validator::pipeline::tables::{CheckpointStore, ChunkTable, GenerationTable};
 use validator::processors::{Request, SignatureVerifier, TransactionValidator};
 use validator::randomness::{
-    BeaconInput, DkgParty, PartyInput, RandomnessGate, SignatureCollector,
+    BeaconInput, DkgParty, GateAvailability, PartyInput, RandomnessGate, SignatureCollector,
 };
 use validator::state_sync::{self, CheckpointServer};
 use validator::submit::SubmitChecker;
@@ -74,10 +74,11 @@ pub(crate) fn spawn(
         // Consensus.
         w.one("voting",            i.votes,            |p, q| p.voter(q.built_waits),                                  drop),
         w.one("commit-decode",     i.commits,          |p, q| p.decoder(q.built_waits),                                into(&q.handler, "handler")),
-        w.one("commit-handler",    i.handler,          move |p, q| p.commit_stage(output, q.gate, q.beacon, q.party, q.checkpoint_waits, q.output_waits), drop),
+        w.one("commit-handler",    i.handler,          move |p, q| p.commit_stage(output, q.gate_waits, q.beacon, q.party, q.checkpoint_waits, q.output_waits), drop),
         // The random beacon.
+        w.one("gate-waiter",       i.gate_waits,       |p, _| WaiterProcessor::new(p.gate_availability()),            into(&q.gate, "randomness gate")),
         w.one("randomness-gate",   i.gate,             |p, q| p.gate(q.resolver, q.settlement),                       drop),
-        w.one("beacon",            i.beacon,           |p, q| p.collector(q.gate),                                    drop),
+        w.one("beacon",            i.beacon,           |p, q| p.collector(q.gate_waits),                              drop),
         w.one("dkg-party",         i.party,            |p, q| p.party(q.beacon),                                      drop),
         // Execution.
         w.one("resolver",          i.resolver,         |p, q| p.resolver(q.input_waits, q.funds),                     drop),
@@ -94,7 +95,7 @@ pub(crate) fn spawn(
         w.one("built-waiter",      i.built_waits,      |p, _| WaiterProcessor::new(p.built_availability()),           BuiltRouter { epoch_closer: q.closer.clone(), aggregator: q.aggregator.clone(), committer: q.committer.clone() }),
         w.one("epoch-closer",      i.closer,           |p, q| p.epoch_closer(q.resolver, q.effects_waits, q.hasher, q.summary), drop),
         w.one("summary",           i.summary,          |p, q| p.summary(q.built_waits, q.output_waits),               drop),
-        w.one("aggregator",        i.aggregator,       move |p, q| p.aggregator(state_sync, q.built_waits),           into(&q.committer, "committer")),
+        w.one("aggregator",        i.aggregator,       move |p, _| p.aggregator(state_sync),                          into(&q.committer, "committer")),
         w.one("committer",         i.committer,        move |p, q| p.committer(q.output_waits, ended),                drop),
         w.one("output-waiter",     i.output_waits,     |p, _| WaiterProcessor::new(p.output_availability()),          into(&q.outputs, "output committer")),
         w.one("output-committer",  i.outputs,          move |_, _| OutputCommitter::new(commits),                     drop),
@@ -140,7 +141,7 @@ queues! {
     signatures: Request<Valid>,
     submit: Request<Verified>,
     handler: DecodedCommit,
-    gate: GateInput,
+    gate: Vec<GatedChunk>,
     party: PartyInput,
     resolver: Chunk,
     executor: Vec<Executable>,
@@ -159,6 +160,7 @@ queues! {
     checkpoint_waits: Command<ChunkSettled, PendingCheckpoint>,
     built_waits: BuiltCommand,
     output_waits: OutputCommand,
+    gate_waits: GateCommand,
 }
 
 /// What the epoch's processors are built from, besides their queues: the
@@ -181,6 +183,9 @@ pub(crate) struct Parts {
     pub chunks: Arc<ChunkTable>,
     /// Shared by the commit stage and the synced scheduler.
     pub chunk_lock: Arc<ChunkLock>,
+    /// The last chunk height of the commits written: the commit stage's
+    /// next chunk follows it.
+    pub resumed_height: u64,
     pub checkpoints: Arc<CheckpointStore>,
     pub statuses: Arc<ConsensusTxStatusCache>,
     pub state_hashes: Arc<StateHashes>,
@@ -228,13 +233,13 @@ impl Parts {
     fn commit_stage(
         &self,
         output: OutputWriter,
-        gate: Queue<GateInput>,
+        gate: GateWaits,
         beacon: Queue<BeaconInput>,
         party: Queue<PartyInput>,
         checkpoint_waits: Queue<Command<ChunkSettled, PendingCheckpoint>>,
         output_waits: OutputWaits,
     ) -> CommitStage {
-        let stage = CommitStage::new(
+        CommitStage::new(
             self.epoch.params.clone(),
             self.start,
             output,
@@ -248,14 +253,10 @@ impl Parts {
             &self.epoch.params.config,
         ))
         .with_randomness(self.dkg.clone())
-        .with_beacon(beacon)
+        .with_beacon(beacon, self.own_index().map(|own| (own, party)))
         .with_backpressure(self.backpressure.clone())
         .with_chunk_lock(self.chunk_lock.clone())
-        .with_output_waits(output_waits);
-        match self.own_index() {
-            Some(own) => stage.with_party(own, party),
-            None => stage,
-        }
+        .with_output_waits(output_waits)
     }
 
     fn party(&self, collector: Queue<BeaconInput>) -> DkgParty {
@@ -269,11 +270,17 @@ impl Parts {
     }
 
     fn gate(&self, resolver: Queue<Chunk>, settlement: Queue<SettlementInput>) -> RandomnessGate {
-        RandomnessGate::new(self.epoch_store.randomness_bytes(), resolver, settlement)
-            .with_chunk_lock(self.chunk_lock.clone())
+        RandomnessGate::new(self.resumed_height + 1, resolver, settlement)
     }
 
-    fn collector(&self, gate: Queue<GateInput>) -> SignatureCollector {
+    fn gate_availability(&self) -> GateAvailability {
+        GateAvailability {
+            chunk_lock: self.chunk_lock.clone(),
+            epoch_store: self.epoch_store.clone(),
+        }
+    }
+
+    fn collector(&self, gate: GateWaits) -> SignatureCollector {
         SignatureCollector::new(
             self.epoch.params.epoch,
             self.dkg.clone(),
@@ -404,18 +411,13 @@ impl Parts {
         )
     }
 
-    fn aggregator(
-        &self,
-        state_sync: Queue<CertifiedCheckpoint>,
-        built: BuiltWaits,
-    ) -> CheckpointAggregator {
+    fn aggregator(&self, state_sync: Queue<CertifiedCheckpoint>) -> CheckpointAggregator {
         CheckpointAggregator::new(
             self.committee.clone(),
             self.checkpoints.clone(),
             self.next_to_certify,
             state_sync,
         )
-        .with_fork_checks(built)
         .with_backpressure(self.backpressure.clone())
     }
 
@@ -433,7 +435,7 @@ impl Parts {
                 hasher: q.hasher,
                 committer: q.committer,
                 beacon: q.beacon,
-                gate: q.gate,
+                gate: q.gate_waits,
             },
         )
     }
@@ -510,14 +512,8 @@ impl Thread<'_> {
     }
 }
 
-/// A sink pushing each batch to `queue`. Inside the pipeline a full queue is
-/// a sizing bug, not load to shed.
+/// A sink pushing each batch to `queue` (`Queue::push`).
 fn into<T: Send + 'static>(queue: &Queue<T>, name: &'static str) -> impl FnMut(T) + Send + use<T> {
     let queue = queue.clone();
-    move |item| {
-        // A closed queue means the pipeline is shutting down.
-        if let Err(workqueue::PushError::Full(_)) = queue.try_push(item) {
-            panic!("the {name} queue refused work");
-        }
-    }
+    move |item| queue.push(item, name)
 }

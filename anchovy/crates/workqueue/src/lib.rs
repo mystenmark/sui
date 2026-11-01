@@ -186,6 +186,18 @@ impl<W> Queue<W> {
             }
         })
     }
+
+    /// Queues `item` from one pipeline processor to another, the `name`d:
+    /// there a full queue is a sizing bug, not load to shed, and a closed
+    /// one means the pipeline is shutting down, so the item is dropped.
+    ///
+    /// # Panics
+    /// If the queue is full.
+    pub fn push(&self, item: W, name: &str) {
+        if let Err(PushError::Full(_)) = self.try_push(item) {
+            panic!("the {name} queue refused work");
+        }
+    }
 }
 
 /// The receiving side of a queue. Clones share the queue; it closes once

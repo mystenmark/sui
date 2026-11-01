@@ -12,7 +12,7 @@
 //! owned input an earlier one locked, and schedules the rest (`sequence`:
 //! the prologue, the protocol's order, shared-object ordinals).
 //! `CommitStage` lays the schedule out in chunks and checkpoints for the
-//! pipeline. Congestion control is not here yet.
+//! pipeline.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -32,7 +32,9 @@ use crate::consensus::capabilities::{self, CapabilitySet};
 use crate::consensus::congestion::{self, CongestionTracker, Tracker};
 use crate::consensus::decode::{CommittedTransaction, DecodedCommit};
 use crate::consensus::deferral::{DeferralKey, Deferred, decode_deferred, encode_deferred};
-use crate::consensus::dkg::{Dkg, DkgChanges, DkgSetup, DkgStatus, decode_status, encode_status};
+use crate::consensus::dkg::{
+    Dkg, DkgChanges, DkgSetup, DkgStatus, GroupKey, decode_status, encode_status,
+};
 use crate::consensus::execution_time::{
     ExecutionTimeEstimator, Key, decode_estimates, encode_estimates,
 };
@@ -47,12 +49,11 @@ use crate::epoch_store::ConsensusOutput;
 use crate::pipeline::backpressure::Backpressure;
 use crate::pipeline::chunk_lock::{ChunkLock, Cut};
 use crate::pipeline::items::{
-    Chunk, ChunkSettlement, EpochClose, ExecutableTransaction, GateInput, GatedChunk,
-    OutputThrough, OutputWaits, PendingCheckpoint, PendingUpdate, ScheduledEntry, SystemKind,
-    SystemTransaction,
+    Chunk, EpochClose, ExecutableTransaction, GateWaits, GatedChunk, OutputThrough, OutputWaits,
+    PendingCheckpoint, PendingUpdate, ScheduledEntry, SystemKind, SystemTransaction,
 };
 use crate::pipeline::keys::{
-    AccumulatorVersion, CheckpointProgress, ChunkSettled, StreamId, TxDigest,
+    AccumulatorVersion, CheckpointProgress, ChunkSettled, GateKey, StreamId, TxDigest,
 };
 use crate::randomness::{BeaconInput, PartyInput};
 
@@ -147,7 +148,9 @@ pub struct CommitHandler {
 pub enum BeaconEvent {
     /// For its DKG party.
     Party(PartyInput),
-    /// A randomness round reserved, for its signer.
+    /// DKG completed with this group key, for its signature collector.
+    GroupKey(GroupKey),
+    /// A randomness round reserved, for its signature collector.
     Round(u64),
 }
 
@@ -278,10 +281,11 @@ impl CommitHandler {
         std::mem::take(&mut self.beacon_events)
     }
 
-    /// The beacon's state as restored, for the member at `own`'s part in
-    /// it: DKG's progress, then whether its message and confirmation were
-    /// sequenced; and the last rounds reserved, which may still lack bytes.
-    pub fn restored_beacon(&self, own: u32, rounds: u64) -> Vec<BeaconEvent> {
+    /// The beacon's state as restored: DKG's progress, then, for a member
+    /// at `own`, whether its message and confirmation were sequenced; the
+    /// group key, if DKG completed; and the last `rounds` reserved, which
+    /// may still lack bytes.
+    pub fn restored_beacon(&self, own: Option<u32>, rounds: u64) -> Vec<BeaconEvent> {
         let Some(randomness) = &self.randomness else {
             return Vec::new();
         };
@@ -293,24 +297,22 @@ impl CommitHandler {
         if let Some(used) = dkg.used() {
             events.push(BeaconEvent::Party(PartyInput::Merged(used)));
         }
-        if let DkgStatus::Successful(_) = dkg.status() {
+        if let DkgStatus::Successful(key) = dkg.status() {
             events.push(BeaconEvent::Party(PartyInput::Completed(
                 dkg.confirmations(),
             )));
+            events.push(BeaconEvent::GroupKey(key.clone()));
         }
-        let (message_seen, confirmation_seen) = dkg.seen(own);
-        events.push(BeaconEvent::Party(PartyInput::Started {
-            message_seen,
-            confirmation_seen,
-        }));
+        if let Some(own) = own {
+            let (message_seen, confirmation_seen) = dkg.seen(own);
+            events.push(BeaconEvent::Party(PartyInput::Started {
+                message_seen,
+                confirmation_seen,
+            }));
+        }
         let next = randomness.next_round;
         events.extend((next.saturating_sub(rounds)..next).map(BeaconEvent::Round));
         events
-    }
-
-    /// DKG's outcome so far, if the epoch has the random beacon.
-    pub fn dkg_status(&self) -> Option<&DkgStatus> {
-        self.randomness.as_ref().map(|r| r.dkg.status())
     }
 
     /// The reference's `init_randomness`, before the commit's DKG traffic:
@@ -377,11 +379,12 @@ impl CommitHandler {
             self.beacon_events
                 .push(BeaconEvent::Party(PartyInput::Merged(used.clone())));
         }
-        if let Some(DkgStatus::Successful(_)) = &changes.status {
+        if let Some(DkgStatus::Successful(key)) = &changes.status {
             self.beacon_events
                 .push(BeaconEvent::Party(PartyInput::Completed(
                     randomness.dkg.confirmations(),
                 )));
+            self.beacon_events.push(BeaconEvent::GroupKey(key.clone()));
         }
         for (author, bytes) in changes.messages {
             output.put_randomness(party_key(DKG_MESSAGE, author), bytes.unwrap_or_default());
@@ -452,7 +455,7 @@ impl CommitHandler {
     pub fn handle<'b>(
         &mut self,
         epoch: &EpochParams,
-        commit: DecodedCommit,
+        mut commit: DecodedCommit,
         bump: &'b Bump,
     ) -> Option<HandledCommit<'b>> {
         // 1. A commit handled before is skipped.
@@ -471,7 +474,13 @@ impl CommitHandler {
         let round = u64::from(commit.leader.round);
         let config = &epoch.config;
         // As of the commits before this one, so every validator drops alike.
+        // Its transactions are still dropped one by one, for their statuses.
         let certs_closed = self.certs_closed;
+        if certs_closed {
+            commit.observations.clear();
+            commit.jwks.clear();
+            commit.capabilities.clear();
+        }
         // The reference's `observe_commit`, before anything is estimated.
         self.observe_prior(config, commit.timestamp_ms);
         // The commit's randomness round, as DKG stood before its traffic.
@@ -536,12 +545,7 @@ impl CommitHandler {
 
         // 4. The commit's execution time observations, before its
         //    transactions are estimated.
-        let observations = if certs_closed {
-            &[][..]
-        } else {
-            &commit.observations[..]
-        };
-        for shared in observations {
+        for shared in &commit.observations {
             if self.execution_times.observe(shared) {
                 self.output.put_execution_time_observations(
                     shared.author,
@@ -554,16 +558,14 @@ impl CommitHandler {
         // 5. The keys voted for (`process_jwks`), and the update adding those
         //    that became active in the last commit
         //    (`create_authenticator_state_update`).
-        let update = self.jwk_update(if certs_closed { &[] } else { &commit.jwks });
+        let update = self.jwk_update(&commit.jwks);
 
         // The capabilities announced (`process_capability_notifications`).
-        if !certs_closed {
-            for announced in commit.capabilities {
-                let encoded = capabilities::encode(&announced);
-                let author = announced.author;
-                if self.capabilities.record(announced) {
-                    self.output.put_capabilities(author, encoded);
-                }
+        for announced in commit.capabilities {
+            let encoded = capabilities::encode(&announced);
+            let author = announced.author;
+            if self.capabilities.record(announced) {
+                self.output.put_capabilities(author, encoded);
             }
         }
 
@@ -922,10 +924,6 @@ fn dkg_failed_inputs(transaction: &VerifiedTransaction) -> Vec<CancelledInput> {
 /// The randomness state (`SUI_RANDOMNESS_STATE_OBJECT_ID`).
 const RANDOMNESS_STATE: messages::base::ObjectId = messages::base::ObjectId::from_u16(0x8);
 
-/// The accumulator root (`SUI_ACCUMULATOR_ROOT_OBJECT_ID`), which each
-/// chunk's settlement writes.
-const ACCUMULATOR_ROOT: messages::base::ObjectId = messages::base::ObjectId::from_u16(0xacc);
-
 /// The system state object, which the change-epoch transaction writes, and
 /// the version its sharing started at.
 const SYSTEM_STATE: messages::base::ObjectId = messages::base::ObjectId::from_u16(0x5);
@@ -936,7 +934,7 @@ const SYSTEM_STATE_INITIAL_SHARED_VERSION: u64 = 1;
 /// once the checkpoints covering it have committed, and only after a commit
 /// that leaves no chunk waiting for a checkpoint: so it is all of the
 /// stage's state.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CommitRecord {
     pub commit_index: u32,
     pub leader_round: u32,
@@ -954,42 +952,13 @@ pub struct CommitRecord {
 
 impl CommitRecord {
     pub fn encode(&self) -> Vec<u8> {
-        bcs::to_bytes(&(
-            self.commit_index,
-            self.leader_round,
-            self.height,
-            self.next_seq,
-            self.last_built_timestamp,
-            self.root_version,
-            self.closed,
-            self.certs_closed,
-        ))
-        .expect("a record encodes")
+        bcs::to_bytes(self).expect("a record encodes")
     }
 
     /// # Panics
     /// If `bytes` is not what `encode` wrote.
     pub fn decode(bytes: &[u8]) -> CommitRecord {
-        let (
-            commit_index,
-            leader_round,
-            height,
-            next_seq,
-            last_built_timestamp,
-            root_version,
-            closed,
-            certs_closed,
-        ) = bcs::from_bytes(bytes).expect("a stored record decodes");
-        CommitRecord {
-            commit_index,
-            leader_round,
-            height,
-            next_seq,
-            last_built_timestamp,
-            root_version,
-            closed,
-            certs_closed,
-        }
+        bcs::from_bytes(bytes).expect("a stored record decodes")
     }
 }
 
@@ -1021,13 +990,9 @@ pub struct EpochStart {
 /// What `CommitStage` decided about one commit, in emission order.
 #[derive(Debug)]
 pub struct Decided<'b> {
-    /// The commit's chunks, by height.
-    pub chunks: containers::Vec<'b, Chunk>,
-    /// The randomness state update heading the chunk at a height, which
-    /// waits for its round's random bytes.
-    pub update: Option<(u64, PendingUpdate)>,
-    /// Each chunk's settlement work, by height.
-    pub settlements: containers::Vec<'b, ChunkSettlement>,
+    /// The commit's chunks, by height, with their settlement work and any
+    /// randomness state update waiting for its round's random bytes.
+    pub chunks: containers::Vec<'b, GatedChunk>,
     /// The checkpoints the commit completed, by sequence number. A commit
     /// may complete none (its chunks wait for a later commit's), or several.
     pub checkpoints: containers::Vec<'b, PendingCheckpoint>,
@@ -1048,9 +1013,10 @@ pub struct Decided<'b> {
 /// - `CommitDecoder`: `DecodedRequest`.
 ///
 /// Outward:
-/// - randomness gate, in height order: each chunk's transactions and its
-///   settlement work (`GatedChunk`), for `VersionResolver` and
-///   `SettlementScheduler`;
+/// - gate waiter, wait for: each chunk's transactions and its settlement
+///   work (`GatedChunk`), for the randomness gate, keyed by `ChunkFree` of
+///   its height and, if headed by a randomness state update, `RoundBytes`
+///   of its round;
 /// - `SignatureCollector`: the group key, once DKG completes;
 /// - checkpoint waiter, wait for: each `PendingCheckpoint`, keyed by
 ///   `ChunkSettled` of each of its chunks;
@@ -1079,14 +1045,13 @@ pub struct CommitStage {
     /// barrier, its root's one exclusive writer and with the root its only
     /// input, writes the next version.
     root_version: u64,
-    gate_out: workqueue::Queue<GateInput>,
+    gate_out: GateWaits,
     checkpoints_out: workqueue::Queue<waiter::Command<ChunkSettled, PendingCheckpoint>>,
     statuses: Arc<ConsensusTxStatusCache>,
     backpressure: Option<Arc<Backpressure>>,
     /// The signature collector: the group key goes once DKG completes,
     /// and each round reserved.
     beacon: Option<workqueue::Queue<BeaconInput>>,
-    key_sent: bool,
     /// This member's DKG party, if it is a member.
     party: Option<workqueue::Queue<PartyInput>>,
     /// Shared with the synced scheduler, if any.
@@ -1100,7 +1065,7 @@ impl CommitStage {
         epoch: Arc<EpochParams>,
         start: EpochStart,
         output: ConsensusOutput,
-        gate: workqueue::Queue<GateInput>,
+        gate: GateWaits,
         checkpoints: workqueue::Queue<waiter::Command<ChunkSettled, PendingCheckpoint>>,
         statuses: Arc<ConsensusTxStatusCache>,
         committee: Vec<([u8; 96], u64)>,
@@ -1139,31 +1104,27 @@ impl CommitStage {
             statuses,
             backpressure: None,
             beacon: None,
-            key_sent: false,
             party: None,
             chunk_lock: None,
             output_waits: None,
         }
     }
 
-    /// Sends the group key to `beacon`'s signature collector once DKG
-    /// completes: now, if it completed before a restart.
+    /// Drives the beacon's signature collector, `beacon`, and, for a member
+    /// at committee index `own`, its DKG `party`, from the state restored:
+    /// the group key if DKG completed, and the last rounds reserved, signed
+    /// again as the reference's `RandomnessManager::try_new` requests them.
     #[must_use]
-    pub fn with_beacon(mut self, beacon: workqueue::Queue<BeaconInput>) -> CommitStage {
-        self.beacon = Some(beacon);
-        self.send_group_key();
-        self
-    }
-
-    /// Takes part in the beacon as the member at committee index `own`,
-    /// through `party` and the signature collector, from the state
-    /// restored: the last rounds reserved are signed again, as the
-    /// reference's `RandomnessManager::try_new` requests them.
-    #[must_use]
-    pub fn with_party(mut self, own: u32, party: workqueue::Queue<PartyInput>) -> CommitStage {
+    pub fn with_beacon(
+        mut self,
+        beacon: workqueue::Queue<BeaconInput>,
+        party: Option<(u32, workqueue::Queue<PartyInput>)>,
+    ) -> CommitStage {
         /// The reference's `max_partial_sigs_rounds_ahead`.
         const ROUNDS: u64 = 50;
-        self.party = Some(party);
+        self.beacon = Some(beacon);
+        let own = party.as_ref().map(|(own, _)| *own);
+        self.party = party.map(|(_, party)| party);
         let events = self.handler.restored_beacon(own, ROUNDS);
         self.send_beacon_events(events);
         self
@@ -1174,29 +1135,20 @@ impl CommitStage {
             match event {
                 BeaconEvent::Party(input) => {
                     if let Some(party) = &self.party {
-                        push(party, input, "DKG party");
+                        party.push(input, "DKG party");
+                    }
+                }
+                BeaconEvent::GroupKey(key) => {
+                    if let Some(beacon) = &self.beacon {
+                        beacon.push(BeaconInput::GroupKey(key), "signature collector");
                     }
                 }
                 BeaconEvent::Round(round) => {
                     if let Some(beacon) = &self.beacon {
-                        push(beacon, BeaconInput::Round(round), "signature collector");
+                        beacon.push(BeaconInput::Round(round), "signature collector");
                     }
                 }
             }
-        }
-    }
-
-    fn send_group_key(&mut self) {
-        if !self.key_sent
-            && let Some(DkgStatus::Successful(key)) = self.handler.dkg_status()
-            && let Some(beacon) = &self.beacon
-        {
-            self.key_sent = true;
-            push(
-                beacon,
-                BeaconInput::GroupKey(key.clone()),
-                "signature collector",
-            );
         }
     }
 
@@ -1304,14 +1256,12 @@ impl CommitStage {
         let transactions =
             std::mem::replace(&mut schedule.transactions, containers::Vec::new_in(bump));
         let mut entries = containers::Vec::with_capacity_in(transactions.len(), bump);
-        let mut digests = containers::Vec::with_capacity_in(transactions.len(), bump);
         let mut update = None;
         for (i, scheduled) in transactions.into_iter().enumerate() {
-            let (transaction, digest, origin) = match scheduled {
+            let (transaction, origin) = match scheduled {
                 Scheduled::Prologue(_) => {
                     let system = prologue_transaction.take().expect("one prologue");
-                    let digest = system.digest;
-                    (ExecutableTransaction::System(system), digest, None)
+                    (ExecutableTransaction::System(system), None)
                 }
                 Scheduled::AuthenticatorStateUpdate(keys) => {
                     let system = authenticator_state_update_transaction(
@@ -1321,8 +1271,7 @@ impl CommitStage {
                             .expect("the authenticator state exists"),
                         keys,
                     );
-                    let digest = system.digest;
-                    (ExecutableTransaction::System(system), digest, None)
+                    (ExecutableTransaction::System(system), None)
                 }
                 Scheduled::RandomnessStateUpdate(randomness) => {
                     update = Some(PendingUpdate {
@@ -1334,18 +1283,11 @@ impl CommitStage {
                     continue;
                 }
                 Scheduled::User(transaction) => {
-                    let digest = *transaction.get().0.digest();
-                    let origin = origins[&digest];
-                    (
-                        ExecutableTransaction::User(transaction),
-                        digest,
-                        Some(origin),
-                    )
+                    let origin = origins[transaction.get().0.digest()];
+                    (ExecutableTransaction::User(transaction), Some(origin))
                 }
                 Scheduled::Cancelled(transaction, inputs) => {
-                    let digest = *transaction.get().0.digest();
-                    let origin = origins[&digest];
-                    digests.push(digest);
+                    let origin = origins[transaction.get().0.digest()];
                     entries.push(ScheduledEntry {
                         transaction: ExecutableTransaction::User(transaction),
                         shared: Vec::new(),
@@ -1358,7 +1300,6 @@ impl CommitStage {
                     continue;
                 }
             };
-            digests.push(digest);
             entries.push(ScheduledEntry {
                 transaction,
                 shared: schedule.accesses(i).to_vec(),
@@ -1367,11 +1308,7 @@ impl CommitStage {
             });
         }
         // The update, left out, stood at the randomness part's start.
-        let randomness = randomness_start.map(|start| {
-            let entries = entries.split_off(start);
-            let digests = digests.split_off(start);
-            (entries, digests, update)
-        });
+        let randomness = randomness_start.map(|start| (entries.split_off(start), update));
 
         // 3. The epoch's last commit reserves the change-epoch transaction's
         //    write of the system state, after every other.
@@ -1379,7 +1316,7 @@ impl CommitStage {
             self.closed = true;
             let writes_before = entries
                 .iter()
-                .chain(randomness.iter().flat_map(|(entries, ..)| entries.iter()))
+                .chain(randomness.iter().flat_map(|(entries, _)| entries.iter()))
                 .filter(|e| {
                     e.shared.iter().any(|a| {
                         a.id == SYSTEM_STATE
@@ -1406,14 +1343,7 @@ impl CommitStage {
         });
 
         // 4. Chunks and checkpoints.
-        let mut decided = self.chunk(
-            epoch,
-            &prologue,
-            (entries, digests),
-            randomness,
-            close,
-            bump,
-        );
+        let mut decided = self.chunk(epoch, &prologue, entries, randomness, close, bump);
         decided.dropped = dropped;
         Some(decided)
     }
@@ -1423,20 +1353,12 @@ impl CommitStage {
     /// `create_pending_checkpoints`. The regular part's chunks go first; the
     /// randomness part's, if any, are queued after the checkpoint queue is
     /// flushed, so they head the next checkpoint (`merge_randomness_into_checkpoint`).
-    #[allow(clippy::type_complexity)]
     fn chunk<'b>(
         &mut self,
         epoch: &Arc<EpochParams>,
         prologue: &Prologue,
-        regular: (
-            containers::Vec<'b, ScheduledEntry>,
-            containers::Vec<'b, TxDigest>,
-        ),
-        randomness: Option<(
-            containers::Vec<'b, ScheduledEntry>,
-            containers::Vec<'b, TxDigest>,
-            Option<PendingUpdate>,
-        )>,
+        regular: containers::Vec<'b, ScheduledEntry>,
+        randomness: Option<(containers::Vec<'b, ScheduledEntry>, Option<PendingUpdate>)>,
         close: Option<(
             Vec<SharedAccess>,
             u64,
@@ -1451,22 +1373,18 @@ impl CommitStage {
         // The update counts toward its chunk's size, though not yet in it.
         let randomness_len = randomness
             .as_ref()
-            .map(|(entries, _, update)| entries.len() + usize::from(update.is_some()));
+            .map(|(entries, update)| entries.len() + usize::from(update.is_some()));
         let chunk_count =
-            regular.0.len().div_ceil(max) + randomness_len.map_or(0, |len| len.div_ceil(max));
+            regular.len().div_ceil(max) + randomness_len.map_or(0, |len| len.div_ceil(max));
         let mut decided = Decided {
             chunks: containers::Vec::with_capacity_in(chunk_count, bump),
-            update: None,
-            settlements: containers::Vec::with_capacity_in(chunk_count, bump),
             checkpoints: containers::Vec::new_in(bump),
             dropped: containers::Vec::new_in(bump),
         };
         let mut flushed = containers::Vec::new_in(bump);
-        let (entries, digests) = regular;
         self.push_chunks(
             prologue,
-            entries,
-            digests,
+            regular,
             0,
             chunk_count,
             max,
@@ -1480,20 +1398,19 @@ impl CommitStage {
         } else {
             self.queue.flush(prologue.timestamp_ms, min_interval)
         });
-        if let Some((entries, digests, update)) = randomness {
+        if let Some((entries, update)) = randomness {
             let first = decided.chunks.len();
             let reserved = usize::from(update.is_some());
             self.push_chunks(
                 prologue,
                 entries,
-                digests,
                 reserved,
                 chunk_count,
                 max,
                 &mut decided,
                 &mut flushed,
             );
-            decided.update = update.map(|update| (decided.chunks[first].height, update));
+            decided.chunks[first].update = update;
         }
         if close.is_some() {
             flushed.extend(self.queue.flush_forced());
@@ -1528,12 +1445,10 @@ impl CommitStage {
     /// Lays `entries` out in chunks of at most `max`, the first with room
     /// left for `reserved` more, each taking the next height and its place
     /// in the checkpoint queue. The commit has `chunk_count` chunks.
-    #[allow(clippy::too_many_arguments)]
     fn push_chunks<'b>(
         &mut self,
         prologue: &Prologue,
         entries: containers::Vec<'b, ScheduledEntry>,
-        digests: containers::Vec<'b, TxDigest>,
         reserved: usize,
         chunk_count: usize,
         max: usize,
@@ -1542,14 +1457,12 @@ impl CommitStage {
     ) {
         let total = entries.len() + reserved;
         let mut entries = entries.into_iter();
-        let mut digests = digests.into_iter();
         let mut start = 0;
         while start < total {
             let size = max.min(total - start);
             let taken = size - if start == 0 { reserved } else { 0 };
             start += size;
             let entries: Vec<_> = entries.by_ref().take(taken).collect();
-            let digests: Vec<_> = digests.by_ref().take(taken).collect();
             let position = decided.chunks.len();
             let height = self.queue.next_height();
             let checkpoint_seq =
@@ -1559,7 +1472,7 @@ impl CommitStage {
             let root_version = self.root_version;
             self.root_version += 1;
             let mut root = [SharedAccess {
-                id: ACCUMULATOR_ROOT,
+                id: messages::tx_index::SUI_ACCUMULATOR_ROOT_OBJECT_ID,
                 initial_shared_version: self.start.accumulator_root_initial_shared_version,
                 mutability: messages::transaction::SharedObjectMutability::Mutable,
                 ordinal: SharedOrdinal {
@@ -1570,26 +1483,22 @@ impl CommitStage {
             }];
             // Linked to the root's last generation in an earlier round.
             self.handler.link(&mut root);
-            decided.settlements.push(ChunkSettlement {
-                version,
-                root_version,
+            decided.chunks.push(GatedChunk {
+                chunk: Chunk {
+                    version,
+                    root_version,
+                    round: prologue.round,
+                    height,
+                    checkpoint_seq,
+                    entries,
+                },
                 last_of_commit: position + 1 == chunk_count,
-                round: prologue.round,
-                height,
-                checkpoint_seq,
-                digests,
                 // One exclusive writer of the root per chunk, its barrier:
                 // the commit's `position`th chunk reads generation
                 // `position`.
                 root: root[0],
-            });
-            decided.chunks.push(Chunk {
-                version,
-                root_version,
-                round: prologue.round,
-                height,
-                checkpoint_seq,
-                entries,
+                update: None,
+                bytes: None,
             });
         }
     }
@@ -1598,28 +1507,25 @@ impl CommitStage {
         // Dropped transactions go nowhere: no processor waits on them yet.
         let Decided {
             chunks,
-            update,
-            settlements,
             checkpoints,
             dropped: _,
         } = decided;
-        for (chunk, settlement) in chunks.into_iter().zip(settlements) {
-            let update = update.filter(|(height, _)| *height == chunk.height);
+        let mut gated = waiter::WaitBatch::with_capacity(chunks.len(), chunks.len() + 1);
+        for chunk in chunks {
+            let height = chunk.chunk.height;
             if let Some(backpressure) = &self.backpressure {
                 backpressure.scheduled(
-                    chunk.height,
-                    chunk.entries.len() + usize::from(update.is_some()),
+                    height,
+                    chunk.chunk.entries.len() + usize::from(chunk.update.is_some()),
                 );
             }
-            push(
-                &self.gate_out,
-                GateInput::Chunk(GatedChunk {
-                    chunk,
-                    settlement,
-                    update: update.map(|(_, update)| update),
-                }),
-                "randomness gate",
-            );
+            let keys = std::iter::once(GateKey::ChunkFree(height))
+                .chain(chunk.update.map(|u| GateKey::RoundBytes(u.round)));
+            gated.push(chunk, keys);
+        }
+        if !gated.is_empty() {
+            self.gate_out
+                .push(waiter::Command::Wait(gated), "gate waiter");
         }
         if !checkpoints.is_empty() {
             let keys = checkpoints.iter().map(|c| c.heights.len()).sum();
@@ -1629,21 +1535,9 @@ impl CommitStage {
                 heights.extend(checkpoint.heights.iter().map(|&h| ChunkSettled(h)));
                 batch.push(checkpoint, heights);
             }
-            push(
-                &self.checkpoints_out,
-                waiter::Command::Wait(batch),
-                "checkpoint waiter",
-            );
+            self.checkpoints_out
+                .push(waiter::Command::Wait(batch), "checkpoint waiter");
         }
-    }
-}
-
-/// Inside the pipeline a full queue is a sizing bug: the handler's state
-/// has moved past the commit, so its outputs cannot be dropped. A closed
-/// queue means the pipeline is shutting down.
-fn push<T>(queue: &workqueue::Queue<T>, item: T, name: &str) {
-    if let Err(workqueue::PushError::Full(_)) = queue.try_push(item) {
-        panic!("the {name} queue refused work");
     }
 }
 
@@ -1721,7 +1615,6 @@ impl CommitStage {
             bump,
         );
         self.emit(decided, bump);
-        self.send_group_key();
         let events = self.handler.take_beacon_events();
         self.send_beacon_events(events);
         self.statuses.update_leader_round(leader_round);
@@ -1749,11 +1642,7 @@ impl CommitStage {
             CheckpointProgress::Committed(cut),
         ]);
         wait.push(OutputThrough(finished), keys.into_iter().flatten());
-        // Inside the pipeline a full queue is a sizing bug; a closed one
-        // means the pipeline is shutting down.
-        if let Err(workqueue::PushError::Full(_)) = waits.try_push(waiter::Command::Wait(wait)) {
-            panic!("the output waiter refused a commit's output");
-        }
+        waits.push(waiter::Command::Wait(wait), "output waiter");
     }
 }
 
@@ -1919,8 +1808,9 @@ fn indirect_state_digest(estimates_us: impl IntoIterator<Item = u64>) -> [u8; 32
 }
 
 /// `prologue`'s `ConsensusCommitPrologueV4`, as the reference's
-/// `create_consensus_commit_prologue_transaction`: no cancelled transactions,
-/// and `additional_state_digest` over the commits through this one.
+/// `create_consensus_commit_prologue_transaction`, listing the commit's
+/// `cancelled` transactions, and `additional_state_digest` over the commits
+/// through this one.
 pub fn prologue_transaction(
     prologue: &Prologue,
     additional_state_digest: &[u8; 32],

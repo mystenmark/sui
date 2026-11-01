@@ -12,8 +12,6 @@ use messages::Message;
 use messages::base::ObjectId;
 use messages::object::Object;
 
-use tokio::sync::oneshot;
-
 use crate::checks::VerifiedTransaction;
 use crate::consensus::execution_time::Key;
 use crate::consensus::sequence::SharedAccess;
@@ -28,6 +26,15 @@ use crate::pipeline::tables::{BuiltCheckpoint, Generation};
 pub enum ExecutableTransaction {
     User(VerifiedTransaction),
     System(SystemTransaction),
+}
+
+impl ExecutableTransaction {
+    pub fn digest(&self) -> TxDigest {
+        match self {
+            ExecutableTransaction::User(transaction) => *transaction.get().0.digest(),
+            ExecutableTransaction::System(system) => system.digest,
+        }
+    }
 }
 
 /// A system transaction built by the commit handler (the prologue) or the
@@ -85,16 +92,37 @@ pub struct Chunk {
     pub entries: Vec<ScheduledEntry>,
 }
 
-/// A chunk and its settlement, on their way from `CommitStage` through the
-/// randomness gate, which holds a chunk headed by a randomness state update
-/// until the round's random bytes arrive, and every chunk after it.
+/// A chunk on its way from `CommitStage` through the gate waiter, until the
+/// synced scheduler is not running it and, if it is headed by a randomness
+/// state update, the round's bytes arrive; then to the randomness gate,
+/// which passes chunks on in height order, with their settlement work.
 #[derive(Debug)]
 pub struct GatedChunk {
     pub chunk: Chunk,
-    pub settlement: ChunkSettlement,
-    /// The update heading the chunk, not yet in its entries or digests.
+    /// As `ChunkSettlement::last_of_commit`.
+    pub last_of_commit: bool,
+    /// As `ChunkSettlement::root`.
+    pub root: SharedAccess,
+    /// The update heading the chunk, not yet in its entries.
     pub update: Option<PendingUpdate>,
+    /// The update's round's random bytes (its signature's BCS), once
+    /// released.
+    pub bytes: Option<Vec<u8>>,
 }
+
+impl waiter::Receive<Option<Vec<u8>>> for GatedChunk {
+    fn receive(&mut self, _: usize, bytes: Option<Vec<u8>>) {
+        if bytes.is_some() {
+            self.bytes = bytes;
+        }
+    }
+}
+
+/// What the gate waiter takes.
+pub type GateCommand = waiter::Command<crate::pipeline::keys::GateKey, GatedChunk, Option<Vec<u8>>>;
+
+/// The gate waiter's queue.
+pub type GateWaits = workqueue::Queue<GateCommand>;
 
 /// A randomness state update waiting for its round's random bytes.
 #[derive(Debug, Clone, Copy)]
@@ -106,29 +134,7 @@ pub struct PendingUpdate {
     pub shared: SharedAccess,
 }
 
-/// What the randomness gate takes.
-#[derive(Debug)]
-pub enum GateInput {
-    /// `CommitStage` → gate, in height order.
-    Chunk(GatedChunk),
-    /// A randomness round's random bytes (its signature's BCS), verified.
-    /// Signature processor → gate.
-    Bytes { round: u64, bytes: Vec<u8> },
-    /// Which round the gate waits for, if any, and the checkpoint its update
-    /// goes into. The p2p endpoint → gate, to fetch rounds peers stopped
-    /// pushing.
-    Waiting(oneshot::Sender<Option<(u64, u64)>>),
-    /// The synced scheduler released chunks in the chunk lock. Synced
-    /// scheduler → gate.
-    Released,
-}
-
-/// A full queue drops the question: the asker asks again.
-impl workqueue::Refuse for GateInput {
-    fn refuse(self, _: workqueue::Refusal) {}
-}
-
-/// What settling a chunk takes. `CommitHandler` → `SettlementScheduler`.
+/// What settling a chunk takes. Randomness gate → `SettlementScheduler`.
 #[derive(Debug, Clone)]
 pub struct ChunkSettlement {
     /// The version the commit's transactions reserve funds against; settling
@@ -210,11 +216,7 @@ pub struct Executable {
     /// `FundsWithdrawStatus::Insufficient`). What it withdraws short of each
     /// is credited back.
     pub reserved: Vec<Reservation>,
-    pub height: u64,
     pub entry: ScheduledEntry,
-    /// Each shared access's generation 0 resolved to the earlier generation
-    /// it reads, where the resolver knew one: (stream, round, generation).
-    pub resolved_base: Vec<(StreamId, u32, u32)>,
     /// What each of its input waiter keys resolved to, by the key's position:
     /// filled in by the input waiter.
     pub inputs: Vec<Option<InputValue>>,
@@ -320,12 +322,10 @@ pub enum EffectsWaitItem {
     /// A wait for one transaction's effects, answered once they are in the
     /// store. The RPC handler's `wait_for_effects` → effects waiter → reply.
     Executed(tokio::sync::oneshot::Sender<()>),
-    /// A chunk's transactions executed. `SettlementScheduler` → effects
-    /// waiter → `SettlementScheduler`.
-    ChunkExecuted(ChunkSettlement),
-    /// A chunk's settlement and barrier transactions executed.
+    /// A chunk's transactions, or its settlement and barrier transactions,
+    /// executed (`SettlementInput::ChunkExecuted`, `SettlementExecuted`).
     /// `SettlementScheduler` → effects waiter → `SettlementScheduler`.
-    SettlementExecuted { height: u64, digests: Vec<TxDigest> },
+    Settlement(SettlementInput),
     /// The change-epoch transaction executed. `EpochCloser` → effects waiter
     /// → `EpochCloser`.
     ChangeEpochExecuted,
@@ -442,12 +442,6 @@ pub enum BuiltWaitItem {
     /// A signature, waiting for the summary it signs. `BlockVoter` and
     /// `CommitDecoder` → built waiter → `CheckpointAggregator`.
     Signature(CheckpointSignature),
-    /// A certified checkpoint, waiting for the local one to compare it
-    /// with. `CheckpointAggregator` → built waiter → fork check.
-    Certified {
-        certified: CertifiedCheckpoint,
-        local: Option<Arc<BuiltCheckpoint>>,
-    },
     /// A certified checkpoint fetched from peers, waiting for the local one
     /// to compare it with, then to be committed. `SyncedScheduler` → built
     /// waiter → fork check → `CheckpointCommitter`.
@@ -459,7 +453,7 @@ pub enum BuiltWaitItem {
 
 impl waiter::Receive<Arc<BuiltCheckpoint>> for BuiltWaitItem {
     fn receive(&mut self, _: usize, built: Arc<BuiltCheckpoint>) {
-        if let BuiltWaitItem::Certified { local, .. } | BuiltWaitItem::Synced { local, .. } = self {
+        if let BuiltWaitItem::Synced { local, .. } = self {
             *local = Some(built);
         }
     }
