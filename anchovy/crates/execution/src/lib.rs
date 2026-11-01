@@ -21,7 +21,6 @@ use messages::base::{Digest, Hashed};
 
 use sui_execution::Executor;
 use sui_protocol_config::{ProtocolConfig, ProtocolVersion};
-use sui_types::accumulator_root::EmptyUnsettledObjectFunds;
 use sui_types::base_types::{ConsensusObjectVersion, ObjectID, SystemObjectVersions};
 use sui_types::digests::TransactionDigest;
 use sui_types::effects::{TransactionEffects, TransactionEffectsAPI};
@@ -83,6 +82,53 @@ impl From<SuiError> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Net withdrawals from accumulator accounts by transactions executed but
+/// not yet settled, by account and the root version they read: what an
+/// object balance withdrawal is checked against beside the settled balance
+/// (the reference's `UnsettledObjectFundsRead`).
+pub trait Unsettled: Sync {
+    fn withdrawn(&self, account: &messages::base::ObjectId, version: u64) -> u128;
+}
+
+/// Where execution waits for an implicitly read system object (the
+/// accumulator root) to reach the version a transaction requires, which
+/// another transaction's execution writes. Causal admission ensures the
+/// writer runs.
+pub trait Awaited: Sync {
+    /// Returns once `id` at `version` is in the store.
+    fn wait(&self, id: &messages::base::ObjectId, version: u64);
+}
+
+/// Nothing is written concurrently: what is missing stays missing.
+pub struct NoneAwaited;
+
+impl Awaited for NoneAwaited {
+    fn wait(&self, _: &messages::base::ObjectId, _: u64) {}
+}
+
+/// No withdrawals unsettled.
+pub struct NoneUnsettled;
+
+impl Unsettled for NoneUnsettled {
+    fn withdrawn(&self, _: &messages::base::ObjectId, _: u64) -> u128 {
+        0
+    }
+}
+
+/// `Unsettled`, as sui's executor reads it.
+struct ReferenceUnsettled<'u>(&'u dyn Unsettled);
+
+impl sui_types::accumulator_root::UnsettledObjectFundsRead for ReferenceUnsettled<'_> {
+    fn get_unsettled_object_withdraw(
+        &self,
+        account: &sui_types::accumulator_root::AccumulatorObjId,
+        accumulator_version: sui_types::base_types::SequenceNumber,
+    ) -> u128 {
+        let account = messages::base::ObjectId(account.inner().into_bytes());
+        self.0.withdrawn(&account, accumulator_version.value())
+    }
+}
+
 /// The pipeline's executor for one epoch: anchovy's.
 ///
 /// With the `testing` feature, sui's executes every transaction too, as an
@@ -99,6 +145,7 @@ impl Execution {
         epoch: u64,
         epoch_start_timestamp_ms: u64,
         reference_gas_price: u64,
+        chain_identifier: [u8; 32],
     ) -> Result<Execution> {
         let reference = Reference::new(
             protocol_version,
@@ -106,13 +153,15 @@ impl Execution {
             epoch,
             epoch_start_timestamp_ms,
             reference_gas_price,
-        )?;
+        )?
+        .with_chain_identifier(chain_identifier);
         let native = native::NativeExecution::new(
             reference.config.clone(),
             reference.metrics.clone(),
             epoch,
             epoch_start_timestamp_ms,
             reference_gas_price,
+            chain_identifier,
         )?;
         Ok(Execution { native, reference })
     }
@@ -124,7 +173,15 @@ impl Execution {
 
     /// As `Reference::execute`.
     pub fn execute(&self, store: &store::Store, transaction: &[u8]) -> Result<Outcome> {
-        self.execute_at(store, transaction, &[], Funds::MaybeSufficient, None)
+        self.execute_at(
+            store,
+            transaction,
+            &[],
+            Funds::MaybeSufficient,
+            None,
+            &NoneUnsettled,
+            &NoneAwaited,
+        )
     }
 
     /// As `Reference::execute_at`.
@@ -138,6 +195,8 @@ impl Execution {
         provided: &[(messages::base::ObjectId, Input<'_>)],
         funds: Funds,
         assigned_accumulator: Option<u64>,
+        unsettled: &dyn Unsettled,
+        awaited: &dyn Awaited,
     ) -> Result<Outcome> {
         let parsed = native::parse(transaction)?;
         let data = parsed.get().0.data();
@@ -148,6 +207,8 @@ impl Execution {
             provided,
             funds,
             assigned_accumulator,
+            unsettled,
+            awaited,
         )?;
         #[cfg(feature = "testing")]
         assert_same(
@@ -157,6 +218,7 @@ impl Execution {
                 provided,
                 funds,
                 assigned_accumulator,
+                unsettled,
             )?,
             &outcome,
         );
@@ -174,6 +236,8 @@ pub struct Reference {
     epoch: u64,
     epoch_start_timestamp_ms: u64,
     rgp: u64,
+    /// Coin reservations' ids are masked with it.
+    chain_identifier: [u8; 32],
 }
 
 /// What executing a transaction produced: its effects, as BCS, and what
@@ -251,7 +315,15 @@ impl Reference {
             epoch,
             epoch_start_timestamp_ms,
             rgp: reference_gas_price,
+            chain_identifier: [0; 32],
         })
+    }
+
+    /// Whose coin reservations' ids are masked with `chain_identifier`.
+    #[must_use]
+    pub fn with_chain_identifier(mut self, chain_identifier: [u8; 32]) -> Reference {
+        self.chain_identifier = chain_identifier;
+        self
     }
 
     pub fn protocol_config(&self) -> &ProtocolConfig {
@@ -266,7 +338,14 @@ impl Reference {
     /// If an owned input is no longer live at the version and digest the
     /// transaction gives: equivocation, which consensus rules out.
     pub fn execute(&self, store: &store::Store, transaction: &[u8]) -> Result<Outcome> {
-        self.execute_at(store, transaction, &[], Funds::MaybeSufficient, None)
+        self.execute_at(
+            store,
+            transaction,
+            &[],
+            Funds::MaybeSufficient,
+            None,
+            &NoneUnsettled,
+        )
     }
 
     /// `execute`, but each input named in `provided` is as given there
@@ -282,6 +361,7 @@ impl Reference {
         provided: &[(messages::base::ObjectId, Input<'_>)],
         funds: Funds,
         assigned_accumulator: Option<u64>,
+        unsettled: &dyn Unsettled,
     ) -> Result<Outcome> {
         let signed: SenderSignedData = bcs::from_bytes(transaction)?;
         let data = signed.transaction_data();
@@ -325,6 +405,20 @@ impl Reference {
             None => ExecutionOrEarlyError::ok(None),
             Some(errors) => ExecutionOrEarlyError::failed(errors, None),
         };
+        // As the reference's `rewrite_transaction_for_coin_reservations`,
+        // skipped on an early error.
+        let mut kind = data.kind().clone();
+        let rewritten = if early.is_ok() {
+            rewrite_coin_reservations(
+                &view,
+                self.chain_identifier,
+                data.sender(),
+                &mut kind,
+                accumulator_version.map(|v| v.version),
+            )?
+        } else {
+            None
+        };
         let (store_out, _, effects, _, _) = self.executor.execute_transaction_to_effects(
             &view,
             &self.config,
@@ -335,11 +429,11 @@ impl Reference {
             self.epoch_start_timestamp_ms,
             inputs,
             SystemObjectVersions::new(accumulator_version),
-            &EmptyUnsettledObjectFunds,
+            &ReferenceUnsettled(unsettled),
             data.gas_data().clone(),
             gas_status,
-            data.kind().clone(),
-            None,
+            kind,
+            rewritten,
             data.sender(),
             digest,
             &mut None,
@@ -579,4 +673,48 @@ fn removed(effects: &TransactionEffects) -> Vec<store::Removed> {
 
 fn digest_of(digest: TransactionDigest) -> messages::base::Digest {
     messages::base::Digest::new(digest.into_inner())
+}
+
+/// Each coin reservation input of `kind` rewritten into a withdrawal from
+/// `sender`'s balance, as of the root at `accumulator_version`: sui-core's
+/// `rewrite_transaction_for_coin_reservations`. Which inputs were
+/// rewritten, if any reservation was.
+fn rewrite_coin_reservations(
+    view: &StoreView<'_>,
+    chain_identifier: [u8; 32],
+    sender: sui_types::base_types::SuiAddress,
+    kind: &mut sui_types::transaction::TransactionKind,
+    accumulator_version: Option<sui_types::base_types::SequenceNumber>,
+) -> Result<Option<Vec<bool>>> {
+    use sui_types::coin_reservation::{
+        BorrowedCoinReservationResolver, CoinReservationResolverTrait as _,
+        ParsedObjectRefWithdrawal,
+    };
+    use sui_types::transaction::{CallArg, ObjectArg, TransactionKind};
+    let TransactionKind::ProgrammableTransaction(pt) = kind else {
+        return Ok(None);
+    };
+    let chain = sui_types::digests::ChainIdentifier::from(
+        sui_types::digests::CheckpointDigest::new(chain_identifier),
+    );
+    if pt.coin_reservation_obj_refs().count() == 0 {
+        return Ok(None);
+    }
+    let resolver = BorrowedCoinReservationResolver::new(view);
+    let mut rewritten = Vec::with_capacity(pt.inputs.len());
+    for input in &mut pt.inputs {
+        if let CallArg::Object(ObjectArg::ImmOrOwnedObject(object_ref)) = input
+            && let Some(parsed) = ParsedObjectRefWithdrawal::parse(object_ref, chain)
+        {
+            *input = CallArg::FundsWithdrawal(resolver.resolve_funds_withdrawal(
+                sender,
+                parsed,
+                accumulator_version,
+            )?);
+            rewritten.push(true);
+        } else {
+            rewritten.push(false);
+        }
+    }
+    Ok(Some(rewritten))
 }

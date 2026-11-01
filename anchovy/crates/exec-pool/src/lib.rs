@@ -4,6 +4,10 @@
 //! Executing transactions whose inputs are available, at the versions their
 //! ordinals resolve to (`docs/consensus_pipeline.md`, Execution).
 
+mod admission;
+
+pub use admission::ExecutionAdmission;
+
 use std::sync::Arc;
 
 use containers::Bump;
@@ -16,16 +20,19 @@ use messages::effects::{
 use messages::execution_status::{ExecutionErrorKind, ExecutionStatus};
 use messages::object::{Object, Owner};
 use messages::transaction::SharedObjectMutability;
+use messages::tx_index::SUI_ACCUMULATOR_ROOT_OBJECT_ID;
 use validator::consensus::sequence::SharedAccess;
 use validator::epoch::EpochState;
 use validator::epoch_store::EpochStore;
 use validator::pipeline::items::{
-    EffectsWaitItem, EpochCloserInput, Executable, ExecutableTransaction, FundsCommand,
-    InputCommand, InputValue, ReservationStatus, ScheduledEntry, Settle, SettlementInput, Synced,
-    SystemKind, SystemTransaction,
+    AdmissionInput, EffectsWaitItem, EpochCloserInput, Executable, ExecutableTransaction,
+    FundsCommand, InputCommand, InputValue, ReservationStatus, ScheduledEntry, Settle,
+    SettlementInput, Synced, SystemKind, SystemTransaction,
 };
 use validator::pipeline::keys::{AccumulatorVersion, EffectsKey, InputKey, StreamId, TxDigest};
-use validator::pipeline::tables::{Generation, GenerationTable};
+use validator::pipeline::tables::{
+    Generation, GenerationTable, RootVersions, UnsettledWithdrawals,
+};
 use validator::state_sync::SyncedInput;
 use waiter::{Availability, Command};
 use workqueue::{Processor, Queue, Sink};
@@ -99,6 +106,15 @@ pub struct Executor {
     inputs: Queue<InputCommand>,
     effects: Queue<Command<EffectsKey, EffectsWaitItem>>,
     funds: Queue<FundsCommand>,
+    /// Withdrawals from accumulator accounts not yet settled: recorded here,
+    /// read by execution.
+    unsettled: Arc<UnsettledWithdrawals>,
+    /// Causal admission, told each index run, if it admits this executor's
+    /// work.
+    admission: Option<Queue<AdmissionInput>>,
+    /// The accumulator root's latest version written, which execution may
+    /// wait on, if other executors write it concurrently.
+    roots: Option<Arc<RootVersions>>,
     /// Scratch, per transaction: each shared access's generation.
     resolved: Vec<Generation>,
 }
@@ -132,8 +148,34 @@ impl Executor {
             inputs,
             effects,
             funds,
+            unsettled: Arc::default(),
+            admission: None,
+            roots: None,
             resolved: Vec::new(),
         }
+    }
+
+    /// Has execution wait on `roots` for a root version another executor
+    /// writes, and tells it of each root version written here.
+    #[must_use]
+    pub fn with_root_versions(mut self, roots: Arc<RootVersions>) -> Executor {
+        self.roots = Some(roots);
+        self
+    }
+
+    /// Tells `admission` of each transaction with a causal index once run.
+    #[must_use]
+    pub fn with_admission(mut self, admission: Queue<AdmissionInput>) -> Executor {
+        self.admission = Some(admission);
+        self
+    }
+
+    /// Records withdrawals in, and has execution read, `unsettled`, which
+    /// the checkpoint committer releases.
+    #[must_use]
+    pub fn with_unsettled(mut self, unsettled: Arc<UnsettledWithdrawals>) -> Executor {
+        self.unsettled = unsettled;
+        self
     }
 
     /// Executes `executable` from the inputs its keys resolved to, records
@@ -499,7 +541,18 @@ impl Executor {
         let outcome = self
             .epoch
             .execution
-            .execute_at(&self.store, bytes, provided, funds, Some(root_version))
+            .execute_at(
+                &self.store,
+                bytes,
+                provided,
+                funds,
+                Some(root_version),
+                &*self.unsettled,
+                match &self.roots {
+                    Some(roots) => &**roots,
+                    None => &execution::NoneAwaited,
+                },
+            )
             .unwrap_or_else(|e| panic!("transaction {digest:?} failed to execute: {e:?}"));
         let mut written = containers::Vec::with_capacity_in(outcome.commit.written.len(), bump);
         written.extend(
@@ -510,9 +563,22 @@ impl Executor {
                 .map(|w| (w.id, w.version, object(w.bytes.clone()))),
         );
         self.store.write(outcome.commit);
-        let effects = Message::parse(outcome.effects)
+        let effects: Message<TransactionEffects<'static>> = Message::parse(outcome.effects)
             .map_err(|(e, _)| e)
             .expect("execution's effects parse");
+        let VersionedEffects::V2(v2) = &effects.get().version else {
+            unreachable!("execution produces V2 effects");
+        };
+        self.unsettled.record(digest, root_version, withdrawals(v2));
+        if let Some(roots) = &self.roots
+            && v2.changed_objects.iter().any(|c| {
+                *c.id == SUI_ACCUMULATOR_ROOT_OBJECT_ID
+                    && matches!(c.output_state, ObjectOut::ObjectWrite(..))
+            })
+        {
+            // Written to the store above, so a waiter finds it.
+            roots.written(v2.lamport_version);
+        }
         (effects, written)
     }
 
@@ -778,6 +844,12 @@ impl Processor for Executor {
             self.funds
                 .push(FundsCommand::Settle(deposits), "funds reserver");
         }
+        if let Some(admission) = &self.admission {
+            let retired: Vec<_> = ready.iter().filter_map(|e| e.causal).collect();
+            if !retired.is_empty() {
+                admission.push(AdmissionInput::Retired(retired), "admission");
+            }
+        }
         None
     }
 }
@@ -834,6 +906,26 @@ impl Sink<Vec<EffectsWaitItem>> for EffectsRouter {
             }
         }
     }
+}
+
+/// Each accumulator account `effects` withdrew from, net, and how much: what
+/// settlement will deduct (the reference records object accounts only, but
+/// an address account's entry is never read: no object's address is a
+/// signer's).
+fn withdrawals(effects: &messages::effects::TransactionEffectsV2<'_>) -> Vec<([u8; 32], u128)> {
+    effects
+        .changed_objects
+        .iter()
+        .filter_map(|change| match change.output_state {
+            ObjectOut::AccumulatorWriteV1(write) => match (write.operation, write.value) {
+                (AccumulatorOperation::Split, AccumulatorValue::Integer(amount)) if amount > 0 => {
+                    Some((change.id.0, u128::from(amount)))
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -918,10 +1010,12 @@ mod tests {
                 }),
                 shared: vec![],
                 origin: None,
+                aliases: None,
                 cancelled: Vec::new(),
             },
             inputs: vec![],
             synced: None,
+            causal: None,
         }
     }
 

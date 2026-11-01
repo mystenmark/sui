@@ -154,6 +154,7 @@ fn executed(count: usize, store: &Store) -> Vec<ExecutedEffects> {
                 digest,
                 effects_digest,
                 effects: Arc::from(effects_bytes),
+                aliases: None,
             }
         })
         .collect()

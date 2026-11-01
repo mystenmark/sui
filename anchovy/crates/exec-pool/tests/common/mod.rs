@@ -285,10 +285,12 @@ impl Node {
                 transaction: ExecutableTransaction::User(transaction),
                 shared,
                 origin: None,
+                aliases: None,
                 cancelled: Vec::new(),
             },
             inputs: Vec::new(),
             synced: None,
+            causal: None,
         };
         // Whatever the input waiter would find resolved now; it fills in the
         // rest.

@@ -64,6 +64,12 @@ pub enum SystemKind {
     RandomnessStateUpdate { round: u64 },
 }
 
+/// Each required signer's signature index, and the version of its
+/// `AddressAliases` object the signature was verified under: a user
+/// transaction's aliases claim (the reference's `aliases()`). Checkpoint
+/// contents list the signatures so.
+pub type AliasVersions = Vec<(u8, Option<u64>)>;
+
 /// A scheduled transaction with its shared accesses and, for a user
 /// transaction, where consensus put it.
 #[derive(Debug)]
@@ -71,6 +77,8 @@ pub struct ScheduledEntry {
     pub transaction: ExecutableTransaction,
     pub shared: Vec<SharedAccess>,
     pub origin: Option<(BlockRef, TransactionIndex)>,
+    /// A user transaction's aliases claim, if its submitter made one.
+    pub aliases: Option<AliasVersions>,
     /// A transaction cancelled for congestion: each consensus object input
     /// and the marker version it reads as instead (then `shared` is empty).
     pub cancelled: Vec<(ObjectId, u64)>,
@@ -80,7 +88,8 @@ pub struct ScheduledEntry {
 /// `CommitHandler` → `VersionResolver`.
 #[derive(Debug)]
 pub struct Chunk {
-    /// The version the commit's transactions reserve funds against.
+    /// The version the chunk's transactions reserve funds against: its root
+    /// version, as the reference's accumulator version.
     pub version: AccumulatorVersion,
     /// The accumulator root's version the chunk's transactions are assigned
     /// (the reference's `SystemObjectVersions`): the one the previous
@@ -99,8 +108,6 @@ pub struct Chunk {
 #[derive(Debug)]
 pub struct GatedChunk {
     pub chunk: Chunk,
-    /// As `ChunkSettlement::last_of_commit`.
-    pub last_of_commit: bool,
     /// As `ChunkSettlement::root`.
     pub root: SharedAccess,
     /// The update heading the chunk, not yet in its entries.
@@ -137,17 +144,18 @@ pub struct PendingUpdate {
 /// What settling a chunk takes. Randomness gate → `SettlementScheduler`.
 #[derive(Debug, Clone)]
 pub struct ChunkSettlement {
-    /// The version the commit's transactions reserve funds against; settling
-    /// the commit's last chunk makes `version + 1`.
+    /// The version the chunk's transactions reserve funds against; settling
+    /// the chunk makes `version + 1`.
     pub version: AccumulatorVersion,
     /// As `Chunk::root_version`; the barrier writes `root_version + 1`.
     pub root_version: u64,
-    pub last_of_commit: bool,
     pub round: u32,
     pub height: u64,
     pub checkpoint_seq: u64,
     /// The chunk's transactions' digests, in schedule order.
     pub digests: Vec<TxDigest>,
+    /// The aliases claims of the chunk's transactions that have one.
+    pub aliases: Vec<(TxDigest, AliasVersions)>,
     /// The accumulator root generation the chunk's settlement reads: its
     /// settlements write it non-exclusively, its barrier exclusively.
     pub root: SharedAccess,
@@ -206,7 +214,7 @@ pub struct EpochClose {
 /// `SettlementScheduler` → input waiter → `Executor`.
 #[derive(Debug)]
 pub struct Executable {
-    /// The version its commit reserves funds against.
+    /// The version it reserves funds against: its chunk's root version.
     pub version: AccumulatorVersion,
     /// As `Chunk::root_version`.
     pub root_version: u64,
@@ -223,6 +231,18 @@ pub struct Executable {
     /// Set on a transaction of a certified checkpoint the synced scheduler
     /// runs; then `entry.shared` is empty and nothing was reserved.
     pub synced: Option<Box<Synced>>,
+    /// Its causal index; none for a settlement or a barrier, which never
+    /// block and bypass admission.
+    pub causal: Option<crate::pipeline::keys::CausalIndex>,
+}
+
+/// What causal admission takes: transactions ready to execute, from the
+/// input waiter, or the causal indices of transactions done, from the
+/// executors.
+#[derive(Debug)]
+pub enum AdmissionInput {
+    Ready(Vec<Executable>),
+    Retired(Vec<crate::pipeline::keys::CausalIndex>),
 }
 
 /// What a certified transaction's effects decide, in place of the consensus
@@ -342,6 +362,8 @@ pub struct ExecutedEffects {
     pub effects_digest: TxDigest,
     /// `TransactionEffects` BCS.
     pub effects: Arc<[u8]>,
+    /// The transaction's aliases claim, for checkpoint contents.
+    pub aliases: Option<AliasVersions>,
 }
 
 /// A settled chunk: its effects in checkpoint order (causal order, the

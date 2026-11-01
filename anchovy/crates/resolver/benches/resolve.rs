@@ -194,6 +194,7 @@ fn chunk(round: u32, transactions: &[Planned]) -> Chunk {
                 transaction: ExecutableTransaction::User(transaction),
                 shared,
                 origin: None,
+                aliases: None,
                 cancelled: Vec::new(),
             }
         })

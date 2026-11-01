@@ -213,6 +213,7 @@ fn committed_effects(store: &store::Store, seq: u64, bump: &mut Bump) -> Vec<Exe
                 digest,
                 effects_digest,
                 effects: effects.get().bytes.into(),
+                aliases: None,
             }
         })
         .collect()

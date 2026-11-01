@@ -12,7 +12,7 @@ use tokio::sync::watch;
 use validator::pipeline::backpressure::Backpressure;
 use validator::pipeline::items::{CertifiedCheckpoint, OutputWaits};
 use validator::pipeline::keys::CheckpointProgress;
-use validator::pipeline::tables::{CheckpointStore, GenerationTable};
+use validator::pipeline::tables::{CheckpointStore, GenerationTable, UnsettledWithdrawals};
 use waiter::Command;
 use workqueue::Processor;
 
@@ -38,12 +38,14 @@ use workqueue::Processor;
 ///
 /// Reads: the checkpoint store. Writes: the object
 /// store, as its only committer; the generation table's committed state;
+/// the unsettled withdrawals, releasing those the checkpoint settled;
 /// backpressure's committed watermark, which releases the commit answers it
 /// withheld.
 pub struct CheckpointCommitter {
     store: Arc<store::Store>,
     checkpoints: Arc<CheckpointStore>,
     generations: Arc<GenerationTable>,
+    unsettled: Arc<UnsettledWithdrawals>,
     outputs: OutputWaits,
     backpressure: Arc<Backpressure>,
     /// The epoch's last checkpoint, once committed.
@@ -57,6 +59,7 @@ impl CheckpointCommitter {
         store: Arc<store::Store>,
         checkpoints: Arc<CheckpointStore>,
         generations: Arc<GenerationTable>,
+        unsettled: Arc<UnsettledWithdrawals>,
         outputs: OutputWaits,
         backpressure: Arc<Backpressure>,
         ended: watch::Sender<Option<u64>>,
@@ -65,6 +68,7 @@ impl CheckpointCommitter {
             store,
             checkpoints,
             generations,
+            unsettled,
             outputs,
             backpressure,
             ended,
@@ -88,6 +92,7 @@ impl CheckpointCommitter {
             bump,
         );
         self.generations.commit(&transactions, bump);
+        self.unsettled.commit(&transactions);
         self.checkpoints.committed(seq);
         self.backpressure.committed(seq, built.last_height);
         if built.ends_epoch {

@@ -23,7 +23,7 @@ use messages::object::Data;
 use messages::transaction::{SharedObjectMutability, TransactionKind};
 use validator::consensus::sequence::SharedAccess;
 use validator::epoch::EpochParams;
-use validator::pipeline::items::ChunkSettlement;
+use validator::pipeline::items::{AliasVersions, ChunkSettlement};
 use validator::pipeline::items::{
     EffectsWaitItem, Executable, ExecutableTransaction, ExecutedEffects, FundsCommand,
     InputCommand, InputValue, PendingCheckpoint, ReservationStatus, ScheduledEntry, Settle,
@@ -72,17 +72,23 @@ fn mutates_root(effects: &TransactionEffects<'_>) -> bool {
     })
 }
 
-fn to_executed(effects: &Effects) -> ExecutedEffects {
+/// `effects`, with its transaction's claim among the chunk's `aliases`.
+fn to_executed(effects: &Effects, aliases: &[(TxDigest, AliasVersions)]) -> ExecutedEffects {
     let view = effects.get();
     let digest = match &view.version {
         VersionedEffects::V1(v1) => *v1.transaction_digest,
         VersionedEffects::V2(v2) => *v2.transaction_digest,
     };
+    // The executor that wrote the effects named the digest it computed.
+    let digest = Hashed::computed(digest);
     ExecutedEffects {
-        // The executor that wrote the effects named the digest it computed.
-        digest: Hashed::computed(digest),
+        digest,
         effects_digest: *effects.digest(),
         effects: Arc::from(effects.wire_bytes()),
+        aliases: aliases
+            .iter()
+            .find(|(d, _)| *d == digest)
+            .map(|(_, a)| a.clone()),
     }
 }
 
@@ -137,8 +143,8 @@ enum Stage {
 /// - input waiter, wait for: the settlement transactions, then the barrier
 ///   (`Executable`), keyed by the root's generation;
 /// - checkpoint waiter, notify: `ChunkSettled(height)`;
-/// - `FundsReserver`: `Settle::Settled` of version `v + 1` once the last
-///   chunk of commit `v` settled, and of the first chunk's version, whose
+/// - `FundsReserver`: `Settle::Settled` of version `v + 1` once the chunk
+///   of version `v` settled, and of the first chunk's version, whose
 ///   accumulator state is the one in the store.
 ///
 /// Reads: the object store (effects, the first transaction, to tell a
@@ -151,7 +157,7 @@ pub struct SettlementScheduler {
     inputs: Queue<InputCommand>,
     checkpoints: Queue<Command<ChunkSettled, PendingCheckpoint>>,
     funds: Queue<FundsCommand>,
-    /// The accounts the settling commit's chunks changed so far.
+    /// The accounts the settling chunk changed.
     accounts: BTreeSet<ObjectId>,
     /// Chunks not settled yet, by height: the first is the one settling.
     pending: BTreeMap<u64, Stage>,
@@ -431,7 +437,7 @@ impl SettlementScheduler {
             .iter()
             .chain(settlements)
             .chain([barrier])
-            .map(to_executed)
+            .map(|e| to_executed(e, &chunk.aliases))
             .collect();
         let count = all.len() as u64;
         self.chunks.insert(SettledChunk {
@@ -447,21 +453,19 @@ impl SettlementScheduler {
         // root before their effects were notified.
         self.accounts
             .extend(effects.iter().flat_map(|e| accounts(e.get())));
-        if chunk.last_of_commit {
-            let root_version = lamport_version(barrier.get());
-            let balances = std::mem::take(&mut self.accounts)
-                .into_iter()
-                .map(|account| (account, balance_at(&self.store, &account, root_version)))
-                .collect();
-            self.funds.push(
-                FundsCommand::Settle(vec![Settle::Settled {
-                    balances,
-                    version: AccumulatorVersion(chunk.version.0 + 1),
-                    root_version,
-                }]),
-                "funds reserver",
-            );
-        }
+        let root_version = lamport_version(barrier.get());
+        let balances = std::mem::take(&mut self.accounts)
+            .into_iter()
+            .map(|account| (account, balance_at(&self.store, &account, root_version)))
+            .collect();
+        self.funds.push(
+            FundsCommand::Settle(vec![Settle::Settled {
+                balances,
+                version: AccumulatorVersion(chunk.version.0 + 1),
+                root_version,
+            }]),
+            "funds reserver",
+        );
         self.offset = Some(match self.offset {
             Some((seq, settled)) if seq == chunk.checkpoint_seq => (seq, settled + count),
             _ => (chunk.checkpoint_seq, count),
@@ -491,10 +495,12 @@ fn executable(
             }),
             shared: vec![SharedAccess { mutability, ..root }],
             origin: None,
+            aliases: None,
             cancelled: Vec::new(),
         },
         inputs: Vec::new(),
         synced: None,
+        causal: None,
     };
     (executable, key)
 }

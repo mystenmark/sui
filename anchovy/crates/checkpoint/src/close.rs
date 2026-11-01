@@ -25,7 +25,7 @@ use validator::pipeline::items::{
     EpochCloserInput, ExecutableTransaction, ExecutedEffects, LastOfEpoch, ScheduledEntry,
 };
 use validator::pipeline::keys::{EffectsKey, TxDigest};
-use validator::pipeline::tables::CheckpointStore;
+use validator::pipeline::tables::{CheckpointStore, ChunkLengths};
 use waiter::{Command, WaitBatch};
 use workqueue::{Processor, Queue};
 
@@ -64,6 +64,9 @@ use crate::{contents_of, summary};
 ///
 /// Reads: the checkpoint store, the object store.
 pub struct EpochCloser {
+    /// Where the change-epoch transaction is registered, for causal
+    /// admission.
+    lengths: Arc<ChunkLengths>,
     epoch: Arc<EpochParams>,
     /// The system objects as the epoch started.
     objects: SystemObjects,
@@ -92,8 +95,10 @@ impl EpochCloser {
         effects: Queue<Command<EffectsKey, EffectsWaitItem>>,
         hasher: Queue<CheckpointEffects>,
         summary: Queue<Vec<CheckpointContentsBuilt>>,
+        lengths: Arc<ChunkLengths>,
     ) -> EpochCloser {
         EpochCloser {
+            lengths,
             epoch,
             objects,
             store,
@@ -129,21 +134,27 @@ impl EpochCloser {
             built.pending.timestamp_ms,
         );
         let digest = transaction.digest;
+        // A unit of its own after the epoch's last chunk, for causal
+        // admission.
+        let height = *built
+            .pending
+            .heights
+            .last()
+            .expect("a checkpoint has chunks")
+            + 1;
+        self.lengths.register(height, 1);
         self.resolver.push(
             Chunk {
                 version: close.version,
                 root_version: close.root_version,
                 round: close.round,
-                height: *built
-                    .pending
-                    .heights
-                    .last()
-                    .expect("a checkpoint has chunks"),
+                height,
                 checkpoint_seq: seq,
                 entries: vec![ScheduledEntry {
                     transaction: ExecutableTransaction::System(transaction),
                     shared: close.shared,
                     origin: None,
+                    aliases: None,
                     cancelled: Vec::new(),
                 }],
             },
@@ -405,6 +416,7 @@ impl EpochCloser {
             digest,
             effects_digest: *effects.digest(),
             effects: effects.wire_bytes().into(),
+            aliases: None,
         }
     }
 

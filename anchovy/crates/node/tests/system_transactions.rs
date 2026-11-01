@@ -50,6 +50,7 @@ impl Node {
             0,
             0,
             RGP,
+            [0; 32],
         )
         .unwrap();
         Node {

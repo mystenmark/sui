@@ -226,11 +226,11 @@ fn bench_process(size: usize, effects: &[Vec<u8>]) {
         let chunk = ChunkSettlement {
             version: AccumulatorVersion(height),
             root_version: height,
-            last_of_commit: true,
             round: height as u32,
             height,
             checkpoint_seq: height,
             digests: digests.clone(),
+            aliases: Vec::new(),
             root: SharedAccess {
                 id: ObjectId(support::ROOT),
                 initial_shared_version: ISV,
