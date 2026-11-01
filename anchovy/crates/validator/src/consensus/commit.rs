@@ -455,7 +455,7 @@ impl CommitHandler {
     pub fn handle<'b>(
         &mut self,
         epoch: &EpochParams,
-        commit: DecodedCommit,
+        mut commit: DecodedCommit,
         bump: &'b Bump,
     ) -> Option<HandledCommit<'b>> {
         // 1. A commit handled before is skipped.
@@ -474,7 +474,13 @@ impl CommitHandler {
         let round = u64::from(commit.leader.round);
         let config = &epoch.config;
         // As of the commits before this one, so every validator drops alike.
+        // Its transactions are still dropped one by one, for their statuses.
         let certs_closed = self.certs_closed;
+        if certs_closed {
+            commit.observations.clear();
+            commit.jwks.clear();
+            commit.capabilities.clear();
+        }
         // The reference's `observe_commit`, before anything is estimated.
         self.observe_prior(config, commit.timestamp_ms);
         // The commit's randomness round, as DKG stood before its traffic.
@@ -539,12 +545,7 @@ impl CommitHandler {
 
         // 4. The commit's execution time observations, before its
         //    transactions are estimated.
-        let observations = if certs_closed {
-            &[][..]
-        } else {
-            &commit.observations[..]
-        };
-        for shared in observations {
+        for shared in &commit.observations {
             if self.execution_times.observe(shared) {
                 self.output.put_execution_time_observations(
                     shared.author,
@@ -557,16 +558,14 @@ impl CommitHandler {
         // 5. The keys voted for (`process_jwks`), and the update adding those
         //    that became active in the last commit
         //    (`create_authenticator_state_update`).
-        let update = self.jwk_update(if certs_closed { &[] } else { &commit.jwks });
+        let update = self.jwk_update(&commit.jwks);
 
         // The capabilities announced (`process_capability_notifications`).
-        if !certs_closed {
-            for announced in commit.capabilities {
-                let encoded = capabilities::encode(&announced);
-                let author = announced.author;
-                if self.capabilities.record(announced) {
-                    self.output.put_capabilities(author, encoded);
-                }
+        for announced in commit.capabilities {
+            let encoded = capabilities::encode(&announced);
+            let author = announced.author;
+            if self.capabilities.record(announced) {
+                self.output.put_capabilities(author, encoded);
             }
         }
 
