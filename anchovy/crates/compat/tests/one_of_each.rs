@@ -1958,11 +1958,19 @@ fn the_composite_workload_runs_alike() {
     let bench = network.runtime.block_on(async move {
         let registry = prometheus::Registry::new();
         let proxy_metrics = BenchmarkProxyMetrics::new(&registry);
-        let proxy: Arc<dyn ValidatorProxy + Send + Sync> = Arc::new(
-            FullNodeProxy::from_url(&rpc_url, &genesis.committee(), &proxy_metrics)
-                .await
-                .unwrap(),
-        );
+        // Its RPC answers once its index has committed a checkpoint.
+        let deadline = Instant::now() + TIMEOUT;
+        let proxy = loop {
+            match FullNodeProxy::from_url(&rpc_url, &genesis.committee(), &proxy_metrics).await {
+                Ok(proxy) => break proxy,
+                Err(e) if Instant::now() < deadline => {
+                    tracing::info!(?e, "the full node's RPC is not ready");
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => panic!("the full node's RPC: {e:?}"),
+            }
+        };
+        let proxy: Arc<dyn ValidatorProxy + Send + Sync> = Arc::new(proxy);
         let bank = BenchmarkBank::new(proxy.clone(), vec![proxy.clone()], primary);
         // Its first state has the reference gas price.
         let mut observer = SystemStateObserver::new(proxy.clone());
