@@ -21,7 +21,6 @@ use messages::base::{Digest, Hashed};
 
 use sui_execution::Executor;
 use sui_protocol_config::{ProtocolConfig, ProtocolVersion};
-use sui_types::accumulator_root::EmptyUnsettledObjectFunds;
 use sui_types::base_types::{ConsensusObjectVersion, ObjectID, SystemObjectVersions};
 use sui_types::digests::TransactionDigest;
 use sui_types::effects::{TransactionEffects, TransactionEffectsAPI};
@@ -83,6 +82,37 @@ impl From<SuiError> for Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Net withdrawals from accumulator accounts by transactions executed but
+/// not yet settled, by account and the root version they read: what an
+/// object balance withdrawal is checked against beside the settled balance
+/// (the reference's `UnsettledObjectFundsRead`).
+pub trait Unsettled: Sync {
+    fn withdrawn(&self, account: &messages::base::ObjectId, version: u64) -> u128;
+}
+
+/// No withdrawals unsettled.
+pub struct NoneUnsettled;
+
+impl Unsettled for NoneUnsettled {
+    fn withdrawn(&self, _: &messages::base::ObjectId, _: u64) -> u128 {
+        0
+    }
+}
+
+/// `Unsettled`, as sui's executor reads it.
+struct ReferenceUnsettled<'u>(&'u dyn Unsettled);
+
+impl sui_types::accumulator_root::UnsettledObjectFundsRead for ReferenceUnsettled<'_> {
+    fn get_unsettled_object_withdraw(
+        &self,
+        account: &sui_types::accumulator_root::AccumulatorObjId,
+        accumulator_version: sui_types::base_types::SequenceNumber,
+    ) -> u128 {
+        let account = messages::base::ObjectId(account.inner().into_bytes());
+        self.0.withdrawn(&account, accumulator_version.value())
+    }
+}
+
 /// The pipeline's executor for one epoch: anchovy's.
 ///
 /// With the `testing` feature, sui's executes every transaction too, as an
@@ -126,7 +156,14 @@ impl Execution {
 
     /// As `Reference::execute`.
     pub fn execute(&self, store: &store::Store, transaction: &[u8]) -> Result<Outcome> {
-        self.execute_at(store, transaction, &[], Funds::MaybeSufficient, None)
+        self.execute_at(
+            store,
+            transaction,
+            &[],
+            Funds::MaybeSufficient,
+            None,
+            &NoneUnsettled,
+        )
     }
 
     /// As `Reference::execute_at`.
@@ -140,6 +177,7 @@ impl Execution {
         provided: &[(messages::base::ObjectId, Input<'_>)],
         funds: Funds,
         assigned_accumulator: Option<u64>,
+        unsettled: &dyn Unsettled,
     ) -> Result<Outcome> {
         let parsed = native::parse(transaction)?;
         let data = parsed.get().0.data();
@@ -150,6 +188,7 @@ impl Execution {
             provided,
             funds,
             assigned_accumulator,
+            unsettled,
         )?;
         #[cfg(feature = "testing")]
         assert_same(
@@ -159,6 +198,7 @@ impl Execution {
                 provided,
                 funds,
                 assigned_accumulator,
+                unsettled,
             )?,
             &outcome,
         );
@@ -268,7 +308,14 @@ impl Reference {
     /// If an owned input is no longer live at the version and digest the
     /// transaction gives: equivocation, which consensus rules out.
     pub fn execute(&self, store: &store::Store, transaction: &[u8]) -> Result<Outcome> {
-        self.execute_at(store, transaction, &[], Funds::MaybeSufficient, None)
+        self.execute_at(
+            store,
+            transaction,
+            &[],
+            Funds::MaybeSufficient,
+            None,
+            &NoneUnsettled,
+        )
     }
 
     /// `execute`, but each input named in `provided` is as given there
@@ -284,6 +331,7 @@ impl Reference {
         provided: &[(messages::base::ObjectId, Input<'_>)],
         funds: Funds,
         assigned_accumulator: Option<u64>,
+        unsettled: &dyn Unsettled,
     ) -> Result<Outcome> {
         let signed: SenderSignedData = bcs::from_bytes(transaction)?;
         let data = signed.transaction_data();
@@ -337,7 +385,7 @@ impl Reference {
             self.epoch_start_timestamp_ms,
             inputs,
             SystemObjectVersions::new(accumulator_version),
-            &EmptyUnsettledObjectFunds,
+            &ReferenceUnsettled(unsettled),
             data.gas_data().clone(),
             gas_status,
             data.kind().clone(),

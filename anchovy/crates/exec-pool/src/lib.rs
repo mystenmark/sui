@@ -25,7 +25,7 @@ use validator::pipeline::items::{
     SystemKind, SystemTransaction,
 };
 use validator::pipeline::keys::{AccumulatorVersion, EffectsKey, InputKey, StreamId, TxDigest};
-use validator::pipeline::tables::{Generation, GenerationTable};
+use validator::pipeline::tables::{Generation, GenerationTable, UnsettledWithdrawals};
 use validator::state_sync::SyncedInput;
 use waiter::{Availability, Command};
 use workqueue::{Processor, Queue, Sink};
@@ -99,6 +99,9 @@ pub struct Executor {
     inputs: Queue<InputCommand>,
     effects: Queue<Command<EffectsKey, EffectsWaitItem>>,
     funds: Queue<FundsCommand>,
+    /// Withdrawals from accumulator accounts not yet settled: recorded here,
+    /// read by execution.
+    unsettled: Arc<UnsettledWithdrawals>,
     /// Scratch, per transaction: each shared access's generation.
     resolved: Vec<Generation>,
 }
@@ -132,8 +135,17 @@ impl Executor {
             inputs,
             effects,
             funds,
+            unsettled: Arc::default(),
             resolved: Vec::new(),
         }
+    }
+
+    /// Records withdrawals in, and has execution read, `unsettled`, which
+    /// the checkpoint committer releases.
+    #[must_use]
+    pub fn with_unsettled(mut self, unsettled: Arc<UnsettledWithdrawals>) -> Executor {
+        self.unsettled = unsettled;
+        self
     }
 
     /// Executes `executable` from the inputs its keys resolved to, records
@@ -499,7 +511,14 @@ impl Executor {
         let outcome = self
             .epoch
             .execution
-            .execute_at(&self.store, bytes, provided, funds, Some(root_version))
+            .execute_at(
+                &self.store,
+                bytes,
+                provided,
+                funds,
+                Some(root_version),
+                &*self.unsettled,
+            )
             .unwrap_or_else(|e| panic!("transaction {digest:?} failed to execute: {e:?}"));
         let mut written = containers::Vec::with_capacity_in(outcome.commit.written.len(), bump);
         written.extend(
@@ -510,9 +529,13 @@ impl Executor {
                 .map(|w| (w.id, w.version, object(w.bytes.clone()))),
         );
         self.store.write(outcome.commit);
-        let effects = Message::parse(outcome.effects)
+        let effects: Message<TransactionEffects<'static>> = Message::parse(outcome.effects)
             .map_err(|(e, _)| e)
             .expect("execution's effects parse");
+        let VersionedEffects::V2(v2) = &effects.get().version else {
+            unreachable!("execution produces V2 effects");
+        };
+        self.unsettled.record(digest, root_version, withdrawals(v2));
         (effects, written)
     }
 
@@ -834,6 +857,26 @@ impl Sink<Vec<EffectsWaitItem>> for EffectsRouter {
             }
         }
     }
+}
+
+/// Each accumulator account `effects` withdrew from, net, and how much: what
+/// settlement will deduct (the reference records object accounts only, but
+/// an address account's entry is never read: no object's address is a
+/// signer's).
+fn withdrawals(effects: &messages::effects::TransactionEffectsV2<'_>) -> Vec<([u8; 32], u128)> {
+    effects
+        .changed_objects
+        .iter()
+        .filter_map(|change| match change.output_state {
+            ObjectOut::AccumulatorWriteV1(write) => match (write.operation, write.value) {
+                (AccumulatorOperation::Split, AccumulatorValue::Integer(amount)) if amount > 0 => {
+                    Some((change.id.0, u128::from(amount)))
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]

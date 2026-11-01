@@ -18,7 +18,7 @@ use executor::execution_params::{
 use executor::gas::SuiGasStatus;
 use executor::inputs::{ExecutionInputs, InputObjectKind, InputState, LoadedInput};
 use executor::static_programmable_transactions::type_cache::TypeCache;
-use executor::storage::EmptyUnsettledObjectFunds;
+use executor::storage::UnsettledObjectFundsRead;
 use messages::arena::Ref;
 use messages::base::{ObjectId, SuiAddress, TransactionDigest};
 use messages::object::MoveObjectType;
@@ -34,7 +34,7 @@ use sui_types::metrics::ExecutionMetrics;
 use validation::inputs::{InputKind, input_objects, receiving_objects};
 
 use crate::reads::StoreReads;
-use crate::{Error, Funds, Input, Outcome, Result};
+use crate::{Error, Funds, Input, Outcome, Result, Unsettled};
 
 /// The arena's first chunk: most transactions fit in it.
 const ARENA_CAPACITY: usize = 1 << 20;
@@ -148,7 +148,15 @@ impl NativeExecution {
         data: &TransactionData<'_, S>,
         transaction: &[u8],
     ) -> Result<Outcome> {
-        self.execute_at(store, data, transaction, &[], Funds::MaybeSufficient, None)
+        self.execute_at(
+            store,
+            data,
+            transaction,
+            &[],
+            Funds::MaybeSufficient,
+            None,
+            &crate::NoneUnsettled,
+        )
     }
 
     /// `execute`, but with inputs, funds and the accumulator root's version as
@@ -162,6 +170,7 @@ impl NativeExecution {
         provided: &[(ObjectId, Input<'_>)],
         funds: Funds,
         assigned_accumulator: Option<u64>,
+        unsettled: &dyn Unsettled,
     ) -> Result<Outcome> {
         let mut state = self.state.lock().expect("the state's lock is not poisoned");
         let State { arena, runtime } = &mut *state;
@@ -174,6 +183,7 @@ impl NativeExecution {
             provided,
             funds,
             assigned_accumulator,
+            unsettled,
         );
         arena.reset();
         if runtime.package_cache.len() > self.max_packages {
@@ -193,6 +203,7 @@ impl NativeExecution {
         provided: &[(ObjectId, Input<'_>)],
         funds: Funds,
         assigned_accumulator: Option<u64>,
+        unsettled: &dyn Unsettled,
     ) -> Result<Outcome> {
         let kept = Kept::new();
         let reads = StoreReads::new(bump, store, &kept);
@@ -254,6 +265,7 @@ impl NativeExecution {
             (*data.kind(), None)
         };
 
+        let unsettled = NativeUnsettled(unsettled);
         let ExecutionOutput {
             inner_store,
             effects,
@@ -262,7 +274,7 @@ impl NativeExecution {
             bump,
             &reads,
             &inputs,
-            &EmptyUnsettledObjectFunds,
+            &unsettled,
             gas_data,
             gas_status,
             kind,
@@ -471,4 +483,13 @@ fn rewrite_coin_reservations<'a>(
         TransactionKind::ProgrammableTransaction(pt),
         Some(rewritten.leak()),
     )
+}
+
+/// `Unsettled`, as anchovy's executor reads it.
+struct NativeUnsettled<'u>(&'u dyn Unsettled);
+
+impl UnsettledObjectFundsRead for NativeUnsettled<'_> {
+    fn get_unsettled_object_withdraw(&self, account: &ObjectId, accumulator_version: u64) -> u128 {
+        self.0.withdrawn(account, accumulator_version)
+    }
 }

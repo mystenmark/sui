@@ -143,6 +143,76 @@ impl GenerationTable {
     }
 }
 
+/// Net withdrawals from accumulator accounts by transactions executed but
+/// not yet settled, by (account, root version): what an object balance
+/// withdrawal is checked against beside the settled balance (the reference's
+/// `UnsettledObjectWithdrawals`). Written by `Executor` (owner: the exec-pool
+/// work) when a transaction executes, by either path; read by execution;
+/// released by `CheckpointCommitter` as each transaction's checkpoint
+/// commits, which settles it.
+///
+/// In memory only: a transaction whose outputs survive a crash committed
+/// with its checkpoint, so it is settled, and any other runs again and
+/// records again.
+#[derive(Default)]
+pub struct UnsettledWithdrawals {
+    inner: Mutex<Unsettled>,
+}
+
+#[derive(Default)]
+struct Unsettled {
+    /// Totals by (account, root version).
+    totals: HashMap<([u8; 32], u64), u128, foldhash::fast::RandomState>,
+    /// What each transaction recorded: its root version and withdrawals.
+    by_producer: HashMap<TxDigest, (u64, Vec<([u8; 32], u128)>), foldhash::fast::RandomState>,
+}
+
+impl UnsettledWithdrawals {
+    /// `producer`, reading the root at `version`, withdrew `withdrawals`
+    /// (account, net amount) from accumulator accounts.
+    pub fn record(&self, producer: TxDigest, version: u64, withdrawals: Vec<([u8; 32], u128)>) {
+        if withdrawals.is_empty() {
+            return;
+        }
+        let mut inner = lock(&self.inner);
+        for &(account, amount) in &withdrawals {
+            let total = inner.totals.entry((account, version)).or_default();
+            *total = total.checked_add(amount).expect("withdrawals fit in u128");
+        }
+        let previous = inner.by_producer.insert(producer, (version, withdrawals));
+        debug_assert!(previous.is_none(), "a transaction executes once");
+    }
+
+    /// `transactions` committed with their checkpoint: their withdrawals
+    /// are settled.
+    pub fn commit(&self, transactions: &[TxDigest]) {
+        let mut inner = lock(&self.inner);
+        for digest in transactions {
+            let Some((version, withdrawals)) = inner.by_producer.remove(digest) else {
+                continue;
+            };
+            for (account, amount) in withdrawals {
+                let key = (account, version);
+                let total = inner.totals.get_mut(&key).expect("recorded with it");
+                *total -= amount;
+                if *total == 0 {
+                    inner.totals.remove(&key);
+                }
+            }
+        }
+    }
+}
+
+impl execution::Unsettled for UnsettledWithdrawals {
+    fn withdrawn(&self, account: &messages::base::ObjectId, version: u64) -> u128 {
+        lock(&self.inner)
+            .totals
+            .get(&(account.0, version))
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
 /// Settled chunks by height, in memory: only checkpoints not yet built read
 /// them, so each is taken as its checkpoint's contents are built, and a
 /// replay settles them again. Written by `SettlementScheduler` (owner: the
@@ -321,5 +391,33 @@ impl CheckpointStore {
         self.committed.fetch_max(seq, Ordering::AcqRel);
         let mut built = lock(&self.built);
         *built = built.split_off(&seq);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use execution::Unsettled as _;
+    use messages::base::{Digest, Hashed, ObjectId};
+
+    use super::*;
+
+    #[test]
+    fn unsettled_withdrawals_add_up_by_version_until_their_checkpoint_commits() {
+        let table = UnsettledWithdrawals::default();
+        let digest = |n: u8| Hashed::computed(Digest::new([n; 32]));
+        let account = ObjectId([1; 32]);
+        table.record(digest(1), 5, vec![(account.0, 30)]);
+        table.record(digest(2), 5, vec![(account.0, 12)]);
+        table.record(digest(3), 6, vec![(account.0, 7)]);
+        assert_eq!(table.withdrawn(&account, 5), 42);
+        assert_eq!(table.withdrawn(&account, 6), 7);
+        assert_eq!(table.withdrawn(&ObjectId([2; 32]), 5), 0);
+
+        table.commit(&[digest(1), digest(9)]);
+        assert_eq!(table.withdrawn(&account, 5), 12);
+        table.commit(&[digest(2), digest(3)]);
+        assert_eq!(table.withdrawn(&account, 5), 0);
+        assert_eq!(table.withdrawn(&account, 6), 0);
+        assert!(lock(&table.inner).totals.is_empty());
     }
 }

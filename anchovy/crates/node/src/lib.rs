@@ -295,6 +295,7 @@ impl Pipeline {
             consensus: consensus.clone(),
             cache: Arc::new(ConsensusTxCache::new()),
             generations: Arc::new(GenerationTable::new(epoch_store.clone())),
+            unsettled: Arc::default(),
             chunks: Arc::new(ChunkTable::new()),
             chunk_lock: Arc::new(ChunkLock::new(
                 resumed_height,
