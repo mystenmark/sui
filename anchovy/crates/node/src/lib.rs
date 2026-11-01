@@ -39,7 +39,9 @@ use validator::pipeline::backpressure::{Backpressure, Limits};
 use validator::pipeline::chunk_lock::{ChunkLock, Cut};
 use validator::pipeline::items::{CertifiedCheckpoint, EffectsWaitItem};
 use validator::pipeline::keys::EffectsKey;
-use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable, GenerationTable};
+use validator::pipeline::tables::{
+    BuiltCheckpoint, CheckpointStore, ChunkTable, GenerationTable, RootVersions,
+};
 use validator::processors::Request;
 use validator::randomness::BeaconInput;
 use validator::server::Consensus;
@@ -301,6 +303,12 @@ impl Pipeline {
             generations: Arc::new(GenerationTable::new(epoch_store.clone())),
             unsettled: Arc::default(),
             chunk_lengths: Arc::default(),
+            root_versions: Arc::new(RootVersions::new(
+                store
+                    .live(&messages::tx_index::SUI_ACCUMULATOR_ROOT_OBJECT_ID)
+                    .expect("the store reads")
+                    .map_or(0, |live| live.version),
+            )),
             chunks: Arc::new(ChunkTable::new()),
             chunk_lock: Arc::new(ChunkLock::new(
                 resumed_height,

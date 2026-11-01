@@ -20,6 +20,7 @@ use messages::effects::{
 use messages::execution_status::{ExecutionErrorKind, ExecutionStatus};
 use messages::object::{Object, Owner};
 use messages::transaction::SharedObjectMutability;
+use messages::tx_index::SUI_ACCUMULATOR_ROOT_OBJECT_ID;
 use validator::consensus::sequence::SharedAccess;
 use validator::epoch::EpochState;
 use validator::epoch_store::EpochStore;
@@ -29,7 +30,9 @@ use validator::pipeline::items::{
     SettlementInput, Synced, SystemKind, SystemTransaction,
 };
 use validator::pipeline::keys::{AccumulatorVersion, EffectsKey, InputKey, StreamId, TxDigest};
-use validator::pipeline::tables::{Generation, GenerationTable, UnsettledWithdrawals};
+use validator::pipeline::tables::{
+    Generation, GenerationTable, RootVersions, UnsettledWithdrawals,
+};
 use validator::state_sync::SyncedInput;
 use waiter::{Availability, Command};
 use workqueue::{Processor, Queue, Sink};
@@ -109,6 +112,9 @@ pub struct Executor {
     /// Causal admission, told each index run, if it admits this executor's
     /// work.
     admission: Option<Queue<AdmissionInput>>,
+    /// The accumulator root's latest version written, which execution may
+    /// wait on, if other executors write it concurrently.
+    roots: Option<Arc<RootVersions>>,
     /// Scratch, per transaction: each shared access's generation.
     resolved: Vec<Generation>,
 }
@@ -144,8 +150,17 @@ impl Executor {
             funds,
             unsettled: Arc::default(),
             admission: None,
+            roots: None,
             resolved: Vec::new(),
         }
+    }
+
+    /// Has execution wait on `roots` for a root version another executor
+    /// writes, and tells it of each root version written here.
+    #[must_use]
+    pub fn with_root_versions(mut self, roots: Arc<RootVersions>) -> Executor {
+        self.roots = Some(roots);
+        self
     }
 
     /// Tells `admission` of each transaction with a causal index once run.
@@ -533,6 +548,10 @@ impl Executor {
                 funds,
                 Some(root_version),
                 &*self.unsettled,
+                match &self.roots {
+                    Some(roots) => &**roots,
+                    None => &execution::NoneAwaited,
+                },
             )
             .unwrap_or_else(|e| panic!("transaction {digest:?} failed to execute: {e:?}"));
         let mut written = containers::Vec::with_capacity_in(outcome.commit.written.len(), bump);
@@ -551,6 +570,15 @@ impl Executor {
             unreachable!("execution produces V2 effects");
         };
         self.unsettled.record(digest, root_version, withdrawals(v2));
+        if let Some(roots) = &self.roots
+            && v2.changed_objects.iter().any(|c| {
+                *c.id == SUI_ACCUMULATOR_ROOT_OBJECT_ID
+                    && matches!(c.output_state, ObjectOut::ObjectWrite(..))
+            })
+        {
+            // Written to the store above, so a waiter finds it.
+            roots.written(v2.lamport_version);
+        }
         (effects, written)
     }
 

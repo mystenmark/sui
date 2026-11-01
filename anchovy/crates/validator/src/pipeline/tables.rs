@@ -213,6 +213,53 @@ impl execution::Unsettled for UnsettledWithdrawals {
     }
 }
 
+/// The latest version of the accumulator root written: what execution
+/// waits on when a transaction reads the root at a version its chunk's
+/// predecessor's barrier has not written yet (an undeclared dependency).
+/// Written by `Executor` (owner: the exec-pool work) after a write of the
+/// root reaches the store; waited on during execution. Causal admission
+/// keeps a writer running, so a wait ends.
+pub struct RootVersions {
+    latest: Mutex<u64>,
+    written: std::sync::Condvar,
+}
+
+impl RootVersions {
+    /// The root is at `version` in the store.
+    pub fn new(version: u64) -> RootVersions {
+        RootVersions {
+            latest: Mutex::new(version),
+            written: std::sync::Condvar::new(),
+        }
+    }
+
+    /// The store has the root at `version`.
+    pub fn written(&self, version: u64) {
+        let mut latest = lock(&self.latest);
+        if version > *latest {
+            *latest = version;
+            self.written.notify_all();
+        }
+    }
+}
+
+impl execution::Awaited for RootVersions {
+    fn wait(&self, id: &messages::base::ObjectId, version: u64) {
+        assert_eq!(
+            *id,
+            messages::tx_index::SUI_ACCUMULATOR_ROOT_OBJECT_ID,
+            "only the accumulator root is read implicitly at a version"
+        );
+        let mut latest = lock(&self.latest);
+        while *latest < version {
+            latest = self
+                .written
+                .wait(latest)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
 /// Each chunk's number of transactions with a causal index (its settlements
 /// and barrier have none), by height: what tells causal admission that a
 /// chunk's last index is followed by the next chunk's first. Written by
@@ -451,5 +498,22 @@ mod tests {
         assert_eq!(table.withdrawn(&account, 5), 0);
         assert_eq!(table.withdrawn(&account, 6), 0);
         assert!(lock(&table.inner).totals.is_empty());
+    }
+
+    #[test]
+    fn a_wait_for_a_root_version_ends_once_it_is_written() {
+        use execution::Awaited as _;
+        let roots = Arc::new(RootVersions::new(3));
+        let root = messages::tx_index::SUI_ACCUMULATOR_ROOT_OBJECT_ID;
+        roots.wait(&root, 3);
+        let waiter = {
+            let roots = roots.clone();
+            std::thread::spawn(move || roots.wait(&root, 5))
+        };
+        roots.written(4);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(!waiter.is_finished(), "version 4 is not 5");
+        roots.written(5);
+        waiter.join().unwrap();
     }
 }

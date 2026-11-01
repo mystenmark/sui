@@ -34,7 +34,7 @@ use sui_types::metrics::ExecutionMetrics;
 use validation::inputs::{InputKind, input_objects, receiving_objects};
 
 use crate::reads::StoreReads;
-use crate::{Error, Funds, Input, Outcome, Result, Unsettled};
+use crate::{Awaited, Error, Funds, Input, Outcome, Result, Unsettled};
 
 /// The arena's first chunk: most transactions fit in it.
 const ARENA_CAPACITY: usize = 1 << 20;
@@ -163,6 +163,7 @@ impl NativeExecution {
             Funds::MaybeSufficient,
             None,
             &crate::NoneUnsettled,
+            &crate::NoneAwaited,
         )
     }
 
@@ -178,6 +179,7 @@ impl NativeExecution {
         funds: Funds,
         assigned_accumulator: Option<u64>,
         unsettled: &dyn Unsettled,
+        awaited: &dyn Awaited,
     ) -> Result<Outcome> {
         let idle = || self.idle.lock().unwrap_or_else(PoisonError::into_inner);
         let taken = idle().pop();
@@ -196,6 +198,7 @@ impl NativeExecution {
             funds,
             assigned_accumulator,
             unsettled,
+            awaited,
         );
         arena.reset();
         if runtime.package_cache.len() > self.max_packages {
@@ -217,9 +220,10 @@ impl NativeExecution {
         funds: Funds,
         assigned_accumulator: Option<u64>,
         unsettled: &dyn Unsettled,
+        awaited: &dyn Awaited,
     ) -> Result<Outcome> {
         let kept = Kept::new();
-        let reads = StoreReads::new(bump, store, &kept);
+        let reads = StoreReads::new(bump, store, &kept).awaiting(awaited);
         let digest = *data.digest();
 
         let kinds = input_objects(data, bump).map_err(|e| Error::Native(format!("{e:?}")))?;

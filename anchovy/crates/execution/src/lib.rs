@@ -90,6 +90,22 @@ pub trait Unsettled: Sync {
     fn withdrawn(&self, account: &messages::base::ObjectId, version: u64) -> u128;
 }
 
+/// Where execution waits for an implicitly read system object (the
+/// accumulator root) to reach the version a transaction requires, which
+/// another transaction's execution writes. Causal admission ensures the
+/// writer runs.
+pub trait Awaited: Sync {
+    /// Returns once `id` at `version` is in the store.
+    fn wait(&self, id: &messages::base::ObjectId, version: u64);
+}
+
+/// Nothing is written concurrently: what is missing stays missing.
+pub struct NoneAwaited;
+
+impl Awaited for NoneAwaited {
+    fn wait(&self, _: &messages::base::ObjectId, _: u64) {}
+}
+
 /// No withdrawals unsettled.
 pub struct NoneUnsettled;
 
@@ -163,6 +179,7 @@ impl Execution {
             Funds::MaybeSufficient,
             None,
             &NoneUnsettled,
+            &NoneAwaited,
         )
     }
 
@@ -178,6 +195,7 @@ impl Execution {
         funds: Funds,
         assigned_accumulator: Option<u64>,
         unsettled: &dyn Unsettled,
+        awaited: &dyn Awaited,
     ) -> Result<Outcome> {
         let parsed = native::parse(transaction)?;
         let data = parsed.get().0.data();
@@ -189,6 +207,7 @@ impl Execution {
             funds,
             assigned_accumulator,
             unsettled,
+            awaited,
         )?;
         #[cfg(feature = "testing")]
         assert_same(

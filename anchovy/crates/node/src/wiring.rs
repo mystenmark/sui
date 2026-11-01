@@ -38,7 +38,7 @@ use validator::pipeline::items::{
 };
 use validator::pipeline::keys::{ChunkSettled, EffectsKey};
 use validator::pipeline::tables::{
-    CheckpointStore, ChunkLengths, ChunkTable, GenerationTable, UnsettledWithdrawals,
+    CheckpointStore, ChunkLengths, ChunkTable, GenerationTable, RootVersions, UnsettledWithdrawals,
 };
 use validator::processors::{Request, SignatureVerifier, TransactionValidator};
 use validator::randomness::{
@@ -204,6 +204,8 @@ pub(crate) struct Parts {
     pub unsettled: Arc<UnsettledWithdrawals>,
     /// Registered by each chunk's creator, read by causal admission.
     pub chunk_lengths: Arc<ChunkLengths>,
+    /// Written by the executors, waited on in execution.
+    pub root_versions: Arc<RootVersions>,
     pub chunks: Arc<ChunkTable>,
     /// Shared by the commit stage and the synced scheduler.
     pub chunk_lock: Arc<ChunkLock>,
@@ -361,6 +363,7 @@ impl Parts {
             funds,
         )
         .with_unsettled(self.unsettled.clone())
+        .with_root_versions(self.root_versions.clone())
     }
 
     fn effects_availability(&self) -> EffectsAvailability {
