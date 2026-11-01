@@ -149,9 +149,26 @@ pub fn system_package_bytes(
     Some(packages)
 }
 
-/// The versions this binary supports.
-pub fn supported_protocol_versions() -> SupportedProtocolVersions {
-    SupportedProtocolVersions::SYSTEM_DEFAULT
+/// The versions this binary supports on `chain`: those from the first its
+/// executor runs to the highest. Announcing more would vote for upgrades it
+/// cannot run.
+///
+/// # Panics
+/// If the executor runs not even the highest version.
+pub fn supported_protocol_versions(chain: Chain) -> SupportedProtocolVersions {
+    let max = ProtocolVersion::MAX;
+    let runs = |v: u64| {
+        executor::runs(&ProtocolConfig::get_for_version(
+            ProtocolVersion::new(v),
+            chain,
+        ))
+    };
+    let min = (ProtocolVersion::MIN.as_u64()..=max.as_u64())
+        .rev()
+        .take_while(|&v| runs(v))
+        .last()
+        .expect("the executor runs the highest version");
+    SupportedProtocolVersions::new_for_message(min, max.as_u64())
 }
 
 /// Whether this binary can run an epoch at `version`.

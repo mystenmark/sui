@@ -81,7 +81,7 @@ impl VersionResolver {
         self.resolve_shared(&entry.shared, &mut resolved_base);
         if let ExecutableTransaction::User(transaction) = &entry.transaction {
             let data = transaction.get().0.data();
-            self.object_keys(data);
+            object_keys(data, &mut self.keys, &mut self.packages);
             funds_withdrawals(data, chain_identifier, &mut self.amounts, bump);
         }
         resolved_base
@@ -119,60 +119,63 @@ impl VersionResolver {
             self.keys.push(key);
         }
     }
+}
 
-    /// Pushes the keys of a user transaction's object inputs, receiving
-    /// objects, packages (each once) and gas coins to `keys`: the
-    /// reference's `input_objects` and `receiving_objects`, without the
-    /// shared inputs, which come from the schedule.
-    fn object_keys(&mut self, data: &TransactionData<'_, impl TxState>) {
-        if let TransactionKind::ProgrammableTransaction(pt) = data.kind() {
-            for arg in pt.inputs {
-                match arg {
-                    CallArg::Object(ObjectArg::ImmOrOwnedObject(r) | ObjectArg::Receiving(r))
-                        if !r.is_coin_reservation() =>
-                    {
-                        self.keys.push(InputKey::ObjectVersion {
-                            id: r.id,
-                            version: r.version.get(),
-                        });
-                    }
-                    _ => {}
+/// Pushes the keys of a user transaction's object inputs, receiving
+/// objects, packages (each once, gathered in `packages`) and gas coins to
+/// `keys`: the reference's `input_objects` and `receiving_objects`, without
+/// the shared inputs, which come from the schedule.
+pub fn object_keys(
+    data: &TransactionData<'_, impl TxState>,
+    keys: &mut Vec<InputKey>,
+    packages: &mut Vec<ObjectId>,
+) {
+    if let TransactionKind::ProgrammableTransaction(pt) = data.kind() {
+        for arg in pt.inputs {
+            match arg {
+                CallArg::Object(ObjectArg::ImmOrOwnedObject(r) | ObjectArg::Receiving(r))
+                    if !r.is_coin_reservation() =>
+                {
+                    keys.push(InputKey::ObjectVersion {
+                        id: r.id,
+                        version: r.version.get(),
+                    });
                 }
+                _ => {}
             }
-            self.packages.clear();
-            for command in pt.commands {
-                match command {
-                    MoveCommand::MoveCall(call) => {
-                        self.packages.push(*call.package);
-                        for t in call.type_arguments {
-                            type_packages(t, &mut self.packages);
-                        }
-                    }
-                    MoveCommand::Publish(_, deps) => self.packages.extend_from_slice(deps),
-                    MoveCommand::Upgrade(_, deps, package, _) => {
-                        self.packages.extend_from_slice(deps);
-                        self.packages.push(**package);
-                    }
-                    MoveCommand::MakeMoveVec(Some(t), _) => type_packages(t, &mut self.packages),
-                    _ => {}
-                }
-            }
-            self.packages.sort_unstable();
-            self.packages.dedup();
-            self.keys
-                .extend(self.packages.iter().map(|id| InputKey::Package(*id)));
         }
-        self.keys.extend(
-            data.gas_data()
-                .payment
-                .iter()
-                .filter(|r| !r.is_coin_reservation())
-                .map(|r| InputKey::ObjectVersion {
-                    id: r.id,
-                    version: r.version.get(),
-                }),
-        );
+        packages.clear();
+        for command in pt.commands {
+            match command {
+                MoveCommand::MoveCall(call) => {
+                    packages.push(*call.package);
+                    for t in call.type_arguments {
+                        type_packages(t, packages);
+                    }
+                }
+                MoveCommand::Publish(_, deps) => packages.extend_from_slice(deps),
+                MoveCommand::Upgrade(_, deps, package, _) => {
+                    packages.extend_from_slice(deps);
+                    packages.push(**package);
+                }
+                MoveCommand::MakeMoveVec(Some(t), _) => type_packages(t, packages),
+                _ => {}
+            }
+        }
+        packages.sort_unstable();
+        packages.dedup();
+        keys.extend(packages.iter().map(|id| InputKey::Package(*id)));
     }
+    keys.extend(
+        data.gas_data()
+            .payment
+            .iter()
+            .filter(|r| !r.is_coin_reservation())
+            .map(|r| InputKey::ObjectVersion {
+                id: r.id,
+                version: r.version.get(),
+            }),
+    );
 }
 
 /// Pushes `data`'s withdrawals to `amounts`, one per account, summed and
@@ -296,6 +299,7 @@ impl Processor for VersionResolver {
                 entry,
                 resolved_base,
                 inputs: Vec::new(),
+                synced: None,
             };
             batch.push(executable, self.keys.drain(..));
         }

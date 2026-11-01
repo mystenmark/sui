@@ -8,7 +8,22 @@
 use messages::Message;
 use messages::base::{Digest, Hashed};
 use messages::checkpoint::CheckpointData;
-use store::{Commit, Executed, Live, Removal, Removed, Store, Written};
+use store::{CheckpointRecord, Commit, Executed, Live, Removal, Removed, Store, Written};
+
+/// Checkpoint `seq`, encoded as `checkpoint`, with digests made of `seq`.
+fn record(seq: u64, checkpoint: Vec<u8>, certified: Vec<u8>) -> CheckpointRecord {
+    let mut digest = [0; 32];
+    digest[..8].copy_from_slice(&seq.to_be_bytes());
+    let mut contents_digest = digest;
+    contents_digest[31] = 1;
+    CheckpointRecord {
+        seq,
+        checkpoint,
+        certified,
+        digest: Digest::new(digest),
+        contents_digest: Digest::new(contents_digest),
+    }
+}
 
 fn checkpoint() -> Message<CheckpointData<'static>> {
     let mut bytes = include_bytes!("../../messages/tests/data/mainnet-325300367.chk").to_vec();
@@ -260,14 +275,15 @@ fn committed_checkpoints_and_the_watermark_survive_reopening() {
         let store = Store::open(dir.path()).unwrap();
         assert_eq!(store.last_checkpoint().unwrap(), None);
         assert_eq!(store.committed_checkpoint().unwrap(), None);
-        store.commit_genesis_checkpoint(b"genesis".to_vec(), b"start".to_vec());
+        store.commit_genesis_checkpoint(
+            record(0, b"genesis".to_vec(), b"certified".to_vec()),
+            b"start".to_vec(),
+        );
         // Past 255, where little-endian keys would sort wrongly.
         for seq in 1..=300u64 {
             store.commit_checkpoint(
-                seq,
+                record(seq, seq.to_le_bytes().to_vec(), vec![seq as u8]),
                 &[],
-                seq.to_le_bytes().to_vec(),
-                vec![seq as u8],
                 &containers::Bump::default(),
             );
         }
@@ -283,10 +299,23 @@ fn committed_checkpoints_and_the_watermark_survive_reopening() {
     store.commit_epoch_start(1, b"next".to_vec());
     assert_eq!(store.epoch_start().unwrap(), Some((1, b"next".to_vec())));
     assert_eq!(store.epoch_record(0).unwrap(), Some(b"start".to_vec()));
-    assert_eq!(store.certified(0).unwrap(), None);
+    assert_eq!(store.certified(0).unwrap(), Some(b"certified".to_vec()));
     assert_eq!(store.certified(2).unwrap(), Some(vec![2]));
+    let two = record(2, Vec::new(), Vec::new());
+    assert_eq!(store.checkpoint_by_digest(&two.digest).unwrap(), Some(2));
+    assert_eq!(
+        store.checkpoint_by_contents(&two.contents_digest).unwrap(),
+        Some(2)
+    );
+    assert_eq!(store.checkpoint_by_contents(&two.digest).unwrap(), None);
+    let missing = record(301, Vec::new(), Vec::new());
+    assert_eq!(store.checkpoint_by_digest(&missing.digest).unwrap(), None);
     assert_eq!(store.checkpoint(301).unwrap(), None);
-    store.commit_checkpoint(301, &[], vec![], vec![], &containers::Bump::default());
+    store.commit_checkpoint(
+        record(301, vec![], vec![]),
+        &[],
+        &containers::Bump::default(),
+    );
 }
 
 #[test]
@@ -294,8 +323,8 @@ fn committed_checkpoints_and_the_watermark_survive_reopening() {
 fn checkpoints_commit_in_order() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
-    store.commit_genesis_checkpoint(vec![], vec![]);
-    store.commit_checkpoint(2, &[], vec![], vec![], &containers::Bump::default());
+    store.commit_genesis_checkpoint(record(0, vec![], Vec::new()), vec![]);
+    store.commit_checkpoint(record(2, vec![], vec![]), &[], &containers::Bump::default());
 }
 
 /// A digest a request names, not executed, is answered from its own

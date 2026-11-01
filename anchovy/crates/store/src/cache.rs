@@ -28,7 +28,7 @@ use messages::object::{Object, Owner};
 use messages::transaction::SenderSignedData;
 
 use crate::db::{self, Db};
-use crate::{Commit, Live, Removal, Removed, Result, Written};
+use crate::{CheckpointRecord, Commit, Live, Removal, Removed, Result, Written};
 
 /// How many committed versions a slot keeps (the reference's `MAX_VERSIONS`).
 const COMMITTED_VERSIONS: usize = 3;
@@ -464,9 +464,9 @@ impl Store {
         shard.slot(id).push_dirty(version, entry);
     }
 
-    /// Commits checkpoint `seq`: one database batch with the outputs of
+    /// Commits checkpoint `record`: one database batch with the outputs of
     /// `transactions` (its transactions, in checkpoint order), the
-    /// checkpoint's record and certified summary, and the committed
+    /// checkpoint's record, certified summary and digests, and the committed
     /// watermark; then their outputs move from uncommitted to committed. A
     /// transaction not uncommitted was committed before (a commit that
     /// crashed before returning), and is skipped.
@@ -475,35 +475,31 @@ impl Store {
     /// If checkpoints commit out of order, or the database write fails.
     pub fn commit_checkpoint(
         &self,
-        seq: u64,
+        record: CheckpointRecord,
         transactions: &[messages::base::Hashed],
-        checkpoint: Vec<u8>,
-        certified: Vec<u8>,
         bump: &containers::Bump,
     ) {
-        self.commit(seq, transactions, checkpoint, Some(certified), None, bump);
+        self.commit(record, transactions, None, bump);
     }
 
     /// Commits the genesis checkpoint, which has no transactions of its own
-    /// (genesis objects are in already) and no certificate, with the first
-    /// epoch's start record.
+    /// (genesis objects are in already), with the first epoch's start record.
     ///
     /// # Panics
     /// If a checkpoint is committed already, or the database write fails.
-    pub fn commit_genesis_checkpoint(&self, checkpoint: Vec<u8>, epoch_start: Vec<u8>) {
+    pub fn commit_genesis_checkpoint(&self, record: CheckpointRecord, epoch_start: Vec<u8>) {
         let bump = containers::Bump::with_capacity(0);
-        self.commit(0, &[], checkpoint, None, Some(epoch_start), &bump);
+        self.commit(record, &[], Some(epoch_start), &bump);
     }
 
     fn commit(
         &self,
-        seq: u64,
+        checkpoint: CheckpointRecord,
         transactions: &[messages::base::Hashed],
-        checkpoint: Vec<u8>,
-        certified: Option<Vec<u8>>,
         epoch_start: Option<Vec<u8>>,
         bump: &containers::Bump,
     ) {
+        let seq = checkpoint.seq;
         {
             let last = *lock(&self.last_committed);
             assert_eq!(
@@ -545,8 +541,7 @@ impl Store {
                 data.events.as_ref().map(|e| e.wire_bytes().to_vec()),
             );
         }
-        self.db
-            .put_committed_checkpoint(&mut batch, seq, checkpoint, certified);
+        self.db.put_committed_checkpoint(&mut batch, checkpoint);
         if let Some(epoch_start) = epoch_start {
             self.db.put_epoch_start(&mut batch, 0, epoch_start);
         }
@@ -889,6 +884,16 @@ impl Store {
     /// Committed checkpoint `seq`'s certified summary.
     pub fn certified(&self, seq: u64) -> Result<Option<Vec<u8>>> {
         self.db.certified(seq)
+    }
+
+    /// The committed checkpoint whose summary has `digest`.
+    pub fn checkpoint_by_digest(&self, digest: &Digest) -> Result<Option<u64>> {
+        self.db.checkpoint_by_digest(digest)
+    }
+
+    /// The committed checkpoint whose contents have `digest`.
+    pub fn checkpoint_by_contents(&self, digest: &Digest) -> Result<Option<u64>> {
+        self.db.checkpoint_by_contents(digest)
     }
 
     /// The highest committed checkpoint, and its sequence number.

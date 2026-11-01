@@ -15,7 +15,22 @@ use messages::base::{Digest, Hashed, ObjectId};
 use messages::checkpoint::CheckpointData;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use store::{Capacity, Commit, Executed, Live, Removal, Removed, Store, Written};
+use store::{Capacity, CheckpointRecord, Commit, Executed, Live, Removal, Removed, Store, Written};
+
+/// Checkpoint `seq`, encoded as `checkpoint`, with digests made of `seq`.
+fn record(seq: u64, checkpoint: Vec<u8>, certified: Vec<u8>) -> CheckpointRecord {
+    let mut digest = [0; 32];
+    digest[..8].copy_from_slice(&seq.to_be_bytes());
+    let mut contents_digest = digest;
+    contents_digest[31] = 1;
+    CheckpointRecord {
+        seq,
+        checkpoint,
+        certified,
+        digest: Digest::new(digest),
+        contents_digest: Digest::new(contents_digest),
+    }
+}
 
 fn checkpoint() -> Message<CheckpointData<'static>> {
     let mut bytes = include_bytes!("../../messages/tests/data/mainnet-325300367.chk").to_vec();
@@ -211,10 +226,8 @@ fn run_model(seed: u64, capacity: Capacity) {
                     digests.insert(0, *old);
                 }
                 store.commit_checkpoint(
-                    next_checkpoint,
+                    record(next_checkpoint, vec![step as u8], vec![]),
                     &digests,
-                    vec![step as u8],
-                    vec![],
                     &containers::Bump::default(),
                 );
                 next_checkpoint += 1;
@@ -434,10 +447,8 @@ fn racing_readers_never_see_an_older_version() {
         pending.push(tx.digest);
         if n % 3 == 2 {
             store.commit_checkpoint(
-                n / 3,
+                record(n / 3, vec![], vec![]),
                 &pending,
-                vec![],
-                vec![],
                 &containers::Bump::default(),
             );
             pending.clear();
@@ -500,10 +511,8 @@ fn racing_readers_never_see_an_executed_transaction_unexecuted() {
         pending.push(tx.digest);
         if n % 2 == 1 {
             store.commit_checkpoint(
-                n / 2,
+                record(n / 2, vec![], vec![]),
                 &pending,
-                vec![],
-                vec![],
                 &containers::Bump::default(),
             );
             pending.clear();

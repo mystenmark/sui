@@ -548,6 +548,7 @@ fn executable(
         },
         resolved_base,
         inputs: Vec::new(),
+        synced: None,
     };
     (executable, key)
 }

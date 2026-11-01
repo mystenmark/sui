@@ -23,6 +23,7 @@ rand.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 serde.workspace = true
+snap.workspace = true
 store.workspace = true
 sui-protocol-config.workspace = true
 sui-types.workspace = true

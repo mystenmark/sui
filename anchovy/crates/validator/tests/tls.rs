@@ -111,7 +111,7 @@ async fn serve(key: NetworkKey) -> SocketAddr {
         let store = Arc::new(store::Store::open(dir.path()).unwrap());
         let (transactions, _inbox) = workqueue::queue(1);
         let (current, _consensus) = common::current(&epoch, transactions, &store);
-        validator::serve(listener, &key, current, std::future::pending())
+        validator::serve(listener, key, current, std::future::pending())
             .await
             .unwrap();
     });

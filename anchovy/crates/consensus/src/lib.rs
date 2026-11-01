@@ -13,6 +13,10 @@ use tokio::sync::{mpsc, oneshot};
 /// A transaction's position in its block.
 pub type TransactionIndex = u16;
 
+/// Where consensus acknowledges a submission of no transactions, a ping:
+/// consensus-core's `PING_TRANSACTION_INDEX`. Every block has one.
+pub const PING_TRANSACTION_INDEX: TransactionIndex = TransactionIndex::MAX;
+
 /// A block's round, author and digest: consensus-core's `BlockRef`.
 /// Ordered by round, then author, then digest, as consensus-core orders it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

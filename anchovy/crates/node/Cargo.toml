@@ -26,6 +26,7 @@ settlement.workspace = true
 checkpoint.workspace = true
 state-hasher.workspace = true
 aggregator.workspace = true
+synced.workspace = true
 sui-protocol-config.workspace = true
 execution.workspace = true
 tokio.workspace = true

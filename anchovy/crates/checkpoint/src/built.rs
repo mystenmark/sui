@@ -38,20 +38,23 @@ impl Availability<CheckpointBuilt, Arc<BuiltCheckpoint>> for BuiltAvailability {
 
 /// Where the built waiter's ready items go, by kind: contents whose previous
 /// checkpoint is built, to `EpochCloser`; signatures, to
-/// `CheckpointAggregator`; certified checkpoints, to the fork check, here.
-/// Runs on the built waiter's thread.
+/// `CheckpointAggregator`; certified checkpoints, to the fork check, here,
+/// and those fetched from peers then to `CheckpointCommitter`. Runs on the
+/// built waiter's thread.
 ///
 /// Inward: built waiter, ready: `Vec<BuiltWaitItem>`.
 /// Outward: `EpochCloser`: `EpochCloserInput::Built`;
-/// `CheckpointAggregator`: `Vec<CheckpointSignature>`.
+/// `CheckpointAggregator`: `Vec<CheckpointSignature>`;
+/// `CheckpointCommitter`: `Vec<CertifiedCheckpoint>`.
 pub struct BuiltRouter {
     pub epoch_closer: Queue<EpochCloserInput>,
     pub aggregator: Queue<Vec<CheckpointSignature>>,
+    pub committer: Queue<Vec<CertifiedCheckpoint>>,
 }
 
 impl Sink<Vec<BuiltWaitItem>> for BuiltRouter {
     fn send(&mut self, ready: Vec<BuiltWaitItem>) {
-        let (mut next, mut signatures) = (Vec::new(), Vec::new());
+        let (mut next, mut signatures, mut synced) = (Vec::new(), Vec::new(), Vec::new());
         for item in ready {
             match item {
                 BuiltWaitItem::Next(built) => next.push(built),
@@ -60,6 +63,13 @@ impl Sink<Vec<BuiltWaitItem>> for BuiltRouter {
                     &certified,
                     &local.expect("released once the local checkpoint resolved"),
                 ),
+                BuiltWaitItem::Synced { certified, local } => {
+                    check_fork(
+                        &certified,
+                        &local.expect("released once the local checkpoint resolved"),
+                    );
+                    synced.push(certified);
+                }
             }
         }
         if !next.is_empty() {
@@ -71,6 +81,9 @@ impl Sink<Vec<BuiltWaitItem>> for BuiltRouter {
         }
         if !signatures.is_empty() {
             push(&self.aggregator, signatures, "aggregator");
+        }
+        if !synced.is_empty() {
+            push(&self.committer, synced, "committer");
         }
     }
 }

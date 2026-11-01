@@ -4,62 +4,71 @@
 //! Committing certified checkpoints to the database
 //! (`docs/writeback_cache_design.md`, Commit path).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use messages::fast::Bump;
 use tokio::sync::watch;
-use validator::epoch_store::CommittedCheckpoints;
 use validator::pipeline::backpressure::Backpressure;
-use validator::pipeline::items::CertifiedCheckpoint;
-use validator::pipeline::tables::{CheckpointStore, ChunkTable, GenerationTable};
+use validator::pipeline::items::{CertifiedCheckpoint, OutputWaits};
+use validator::pipeline::keys::CheckpointProgress;
+use validator::pipeline::tables::{CheckpointStore, GenerationTable};
+use waiter::Command;
 use workqueue::Processor;
 
 /// Commits each certified checkpoint's transactions from the writeback
 /// cache to the database, with its record, certificate and the committed
-/// watermark, in one batch. Then writes the epoch store's state that waited
-/// for the checkpoint: the generations its transactions produced, and the
-/// consensus output it covers. In that order, as the reference's
+/// watermark, in one batch. Then writes the generations its transactions
+/// produced, and tells the output waiter, which may then write the consensus
+/// output it covers. In that order, as the reference's
 /// `execute_checkpoint`: a crash between them leaves the epoch store behind
 /// the object store, which a replay catches up; the other order could leave
 /// it claiming outputs a crash lost. Once the epoch's last checkpoint has
 /// committed, says so: the epoch is over. The start of a `CheckpointExecutor`.
 ///
-/// Inward: `CheckpointAggregator`: `Vec<CertifiedCheckpoint>`, in sequence
+/// Each checkpoint commits once, in sequence order, with whichever
+/// certificate comes first: any quorum's certificate over the summary built
+/// here is as good as another.
+///
+/// Inward: `CheckpointAggregator`, and the built waiter's fork check of
+/// those fetched from peers: `Vec<CertifiedCheckpoint>`, each in sequence
 /// order.
 ///
-/// Reads: the checkpoint store. Prunes: the chunk table. Writes: the object
-/// store, as its only committer; the generation table's and the consensus
-/// output's committed state; backpressure's committed watermark, which
-/// releases the commit answers it withheld.
+/// Outward: output waiter, notify: `CheckpointProgress::Committed(seq)`.
+///
+/// Reads: the checkpoint store. Writes: the object
+/// store, as its only committer; the generation table's committed state;
+/// backpressure's committed watermark, which releases the commit answers it
+/// withheld.
 pub struct CheckpointCommitter {
     store: Arc<store::Store>,
     checkpoints: Arc<CheckpointStore>,
-    chunks: Arc<ChunkTable>,
     generations: Arc<GenerationTable>,
-    consensus_output: CommittedCheckpoints,
+    outputs: OutputWaits,
     backpressure: Arc<Backpressure>,
     /// The epoch's last checkpoint, once committed.
     ended: watch::Sender<Option<u64>>,
+    /// Certified past the next to commit, by sequence number.
+    waiting: BTreeMap<u64, CertifiedCheckpoint>,
 }
 
 impl CheckpointCommitter {
     pub fn new(
         store: Arc<store::Store>,
         checkpoints: Arc<CheckpointStore>,
-        chunks: Arc<ChunkTable>,
         generations: Arc<GenerationTable>,
-        consensus_output: CommittedCheckpoints,
+        outputs: OutputWaits,
         backpressure: Arc<Backpressure>,
         ended: watch::Sender<Option<u64>>,
     ) -> CheckpointCommitter {
         CheckpointCommitter {
             store,
             checkpoints,
-            chunks,
             generations,
-            consensus_output,
+            outputs,
             backpressure,
             ended,
+            waiting: BTreeMap::new(),
         }
     }
 
@@ -74,19 +83,23 @@ impl CheckpointCommitter {
             .expect("a checkpoint is certified only once built here");
         let transactions = crate::transactions(&built.contents, bump);
         self.store.commit_checkpoint(
-            seq,
+            built.record(certified.summary.to_vec()),
             &transactions,
-            built.encode(),
-            certified.summary.to_vec(),
             bump,
         );
         self.generations.commit(&transactions, bump);
-        self.consensus_output.committed_through(built.last_height);
-        self.chunks.prune_through(built.last_height);
         self.checkpoints.committed(seq);
         self.backpressure.committed(seq, built.last_height);
-        if built.root_state.is_some() {
+        if built.ends_epoch {
             self.ended.send_replace(Some(seq));
+        }
+        // Inside the pipeline a full queue is a sizing bug; a closed one
+        // means the pipeline is shutting down.
+        if let Err(workqueue::PushError::Full(_)) = self
+            .outputs
+            .try_push(Command::notify([CheckpointProgress::Committed(seq)]))
+        {
+            panic!("the output waiter refused a committed checkpoint");
         }
     }
 }
@@ -96,9 +109,16 @@ impl Processor for CheckpointCommitter {
     type Output = ();
 
     fn process(&mut self, certified: Vec<CertifiedCheckpoint>, bump: &mut Bump) -> Option<()> {
-        for checkpoint in &certified {
-            self.commit(checkpoint, bump);
+        let mut next = self.checkpoints.last_committed() + 1;
+        for checkpoint in certified {
+            if checkpoint.seq >= next {
+                self.waiting.entry(checkpoint.seq).or_insert(checkpoint);
+            }
+        }
+        while let Some(checkpoint) = self.waiting.remove(&next) {
+            self.commit(&checkpoint, bump);
             bump.reset();
+            next += 1;
         }
         None
     }

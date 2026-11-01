@@ -30,7 +30,7 @@ use validator::epoch_store::{BuilderOutput, EpochStore};
 use validator::pipeline::items::{
     BuiltWaitItem, CheckpointContentsBuilt, ExecutedEffects, PendingCheckpoint, SettledChunk,
 };
-use validator::pipeline::keys::CheckpointBuilt;
+use validator::pipeline::keys::{CheckpointBuilt, CheckpointProgress};
 use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore, ChunkTable};
 use waiter::{Command, WaiterProcessor};
 use workqueue::{Inbox, Processor, queue};
@@ -157,7 +157,7 @@ fn previous(seq: u64, epoch: u64, digest: [u8; 32], total: u64, gas: [u64; 4]) -
         epoch_rolling_gas: gas,
         last_height: 0,
         timestamp_ms: 0,
-        root_state: None,
+        ends_epoch: false,
     }
 }
 
@@ -426,6 +426,7 @@ fn out_of_order_checkpoints_summarize_in_order() {
     let (to_hasher, hasher_inbox) = queue(16);
     let (built, built_inbox) = queue(16);
     let (consensus, _normal, mut signatures) = consensus::TransactionClient::new(16);
+    let (outputs, output_waits) = queue(64);
     let mut contents = ContentsBuilder::new(
         epoch.clone(),
         chunks,
@@ -436,8 +437,14 @@ fn out_of_order_checkpoints_summarize_in_order() {
     let mut waiter = WaiterProcessor::new(BuiltAvailability {
         checkpoints: checkpoints.clone(),
     });
-    let mut summary =
-        SummaryBuilder::new(epoch.clone(), checkpoints.clone(), key(), built, consensus);
+    let mut summary = SummaryBuilder::new(
+        epoch.clone(),
+        checkpoints.clone(),
+        key(),
+        built,
+        consensus,
+        outputs,
+    );
 
     // Runs the built waiter and the summary builder until quiet; returns the
     // sequence numbers summarized, in order. Records the checkpoints the
@@ -505,6 +512,20 @@ fn out_of_order_checkpoints_summarize_in_order() {
     }
 
     assert_eq!(resolved, vec![11, 12, 13]);
+    let built_here: Vec<CheckpointProgress> = drain(&output_waits)
+        .into_iter()
+        .flat_map(|command| match command {
+            Command::Resolve(keys) => keys.into_iter().map(|(key, ())| key),
+            Command::Wait(_) => panic!("the summary builder only notifies"),
+        })
+        .collect();
+    assert_eq!(
+        built_here,
+        (11..=13)
+            .map(CheckpointProgress::BuiltHere)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(checkpoints.built_here(), 13);
 
     // Each on the priority lane, alone.
     let signed: Vec<u64> = std::iter::from_fn(|| signatures.try_recv().ok())

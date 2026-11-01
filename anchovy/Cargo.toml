@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/aggregator",
+    "crates/anchovy-node",
     "crates/arena",
     "crates/checkpoint",
     "crates/consensus",
@@ -19,6 +20,7 @@ members = [
     "crates/settlement",
     "crates/state-hasher",
     "crates/store",
+    "crates/synced",
     "crates/validation",
     "crates/validator",
     "crates/waiter",
@@ -77,6 +79,7 @@ arena = { path = "crates/arena" }
 checkpoint = { path = "crates/checkpoint" }
 consensus = { path = "crates/consensus" }
 consensus-glue = { path = "crates/consensus-glue" }
+anchovy-node = { path = "crates/anchovy-node" }
 containers = { path = "crates/containers" }
 exec-pool = { path = "crates/exec-pool" }
 execution = { path = "crates/execution" }
@@ -89,6 +92,7 @@ resolver = { path = "crates/resolver" }
 settlement = { path = "crates/settlement" }
 state-hasher = { path = "crates/state-hasher" }
 store = { path = "crates/store" }
+synced = { path = "crates/synced" }
 validation = { path = "crates/validation" }
 validator = { path = "crates/validator" }
 waiter = { path = "crates/waiter" }
@@ -110,6 +114,7 @@ serde-reflection = "0.5.0"
 serde_yaml = "0.9"
 serde_json = "1"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "env-filter", "fmt", "std"] }
 bs58 = "0.5"
 # Crypto is fastcrypto's (PRD), at sui's revision; base64ct and roaring at
 # the versions sui decodes signatures with.

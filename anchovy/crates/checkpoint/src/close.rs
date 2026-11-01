@@ -385,7 +385,7 @@ impl EpochCloser {
             CheckpointEffects {
                 seq,
                 effects,
-                last_of_epoch: true,
+                closing: true,
             },
             "hasher",
         );
@@ -411,7 +411,7 @@ impl EpochCloser {
     }
 
     /// Step 4.
-    fn rooted(&mut self, root_state: Vec<u8>) {
+    fn rooted(&mut self, root_state: &[u8]) {
         let Closing { mut built, .. } = self.closing.take().expect("closing the epoch");
         let next = execution::system_state::read(&self.store)
             .expect("the change-epoch transaction wrote the system state");
@@ -424,11 +424,10 @@ impl EpochCloser {
             .epoch
             .config
             .commit_root_state_digest()
-            .then(|| state_hasher::decode(&root_state).digest().digest);
+            .then(|| state_hasher::decode(root_state).digest().digest);
         built.last = Some(LastOfEpoch::Closed(EndOfEpoch {
             next_committee: next.stakes(),
             next_protocol_version: next.protocol_version,
-            root_state,
             root_state_digest,
         }));
         push(&self.summary, vec![built], "summary builder");
@@ -455,7 +454,7 @@ impl Processor for EpochCloser {
                 }
             }
             EpochCloserInput::ChangeEpochExecuted => self.executed(bump),
-            EpochCloserInput::Root(root) => self.rooted(root),
+            EpochCloserInput::Root(root) => self.rooted(&root),
         }
         None
     }

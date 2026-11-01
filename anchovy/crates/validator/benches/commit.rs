@@ -151,6 +151,7 @@ fn commit(index: u32, transactions: &[Vec<u8>]) -> DecodedCommit {
         leader: block,
         timestamp_ms: 250 * u64::from(index),
         digest: [index as u8; 32],
+        blocks: vec![block],
         transactions: transactions
             .iter()
             .enumerate()

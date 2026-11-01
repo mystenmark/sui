@@ -30,6 +30,8 @@ struct State {
     transactions: usize,
     certified: u64,
     committed: u64,
+    /// The last chunk height of the last checkpoint committed.
+    committed_height: u64,
     withheld: Vec<oneshot::Sender<()>>,
 }
 
@@ -45,8 +47,8 @@ impl State {
 
 impl Backpressure {
     /// Nothing in flight, checkpoints certified and committed through
-    /// `committed`.
-    pub fn new(limits: Limits, committed: u64) -> Backpressure {
+    /// `committed`, whose last chunk is at `committed_height`.
+    pub fn new(limits: Limits, committed: u64, committed_height: u64) -> Backpressure {
         Backpressure {
             limits,
             state: Mutex::new(State {
@@ -54,14 +56,19 @@ impl Backpressure {
                 transactions: 0,
                 certified: committed,
                 committed,
+                committed_height,
                 withheld: Vec::new(),
             }),
         }
     }
 
-    /// The chunk at `height`, of `transactions`, is scheduled.
+    /// The chunk at `height`, of `transactions`, is scheduled. One a
+    /// certified checkpoint committed already is not in flight.
     pub fn scheduled(&self, height: u64, transactions: usize) {
         let mut state = self.lock();
+        if height <= state.committed_height {
+            return;
+        }
         state.transactions += transactions;
         let previous = state.chunks.insert(height, transactions);
         assert!(previous.is_none(), "chunk {height} scheduled twice");
@@ -89,6 +96,7 @@ impl Backpressure {
     pub fn committed(&self, seq: u64, last_height: u64) {
         let mut state = self.lock();
         state.committed = state.committed.max(seq);
+        state.committed_height = state.committed_height.max(last_height);
         let in_flight = state.chunks.split_off(&(last_height + 1));
         let done = std::mem::replace(&mut state.chunks, in_flight);
         state.transactions -= done.values().sum::<usize>();
@@ -123,7 +131,7 @@ mod tests {
 
     #[test]
     fn answers_at_once_under_the_limits() {
-        let backpressure = Backpressure::new(LIMITS, 0);
+        let backpressure = Backpressure::new(LIMITS, 0, 0);
         backpressure.scheduled(1, 10);
         backpressure.scheduled(2, 0);
         backpressure.certified(1);
@@ -132,7 +140,7 @@ mod tests {
 
     #[test]
     fn withholds_over_the_chunk_limit_until_a_checkpoint_commits() {
-        let backpressure = Backpressure::new(LIMITS, 0);
+        let backpressure = Backpressure::new(LIMITS, 0, 0);
         for height in 1..=3 {
             backpressure.scheduled(height, 1);
         }
@@ -145,7 +153,7 @@ mod tests {
 
     #[test]
     fn withholds_over_the_transaction_limit_until_it_is_under() {
-        let backpressure = Backpressure::new(LIMITS, 0);
+        let backpressure = Backpressure::new(LIMITS, 0, 0);
         backpressure.scheduled(1, 6);
         backpressure.scheduled(2, 6);
         backpressure.certified(3);
@@ -160,7 +168,7 @@ mod tests {
 
     #[test]
     fn never_withholds_with_every_certified_checkpoint_committed() {
-        let backpressure = Backpressure::new(LIMITS, 5);
+        let backpressure = Backpressure::new(LIMITS, 5, 0);
         for height in 1..=10 {
             backpressure.scheduled(height, 100);
         }
@@ -171,5 +179,21 @@ mod tests {
         // Committing what was certified lifts it, though still over.
         backpressure.committed(6, 1);
         assert_eq!(answer.try_recv(), Ok(()));
+    }
+
+    #[test]
+    fn chunks_of_a_committed_checkpoint_are_not_in_flight() {
+        let backpressure = Backpressure::new(LIMITS, 0, 0);
+        // A certified checkpoint through chunk 5 commits before consensus
+        // schedules its chunks.
+        backpressure.certified(1);
+        backpressure.committed(1, 5);
+        backpressure.certified(2);
+        for height in 1..=5 {
+            backpressure.scheduled(height, 100);
+        }
+        assert_eq!(answered(&backpressure).try_recv(), Ok(()));
+        backpressure.scheduled(6, 100);
+        assert!(answered(&backpressure).try_recv().is_err());
     }
 }

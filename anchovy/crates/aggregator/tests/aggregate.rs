@@ -6,9 +6,16 @@
 
 use std::sync::Arc;
 
-use aggregator::{CheckpointAggregator, Committee, CommitteeError};
+use aggregator::{CertificateError, CheckpointAggregator, Committee, CommitteeError};
+use fastcrypto::traits::AggregateAuthenticator as _;
+use messages::arena::BumpAlloc;
+use messages::fast::Bump;
+use messages::reader::Reader;
+use roaring::RoaringBitmap;
 use sui_types::committee::Committee as SuiCommittee;
-use sui_types::crypto::{AuthorityKeyPair, AuthorityQuorumSignInfo, KeypairTraits};
+use sui_types::crypto::{
+    AggregateAuthoritySignature, AuthorityKeyPair, AuthorityQuorumSignInfo, KeypairTraits,
+};
 use sui_types::digests::CheckpointContentsDigest;
 use sui_types::gas::GasCostSummary;
 use sui_types::message_envelope::Message as _;
@@ -24,6 +31,7 @@ struct Setup {
     sui: SuiCommittee,
     /// Key pairs by committee position.
     keys: Vec<AuthorityKeyPair>,
+    committee: Arc<Committee>,
     checkpoints: Arc<CheckpointStore>,
     aggregator: CheckpointAggregator,
     /// What the aggregator handed on, and what state sync got.
@@ -50,20 +58,18 @@ fn setup(size: usize, next: u64) -> Setup {
     )
     .unwrap();
     assert_eq!(committee.quorum_threshold(), sui.quorum_threshold());
+    let committee = Arc::new(committee);
     let epochs = tempfile::tempdir().unwrap();
     let (epoch_store, _, builder) = validator::epoch_store::EpochStore::open(epochs.path(), 0);
     let objects = Arc::new(store::Store::open(&epochs.path().join("perpetual")).unwrap());
     let checkpoints = Arc::new(CheckpointStore::new(objects, 0, epoch_store, builder));
     let (to_state_sync, state_sync) = workqueue::queue(16);
-    let aggregator = CheckpointAggregator::new(
-        Arc::new(committee),
-        checkpoints.clone(),
-        next,
-        to_state_sync,
-    );
+    let aggregator =
+        CheckpointAggregator::new(committee.clone(), checkpoints.clone(), next, to_state_sync);
     Setup {
         sui,
         keys,
+        committee,
         checkpoints,
         aggregator,
         committer: Vec::new(),
@@ -97,7 +103,7 @@ fn build(checkpoints: &CheckpointStore, summary: &CheckpointSummary) {
         epoch_rolling_gas: [1, 2, 3, 4],
         last_height: 0,
         timestamp_ms: 0,
-        root_state: None,
+        ends_epoch: false,
     });
 }
 
@@ -165,6 +171,43 @@ impl Setup {
             quorum,
         ))
         .unwrap()
+    }
+}
+
+impl Setup {
+    /// A certificate over `summary` signed in `epoch`, its signature
+    /// aggregated from `signers`' and its bitmap naming `named`.
+    fn certificate(
+        &self,
+        summary: &CheckpointSummary,
+        epoch: u64,
+        signers: &[usize],
+        named: &[u32],
+    ) -> Vec<u8> {
+        let signatures: Vec<_> = signers
+            .iter()
+            .map(|&i| self.signed(summary, i, i).auth_sig().signature.clone())
+            .collect();
+        let quorum = AuthorityQuorumSignInfo::<true> {
+            epoch,
+            signature: AggregateAuthoritySignature::aggregate(&signatures).unwrap(),
+            signers_map: named.iter().copied().collect::<RoaringBitmap>(),
+        };
+        bcs::to_bytes(&CertifiedCheckpointSummary::new_from_data_and_sig(
+            summary.clone(),
+            quorum,
+        ))
+        .unwrap()
+    }
+
+    fn verify(&self, certificate: &[u8]) -> Result<(), CertificateError> {
+        let bump = Bump::default();
+        let certified = messages::checkpoint::CertifiedCheckpointSummary::parse(
+            &mut Reader::new(certificate),
+            &mut BumpAlloc(&bump),
+        )
+        .unwrap();
+        self.committee.verify_certified(&certified, &bump)
     }
 }
 
@@ -427,4 +470,67 @@ fn a_committee_rejects_bad_and_repeated_keys() {
         Committee::new(0, [(name, 1), (name, 2)]).err(),
         Some(CommitteeError::Duplicate)
     );
+}
+
+#[test]
+fn a_quorum_s_certificate_verifies() {
+    let s = setup(4, 1);
+    let local = summary(1, 10);
+    assert_eq!(s.verify(&s.sui_certificate(&local, &[0, 1, 3])), Ok(()));
+    assert_eq!(
+        s.verify(&s.certificate(&local, 0, &[0, 1, 2, 3], &[0, 1, 2, 3])),
+        Ok(())
+    );
+}
+
+#[test]
+fn a_certificate_short_of_a_quorum_does_not_verify() {
+    let s = setup(4, 1);
+    let local = summary(1, 10);
+    assert_eq!(
+        s.verify(&s.certificate(&local, 0, &[0, 1], &[0, 1])),
+        Err(CertificateError::NoQuorum)
+    );
+}
+
+#[test]
+fn a_certificate_of_another_epoch_does_not_verify() {
+    let s = setup(4, 1);
+    let local = summary(1, 10);
+    assert_eq!(
+        s.verify(&s.certificate(&local, 1, &[0, 1, 2], &[0, 1, 2])),
+        Err(CertificateError::WrongEpoch)
+    );
+    let mut later = summary(1, 10);
+    later.epoch = 1;
+    assert_eq!(
+        s.verify(&s.certificate(&later, 0, &[0, 1, 2], &[0, 1, 2])),
+        Err(CertificateError::WrongEpoch)
+    );
+}
+
+#[test]
+fn a_certificate_naming_an_outsider_does_not_verify() {
+    let s = setup(4, 1);
+    let local = summary(1, 10);
+    assert_eq!(
+        s.verify(&s.certificate(&local, 0, &[0, 1, 2], &[0, 1, 2, 4])),
+        Err(CertificateError::BadSigners)
+    );
+}
+
+#[test]
+fn a_certificate_whose_signers_did_not_sign_does_not_verify() {
+    let s = setup(4, 1);
+    let local = summary(1, 10);
+    assert_eq!(
+        s.verify(&s.certificate(&local, 0, &[0, 1, 2], &[0, 1, 3])),
+        Err(CertificateError::BadSignature)
+    );
+    let other = summary(1, 11);
+    let mut forged = s.certificate(&other, 0, &[0, 1, 2], &[0, 1, 2]);
+    let genuine = s.certificate(&local, 0, &[0, 1, 2], &[0, 1, 2]);
+    let summary_len = bcs::to_bytes(&local).unwrap().len();
+    forged[..summary_len].copy_from_slice(&genuine[..summary_len]);
+    assert_eq!(s.verify(&forged), Err(CertificateError::BadSignature));
 }

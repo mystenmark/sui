@@ -79,6 +79,7 @@ fn the_node_runs_epoch_after_epoch() {
     node::epoch::genesis(
         &store,
         &genesis.checkpoint,
+        genesis.certified.clone(),
         genesis.objects.iter().map(|o| o.digest().into_inner()),
     );
     let (state_sync, _certified) = workqueue::queue(1024);

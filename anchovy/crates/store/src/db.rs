@@ -21,7 +21,7 @@ use tidehunter::db::{Db as Tidehunter, DbError};
 use tidehunter::key_shape::{KeyShapeBuilder, KeySpace, KeyType};
 use tidehunter::metrics::Metrics;
 
-use crate::{Commit, Error, Live, Removal, Result};
+use crate::{CheckpointRecord, Commit, Error, Live, Removal, Result};
 
 /// An object's latest version in the database.
 pub(crate) enum Latest {
@@ -54,8 +54,12 @@ pub(crate) struct Db {
     /// pipeline encodes it. The highest is the committed watermark's.
     checkpoints: KeySpace,
     /// Big-endian sequence number: each committed checkpoint's certified
-    /// summary. Genesis has none.
+    /// summary.
     certified: KeySpace,
+    /// Summary digest: big-endian sequence number.
+    checkpoint_digests: KeySpace,
+    /// Contents digest: big-endian sequence number.
+    contents_digests: KeySpace,
     /// Big-endian epoch: each epoch's start record, as the node encodes it.
     /// The highest is the current epoch's.
     epochs: KeySpace,
@@ -85,6 +89,8 @@ impl Db {
             .add_key_space("meta", GENESIS.len(), 1, uniform)
             .add_key_space("checkpoints", 8, MUTEXES, uniform)
             .add_key_space("certified", 8, MUTEXES, uniform)
+            .add_key_space("checkpoint_digests", DIGEST, MUTEXES, uniform)
+            .add_key_space("contents_digests", DIGEST, MUTEXES, uniform)
             .add_key_space("epochs", 8, MUTEXES, uniform);
         let db = Tidehunter::open(
             path,
@@ -102,6 +108,8 @@ impl Db {
             meta: db.ks("meta"),
             checkpoints: db.ks("checkpoints"),
             certified: db.ks("certified"),
+            checkpoint_digests: db.ks("checkpoint_digests"),
+            contents_digests: db.ks("contents_digests"),
             epochs: db.ks("epochs"),
             tidehunter: db,
         })
@@ -136,6 +144,23 @@ impl Db {
             .tidehunter
             .get(self.certified, &seq.to_be_bytes())?
             .map(|v| v.to_vec()))
+    }
+
+    /// The committed checkpoint whose summary has `digest`.
+    pub fn checkpoint_by_digest(&self, digest: &Digest) -> Result<Option<u64>> {
+        self.seq(self.checkpoint_digests, digest)
+    }
+
+    /// The committed checkpoint whose contents have `digest`.
+    pub fn checkpoint_by_contents(&self, digest: &Digest) -> Result<Option<u64>> {
+        self.seq(self.contents_digests, digest)
+    }
+
+    fn seq(&self, index: KeySpace, digest: &Digest) -> Result<Option<u64>> {
+        Ok(self
+            .tidehunter
+            .get(index, &digest.bytes)?
+            .map(|v| u64::from_be_bytes(v[..].try_into().expect("eight bytes"))))
     }
 
     /// The highest committed checkpoint, and its sequence number: none on a
@@ -316,22 +341,24 @@ impl Db {
         }
     }
 
-    /// Checkpoint `seq` and the committed watermark, which says the
-    /// outputs of every checkpoint through `seq` are in the database.
-    /// Checkpoint `seq`, its certified summary unless it is genesis, and
-    /// the committed watermark at it.
-    pub fn put_committed_checkpoint(
-        &self,
-        batch: &mut WriteBatch,
-        seq: u64,
-        checkpoint: Vec<u8>,
-        certified: Option<Vec<u8>>,
-    ) {
-        batch.write(self.checkpoints, seq.to_be_bytes().to_vec(), checkpoint);
-        if let Some(certified) = certified {
-            batch.write(self.certified, seq.to_be_bytes().to_vec(), certified);
-        }
-        batch.write(self.meta, COMMITTED.to_vec(), seq.to_be_bytes().to_vec());
+    /// Checkpoint `record`, its certified summary and digests, and the
+    /// committed watermark at it, which says the outputs of every checkpoint
+    /// through it are in the database.
+    pub fn put_committed_checkpoint(&self, batch: &mut WriteBatch, record: CheckpointRecord) {
+        let seq = record.seq.to_be_bytes().to_vec();
+        batch.write(self.checkpoints, seq.clone(), record.checkpoint);
+        batch.write(self.certified, seq.clone(), record.certified);
+        batch.write(
+            self.checkpoint_digests,
+            record.digest.bytes.to_vec(),
+            seq.clone(),
+        );
+        batch.write(
+            self.contents_digests,
+            record.contents_digest.bytes.to_vec(),
+            seq.clone(),
+        );
+        batch.write(self.meta, COMMITTED.to_vec(), seq);
     }
 
     /// Epoch `epoch`'s start record, as the node encodes it.

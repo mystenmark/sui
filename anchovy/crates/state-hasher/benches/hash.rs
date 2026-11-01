@@ -81,7 +81,7 @@ fn main() {
         let mut bump = workqueue::Bump::default();
         for seq in 0..=u64::from(rounds) {
             let item = CheckpointEffects {
-                last_of_epoch: false,
+                closing: false,
                 seq,
                 effects: effects.clone(),
             };

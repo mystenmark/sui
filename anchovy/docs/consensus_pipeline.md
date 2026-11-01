@@ -34,6 +34,14 @@ Diagram: `consensus_pipeline.svg`.
 - **Black boxes.** Consensus, which takes transactions, asks for votes and
   emits commits; RPC clients; state sync.
 
+**Conditions go through waiters.** Work that waits for another
+processor's progress waits in a waiter on keys, so each processor reads as
+an action taken once its keys hold. A processor may still order its own
+work (the state hasher folds roots in sequence), accumulate toward a
+threshold (the aggregator's quorum), or hold its input for a condition it
+is the documented home of (the randomness gate). It never blocks its
+thread on another processor.
+
 Every arrow in the diagram is a queue, except store reads and writes. Every
 waiter has three kinds of edge:
 - **wait for:** from the processor enqueuing work;
@@ -236,9 +244,11 @@ Ordinals defer that to execution, which simplifies three things:
   the reference, a transaction may be assigned version `v` of an object an
   earlier transaction deleted, and `(id, v)` never appears. So deletion
   writes `ConsensusStreamEnded` markers, smeared at the deleter's version for
-  every stream it touched, and input loading looks for them. Here the
-  deleting writer still produces its generation, recorded as "stream ended",
-  and its readers resolve to that.
+  every stream it touched, and input loading looks for them. Every later
+  exclusive writer is still assigned the next version, and marks the stream
+  ended there. Here the deleting writer still produces its generation,
+  recorded as "stream ended", and so does each later writer, at its own
+  version; readers resolve to the last.
 - **The accumulator root needs no lookups.** The root is a stream with one
   exclusive writer per chunk, so a chunk's root generation follows from its
   height.
@@ -491,6 +501,8 @@ effects waiter does.
 | (`FundsReserver`) | `Reservation(account, amount, v)`, resolving `Fulfilled` or `Cancelled` | `VersionResolver` | `Settle::Deposit` and `Settle::Credit` from `Executor`, `Settle::Settled` from `SettlementScheduler` | the rules of "Funds reservation" |
 | checkpoint | `ChunkSettled(height)` | `CommitHandler` (pending checkpoint) | `SettlementScheduler` | chunk table has it |
 | built | `CheckpointBuilt(seq)`, resolving the checkpoint built | `ContentsBuilder`, `BlockVoter`, `CommitDecoder`, `CheckpointAggregator` | `SummaryBuilder` | checkpoint store has it, or committed it |
+| output | `CheckpointProgress::BuiltHere(seq)` | `CommitStage` (consensus output) | `SummaryBuilder` | the consensus path built through `seq` in this run |
+| output | `CheckpointProgress::Committed(seq)` | `CommitStage` (consensus output) | `CheckpointCommitter` | checkpoint store committed through `seq` |
 
 ## What must match the reference
 

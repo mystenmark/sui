@@ -124,6 +124,13 @@ pub fn validate_one(
     Ok(transaction.with_digest().relabel(&Witness(PhantomData)))
 }
 
+/// `transaction`, from a checkpoint a quorum certified: verified as the
+/// quorum verified it. Its signatures are not checked again (R3.6 of
+/// `docs/state_sync_reference.md`).
+pub fn certified(transaction: Unchecked) -> VerifiedTransaction {
+    transaction.with_digest().relabel(&Witness(PhantomData))
+}
+
 /// Signature verification in one epoch, remembering what verified.
 pub struct SignatureChecks {
     epoch: Arc<EpochState>,

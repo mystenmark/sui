@@ -143,11 +143,11 @@ impl GenerationTable {
     }
 }
 
-/// Settled chunks by height, in memory: only checkpoints not yet committed
-/// read them, so they are pruned as checkpoints commit, and a replay
-/// settles them again. Written by `SettlementScheduler` (owner: the
-/// settlement work), read by the checkpoint waiter's availability check and
-/// by `ContentsBuilder`, pruned by `CheckpointCommitter`.
+/// Settled chunks by height, in memory: only checkpoints not yet built read
+/// them, so each is taken as its checkpoint's contents are built, and a
+/// replay settles them again. Written by `SettlementScheduler` (owner: the
+/// settlement work), read by the checkpoint waiter's availability check,
+/// taken by `ContentsBuilder`.
 #[derive(Default)]
 pub struct ChunkTable {
     chunks: Mutex<HashMap<u64, Arc<SettledChunk>, foldhash::fast::RandomState>>,
@@ -166,9 +166,9 @@ impl ChunkTable {
         lock(&self.chunks).get(&height).cloned()
     }
 
-    /// Drops the chunks at or below `height`.
-    pub fn prune_through(&self, height: u64) {
-        lock(&self.chunks).retain(|&h, _| h > height);
+    /// Removes the chunk at `height`, if settled.
+    pub fn take(&self, height: u64) -> Option<Arc<SettledChunk>> {
+        lock(&self.chunks).remove(&height)
     }
 }
 
@@ -189,12 +189,23 @@ pub struct BuiltCheckpoint {
     /// and checkpoint intervals continue from.
     pub last_height: u64,
     pub timestamp_ms: u64,
-    /// The epoch's last checkpoint only: the live object set's ECMH after it
-    /// (`StateHash` BCS), which the next epoch continues from.
-    pub root_state: Option<Vec<u8>>,
+    /// Whether it is the epoch's last checkpoint.
+    pub ends_epoch: bool,
 }
 
 impl BuiltCheckpoint {
+    /// As the object store commits it, with its certified summary.
+    pub fn record(&self, certified: Vec<u8>) -> store::CheckpointRecord {
+        store::CheckpointRecord {
+            seq: self.seq,
+            checkpoint: self.encode(),
+            certified,
+            digest: messages::base::Digest::new(self.digest),
+            contents_digest: *messages::base::Hashed::of("CheckpointContents", &self.contents)
+                .digest(),
+        }
+    }
+
     /// As the object store keeps it (`Store::commit_checkpoint`).
     pub fn encode(&self) -> Vec<u8> {
         bcs::to_bytes(&(
@@ -206,7 +217,7 @@ impl BuiltCheckpoint {
             self.epoch_rolling_gas,
             self.last_height,
             self.timestamp_ms,
-            &self.root_state,
+            self.ends_epoch,
         ))
         .expect("a checkpoint encodes")
     }
@@ -223,7 +234,7 @@ impl BuiltCheckpoint {
             epoch_rolling_gas,
             last_height,
             timestamp_ms,
-            root_state,
+            ends_epoch,
         ) = bcs::from_bytes(bytes).expect("a stored checkpoint decodes");
         BuiltCheckpoint {
             seq,
@@ -234,7 +245,7 @@ impl BuiltCheckpoint {
             epoch_rolling_gas,
             last_height,
             timestamp_ms,
-            root_state,
+            ends_epoch,
         }
     }
 }
@@ -258,6 +269,8 @@ pub struct CheckpointStore {
     built: Mutex<BTreeMap<u64, Arc<BuiltCheckpoint>>>,
     /// The last checkpoint committed.
     committed: AtomicU64,
+    /// The last checkpoint the consensus path built in this run.
+    built_here: AtomicU64,
 }
 
 impl CheckpointStore {
@@ -274,16 +287,34 @@ impl CheckpointStore {
             output,
             built: Mutex::default(),
             committed: AtomicU64::new(committed),
+            built_here: AtomicU64::new(0),
         }
     }
 
-    /// Records `checkpoint`, built here.
+    /// Records `checkpoint`, which the consensus path built here.
+    ///
+    /// # Panics
+    /// As `insert_certified`.
+    pub fn insert_built(&self, checkpoint: BuiltCheckpoint) -> Arc<BuiltCheckpoint> {
+        let seq = checkpoint.seq;
+        let checkpoint = self.insert_certified(checkpoint);
+        self.built_here.fetch_max(seq, Ordering::AcqRel);
+        checkpoint
+    }
+
+    /// The last checkpoint the consensus path built in this run, 0 if none.
+    pub fn built_here(&self) -> u64 {
+        self.built_here.load(Ordering::Acquire)
+    }
+
+    /// Records `checkpoint`, taken from its certificate and contents, to be
+    /// committed before the consensus path builds it.
     ///
     /// # Panics
     /// If a checkpoint of the same sequence number was built with another
     /// digest, in this run or before a restart: a fork, as this validator
     /// may have signed the first.
-    pub fn insert_built(&self, checkpoint: BuiltCheckpoint) -> Arc<BuiltCheckpoint> {
+    pub fn insert_certified(&self, checkpoint: BuiltCheckpoint) -> Arc<BuiltCheckpoint> {
         if let Some(bytes) = self.store.built(checkpoint.seq) {
             assert!(
                 BuiltCheckpoint::decode(&bytes).digest == checkpoint.digest,
@@ -310,6 +341,11 @@ impl CheckpointStore {
         }
         let bytes = self.objects.checkpoint(seq).expect("the store reads")?;
         Some(Arc::new(BuiltCheckpoint::decode(&bytes)))
+    }
+
+    /// The last checkpoint committed.
+    pub fn last_committed(&self) -> u64 {
+        self.committed.load(Ordering::Acquire)
     }
 
     /// Checkpoint `seq` has committed: those before it are read from the

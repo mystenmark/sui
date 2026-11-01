@@ -22,8 +22,7 @@ use validator::Validator;
 use validator::codec::{BcsCodec, Encoded};
 use validator::epoch::EpochState;
 use validator::proto::{
-    PingType, RawSubmitTxRequest, RawValidatorHealthRequest, RawValidatorHealthResponse,
-    RawWaitForEffectsRequest, SubmitTxType,
+    PingType, RawValidatorHealthRequest, RawValidatorHealthResponse, RawWaitForEffectsRequest,
 };
 use validator::service::validator_client::ValidatorClient;
 
@@ -73,14 +72,9 @@ async fn assert_healthy(client: &mut ValidatorClient<Channel>) {
     assert_eq!(health, RawValidatorHealthResponse::default());
 }
 
-/// A request that decoded and reached a `todo!()` handler, whose panic
-/// resets the stream.
-fn assert_reached_todo<T: std::fmt::Debug>(result: Result<T, tonic::Status>) {
-    let status = result.unwrap_err();
-    assert!(
-        !matches!(status.code(), Code::InvalidArgument | Code::Unimplemented),
-        "{status:?}"
-    );
+/// A request that decoded and reached a handler not yet ported.
+fn assert_unimplemented<T: std::fmt::Debug>(result: Result<T, tonic::Status>) {
+    assert_eq!(result.unwrap_err().code(), Code::Unimplemented);
 }
 
 #[tokio::test]
@@ -89,25 +83,17 @@ async fn every_route_is_served() {
     let mut client = ValidatorClient::new(channel(addr).await);
     assert_healthy(&mut client).await;
 
-    assert_reached_todo(
-        client
-            .submit_transaction(RawSubmitTxRequest {
-                transactions: vec![],
-                submit_type: SubmitTxType::Ping as i32,
-            })
-            .await,
-    );
-    assert_reached_todo(
-        client
-            .wait_for_effects(RawWaitForEffectsRequest {
-                transaction_digest: None,
-                consensus_position: Some(Bytes::from_static(&[0; 8])),
-                include_details: false,
-                ping_type: Some(PingType::Consensus as i32),
-            })
-            .await,
-    );
-    assert_reached_todo(
+    let status = client
+        .wait_for_effects(RawWaitForEffectsRequest {
+            transaction_digest: None,
+            consensus_position: Some(Bytes::from_static(&[0; 8])),
+            include_details: false,
+            ping_type: Some(PingType::Consensus as i32),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+    assert_unimplemented(
         client
             .object_info(ObjectInfoRequest {
                 object_id: ObjectId([1; 32]),
@@ -116,14 +102,14 @@ async fn every_route_is_served() {
             })
             .await,
     );
-    assert_reached_todo(
+    assert_unimplemented(
         client
             .transaction_info(TransactionInfoRequest {
                 transaction_digest: Digest::new([2; 32]),
             })
             .await,
     );
-    assert_reached_todo(
+    assert_unimplemented(
         client
             .checkpoint(CheckpointRequest {
                 sequence_number: None,
@@ -131,7 +117,7 @@ async fn every_route_is_served() {
             })
             .await,
     );
-    assert_reached_todo(
+    assert_unimplemented(
         client
             .checkpoint_v2(CheckpointRequestV2 {
                 sequence_number: Some(7),
@@ -140,13 +126,12 @@ async fn every_route_is_served() {
             })
             .await,
     );
-    assert_reached_todo(
+    assert_unimplemented(
         client
             .get_system_state_object(SystemStateRequest { unused: false })
             .await,
     );
 
-    // The panics took down their streams only.
     assert_healthy(&mut client).await;
 }
 

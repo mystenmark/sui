@@ -35,3 +35,9 @@ pub mod storage;
 pub mod temporary_store;
 pub mod transaction;
 pub mod type_layout_resolver;
+
+/// Whether this executor runs `config`'s version: the reference's latest
+/// execution version (4), from gas model 15 on.
+pub fn runs(config: &sui_protocol_config::ProtocolConfig) -> bool {
+    config.execution_version_as_option() == Some(4) && config.gas_model_version() >= 15
+}

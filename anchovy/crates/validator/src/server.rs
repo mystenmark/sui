@@ -8,9 +8,8 @@
 //! submits the rest to consensus and answers with their positions; a client
 //! then waits for each with `wait_for_effects`.
 //!
-//! The rest need more of storage, which does not exist yet. Pings are among
-//! them, since a ping's answer is a consensus position and then that
-//! position's commit.
+//! A ping submits no transactions: its answer is a consensus position, and
+//! then that position's block committing.
 //!
 //! The server is perpetual; the epoch it serves is not. Each request takes
 //! the running epoch once and works against it. If that epoch ends first,
@@ -30,7 +29,7 @@ use messages::grpc::{
 };
 use tonic::{Request, Response, Status};
 
-use ::consensus::{Priority, TransactionClient};
+use ::consensus::{PING_TRANSACTION_INDEX, Priority, TransactionClient};
 use waiter::{Command, WaitBatch};
 
 use crate::codec::Encoded;
@@ -49,6 +48,8 @@ use crate::proto::{
     RawWaitForEffectsResponse, SubmitTxType,
 };
 use crate::service::validator_server::{self, ValidatorServer};
+
+const PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct Validator {
     current: CurrentEpoch,
@@ -94,11 +95,23 @@ impl Validator {
         }
     }
 
-    /// Checks, then submits, `request`'s transactions in `epoch`.
+    /// Checks, then submits, `request`'s transactions in `epoch`; or, for a
+    /// ping, submits none and answers with the ping's position.
     async fn submit_in(
         epoch: &EpochHandle,
         request: &RawSubmitTxRequest,
+        ping: bool,
     ) -> Result<RawSubmitTxResponse, Failure> {
+        if ping {
+            let position = Self::submit_ping(epoch).await?;
+            return Ok(RawSubmitTxResponse {
+                results: vec![RawSubmitTxResult {
+                    inner: Some(RawValidatorSubmitStatus::Submitted(
+                        position.to_bcs().into(),
+                    )),
+                }],
+            });
+        }
         let outcomes = Self::enqueue(epoch, request)?
             .await
             .map_err(|_| Failure::EpochEnded)?
@@ -161,6 +174,85 @@ impl Validator {
             .collect())
     }
 
+    /// Submits no transactions: consensus acknowledges that with the ping
+    /// position of the block it will propose next.
+    async fn submit_ping(epoch: &EpochHandle) -> Result<ConsensusPosition, Failure> {
+        let (block, indices, _) = epoch
+            .consensus
+            .client
+            .submit(Vec::new(), Priority::Normal)
+            .await
+            .map_err(|_| Failure::EpochEnded)?;
+        debug_assert_eq!(indices, [PING_TRANSACTION_INDEX]);
+        Ok(ConsensusPosition {
+            epoch: epoch.epoch.params.epoch,
+            block,
+            index: PING_TRANSACTION_INDEX,
+        })
+    }
+
+    /// What became of a ping's block, as the reference's `ping_response`:
+    /// its commit answers as executed with no effects.
+    async fn pinged(
+        epoch: &EpochState,
+        statuses: &ConsensusTxStatusCache,
+        position: ConsensusPosition,
+        include_details: bool,
+    ) -> RawValidatorTransactionStatus {
+        match statuses.notify_read(position).await {
+            StatusResult::Status(ConsensusTxStatus::Finalized) => {
+                RawValidatorTransactionStatus::Executed(RawExecutedStatus {
+                    effects_digest: bcs::to_bytes(
+                        &sui_types::digests::TransactionEffectsDigest::ZERO,
+                    )
+                    .expect("a digest serializes")
+                    .into(),
+                    // A client decodes the effects: the reference sends
+                    // default ones.
+                    details: include_details.then(|| RawExecutedData {
+                        effects: bcs::to_bytes(&sui_types::effects::TransactionEffects::default())
+                            .expect("effects serialize")
+                            .into(),
+                        ..RawExecutedData::default()
+                    }),
+                })
+            }
+            status => Self::undecided(epoch, status),
+        }
+    }
+
+    /// Answers a ping's `wait_for_effects` within ten seconds, as the
+    /// reference does.
+    async fn ping(
+        &self,
+        request: &RawWaitForEffectsRequest,
+    ) -> Result<Response<RawWaitForEffectsResponse>, Status> {
+        let position = request
+            .consensus_position
+            .as_deref()
+            .ok_or_else(|| Status::invalid_argument("a ping needs a consensus position"))?;
+        let position = ConsensusPosition::from_bcs(position)
+            .ok_or_else(|| Status::invalid_argument("not a consensus position"))?;
+        let epoch = self.current.get().await;
+        if position.epoch < epoch.epoch.params.epoch {
+            return Err(epoch_ended());
+        }
+        let statuses = &epoch.consensus.statuses;
+        if statuses.too_far_ahead(&position) {
+            return Err(Status::unavailable("ValidatorConsensusLagging"));
+        }
+        let pinged = Self::pinged(&epoch.epoch, statuses, position, request.include_details);
+        let status = tokio::select! {
+            status = tokio::time::timeout(PING_TIMEOUT, pinged) => {
+                status.map_err(|_| Status::deadline_exceeded("TimeoutError"))?
+            }
+            () = self.current.ended(&epoch) => return Err(epoch_ended()),
+        };
+        Ok(Response::new(RawWaitForEffectsResponse {
+            inner: Some(status),
+        }))
+    }
+
     /// The transaction's effects, once executed.
     async fn executed(
         consensus: &Consensus,
@@ -207,10 +299,20 @@ impl Validator {
         position: ConsensusPosition,
     ) -> RawValidatorTransactionStatus {
         match statuses.notify_read(position).await {
+            StatusResult::Status(ConsensusTxStatus::Finalized) => std::future::pending().await,
+            status => Self::undecided(epoch, status),
+        }
+    }
+
+    /// A status other than finalized, as the reference answers it.
+    fn undecided(epoch: &EpochState, status: StatusResult) -> RawValidatorTransactionStatus {
+        match status {
             StatusResult::Status(ConsensusTxStatus::Rejected | ConsensusTxStatus::Dropped) => {
                 RawValidatorTransactionStatus::Rejected(RawRejectedStatus { error: None })
             }
-            StatusResult::Status(ConsensusTxStatus::Finalized) => std::future::pending().await,
+            StatusResult::Status(ConsensusTxStatus::Finalized) => {
+                unreachable!("finalized is answered by the caller")
+            }
             StatusResult::Expired(round) => {
                 RawValidatorTransactionStatus::Expired(RawExpiredStatus {
                     epoch: epoch.params.epoch,
@@ -347,11 +449,9 @@ impl validator_server::Validator for Validator {
         let request = request.into_inner();
         loop {
             let epoch = self.current.get().await;
-            if Self::check_request(&epoch.epoch, &request)? == SubmitTxType::Ping {
-                todo!("ping: a consensus position")
-            }
+            let ping = Self::check_request(&epoch.epoch, &request)? == SubmitTxType::Ping;
             let failure = tokio::select! {
-                result = Self::submit_in(&epoch, &request) => match result {
+                result = Self::submit_in(&epoch, &request, ping) => match result {
                     Ok(response) => return Ok(Response::new(response)),
                     Err(failure) => failure,
                 },
@@ -374,7 +474,7 @@ impl validator_server::Validator for Validator {
     ) -> Result<Response<RawWaitForEffectsResponse>, Status> {
         let request = request.into_inner();
         if request.ping_type.is_some() {
-            todo!("ping: a consensus position's commit")
+            return self.ping(&request).await;
         }
         let digest: [u8; 32] = request
             .transaction_digest
@@ -429,39 +529,38 @@ impl validator_server::Validator for Validator {
         }
     }
 
+    // The reads below serve only diagnostic tools (sui-tool) in the
+    // reference; not yet ported.
     async fn object_info(
         &self,
-        _request: Request<ObjectInfoRequest>,
+        _: Request<ObjectInfoRequest>,
     ) -> Result<Response<Encoded>, Status> {
-        todo!("object_info")
+        Err(Status::unimplemented("object_info"))
     }
 
     async fn transaction_info(
         &self,
-        _request: Request<TransactionInfoRequest>,
+        _: Request<TransactionInfoRequest>,
     ) -> Result<Response<Encoded>, Status> {
-        todo!("transaction_info")
+        Err(Status::unimplemented("transaction_info"))
     }
 
-    async fn checkpoint(
-        &self,
-        _request: Request<CheckpointRequest>,
-    ) -> Result<Response<Encoded>, Status> {
-        todo!("checkpoint")
+    async fn checkpoint(&self, _: Request<CheckpointRequest>) -> Result<Response<Encoded>, Status> {
+        Err(Status::unimplemented("checkpoint"))
     }
 
     async fn checkpoint_v2(
         &self,
-        _request: Request<CheckpointRequestV2>,
+        _: Request<CheckpointRequestV2>,
     ) -> Result<Response<Encoded>, Status> {
-        todo!("checkpoint_v2")
+        Err(Status::unimplemented("checkpoint_v2"))
     }
 
     async fn get_system_state_object(
         &self,
-        _request: Request<SystemStateRequest>,
+        _: Request<SystemStateRequest>,
     ) -> Result<Response<Encoded>, Status> {
-        todo!("get_system_state_object")
+        Err(Status::unimplemented("get_system_state_object"))
     }
 
     /// Every field is optional in the reference; absent until the

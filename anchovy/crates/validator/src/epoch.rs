@@ -93,12 +93,15 @@ impl EpochState {
             reference_gas_price,
             committee_size,
             0,
+            chain_identifier.bytes,
             jwks,
         )
     }
 
     /// An epoch whose transactions read `epoch_start_timestamp_ms` as its
-    /// start.
+    /// start, following the checkpoint whose digest is `epoch_digest`: the
+    /// previous epoch's last, or genesis.
+    #[allow(clippy::too_many_arguments)]
     pub fn starting_at(
         chain: Chain,
         protocol_version: u64,
@@ -107,9 +110,10 @@ impl EpochState {
         reference_gas_price: u64,
         committee_size: u32,
         epoch_start_timestamp_ms: u64,
+        epoch_digest: [u8; 32],
         jwks: impl IntoIterator<Item = (JwkId, JWK)>,
     ) -> EpochState {
-        let params = EpochParams::new(
+        let mut params = EpochParams::new(
             chain,
             protocol_version,
             epoch,
@@ -117,6 +121,10 @@ impl EpochState {
             reference_gas_price,
             committee_size,
         );
+        // As the reference's epoch store: in debug builds, from protocol
+        // version 114, a checkpoint holds 10 to 100 transactions, drawn from
+        // `epoch_digest`.
+        params.config.apply_seeded_test_overrides(&epoch_digest);
         let sui_chain = match chain {
             Chain::Mainnet => execution::Chain::Mainnet,
             Chain::Testnet => execution::Chain::Testnet,

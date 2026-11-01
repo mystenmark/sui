@@ -195,8 +195,13 @@ scheduled. It is built in two steps:
 **The epoch's root.** The root state hash is cumulative from genesis. The
 state hasher starts each epoch from the root after the epoch's previous
 checkpoint, which the epoch's start record carries. Genesis computes it
-from the genesis objects; the final checkpoint's record carries the root
-after it, committed with it, for the next epoch's record.
+from the genesis objects. Writing the next epoch's record takes the root
+after the final checkpoint from the epoch's state hashes, folding it from
+committed effects if a crash lost it. So a final checkpoint committed on
+certified contents, before any root is folded, needs nothing else
+(`docs/state_sync_design.md`). Before writing, it checks the next
+committee, protocol version and root against the certified end-of-epoch
+data.
 
 The reference executes the change-epoch transaction in the builder without
 committing it, then again in the checkpoint executor (R2.13, R3.2). Anchovy

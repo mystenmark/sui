@@ -188,6 +188,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c880a97d28a3681c0267bd29cff89621202715b065127cd445fa0f0fe0aa2880"
 
 [[package]]
+name = "anchovy-node"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bcs",
+ "checkpoint",
+ "clap",
+ "consensus-glue",
+ "execution",
+ "fastcrypto",
+ "messages",
+ "node",
+ "store",
+ "sui-config",
+ "sui-protocol-config",
+ "sui-swarm-config",
+ "sui-types",
+ "tokio",
+ "tonic 0.14.6",
+ "tracing",
+ "tracing-subscriber",
+ "validator",
+ "workqueue",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1708,6 +1734,7 @@ version = "0.1.0"
 dependencies = [
  "bcs",
  "checkpoint",
+ "consensus",
  "consensus-glue",
  "execution",
  "fastcrypto",
@@ -3031,6 +3058,7 @@ dependencies = [
  "store",
  "sui-protocol-config",
  "sui-types",
+ "synced",
  "tempfile",
  "tokio",
  "validator",
@@ -6331,6 +6359,7 @@ dependencies = [
  "sui-genesis-builder",
  "sui-protocol-config",
  "sui-types",
+ "synced",
  "tempfile",
  "tokio",
  "tonic 0.14.6",
@@ -11144,6 +11173,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "synced"
+version = "0.1.0"
+dependencies = [
+ "aggregator",
+ "bcs",
+ "fastcrypto",
+ "messages",
+ "resolver",
+ "store",
+ "sui-types",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "validator",
+ "waiter",
+ "workqueue",
+]
+
+[[package]]
 name = "synstructure"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12393,6 +12441,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "snap",
  "store",
  "sui-protocol-config",
  "sui-types",

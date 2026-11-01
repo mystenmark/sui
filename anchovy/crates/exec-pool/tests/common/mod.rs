@@ -17,7 +17,7 @@ use move_core_types::ident_str;
 use resolver::InputAvailability;
 use sui_protocol_config::{Chain, ProtocolVersion};
 use sui_types::base_types::{ObjectID, ObjectRef, SequenceNumber, SuiAddress};
-use sui_types::crypto::{AccountKeyPair, get_key_pair};
+use sui_types::crypto::{AccountKeyPair, KeypairTraits, get_key_pair};
 use sui_types::digests::TransactionDigest;
 use sui_types::effects::{TransactionEffects, TransactionEffectsAPI};
 use sui_types::gas_coin::{GAS, GasCoin};
@@ -107,6 +107,15 @@ impl Node {
     /// A genesis with `coins` gas coins of 10 SUI for the sender.
     pub fn new(coins: usize) -> Node {
         let (sender, key) = get_key_pair::<AccountKeyPair>();
+        Node::of(sender, key, coins)
+    }
+
+    /// Another node from the same genesis, which has executed nothing.
+    pub fn twin(&self, coins: usize) -> Node {
+        Node::of(self.sender, self.key.copy(), coins)
+    }
+
+    fn of(sender: SuiAddress, key: AccountKeyPair, coins: usize) -> Node {
         let epoch = Arc::new(EpochState::new(
             Chain::Unknown,
             ProtocolVersion::MAX.as_u64(),
@@ -270,6 +279,7 @@ impl Node {
             },
             resolved_base,
             inputs: Vec::new(),
+            synced: None,
         };
         // Whatever the input waiter would find resolved now; it fills in the
         // rest.
@@ -303,7 +313,14 @@ impl Node {
 
     /// Shares a coin split off gas coin `i`.
     pub fn new_shared(&mut self, i: u64) -> Shared {
-        let effects = self.execute_owned(self.share(self.coin(i)));
+        self.new_shared_by(i).0
+    }
+
+    /// `new_shared`, and the digest of the transaction that shared it.
+    pub fn new_shared_by(&mut self, i: u64) -> (Shared, Hashed) {
+        let share = self.share(self.coin(i));
+        let digest = digest(&share);
+        let effects = self.execute_owned(share);
         let (object, owner) = effects
             .created()
             .into_iter()
@@ -315,10 +332,11 @@ impl Node {
         else {
             unreachable!()
         };
-        Shared {
+        let shared = Shared {
             id: object.0,
             initial_shared_version: initial_shared_version.value(),
-        }
+        };
+        (shared, digest)
     }
 
     /// The input waiter's lookup.
@@ -438,9 +456,20 @@ impl InputWaiter {
     /// ready, feeding the executor's notifications back, until nothing more
     /// is. How many batches it executed.
     pub fn run(&mut self, node: &mut Node, executables: Vec<Executable>) -> usize {
+        let keyed = executables
+            .into_iter()
+            .map(|executable| {
+                let keys = keys(&executable);
+                (executable, keys)
+            })
+            .collect();
+        self.run_keyed(node, keyed)
+    }
+
+    /// `run`, each executable with the keys given.
+    pub fn run_keyed(&mut self, node: &mut Node, keyed: Vec<(Executable, Vec<InputKey>)>) -> usize {
         let mut batch = WaitBatch::new();
-        for executable in executables {
-            let keys = keys(&executable);
+        for (executable, keys) in keyed {
             batch.push(executable, keys);
         }
         self.waiter.wait_for(&mut batch);
