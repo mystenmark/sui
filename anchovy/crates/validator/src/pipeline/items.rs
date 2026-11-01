@@ -28,6 +28,15 @@ pub enum ExecutableTransaction {
     System(SystemTransaction),
 }
 
+impl ExecutableTransaction {
+    pub fn digest(&self) -> TxDigest {
+        match self {
+            ExecutableTransaction::User(transaction) => *transaction.get().0.digest(),
+            ExecutableTransaction::System(system) => system.digest,
+        }
+    }
+}
+
 /// A system transaction built by the commit handler (the prologue) or the
 /// settlement scheduler (settlements, the barrier).
 #[derive(Debug, Clone)]
@@ -83,15 +92,18 @@ pub struct Chunk {
     pub entries: Vec<ScheduledEntry>,
 }
 
-/// A chunk and its settlement, on their way from `CommitStage` through the
-/// gate waiter, until the synced scheduler is not running the chunk and, if
-/// it is headed by a randomness state update, the round's bytes arrive; then
-/// to the randomness gate, which passes chunks on in height order.
+/// A chunk on its way from `CommitStage` through the gate waiter, until the
+/// synced scheduler is not running it and, if it is headed by a randomness
+/// state update, the round's bytes arrive; then to the randomness gate,
+/// which passes chunks on in height order, with their settlement work.
 #[derive(Debug)]
 pub struct GatedChunk {
     pub chunk: Chunk,
-    pub settlement: ChunkSettlement,
-    /// The update heading the chunk, not yet in its entries or digests.
+    /// As `ChunkSettlement::last_of_commit`.
+    pub last_of_commit: bool,
+    /// As `ChunkSettlement::root`.
+    pub root: SharedAccess,
+    /// The update heading the chunk, not yet in its entries.
     pub update: Option<PendingUpdate>,
     /// The update's round's random bytes (its signature's BCS), once
     /// released.
@@ -122,7 +134,7 @@ pub struct PendingUpdate {
     pub shared: SharedAccess,
 }
 
-/// What settling a chunk takes. `CommitHandler` → `SettlementScheduler`.
+/// What settling a chunk takes. Randomness gate → `SettlementScheduler`.
 #[derive(Debug, Clone)]
 pub struct ChunkSettlement {
     /// The version the commit's transactions reserve funds against; settling

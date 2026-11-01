@@ -267,14 +267,10 @@ impl Node {
         resolved_base: Vec<(StreamId, u32, u32)>,
     ) -> Executable {
         // As the commit handler links them.
-        for access in &mut shared {
-            let stream = StreamId {
-                id: access.id,
-                initial_shared_version: access.initial_shared_version,
-            };
-            if let Some(&(_, round, writes_before)) =
-                resolved_base.iter().find(|(s, ..)| *s == stream)
-            {
+        for (stream, round, writes_before) in resolved_base {
+            if let Some(access) = shared.iter_mut().find(|a| {
+                a.id == stream.id && a.initial_shared_version == stream.initial_shared_version
+            }) {
                 access.base = Some(SharedOrdinal {
                     round,
                     writes_before,

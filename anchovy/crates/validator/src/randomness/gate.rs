@@ -12,7 +12,7 @@ use crate::consensus::commit::randomness_state_update_transaction;
 use crate::epoch_store::EpochStore;
 use crate::pipeline::chunk_lock::ChunkLock;
 use crate::pipeline::items::{
-    Chunk, ExecutableTransaction, GatedChunk, ScheduledEntry, SettlementInput,
+    Chunk, ChunkSettlement, ExecutableTransaction, GatedChunk, ScheduledEntry, SettlementInput,
 };
 use crate::pipeline::keys::GateKey;
 
@@ -88,14 +88,14 @@ impl Processor for RandomnessGate {
             self.next += 1;
             let GatedChunk {
                 mut chunk,
-                mut settlement,
+                last_of_commit,
+                root,
                 update,
                 bytes,
             } = gated;
             if let Some(update) = update {
                 let bytes = bytes.expect("released with its round's bytes");
                 let system = randomness_state_update_transaction(&update, bytes);
-                settlement.digests.insert(0, system.digest);
                 chunk.entries.insert(
                     0,
                     ScheduledEntry {
@@ -106,6 +106,20 @@ impl Processor for RandomnessGate {
                     },
                 );
             }
+            let settlement = ChunkSettlement {
+                version: chunk.version,
+                root_version: chunk.root_version,
+                last_of_commit,
+                round: chunk.round,
+                height: chunk.height,
+                checkpoint_seq: chunk.checkpoint_seq,
+                digests: chunk
+                    .entries
+                    .iter()
+                    .map(|e| e.transaction.digest())
+                    .collect(),
+                root,
+            };
             push(&self.chunks_out, chunk, "resolver");
             push(
                 &self.settlements_out,
@@ -125,20 +139,10 @@ mod tests {
     use super::*;
     use crate::consensus::sequence::{SharedAccess, SharedOrdinal};
     use crate::pipeline::chunk_lock::Cut;
-    use crate::pipeline::items::{ChunkSettlement, PendingUpdate};
+    use crate::pipeline::items::PendingUpdate;
     use crate::pipeline::keys::AccumulatorVersion;
 
     fn gated(height: u64, update: Option<PendingUpdate>) -> GatedChunk {
-        let root = SharedAccess {
-            id: ObjectId([0xac; 32]),
-            initial_shared_version: 1,
-            mutability: SharedObjectMutability::Mutable,
-            ordinal: SharedOrdinal {
-                round: 1,
-                writes_before: 0,
-            },
-            base: None,
-        };
         GatedChunk {
             chunk: Chunk {
                 version: AccumulatorVersion(1),
@@ -148,15 +152,16 @@ mod tests {
                 checkpoint_seq: 1,
                 entries: Vec::new(),
             },
-            settlement: ChunkSettlement {
-                version: AccumulatorVersion(1),
-                root_version: 1,
-                last_of_commit: true,
-                round: 1,
-                height,
-                checkpoint_seq: 1,
-                digests: Vec::new(),
-                root,
+            last_of_commit: true,
+            root: SharedAccess {
+                id: ObjectId([0xac; 32]),
+                initial_shared_version: 1,
+                mutability: SharedObjectMutability::Mutable,
+                ordinal: SharedOrdinal {
+                    round: 1,
+                    writes_before: 0,
+                },
+                base: None,
             },
             update,
             bytes: None,
@@ -173,7 +178,7 @@ mod tests {
             epoch_store: epoch_store.clone(),
         });
         let (chunks, chunks_out) = workqueue::queue(16);
-        let (settlements, _settlements_out) = workqueue::queue(16);
+        let (settlements, settlements_out) = workqueue::queue(16);
         let mut gate = RandomnessGate::new(1, chunks, settlements);
         let mut run = |waits: &mut waiter::Waiter<_, _, _, _>| {
             let mut ready = Vec::new();
@@ -192,7 +197,7 @@ mod tests {
             epoch: 0,
             round: 7,
             initial_shared_version: 1,
-            shared: gated(0, None).settlement.root,
+            shared: gated(0, None).root,
         };
         let mut batch = waiter::WaitBatch::new();
         for height in 1..=4 {
@@ -219,5 +224,14 @@ mod tests {
         epoch_store.put_randomness_bytes(7, &[1; 96]);
         waits.resolve([(GateKey::RoundBytes(7), Some(vec![1; 96]))]);
         assert_eq!(run(&mut waits), vec![(3, 1), (4, 0)]);
+
+        // Each chunk's settlement lists its transactions, the update first.
+        let settled: Vec<_> = std::iter::from_fn(|| settlements_out.try_pop())
+            .map(|s| match s {
+                SettlementInput::Chunk(s) => (s.height, s.digests.len()),
+                _ => panic!("a chunk's settlement"),
+            })
+            .collect();
+        assert_eq!(settled, vec![(1, 0), (2, 0), (3, 1), (4, 0)]);
     }
 }
