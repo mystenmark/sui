@@ -422,6 +422,7 @@ impl Parts {
     fn synced(&self, q: Queues) -> SyncedScheduler {
         SyncedScheduler::new(
             self.committee.clone(),
+            !self.epoch.params.config.disable_effects_tx_dependencies(),
             self.store.clone(),
             self.checkpoints.clone(),
             self.chunk_lock.clone(),

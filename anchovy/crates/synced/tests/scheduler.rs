@@ -174,6 +174,7 @@ impl Setup {
         let lock = Arc::new(ChunkLock::new(cut.height, cut));
         let scheduler = SyncedScheduler::new(
             Arc::new(signers.committee()),
+            true,
             store,
             checkpoints.clone(),
             lock.clone(),

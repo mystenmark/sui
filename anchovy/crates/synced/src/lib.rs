@@ -15,7 +15,7 @@ use aggregator::{CertificateError, Committee};
 use messages::arena::BumpAlloc;
 use messages::base::{Digest, ObjectId, TransactionDigest};
 use messages::checkpoint::{CertifiedCheckpointSummary, ExecutionData};
-use messages::effects::{ObjectIn, VersionedEffects};
+use messages::effects::{ObjectIn, TransactionEffectsV2, UnchangedConsensusKind, VersionedEffects};
 use messages::reader::Reader;
 use messages::transaction::TransactionKind;
 use tracing::warn;
@@ -145,6 +145,10 @@ pub struct Outputs {
 /// checkpoint it commits as built.
 pub struct SyncedScheduler {
     committee: Arc<Committee>,
+    /// Whether effects list their transactions' dependencies; if not, the
+    /// transaction that ended a consensus object's stream reaches no
+    /// effects, and goes unnamed.
+    dependencies: bool,
     store: Arc<store::Store>,
     checkpoints: Arc<CheckpointStore>,
     chunk_lock: Arc<ChunkLock>,
@@ -172,6 +176,7 @@ impl SyncedScheduler {
     /// holds.
     pub fn new(
         committee: Arc<Committee>,
+        dependencies: bool,
         store: Arc<store::Store>,
         checkpoints: Arc<CheckpointStore>,
         chunk_lock: Arc<ChunkLock>,
@@ -191,6 +196,7 @@ impl SyncedScheduler {
             last: (seq, summary.digest.into()),
             ended: summary.epoch == committee.epoch() && summary.end_of_epoch_data.is_some(),
             committee,
+            dependencies,
             store,
             checkpoints,
             chunk_lock,
@@ -377,6 +383,9 @@ impl SyncedScheduler {
                 for t in &transactions[start..end] {
                     let deleter =
                         |id: &ObjectId, version: u64, dependencies: &[TransactionDigest]| {
+                            if !self.dependencies {
+                                return [0; 32];
+                            }
                             deleter(
                                 &self.store,
                                 &self.running,
@@ -561,7 +570,7 @@ fn barrier_root_version(barrier: &ExecutionData<'_>) -> u64 {
         .expect("a barrier changes the existing root")
 }
 
-/// The transaction among `dependencies` that ended `id`'s stream at
+/// The transaction among `dependencies` that left `id`'s stream ended at
 /// `version`: in this checkpoint's `transactions`, a checkpoint `running`,
 /// or the store.
 ///
@@ -579,9 +588,7 @@ fn deleter(
         let VersionedEffects::V2(effects) = &t.effects.version else {
             return false;
         };
-        dependencies.contains(t.transaction.digest().digest())
-            && effects.lamport_version == version
-            && effects.changed_objects.iter().any(|c| c.id == id)
+        dependencies.contains(t.transaction.digest().digest()) && ended_at(effects, id, version)
     };
     if let Some(t) = transactions.iter().find(|t| ended(t)) {
         return t.transaction.digest().bytes;
@@ -608,11 +615,22 @@ fn deleter(
         let VersionedEffects::V2(v2) = &effects.get().version else {
             continue;
         };
-        if v2.lamport_version == version && v2.changed_objects.iter().any(|c| c.id == id) {
+        if ended_at(v2, id, version) {
             return dependency.bytes;
         }
     }
     panic!("no dependency ended {id:?} at version {version}");
+}
+
+/// Whether a transaction with `effects` left `id`'s stream ended at
+/// `version`: it took the object out of the stream, or wrote it ended (the
+/// reference marks an ended stream at each writer's version).
+fn ended_at(effects: &TransactionEffectsV2<'_>, id: &ObjectId, version: u64) -> bool {
+    effects.lamport_version == version
+        && (effects.changed_objects.iter().any(|c| c.id == id)
+            || effects.unchanged_consensus_objects.iter().any(|(o, kind)| {
+                *o == id && matches!(kind, UnchangedConsensusKind::MutateConsensusStreamEnded(_))
+            }))
 }
 
 /// Inside the pipeline a full queue is a sizing bug; a closed one means the
