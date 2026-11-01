@@ -9,7 +9,7 @@ use messages::arena::BumpAlloc;
 use messages::base::{Digest, ObjectId};
 use messages::checkpoint::{ExecutionData, VersionedFullCheckpointContents};
 use messages::effects::VersionedEffects;
-use messages::fast::{Built, Bump};
+use messages::fast::Bump;
 use messages::reader::Reader;
 use messages::transaction::TransactionKind;
 
@@ -26,19 +26,6 @@ pub enum Invalid {
     Unmatched,
 }
 
-/// A checkpoint's contents, verified.
-pub struct Contents<'a> {
-    pub full: VersionedFullCheckpointContents<'a>,
-    /// The `CheckpointContents` they expand to, as the summary commits.
-    pub contents: Built<'a>,
-}
-
-impl Contents<'_> {
-    pub fn transactions(&self) -> &[ExecutionData<'_>] {
-        self.full.transactions()
-    }
-}
-
 /// `bytes`, a `VersionedFullCheckpointContents`, if they are the contents
 /// whose digest is `digest`, each transaction with its own effects (R3.5).
 /// User signatures are not checked (R3.6).
@@ -46,7 +33,7 @@ pub fn verify<'a>(
     bytes: &'a [u8],
     digest: &Digest,
     bump: &'a Bump,
-) -> Result<Contents<'a>, Invalid> {
+) -> Result<VersionedFullCheckpointContents<'a>, Invalid> {
     let mut r = Reader::new(bytes);
     let full = VersionedFullCheckpointContents::parse(&mut r, &mut BumpAlloc(bump))
         .and_then(|c| r.finish().map(|()| c))
@@ -63,7 +50,13 @@ pub fn verify<'a>(
             return Err(Invalid::Unmatched);
         }
     }
-    Ok(Contents { full, contents })
+    Ok(full)
+}
+
+/// `bytes`, contents `verify` passed already.
+pub fn parse<'a>(bytes: &'a [u8], bump: &'a Bump) -> VersionedFullCheckpointContents<'a> {
+    VersionedFullCheckpointContents::parse(&mut Reader::new(bytes), &mut BumpAlloc(bump))
+        .expect("verified as fetched")
 }
 
 /// Where each settlement chunk of `transactions` ends: just past its
@@ -73,8 +66,11 @@ pub fn verify<'a>(
 /// # Panics
 /// If anything follows the last barrier but the epoch's change-epoch
 /// transaction: the quorum certified a checkpoint no validator builds.
-pub fn chunk_ends(transactions: &[ExecutionData<'_>]) -> Vec<usize> {
-    let mut ends = Vec::new();
+pub fn chunk_ends<'b>(
+    transactions: &[ExecutionData<'_>],
+    bump: &'b Bump,
+) -> containers::Vec<'b, usize> {
+    let mut ends = containers::Vec::new_in(bump);
     for (i, t) in transactions.iter().enumerate() {
         let VersionedEffects::V2(effects) = &t.effects.version else {
             unreachable!("verified effects are V2");

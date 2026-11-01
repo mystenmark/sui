@@ -77,7 +77,7 @@ struct Slow {
 /// A checkpoint split, until its transactions have executed.
 struct Running {
     certified: CertifiedCheckpoint,
-    contents_digest: Digest,
+    /// Verified.
     contents: Vec<u8>,
     /// The chunk heights it took from the commit stage.
     synced: RangeInclusive<u64>,
@@ -358,10 +358,9 @@ impl SyncedScheduler {
     /// transaction of the checkpoint to execute.
     fn split(&mut self, slow: Slow, bump: &Bump) {
         let bytes = slow.contents.expect("fetched");
-        let contents =
-            contents::verify(&bytes, &slow.contents_digest, bump).expect("verified as fetched");
+        let contents = contents::parse(&bytes, bump);
         let transactions = contents.transactions();
-        let ends = contents::chunk_ends(transactions);
+        let ends = contents::chunk_ends(transactions, bump);
         let settled = *ends.last().expect("a checkpoint has chunks");
         assert_eq!(
             settled < transactions.len(),
@@ -442,7 +441,6 @@ impl SyncedScheduler {
             seq,
             Running {
                 certified: slow.certified,
-                contents_digest: slow.contents_digest,
                 contents: bytes,
                 synced: (handled + 1).max(first)..=last,
                 last_height: last,
@@ -478,8 +476,7 @@ impl SyncedScheduler {
     /// validator, or the quorum, forked.
     fn executed(&mut self, seq: u64, bump: &Bump) {
         let running = self.running.remove(&seq).expect("a checkpoint it ran");
-        let contents = contents::verify(&running.contents, &running.contents_digest, bump)
-            .expect("verified as fetched");
+        let contents = contents::parse(&running.contents, bump);
         let mut effects = Vec::with_capacity(contents.transactions().len());
         for t in contents.transactions() {
             let digest = *t.transaction.digest();
@@ -521,7 +518,11 @@ impl SyncedScheduler {
             seq,
             summary: summary.bytes.to_vec(),
             digest: summary.digest.bytes,
-            contents: contents.contents.bytes.to_vec(),
+            contents: contents
+                .contents(bump)
+                .expect("verified as fetched")
+                .bytes
+                .to_vec(),
             network_total_transactions: summary.network_total_transactions,
             epoch_rolling_gas: [
                 gas.computation_cost,
@@ -598,8 +599,7 @@ fn deleter(
     }
     let bump = Bump::default();
     for r in running.values() {
-        let contents =
-            contents::verify(&r.contents, &r.contents_digest, &bump).expect("verified as fetched");
+        let contents = contents::parse(&r.contents, &bump);
         if let Some(t) = contents.transactions().iter().find(|t| ended(t)) {
             return t.transaction.digest().bytes;
         }
