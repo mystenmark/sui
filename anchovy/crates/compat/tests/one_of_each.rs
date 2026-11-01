@@ -43,11 +43,12 @@ use sui_types::committee::{Committee, CommitteeTrait as _};
 use sui_types::crypto::{AccountKeyPair, NetworkKeyPair};
 use sui_types::digests::TransactionDigest;
 use sui_types::effects::TransactionEffects;
-use sui_types::effects::TransactionEffectsAPI as _;
+use sui_types::effects::{TransactionEffectsAPI as _, UnchangedConsensusKind};
 use sui_types::execution_status::{ExecutionErrorKind, ExecutionFailure, ExecutionStatus};
 use sui_types::gas_coin::{GAS, GasCoin};
 use sui_types::message_envelope::Message as _;
 use sui_types::messages_checkpoint::{CheckpointContents, CheckpointSummary};
+use sui_types::messages_consensus::ConsensusTransaction;
 use sui_types::messages_grpc::SubmitTxRequest;
 use sui_types::object::{Object, Owner};
 use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
@@ -93,10 +94,12 @@ struct Anchovy {
 }
 
 /// Anchovy's consensus, whose commits are held back from its pipeline while
-/// `held`: its consensus lags while sui's validators go on.
+/// `held`: its consensus lags while sui's validators go on. Its commits
+/// leave out the `omitted` transaction, as rejected.
 struct Lagging {
     runner: Runner,
     held: Arc<AtomicBool>,
+    omitted: Arc<Mutex<Option<TransactionDigest>>>,
 }
 
 impl Lagging {
@@ -104,6 +107,29 @@ impl Lagging {
         Lagging {
             runner,
             held: Arc::new(AtomicBool::new(false)),
+            omitted: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+/// Marks `omitted`, wherever `commit` carries it, as rejected.
+fn omit(commit: &mut consensus::CommittedSubDag, omitted: &TransactionDigest) {
+    for block in &commit.blocks {
+        for (index, bytes) in block.transactions.iter().enumerate() {
+            let carries = bcs::from_bytes::<ConsensusTransaction>(bytes).is_ok_and(|t| {
+                t.kind.as_user_transaction().map(Transaction::digest) == Some(omitted)
+            });
+            if carries {
+                let index = index.try_into().unwrap();
+                match commit
+                    .rejected
+                    .iter_mut()
+                    .find(|(b, _)| *b == block.reference)
+                {
+                    Some((_, rejected)) => rejected.push(index),
+                    None => commit.rejected.push((block.reference, vec![index])),
+                }
+            }
         }
     }
 }
@@ -112,14 +138,17 @@ impl node::epoch::Consensus for Lagging {
     fn start(&mut self, mut start: node::epoch::ConsensusStart) -> consensus::TransactionClient {
         let (proxy, commits) = workqueue::queue(1024);
         let pipeline = std::mem::replace(&mut start.output.commits, proxy);
-        let held = self.held.clone();
+        let (held, omitted) = (self.held.clone(), self.omitted.clone());
         // Until the pipeline's queue closes, as the epoch ends.
         std::thread::spawn(move || {
             loop {
                 match commits.try_pop() {
-                    Some(commit) => {
+                    Some(mut commit) => {
                         while held.load(Ordering::SeqCst) {
                             std::thread::sleep(Duration::from_millis(10));
+                        }
+                        if let Some(omitted) = &*omitted.lock().unwrap() {
+                            omit(&mut commit.commit, omitted);
                         }
                         if pipeline.try_push(commit).is_err() {
                             return;
@@ -508,6 +537,36 @@ impl Network {
         })
     }
 
+    /// Joins the shared coin `shared` into coin `i`, which pays: deletes it.
+    fn delete_shared(&self, i: usize, shared: ObjectID) -> Transaction {
+        let shared = self.shared(shared, true);
+        self.ptb(i, |b| {
+            let shared = b.obj(shared).unwrap();
+            b.programmable_move_call(
+                SUI_FRAMEWORK_PACKAGE_ID,
+                ident_str!("pay").to_owned(),
+                ident_str!("join").to_owned(),
+                vec![GAS::type_tag()],
+                vec![Argument::GasCoin, shared],
+            );
+        })
+    }
+
+    /// Reads the shared coin `shared`'s value, paid with coin `i`.
+    fn read_shared(&self, i: usize, shared: ObjectID) -> Transaction {
+        let shared = self.shared(shared, false);
+        self.ptb(i, |b| {
+            b.move_call(
+                SUI_FRAMEWORK_PACKAGE_ID,
+                ident_str!("coin").to_owned(),
+                ident_str!("value").to_owned(),
+                vec![GAS::type_tag()],
+                vec![CallArg::Object(shared)],
+            )
+            .unwrap();
+        })
+    }
+
     /// Sends `amount` split off coin `i` to the sender's address balance.
     fn send_funds(&self, i: usize, amount: u64) -> Transaction {
         let sender = self.sender;
@@ -759,6 +818,35 @@ impl Network {
         });
     }
 
+    /// Submits `transactions` through a sui validator's service as a soft
+    /// bundle, so in one block, without waiting for their effects.
+    fn submit_bundle_through_sui(&mut self, transactions: &[&Transaction]) {
+        let request = sui_types::messages_grpc::RawSubmitTxRequest {
+            transactions: transactions
+                .iter()
+                .map(|t| bcs::to_bytes(t).unwrap().into())
+                .collect(),
+            submit_type: sui_types::messages_grpc::SubmitTxType::SoftBundle as i32,
+        };
+        let mut client = self.sui_client.get_client_for_testing().unwrap();
+        self.runtime.block_on(async {
+            tokio::time::timeout(TIMEOUT, client.submit_transaction(request))
+                .await
+                .expect("submitted in time")
+                .unwrap();
+        });
+    }
+
+    /// Waits until anchovy has committed the checkpoint of `transaction`,
+    /// from its certificate if its consensus lags; its effects.
+    fn committed(&mut self, transaction: &Transaction) -> TransactionEffects {
+        self.wait_for("a certified checkpoint committed", |network| {
+            let seq = network.anchovy.checkpoint_of(transaction.digest())?;
+            (network.anchovy.checkpoints().last_committed() >= seq).then_some(())
+        });
+        self.anchovy.effects(transaction.digest()).unwrap()
+    }
+
     /// Waits until anchovy has certified the checkpoints of `transactions`,
     /// each of which succeeded; their effects.
     fn agree_on(&mut self, transactions: &[&Transaction]) -> Vec<TransactionEffects> {
@@ -986,6 +1074,7 @@ impl Anchovy {
         self.runner = Lagging {
             runner: Runner::new(&keys, parameters()),
             held: self.runner.held.clone(),
+            omitted: self.runner.omitted.clone(),
         };
         let mut node = Node::new(Perpetual {
             store: store.clone(),
@@ -1072,6 +1161,30 @@ fn shared_objects_execute_alike() {
     let again = network.split_shared(0, shared);
     let other = network.split_shared(1, shared);
     network.execute_together(&[&again, &other]);
+    drop(network.runtime);
+}
+
+/// A deleted shared coin's stream moves on to each later writer's version:
+/// a read after a write of it reads the stream ended there, alike.
+#[test]
+fn a_deleted_shared_object_s_stream_moves_on_alike() {
+    let mut network = Network::new();
+    let shared = shared_coin(&mut network, 0);
+    let write = network.split_shared(2, shared);
+    let read = network.read_shared(3, shared);
+    let delete = network.delete_shared(1, shared);
+    network.execute(&delete);
+    network.submit_through_sui(&[&write]);
+    let written = network.effects_of(&[&write]).remove(0);
+    network.submit_through_sui(&[&read]);
+    let read = network.effects_of(&[&read]).remove(0);
+    assert!(
+        read.unchanged_consensus_objects().contains(&(
+            shared,
+            UnchangedConsensusKind::ReadConsensusStreamEnded(written.lamport_version())
+        )),
+        "{read:?}"
+    );
     drop(network.runtime);
 }
 
@@ -1632,13 +1745,8 @@ fn a_lagging_consensus_follows_certified_checkpoints_alike() {
     let write = network.split_shared(2, shared);
     network.submit_through_sui(&[&transfer, &write]);
     for transaction in [&transfer, &write] {
-        let seq = network.wait_for("a certified checkpoint executed", |network| {
-            let seq = network.anchovy.checkpoint_of(transaction.digest())?;
-            let committed = network.anchovy.checkpoints().last_committed();
-            (committed >= seq).then_some(seq)
-        });
-        let effects = network.anchovy.effects(transaction.digest()).unwrap();
-        assert!(effects.status().is_ok(), "{seq}: {:?}", effects.status());
+        let effects = network.committed(transaction);
+        assert!(effects.status().is_ok(), "{:?}", effects.status());
     }
 
     network.anchovy.runner.held.store(false, Ordering::SeqCst);
@@ -1666,4 +1774,99 @@ fn a_lagging_consensus_catches_up_an_epoch_s_end_alike() {
     let later = network.transfer(0);
     network.execute(&later);
     drop(network.runtime);
+}
+
+/// While anchovy's consensus lags, a shared coin is deleted, then written
+/// and read: anchovy runs both from their certificates at the stream's end,
+/// then its consensus catches up behind them and agrees.
+#[test]
+fn a_lagging_consensus_follows_an_ended_stream_alike() {
+    let mut network = Network::new();
+    let shared = shared_coin(&mut network, 0);
+    let write = network.split_shared(2, shared);
+    let read = network.read_shared(3, shared);
+    network.anchovy.runner.held.store(true, Ordering::SeqCst);
+
+    let delete = network.delete_shared(1, shared);
+    network.submit_through_sui(&[&delete]);
+    let effects = network.committed(&delete);
+    assert!(effects.status().is_ok(), "{:?}", effects.status());
+    network.submit_through_sui(&[&write, &read]);
+    for transaction in [&write, &read] {
+        let effects = network.committed(transaction);
+        let ended = effects
+            .unchanged_consensus_objects()
+            .into_iter()
+            .any(|(id, kind)| {
+                id == shared
+                    && matches!(
+                        kind,
+                        UnchangedConsensusKind::MutateConsensusStreamEnded(_)
+                            | UnchangedConsensusKind::ReadConsensusStreamEnded(_)
+                    )
+            });
+        assert!(ended, "{effects:?}");
+    }
+
+    network.anchovy.runner.held.store(false, Ordering::SeqCst);
+    let later = network.transfer(0);
+    network.execute(&later);
+    drop(network.runtime);
+}
+
+/// Set in the child process a test runs itself in.
+const CHILD: &str = "COMPAT_CHILD";
+
+/// Runs `test` again in a child process, unless this is it; its output.
+fn in_child(test: &str) -> Option<std::process::Output> {
+    if std::env::var_os(CHILD).is_some() {
+        return None;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    Some(output)
+}
+
+/// The quorum certifies a write of a shared coin that anchovy's consensus
+/// never ordered: anchovy runs it and the next write from their
+/// certificates, then aborts once its consensus reaches their commit, which
+/// it decides otherwise (its prologue, and the next write's version).
+#[test]
+fn a_certificate_that_consensus_contradicts_aborts() {
+    if let Some(output) = in_child("a_certificate_that_consensus_contradicts_aborts") {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{stderr}");
+        assert!(stderr.contains("deviation: transaction"), "{stderr}");
+        return;
+    }
+    let mut network = Network::new();
+    let shared = shared_coin(&mut network, 0);
+    network.anchovy.runner.held.store(true, Ordering::SeqCst);
+
+    // One block, so one commit: the consensus path decides it before it
+    // builds a checkpoint without the first write.
+    let writes = [
+        network.split_shared(1, shared),
+        network.split_shared(2, shared),
+    ];
+    network.submit_bundle_through_sui(&writes.iter().collect::<Vec<_>>());
+    let read = |effects: &TransactionEffects| {
+        let modified = effects.modified_at_versions();
+        modified
+            .into_iter()
+            .find(|(id, _)| *id == shared)
+            .unwrap()
+            .1
+    };
+    let first = writes
+        .iter()
+        .min_by_key(|write| read(&network.committed(write)))
+        .unwrap();
+    *network.anchovy.runner.omitted.lock().unwrap() = Some(*first.digest());
+
+    network.anchovy.runner.held.store(false, Ordering::SeqCst);
+    network.wait_for("the abort", |_| None::<()>);
 }
