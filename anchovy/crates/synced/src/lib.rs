@@ -29,7 +29,7 @@ use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore};
 use validator::randomness::BeaconInput;
 use validator::state_sync::{SyncRequest, SyncedInput, Wanted};
 use waiter::{Command, WaitBatch};
-use workqueue::{Bump, Processor, PushError, Queue};
+use workqueue::{Bump, Processor, Queue};
 
 /// How far past the last committed checkpoint summaries are taken: each
 /// waits in memory until committed.
@@ -295,7 +295,9 @@ impl SyncedScheduler {
             }
         }
         if !waits.is_empty() {
-            push(&self.outputs.built, Command::Wait(waits), "built waiter");
+            self.outputs
+                .built
+                .push(Command::Wait(waits), "built waiter");
         }
 
         for (seq, bytes) in request.contents {
@@ -422,7 +424,9 @@ impl SyncedScheduler {
             runs.push(executable, self.keys.drain(..));
         }
         if !runs.is_empty() {
-            push(&self.outputs.inputs, Command::Wait(runs), "input waiter");
+            self.outputs
+                .inputs
+                .push(Command::Wait(runs), "input waiter");
         }
         let seq = slow.certified.seq;
         let mut executed = WaitBatch::with_capacity(1, transactions.len());
@@ -432,11 +436,9 @@ impl SyncedScheduler {
                 .iter()
                 .map(|t| EffectsKey(*t.transaction.digest().digest())),
         );
-        push(
-            &self.outputs.effects,
-            Command::Wait(executed),
-            "effects waiter",
-        );
+        self.outputs
+            .effects
+            .push(Command::Wait(executed), "effects waiter");
         self.running.insert(
             seq,
             Running {
@@ -456,8 +458,7 @@ impl SyncedScheduler {
         for t in transactions {
             if let TransactionKind::RandomnessStateUpdate(update) = t.transaction.data().kind() {
                 let update = update.get();
-                push(
-                    &self.outputs.beacon,
+                self.outputs.beacon.push(
                     BeaconInput::Certified {
                         round: update.randomness_round,
                         bytes: update.random_bytes.to_vec(),
@@ -500,11 +501,9 @@ impl SyncedScheduler {
                 self.chunk_lock.release(height);
             }
             let free = running.synced.map(|h| (GateKey::ChunkFree(h), None));
-            push(
-                &self.outputs.gate,
-                Command::Resolve(free.collect()),
-                "gate waiter",
-            );
+            self.outputs
+                .gate
+                .push(Command::Resolve(free.collect()), "gate waiter");
         }
 
         let summary = CertifiedCheckpointSummary::parse(
@@ -534,8 +533,7 @@ impl SyncedScheduler {
             timestamp_ms: summary.timestamp_ms,
             ends_epoch: summary.end_of_epoch_data.is_some(),
         });
-        push(
-            &self.outputs.hasher,
+        self.outputs.hasher.push(
             CheckpointEffects {
                 seq,
                 effects,
@@ -543,11 +541,9 @@ impl SyncedScheduler {
             },
             "state hasher",
         );
-        push(
-            &self.outputs.committer,
-            vec![running.certified],
-            "committer",
-        );
+        self.outputs
+            .committer
+            .push(vec![running.certified], "committer");
     }
 }
 
@@ -634,14 +630,6 @@ fn ended_at(effects: &TransactionEffectsV2<'_>, id: &ObjectId, version: u64) -> 
             || effects.unchanged_consensus_objects.iter().any(|(o, kind)| {
                 *o == id && matches!(kind, UnchangedConsensusKind::MutateConsensusStreamEnded(_))
             }))
-}
-
-/// Inside the pipeline a full queue is a sizing bug; a closed one means the
-/// pipeline is shutting down.
-fn push<T>(queue: &Queue<T>, item: T, name: &str) {
-    if let Err(PushError::Full(_)) = queue.try_push(item) {
-        panic!("the {name} queue refused synced work");
-    }
 }
 
 impl Processor for SyncedScheduler {

@@ -18,8 +18,6 @@ use validator::pipeline::tables::{BuiltCheckpoint, CheckpointStore};
 use waiter::Availability;
 use workqueue::{Queue, Sink};
 
-use crate::push;
-
 /// The built waiter's availability check: the checkpoint this validator
 /// built, from the checkpoint store (including the previous epoch's last).
 pub struct BuiltAvailability {
@@ -69,17 +67,14 @@ impl Sink<Vec<BuiltWaitItem>> for BuiltRouter {
             }
         }
         if !next.is_empty() {
-            push(
-                &self.epoch_closer,
-                EpochCloserInput::Built(next),
-                "epoch closer",
-            );
+            self.epoch_closer
+                .push(EpochCloserInput::Built(next), "epoch closer");
         }
         if !signatures.is_empty() {
-            push(&self.aggregator, signatures, "aggregator");
+            self.aggregator.push(signatures, "aggregator");
         }
         if !synced.is_empty() {
-            push(&self.committer, synced, "committer");
+            self.committer.push(synced, "committer");
         }
     }
 }

@@ -39,14 +39,6 @@ pub use commit::CheckpointCommitter;
 pub use key::ProtocolKey;
 pub use output::{OutputAvailability, OutputCommitter};
 
-/// Pushes `item` to `queue`. Inside the pipeline a full queue is a sizing
-/// bug, not load to shed; a closed one means the pipeline is shutting down.
-fn push<T>(queue: &Queue<T>, item: T, name: &str) {
-    if let Err(workqueue::PushError::Full(_)) = queue.try_push(item) {
-        panic!("the {name} queue refused work");
-    }
-}
-
 /// Builds everything of a checkpoint that needs only the checkpoint itself
 /// (many checkpoints in flight): its contents (execution digests and user
 /// signatures) and their digest, its gas cost summary, the artifacts
@@ -171,8 +163,7 @@ impl Processor for ContentsBuilder {
                 // Built again, and hashed, with the change-epoch transaction.
                 built.last = Some(LastOfEpoch::Effects(effects));
             } else {
-                push(
-                    &self.hasher,
+                self.hasher.push(
                     CheckpointEffects {
                         seq,
                         effects,
@@ -186,7 +177,7 @@ impl Processor for ContentsBuilder {
                 seq.checked_sub(1).map(CheckpointBuilt),
             );
         }
-        push(&self.built, Command::Wait(waits), "built waiter");
+        self.built.push(Command::Wait(waits), "built waiter");
         Some(())
     }
 }
@@ -281,8 +272,9 @@ impl Processor for SummaryBuilder {
             .iter()
             .map(|(CheckpointBuilt(seq), _)| CheckpointProgress::BuiltHere(*seq))
             .collect::<Vec<_>>();
-        push(&self.built, Command::Resolve(resolved), "built waiter");
-        push(&self.outputs, Command::notify(built_here), "output waiter");
+        self.built.push(Command::Resolve(resolved), "built waiter");
+        self.outputs
+            .push(Command::notify(built_here), "output waiter");
         for signature in signatures {
             // Where it is included is not needed: the built waiter waits for
             // whatever signatures consensus commits. Failing only as

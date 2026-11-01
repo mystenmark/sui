@@ -1169,17 +1169,17 @@ impl CommitStage {
             match event {
                 BeaconEvent::Party(input) => {
                     if let Some(party) = &self.party {
-                        push(party, input, "DKG party");
+                        party.push(input, "DKG party");
                     }
                 }
                 BeaconEvent::GroupKey(key) => {
                     if let Some(beacon) = &self.beacon {
-                        push(beacon, BeaconInput::GroupKey(key), "signature collector");
+                        beacon.push(BeaconInput::GroupKey(key), "signature collector");
                     }
                 }
                 BeaconEvent::Round(round) => {
                     if let Some(beacon) = &self.beacon {
-                        push(beacon, BeaconInput::Round(round), "signature collector");
+                        beacon.push(BeaconInput::Round(round), "signature collector");
                     }
                 }
             }
@@ -1558,7 +1558,8 @@ impl CommitStage {
             gated.push(chunk, keys);
         }
         if !gated.is_empty() {
-            push(&self.gate_out, waiter::Command::Wait(gated), "gate waiter");
+            self.gate_out
+                .push(waiter::Command::Wait(gated), "gate waiter");
         }
         if !checkpoints.is_empty() {
             let keys = checkpoints.iter().map(|c| c.heights.len()).sum();
@@ -1568,21 +1569,9 @@ impl CommitStage {
                 heights.extend(checkpoint.heights.iter().map(|&h| ChunkSettled(h)));
                 batch.push(checkpoint, heights);
             }
-            push(
-                &self.checkpoints_out,
-                waiter::Command::Wait(batch),
-                "checkpoint waiter",
-            );
+            self.checkpoints_out
+                .push(waiter::Command::Wait(batch), "checkpoint waiter");
         }
-    }
-}
-
-/// Inside the pipeline a full queue is a sizing bug: the handler's state
-/// has moved past the commit, so its outputs cannot be dropped. A closed
-/// queue means the pipeline is shutting down.
-fn push<T>(queue: &workqueue::Queue<T>, item: T, name: &str) {
-    if let Err(workqueue::PushError::Full(_)) = queue.try_push(item) {
-        panic!("the {name} queue refused work");
     }
 }
 
@@ -1687,11 +1676,7 @@ impl CommitStage {
             CheckpointProgress::Committed(cut),
         ]);
         wait.push(OutputThrough(finished), keys.into_iter().flatten());
-        // Inside the pipeline a full queue is a sizing bug; a closed one
-        // means the pipeline is shutting down.
-        if let Err(workqueue::PushError::Full(_)) = waits.try_push(waiter::Command::Wait(wait)) {
-            panic!("the output waiter refused a commit's output");
-        }
+        waits.push(waiter::Command::Wait(wait), "output waiter");
     }
 }
 

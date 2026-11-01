@@ -28,7 +28,7 @@ use validator::pipeline::keys::{AccumulatorVersion, EffectsKey, InputKey, Stream
 use validator::pipeline::tables::{Generation, GenerationTable};
 use validator::state_sync::SyncedInput;
 use waiter::{Availability, Command};
-use workqueue::{Processor, PushError, Queue, Sink};
+use workqueue::{Processor, Queue, Sink};
 
 /// Executes ready transactions. Resolves each shared access to an exact
 /// version from the generation table, executes, commits the outputs,
@@ -748,14 +748,6 @@ fn produced(
     }
 }
 
-/// Pushes `item` to a queue inside the pipeline, where a full queue is a
-/// sizing bug; a closed one means the pipeline is shutting down.
-fn push<T>(queue: &Queue<T>, item: T, name: &str) {
-    if let Err(PushError::Full(_)) = queue.try_push(item) {
-        panic!("the {name} queue refused work");
-    }
-}
-
 impl Processor for Executor {
     type Input = Vec<Executable>;
     type Output = ();
@@ -775,25 +767,16 @@ impl Processor for Executor {
         }
         // Everything is committed and recorded: now the keys are visible.
         if !resolved_keys.is_empty() {
-            push(
-                &self.inputs,
-                Command::Resolve(resolved_keys),
-                "input waiter",
-            );
+            self.inputs
+                .push(Command::Resolve(resolved_keys), "input waiter");
         }
         if !effects_keys.is_empty() {
-            push(
-                &self.effects,
-                Command::notify(effects_keys),
-                "effects waiter",
-            );
+            self.effects
+                .push(Command::notify(effects_keys), "effects waiter");
         }
         if !deposits.is_empty() {
-            push(
-                &self.funds,
-                FundsCommand::Settle(deposits),
-                "funds reserver",
-            );
+            self.funds
+                .push(FundsCommand::Settle(deposits), "funds reserver");
         }
         None
     }
@@ -840,23 +823,19 @@ impl Sink<Vec<EffectsWaitItem>> for EffectsRouter {
                 EffectsWaitItem::Executed(reply) => {
                     let _ = reply.send(());
                 }
-                EffectsWaitItem::ChunkExecuted(chunk) => push(
-                    &self.settlement,
-                    SettlementInput::ChunkExecuted(chunk),
-                    "settlement",
-                ),
-                EffectsWaitItem::SettlementExecuted { height, digests } => push(
-                    &self.settlement,
+                EffectsWaitItem::ChunkExecuted(chunk) => self
+                    .settlement
+                    .push(SettlementInput::ChunkExecuted(chunk), "settlement"),
+                EffectsWaitItem::SettlementExecuted { height, digests } => self.settlement.push(
                     SettlementInput::SettlementExecuted { height, digests },
                     "settlement",
                 ),
-                EffectsWaitItem::ChangeEpochExecuted => push(
-                    &self.epoch_closer,
-                    EpochCloserInput::ChangeEpochExecuted,
-                    "epoch closer",
-                ),
+                EffectsWaitItem::ChangeEpochExecuted => self
+                    .epoch_closer
+                    .push(EpochCloserInput::ChangeEpochExecuted, "epoch closer"),
                 EffectsWaitItem::SyncedExecuted(seq) => {
-                    push(&self.synced, SyncedInput::Executed(seq), "synced scheduler");
+                    self.synced
+                        .push(SyncedInput::Executed(seq), "synced scheduler");
                 }
             }
         }

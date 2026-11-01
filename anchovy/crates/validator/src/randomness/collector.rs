@@ -294,11 +294,10 @@ impl SignatureCollector {
         let bytes = bcs::to_bytes(sig).expect("a signature serializes");
         self.store.put_randomness_bytes(round, &bytes);
         self.mark_done(round);
-        if let Err(workqueue::PushError::Full(_)) = self.gate.try_push(waiter::Command::Resolve(
-            vec![(GateKey::RoundBytes(round), Some(bytes))],
-        )) {
-            panic!("the gate waiter refused bytes");
-        }
+        self.gate.push(
+            waiter::Command::Resolve(vec![(GateKey::RoundBytes(round), Some(bytes))]),
+            "gate waiter",
+        );
     }
 }
 

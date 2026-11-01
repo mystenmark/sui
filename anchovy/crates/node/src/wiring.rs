@@ -512,14 +512,8 @@ impl Thread<'_> {
     }
 }
 
-/// A sink pushing each batch to `queue`. Inside the pipeline a full queue is
-/// a sizing bug, not load to shed.
+/// A sink pushing each batch to `queue` (`Queue::push`).
 fn into<T: Send + 'static>(queue: &Queue<T>, name: &'static str) -> impl FnMut(T) + Send + use<T> {
     let queue = queue.clone();
-    move |item| {
-        // A closed queue means the pipeline is shutting down.
-        if let Err(workqueue::PushError::Full(_)) = queue.try_push(item) {
-            panic!("the {name} queue refused work");
-        }
-    }
+    move |item| queue.push(item, name)
 }

@@ -24,7 +24,7 @@ use validator::pipeline::items::{
 use validator::pipeline::keys::{self, InputKey};
 use validator::pipeline::tables::{Generation, GenerationTable};
 use waiter::{Availability, Command, WaitBatch};
-use workqueue::{Processor, PushError, Queue};
+use workqueue::{Processor, Queue};
 
 /// Turns each scheduled transaction's inputs into input waiter keys:
 /// `ObjectVersion` for owned, immutable and receiving objects; `Package` for
@@ -260,19 +260,12 @@ impl Processor for VersionResolver {
             };
             batch.push(executable, self.keys.drain(..));
         }
-        // Inside the pipeline a full queue is a sizing bug, not load to shed;
-        // a closed one means the pipeline is shutting down.
-        if !batch.is_empty()
-            && let Err(PushError::Full(_)) = self.inputs.try_push(Command::Wait(batch))
-        {
-            panic!("the input waiter's queue refused work");
+        if !batch.is_empty() {
+            self.inputs.push(Command::Wait(batch), "input waiter");
         }
-        if !withdrawals.is_empty()
-            && let Err(PushError::Full(_)) = self
-                .withdrawals
-                .try_push(FundsCommand::Reserve(withdrawals))
-        {
-            panic!("the funds reserver's queue refused work");
+        if !withdrawals.is_empty() {
+            self.withdrawals
+                .push(FundsCommand::Reserve(withdrawals), "funds reserver");
         }
         None
     }

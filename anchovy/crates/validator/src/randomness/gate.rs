@@ -68,14 +68,6 @@ impl RandomnessGate {
     }
 }
 
-/// Inside the pipeline a full queue is a sizing bug; a closed one means the
-/// pipeline is shutting down.
-fn push<T>(queue: &workqueue::Queue<T>, item: T, name: &str) {
-    if let Err(workqueue::PushError::Full(_)) = queue.try_push(item) {
-        panic!("the {name} queue refused work");
-    }
-}
-
 impl Processor for RandomnessGate {
     type Input = Vec<GatedChunk>;
     type Output = ();
@@ -120,12 +112,9 @@ impl Processor for RandomnessGate {
                     .collect(),
                 root,
             };
-            push(&self.chunks_out, chunk, "resolver");
-            push(
-                &self.settlements_out,
-                SettlementInput::Chunk(settlement),
-                "settlement",
-            );
+            self.chunks_out.push(chunk, "resolver");
+            self.settlements_out
+                .push(SettlementInput::Chunk(settlement), "settlement");
         }
         None
     }

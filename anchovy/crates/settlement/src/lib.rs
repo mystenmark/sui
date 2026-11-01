@@ -39,14 +39,6 @@ use crate::settle::{ACCUMULATOR_ROOT, SettlementBuilder};
 
 type Effects = Message<TransactionEffects<'static>>;
 
-/// A full queue is a sizing bug; a closed one means the pipeline is shutting
-/// down.
-fn push<W>(queue: &Queue<W>, item: W, to: &str) {
-    if let Err(workqueue::PushError::Full(_)) = queue.try_push(item) {
-        panic!("the {to} queue refused work");
-    }
-}
-
 /// The executed effects of `digest`, which its waiter released: this
 /// validator's own.
 fn executed(store: &store::Store, digest: &TxDigest) -> Effects {
@@ -200,8 +192,7 @@ impl SettlementScheduler {
             self.started = true;
             // Every chunk before the first one seen settled before this
             // run: the epoch's start.
-            push(
-                &self.funds,
+            self.funds.push(
                 FundsCommand::Settle(vec![Settle::Settled {
                     balances: Vec::new(),
                     version: chunk.version,
@@ -215,7 +206,7 @@ impl SettlementScheduler {
         let mut keys = containers::Vec::with_capacity_in(chunk.digests.len(), bump);
         keys.extend(chunk.digests.iter().map(|d| EffectsKey(**d)));
         batch.push(EffectsWaitItem::ChunkExecuted(chunk), keys);
-        push(&self.effects, Command::Wait(batch), "effects waiter");
+        self.effects.push(Command::Wait(batch), "effects waiter");
     }
 
     fn chunk_executed(&mut self, chunk: ChunkSettlement, bump: &mut Bump) {
@@ -321,8 +312,9 @@ impl SettlementScheduler {
             },
             settlements.iter().map(|d| EffectsKey(**d)),
         );
-        push(&self.inputs, Command::Wait(transactions), "input waiter");
-        push(&self.effects, Command::Wait(waits), "effects waiter");
+        self.inputs
+            .push(Command::Wait(transactions), "input waiter");
+        self.effects.push(Command::Wait(waits), "effects waiter");
         *self
             .pending
             .get_mut(&height)
@@ -365,8 +357,9 @@ impl SettlementScheduler {
             },
             [EffectsKey(*barrier)],
         );
-        push(&self.inputs, Command::Wait(transactions), "input waiter");
-        push(&self.effects, Command::Wait(waits), "effects waiter");
+        self.inputs
+            .push(Command::Wait(transactions), "input waiter");
+        self.effects.push(Command::Wait(waits), "effects waiter");
         *self
             .pending
             .get_mut(&height)
@@ -442,8 +435,7 @@ impl SettlementScheduler {
             checkpoint_seq: chunk.checkpoint_seq,
             effects: all,
         });
-        push(
-            &self.checkpoints,
+        self.checkpoints.push(
             Command::notify(vec![ChunkSettled(chunk.height)]),
             "checkpoint waiter",
         );
@@ -457,8 +449,7 @@ impl SettlementScheduler {
                 .into_iter()
                 .map(|account| (account, balance_at(&self.store, &account, root_version)))
                 .collect();
-            push(
-                &self.funds,
+            self.funds.push(
                 FundsCommand::Settle(vec![Settle::Settled {
                     balances,
                     version: AccumulatorVersion(chunk.version.0 + 1),
@@ -727,7 +718,7 @@ impl FundsReserver {
             }
         }
         if !released.is_empty() {
-            push(&self.inputs, Command::Resolve(released), "input waiter");
+            self.inputs.push(Command::Resolve(released), "input waiter");
         }
     }
 }

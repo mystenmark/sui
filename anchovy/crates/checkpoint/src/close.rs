@@ -29,7 +29,7 @@ use validator::pipeline::tables::CheckpointStore;
 use waiter::{Command, WaitBatch};
 use workqueue::{Processor, Queue};
 
-use crate::{contents_of, push, summary};
+use crate::{contents_of, summary};
 
 /// Passes each checkpoint on to `SummaryBuilder` once the previous one is
 /// built, but the epoch's last, which it closes:
@@ -129,8 +129,7 @@ impl EpochCloser {
             built.pending.timestamp_ms,
         );
         let digest = transaction.digest;
-        push(
-            &self.resolver,
+        self.resolver.push(
             Chunk {
                 version: close.version,
                 root_version: close.root_version,
@@ -155,7 +154,7 @@ impl EpochCloser {
             EffectsWaitItem::ChangeEpochExecuted,
             [EffectsKey(digest.into())],
         );
-        push(&self.effects, Command::Wait(wait), "effects waiter");
+        self.effects.push(Command::Wait(wait), "effects waiter");
         self.closing = Some(Closing {
             built,
             change_epoch: digest,
@@ -380,8 +379,7 @@ impl EpochCloser {
             &effects,
             bump,
         );
-        push(
-            &self.hasher,
+        self.hasher.push(
             CheckpointEffects {
                 seq,
                 effects,
@@ -430,7 +428,7 @@ impl EpochCloser {
             next_protocol_version: next.protocol_version,
             root_state_digest,
         }));
-        push(&self.summary, vec![built], "summary builder");
+        self.summary.push(vec![built], "summary builder");
     }
 }
 
@@ -450,7 +448,7 @@ impl Processor for EpochCloser {
                     }
                 }
                 if !passed.is_empty() {
-                    push(&self.summary, passed, "summary builder");
+                    self.summary.push(passed, "summary builder");
                 }
             }
             EpochCloserInput::ChangeEpochExecuted => self.executed(bump),
