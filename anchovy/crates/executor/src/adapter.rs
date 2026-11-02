@@ -12,7 +12,7 @@ use containers::{Bump, Vec};
 use exec_types::base::{EpochId, move_address};
 use exec_types::error::{ExecutionError, ExecutionErrorKind};
 use exec_types::make_invariant_violation;
-use exec_types::storage::{ObjectFundsResolver, RuntimeObjectResolver, SuiError};
+use exec_types::storage::{ImplicitSystemObjectResolver, RuntimeObjectResolver, SuiError};
 use exec_types::tx_context::TxContext;
 use messages::base::ObjectId;
 use move_binary_format::file_format::CompiledModule;
@@ -75,7 +75,7 @@ pub fn vm_config(protocol_config: &ProtocolConfig) -> VMConfig {
 pub fn new_native_extensions<'a>(
     bump: &'a Bump,
     child_resolver: &'a dyn RuntimeObjectResolver<'a>,
-    object_funds_resolver: &'a dyn ObjectFundsResolver,
+    system_object_resolver: &'a dyn ImplicitSystemObjectResolver<'a>,
     input_objects: Vec<'a, (ObjectId, object_runtime::InputObject<'a>)>,
     is_metered: bool,
     protocol_config: &'a ProtocolConfig,
@@ -94,7 +94,7 @@ pub fn new_native_extensions<'a>(
     exts.add(ObjectRuntime::new(
         bump,
         child_resolver,
-        object_funds_resolver,
+        system_object_resolver,
         input_objects,
         is_metered,
         protocol_config,

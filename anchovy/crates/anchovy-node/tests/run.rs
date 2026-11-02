@@ -7,6 +7,7 @@
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
+use sui_protocol_config::ProtocolVersion;
 use sui_swarm_config::network_config_builder::ConfigBuilder;
 
 const TIMEOUT: Duration = Duration::from_mins(2);
@@ -41,6 +42,9 @@ fn crash(runtime: &tokio::runtime::Runtime, running: anchovy_node::Running) {
 fn a_validator_runs_from_its_sui_config() {
     let network = ConfigBuilder::new_with_temp_dir()
         .committee_size(NonZeroUsize::new(1).unwrap())
+        .with_protocol_version(ProtocolVersion::new(
+            execution::upgrade::MAX_PROTOCOL_VERSION,
+        ))
         .build();
     let config = &network.validator_configs()[0];
     let runtime = tokio::runtime::Runtime::new().unwrap();
