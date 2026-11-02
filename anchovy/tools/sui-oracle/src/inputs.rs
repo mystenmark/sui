@@ -37,7 +37,9 @@ use sui_types::transaction::{
     ReceivingObjectReadResultKind, ReceivingObjects, SharedObjectMutability, TransactionData,
     TransactionDataAPI,
 };
-use sui_types::{SUI_CLOCK_OBJECT_ID, SUI_FRAMEWORK_ADDRESS};
+use sui_types::{
+    SUI_CLOCK_OBJECT_ID, SUI_FORWARDING_ADDRESS_REGISTRY_OBJECT_ID, SUI_FRAMEWORK_ADDRESS,
+};
 
 const RGP: u64 = 1000;
 const BUDGET: u64 = 50_000_000;
@@ -236,6 +238,7 @@ struct World {
     deleted: Object,
     to_receive: Object,
     clock: Object,
+    forwarding_address_registry: Object,
 }
 
 fn id(n: u8) -> ObjectID {
@@ -337,6 +340,21 @@ fn world(store: &mut Store) -> World {
         deleted,
         to_receive: coin(0x1e, Owner::AddressOwner(address(0x11)), SUI),
         clock,
+        // Only the ID and the owner matter to the checks.
+        forwarding_address_registry: {
+            let coin = MoveObject::new_gas_coin(
+                SequenceNumber::from_u64(1),
+                SUI_FORWARDING_ADDRESS_REGISTRY_OBJECT_ID,
+                SUI,
+            );
+            Object::new_move(
+                coin,
+                Owner::Shared {
+                    initial_shared_version: SequenceNumber::from_u64(1),
+                },
+                TransactionDigest::genesis_marker(),
+            )
+        },
     };
     for object in [
         &world.gas,
@@ -352,6 +370,7 @@ fn world(store: &mut Store) -> World {
         &world.child,
         &world.to_receive,
         &world.clock,
+        &world.forwarding_address_registry,
     ] {
         store.add(object.clone(), true);
     }
@@ -491,6 +510,14 @@ fn cases(w: &World) -> Vec<(&'static str, TransactionData)> {
         one("consensus_owned_as_owned", vec![owned(&w.consensus_owned)]),
         one("clock", vec![shared(&w.clock, 1, false)]),
         one("clock_mutably", vec![shared(&w.clock, 1, true)]),
+        one(
+            "forwarding_address_registry",
+            vec![shared(&w.forwarding_address_registry, 1, false)],
+        ),
+        one(
+            "forwarding_address_registry_mutably",
+            vec![shared(&w.forwarding_address_registry, 1, true)],
+        ),
         one(
             "stale_version",
             vec![CallArg::Object(ObjectArg::ImmOrOwnedObject(
