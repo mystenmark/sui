@@ -244,6 +244,16 @@ impl Dkg {
         &self.status
     }
 
+    /// Whether DKG, still pending, counts as timed out at leader `round`:
+    /// the reference's `dkg_status_for_commit_round`.
+    pub fn timed_out(config: &ProtocolConfig, round: u64) -> bool {
+        config.allow_dkg_completion_after_timeout() && Self::past_timeout(config, round)
+    }
+
+    fn past_timeout(config: &ProtocolConfig, round: u64) -> bool {
+        round > u64::from(config.random_beacon_dkg_timeout_round())
+    }
+
     /// The messages processed, by sender.
     pub fn processed(&self) -> impl Iterator<Item = &DkgMessage> {
         self.processed.iter().flatten()
@@ -280,7 +290,9 @@ impl Dkg {
         round: u64,
     ) -> DkgChanges {
         // Advancing on every commit while pending, as below, is this flag's
-        // rule; the older rule advanced only on commits with DKG traffic.
+        // rule; the older rule advanced only on commits with DKG traffic, as
+        // does `allow_dkg_completion_after_timeout`'s, under which a commit
+        // without traffic advances nothing.
         assert!(
             config.always_advance_dkg_to_resolution(),
             "DKG advances every commit"
@@ -356,8 +368,11 @@ impl Dkg {
                 self.status = DkgStatus::Successful(output.vss_pk);
             }
         }
+        // Once DKG may complete after its timeout, timing out is not an
+        // outcome: each commit derives it from its round (`timed_out`).
         if self.status == DkgStatus::Pending
-            && round > u64::from(config.random_beacon_dkg_timeout_round())
+            && !config.allow_dkg_completion_after_timeout()
+            && Self::past_timeout(config, round)
         {
             self.status = DkgStatus::Failed;
         }

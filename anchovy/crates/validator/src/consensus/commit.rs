@@ -319,17 +319,19 @@ impl CommitHandler {
 
     /// The reference's `init_randomness`, before the commit's DKG traffic:
     /// the commit's randomness round, if DKG succeeded and the last round's
-    /// commit was long enough ago, and whether DKG failed.
+    /// commit was long enough ago, and whether DKG failed or, at leader
+    /// `round`, timed out.
     fn reserve_randomness(
         &mut self,
         config: &ProtocolConfig,
         timestamp_ms: u64,
+        round: u64,
     ) -> (Option<u64>, bool) {
         let Some(randomness) = &mut self.randomness else {
             return (None, false);
         };
         match randomness.dkg.status() {
-            DkgStatus::Pending => (None, false),
+            DkgStatus::Pending => (None, Dkg::timed_out(config, round)),
             DkgStatus::Failed => (None, true),
             DkgStatus::Successful(_) => {
                 if randomness.last_round_ms.is_some_and(|last| {
@@ -486,7 +488,8 @@ impl CommitHandler {
         // The reference's `observe_commit`, before anything is estimated.
         self.observe_prior(config, commit.timestamp_ms);
         // The commit's randomness round, as DKG stood before its traffic.
-        let (randomness_round, dkg_failed) = self.reserve_randomness(config, commit.timestamp_ms);
+        let (randomness_round, dkg_failed) =
+            self.reserve_randomness(config, commit.timestamp_ms, round);
         let randomness_deferrable = self.randomness.is_some() && randomness_round.is_none();
         self.handle_dkg(config, commit.dkg, round);
 
