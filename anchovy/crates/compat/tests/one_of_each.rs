@@ -1905,9 +1905,13 @@ fn the_composite_workload_runs_alike() {
     use sui_benchmark::workloads::workload_configuration::{
         WorkloadConfig, WorkloadConfiguration, WorkloadWeights,
     };
-    use sui_benchmark::{BenchmarkProxyMetrics, FullNodeProxy, ValidatorProxy};
+    use sui_benchmark::{
+        BenchmarkProxyMetrics, FullNodeProxy, LocalValidatorAggregatorProxy, ValidatorProxy,
+    };
 
-    let mut network = Network::new();
+    // Two epochs end under load. The workload's transactions are valid for
+    // the epoch its observer last read and the next, and it reads every 60 s.
+    let mut network = Network::with_epoch_duration(Some(61_000));
     let config = FullnodeConfigBuilder::new().build(&mut OsRng, &network.config);
     let rpc_url = format!("http://{}", config.json_rpc_address);
     let full_node = sui_swarm::memory::Node::new(config);
@@ -1955,7 +1959,7 @@ fn the_composite_workload_runs_alike() {
         Arc::new(network.key.copy()),
     );
     let genesis = network.config.genesis.clone();
-    let bench = network.runtime.block_on(async move {
+    let workload = network.runtime.spawn(async move {
         let registry = prometheus::Registry::new();
         let proxy_metrics = BenchmarkProxyMetrics::new(&registry);
         // Its RPC answers once its index has committed a checkpoint.
@@ -1970,10 +1974,14 @@ fn the_composite_workload_runs_alike() {
                 Err(e) => panic!("the full node's RPC: {e:?}"),
             }
         };
-        let proxy: Arc<dyn ValidatorProxy + Send + Sync> = Arc::new(proxy);
-        let bank = BenchmarkBank::new(proxy.clone(), vec![proxy.clone()], primary);
+        let full_node: Arc<dyn ValidatorProxy + Send + Sync> = Arc::new(proxy);
+        // Submits to the validators, anchovy among them, as sui's clients do.
+        let proxy: Arc<dyn ValidatorProxy + Send + Sync> = Arc::new(
+            LocalValidatorAggregatorProxy::from_genesis(&genesis, &rpc_url, &proxy_metrics).await,
+        );
+        let bank = BenchmarkBank::new(proxy.clone(), vec![full_node.clone()], primary);
         // Its first state has the reference gas price.
-        let mut observer = SystemStateObserver::new(proxy.clone());
+        let mut observer = SystemStateObserver::new(full_node.clone());
         observer.state.changed().await.unwrap();
         let observer = Arc::new(observer);
         let config = WorkloadConfig {
@@ -2023,18 +2031,24 @@ fn the_composite_workload_runs_alike() {
                 .unwrap();
         let (bench, _) = BenchDriver::new(5, false)
             .run(
-                vec![proxy.clone()],
                 vec![proxy],
+                vec![full_node],
                 workloads,
                 observer,
                 &registry,
                 false,
-                Interval::Time(Duration::from_mins(1)),
+                Interval::Time(Duration::from_mins(2)),
             )
             .await
             .unwrap();
         bench
     });
+    // Anchovy moves into each next epoch only as it is polled.
+    while !workload.is_finished() {
+        network.anchovy.poll();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let bench = network.runtime.block_on(workload).unwrap();
     tracing::info!(?bench, "composite workload done");
 
     // Anchovy certifies whatever the quorum certified by now.
@@ -2046,6 +2060,7 @@ fn the_composite_workload_runs_alike() {
         .map(|c| *c.sequence_number())
         .unwrap();
     network.wait_for_certified(last);
+    assert!(network.anchovy.epoch() >= 2, "epochs ended under load");
 
     let metrics = metrics.lock().unwrap();
     let sum = metrics.sum_all();
