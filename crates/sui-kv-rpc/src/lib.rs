@@ -6,13 +6,16 @@ use std::sync::Arc;
 
 use prometheus::HistogramVec;
 use prometheus::IntCounterVec;
+use prometheus::IntGauge;
 use prometheus::Registry;
 use prometheus::register_histogram_vec_with_registry;
 use prometheus::register_int_counter_vec_with_registry;
+use prometheus::register_int_gauge_with_registry;
 use sui_kvstore::BITMAP_INDEX_PIPELINE;
 use sui_kvstore::BigTableClient;
 use sui_kvstore::CHECKPOINTS_BY_DIGEST_PIPELINE;
 use sui_kvstore::CHECKPOINTS_PIPELINE;
+pub use sui_kvstore::ChannelHealthConfig;
 use sui_kvstore::EPOCH_END_PIPELINE;
 use sui_kvstore::EPOCH_START_PIPELINE;
 use sui_kvstore::EVENT_BITMAP_INDEX_PIPELINE;
@@ -21,6 +24,7 @@ use sui_kvstore::OBJECTS_PIPELINE;
 use sui_kvstore::PACKAGES_BY_ID_PIPELINE;
 use sui_kvstore::PACKAGES_PIPELINE;
 pub use sui_kvstore::PoolConfig;
+pub use sui_kvstore::ReadRowsRetryConfig;
 use sui_kvstore::TRANSACTIONS_PIPELINE;
 use sui_kvstore::TX_SEQ_DIGEST_PIPELINE;
 use sui_package_resolver::PackageStore;
@@ -34,22 +38,28 @@ use sui_rpc::proto::sui::rpc::v2::move_package_service_server::MovePackageServic
 use sui_rpc_api::ServerVersion;
 use sui_types::digests::ChainIdentifier;
 use sui_types::message_envelope::Message;
-use tokio::sync::RwLock;
+use tokio::sync::watch;
 use tokio::time::Duration;
 use tokio::time::sleep;
 use tonic::transport::Identity;
 use tonic::transport::Server;
 use tonic::transport::ServerTlsConfig;
+use tonic::transport::server::TcpIncoming;
 use tracing::error;
 
 mod bigtable_client;
 mod config;
+mod error_log;
+mod indexer_streams;
+mod monotonic_read;
 mod object_cache;
 mod operation;
 mod package_store;
 mod pipeline;
 mod render;
+mod request_cache;
 mod resolve;
+mod served_height;
 mod v2;
 
 use bigtable_client::Metrics as BigTableLimiterMetrics;
@@ -61,6 +71,9 @@ pub use config::ResolvedLedgerHistoryMethodConfig;
 pub use config::ResolvedStageConfig;
 pub use config::StageConfig;
 pub use config::StagesConfig;
+pub use indexer_streams::WatermarkSource;
+use monotonic_read::MonotonicReadLayer;
+pub use monotonic_read::X_SUI_MIN_CHECKPOINT;
 use package_store::BigTablePackageStore;
 
 /// Pipelines whose watermarks always bound the `GetServiceInfo` checkpoint
@@ -76,9 +89,9 @@ pub const DEFAULT_SERVICE_INFO_WATERMARK_PIPELINES: [&str; 8] = [
     PACKAGES_BY_ID_PIPELINE,
 ];
 
-/// Pipelines that only back the List APIs. Folded into the `GetServiceInfo`
-/// watermark set when the List APIs are enabled, so an instance whose indexer
-/// has not caught up on them does not advertise a height it cannot serve.
+/// Pipelines that only back the List APIs. Part of the `GetServiceInfo`
+/// watermark set, so an instance whose indexer has not caught up on them does
+/// not advertise a height it cannot serve.
 pub const LIST_API_SERVICE_INFO_WATERMARK_PIPELINES: [&str; 3] = [
     TX_SEQ_DIGEST_PIPELINE,
     BITMAP_INDEX_PIPELINE,
@@ -99,6 +112,8 @@ pub(crate) struct KvRpcMetrics {
     bitmap_buckets_evaluated: HistogramVec,
     bitmap_buckets_discarded: HistogramVec,
     bitmap_leaf_seeks: HistogramVec,
+    served_checkpoint: IntGauge,
+    served_checkpoint_timestamp_ms: IntGauge,
 }
 
 impl KvRpcMetrics {
@@ -154,7 +169,7 @@ impl KvRpcMetrics {
             .unwrap(),
             bitmap_buckets_evaluated: register_histogram_vec_with_registry!(
                 "kv_rpc_bitmap_buckets_evaluated",
-                "Buckets evaluated against the per-request bitmap scan budget. Caps at the configured budget; actual backend bucket reads may exceed it by up to max_bitmap_filter_literals (one extra fetched-and-discarded bucket per leaf stream at exhaustion). Tail near the per-request cap means clients are hitting SCAN_LIMIT and paging.",
+                "Buckets evaluated against the per-request bitmap scan budget. Caps at the effective budget (the configured budget, raised to the query's unique leaf count when that is larger); actual backend bucket reads may exceed it by up to the number of Bigtable-backed leaves (one extra fetched-and-discarded bucket per leaf stream at exhaustion; at most twice max_bitmap_filter_literals). Tail near the per-request cap means clients are hitting SCAN_LIMIT and paging.",
                 &["method"],
                 // Exponential 1..2048: many requests evaluate few buckets
                 // (small or empty scans), a tail saturates at the default 1k cap.
@@ -178,7 +193,30 @@ impl KvRpcMetrics {
                 registry,
             )
             .unwrap(),
+            served_checkpoint: register_int_gauge_with_registry!(
+                "kv_rpc_served_checkpoint",
+                "Highest checkpoint this replica serves: the checkpoint height GetServiceInfo reports, i.e. the lowest checkpoint_hi_inclusive across the watermarks of the pipelines this replica serves. The watermarks are read from Bigtable's watermark rows, or, when indexer-urls lists any indexer, are the highest each pipeline has reached in the kvstore indexers' watermark streams. Set in the background, so it is reported without request traffic. Keeps its last value while Bigtable reads fail or every indexer stream is down. It is 0 until the first successful refresh: when polling, the first Bigtable read that returns a readable watermark for every served pipeline; when following indexers, the first time every served pipeline has a streamed watermark.",
+                registry,
+            )
+            .unwrap(),
+            served_checkpoint_timestamp_ms: register_int_gauge_with_registry!(
+                "kv_rpc_served_checkpoint_timestamp_ms",
+                "Consensus timestamp (Unix ms) of kv_rpc_served_checkpoint, read from the same watermark; time() - value / 1000 is how stale this replica's data is. Set together with kv_rpc_served_checkpoint, so it is reported without request traffic, keeps its last value whenever that gauge does, and is 0 until that gauge's first successful refresh.",
+                registry,
+            )
+            .unwrap(),
         })
+    }
+
+    /// Record the checkpoint `info` (a `GetServiceInfo` answer) says this replica serves.
+    fn observe_served_service_info(&self, info: &GetServiceInfoResponse) {
+        if let Some(checkpoint) = info.checkpoint_height {
+            self.served_checkpoint.set(checkpoint as i64);
+        }
+        if let Some(timestamp) = &info.timestamp {
+            self.served_checkpoint_timestamp_ms
+                .set(timestamp.seconds * 1_000 + i64::from(timestamp.nanos) / 1_000_000);
+        }
     }
 
     fn observe_response_render(
@@ -266,17 +304,38 @@ pub struct KvRpcServer {
     client: BigTableClient,
     server_version: Option<ServerVersion>,
     service_info_watermark_pipelines: Vec<&'static str>,
-    cache: Arc<RwLock<Option<GetServiceInfoResponse>>>,
+    /// Latest service info this replica serves, `None` until the first successful refresh.
+    /// Refreshed from Bigtable's watermark rows by the task spawned in
+    /// [`KvRpcServer::init`], or from indexer watermark streams by the service started in
+    /// [`KvRpcServer::start_service`], as `watermark_source` selects.
+    /// A `watch` channel so a monotonic read can await a refresh rather than poll for one.
+    cache: Arc<watch::Sender<Option<GetServiceInfoResponse>>>,
+    watermark_source: WatermarkSource,
     package_resolver: PackageResolver,
     metrics: Arc<KvRpcMetrics>,
     pub(crate) ledger_history: LedgerHistoryConfig,
     pub(crate) request_bigtable_concurrency: usize,
+    pub(crate) monotonic_read_wait_timeout: Duration,
     pub(crate) stages: StagesConfig,
-    // The list RPCs are part of the stable v2 LedgerService, but serving them
-    // needs the pipelines in [`LIST_API_SERVICE_INFO_WATERMARK_PIPELINES`].
-    // Instances that do not index them reject list requests with
-    // `Unimplemented`.
-    list_apis_enabled: bool,
+}
+
+/// Answers whether a replica is ready for traffic, for its `/health` endpoint.
+#[derive(Clone)]
+pub struct Health {
+    /// The replica's service info when readiness waits for it, or `None` for a replica that
+    /// polls Bigtable, which is ready from startup.
+    served: Option<watch::Receiver<Option<GetServiceInfoResponse>>>,
+}
+
+impl Health {
+    /// Whether the replica is ready. A replica that follows indexer watermark streams is ready
+    /// once every served pipeline has a streamed watermark, and stays ready after that, because
+    /// its served checkpoint is never cleared. A replica that polls Bigtable is always ready.
+    pub fn is_ready(&self) -> bool {
+        self.served
+            .as_ref()
+            .is_none_or(|served| served.borrow().is_some())
+    }
 }
 
 /// Optional configuration for the gRPC server (TLS, metrics, reflection, and
@@ -335,7 +394,16 @@ fn spawn_listener(
                 grpc_method_allowlist,
             ),
         ))
+        // Logs each response that ends in a server-side error; outside the monotonic-read layer so
+        // its rejections are logged too.
+        .layer(CallbackLayer::new(error_log::MakeServerErrorLog))
         .layer(request_log_layer)
+        // Innermost, so a request held or rejected here is still counted by the metrics layer and
+        // recorded by the request log above it.
+        .layer(MonotonicReadLayer::new(
+            ledger.cache.subscribe(),
+            ledger.monotonic_read_wait_timeout,
+        ))
         .add_service(move_package_service_with_response_compression(
             ledger.clone(),
         ))
@@ -354,8 +422,21 @@ fn spawn_listener(
             .add_service(reflection_v1alpha_builder.build_v1alpha()?);
     }
 
+    // Bind here rather than inside the spawned task. `serve_with_shutdown` binds
+    // within the future it returns, so the caller would get a `Service` back while
+    // the address still refuses connections, and anything that dials immediately
+    // races the bind. Binding first also turns an unusable address into an error
+    // from `start_service` instead of a task that dies after start-up.
+    //
+    // `serve_with_incoming_shutdown` discards the builder's TCP configuration, so
+    // restate the `TCP_NODELAY` that `serve_with_shutdown` would have applied from
+    // its default. Keepalive stays off, which is also tonic's default.
+    let incoming = TcpIncoming::bind(listen_address)
+        .map_err(|e| anyhow::anyhow!("Failed to bind kv-rpc listener on {listen_address}: {e}"))?
+        .with_nodelay(Some(true));
+
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let server_future = router.serve_with_shutdown(listen_address, async {
+    let server_future = router.serve_with_incoming_shutdown(incoming, async {
         let _ = rx.await;
     });
 
@@ -379,10 +460,12 @@ impl KvRpcServer {
         registry: &Registry,
         credentials_path: Option<String>,
         pool_config: PoolConfig,
+        read_rows_retry: ReadRowsRetryConfig,
         ledger_history: LedgerHistoryConfig,
         request_bigtable_concurrency: usize,
+        monotonic_read_wait_timeout: Duration,
         stages: StagesConfig,
-        enable_list_apis: bool,
+        watermark_source: WatermarkSource,
     ) -> anyhow::Result<Self> {
         ledger_history.validate()?;
         let mut client = BigTableClient::new_remote_with_credentials(
@@ -398,7 +481,8 @@ impl KvRpcServer {
             credentials_path,
             false,
         )
-        .await?;
+        .await?
+        .with_read_rows_retry(read_rows_retry);
         let genesis = client
             .get_checkpoints(&[0])
             .await?
@@ -411,11 +495,12 @@ impl KvRpcServer {
             client,
             chain_id,
             server_version,
-            enable_list_apis,
             metrics,
             ledger_history,
             request_bigtable_concurrency,
+            monotonic_read_wait_timeout,
             stages,
+            watermark_source,
         )
     }
 
@@ -431,24 +516,26 @@ impl KvRpcServer {
             server_version,
             LedgerHistoryConfig::default(),
             KvRpcConfig::default().request_bigtable_concurrency(),
+            KvRpcConfig::default().monotonic_read_wait_timeout(),
             StagesConfig::default(),
-            false,
+            WatermarkSource::Bigtable,
         )
         .await
     }
 
     /// Construct a KvRpcServer backed by a local BigTable emulator with explicit
     /// ledger-history and per-stage configuration. Tests use this to exercise
-    /// scan-budget / chunk-size behaviour (e.g. a small `tx_seq_digest` chunk
-    /// size) against a modest synthetic dataset.
+    /// scan-budget / read-size behaviour (e.g. small `tx_seq_digest` reads)
+    /// against a modest synthetic dataset.
     pub async fn new_local_with_config(
         host: String,
         instance_id: String,
         server_version: Option<ServerVersion>,
         ledger_history: LedgerHistoryConfig,
         request_bigtable_concurrency: usize,
+        monotonic_read_wait_timeout: Duration,
         stages: StagesConfig,
-        enable_list_apis: bool,
+        watermark_source: WatermarkSource,
     ) -> anyhow::Result<Self> {
         let client = BigTableClient::new_local(host, instance_id).await?;
         // Emulator/test path: metrics are inert (no scrape endpoint), but the
@@ -458,11 +545,12 @@ impl KvRpcServer {
             client,
             ChainIdentifier::from(sui_types::digests::CheckpointDigest::default()),
             server_version,
-            enable_list_apis,
             metrics,
             ledger_history,
             request_bigtable_concurrency,
+            monotonic_read_wait_timeout,
             stages,
+            watermark_source,
         )
     }
 
@@ -470,15 +558,16 @@ impl KvRpcServer {
         client: BigTableClient,
         chain_id: ChainIdentifier,
         server_version: Option<ServerVersion>,
-        enable_list_apis: bool,
         metrics: Arc<KvRpcMetrics>,
         ledger_history: LedgerHistoryConfig,
         request_bigtable_concurrency: usize,
+        monotonic_read_wait_timeout: Duration,
         stages: StagesConfig,
+        watermark_source: WatermarkSource,
     ) -> anyhow::Result<Self> {
         ledger_history.validate()?;
 
-        let cache = Arc::new(RwLock::new(None));
+        let cache = Arc::new(watch::Sender::new(None));
 
         let package_store: Arc<dyn PackageStore> = Arc::new(PackageStoreWithLruCache::new(
             BigTablePackageStore::new(client.clone()),
@@ -489,51 +578,53 @@ impl KvRpcServer {
             chain_id,
             client,
             server_version,
-            service_info_watermark_pipelines: service_info_watermark_pipelines(enable_list_apis),
+            service_info_watermark_pipelines: service_info_watermark_pipelines(),
             cache,
+            watermark_source,
             package_resolver,
             metrics,
             ledger_history,
             request_bigtable_concurrency,
+            monotonic_read_wait_timeout,
             stages,
-            list_apis_enabled: enable_list_apis,
         };
 
-        let server_clone = server.clone();
-        tokio::spawn(async move {
-            loop {
-                match v2::get_service_info(
-                    server_clone.client.clone(),
-                    server_clone.chain_id,
-                    server_clone.server_version.clone(),
-                    &server_clone.service_info_watermark_pipelines,
-                )
-                .await
-                {
-                    Ok(info) => {
-                        let mut cache = server_clone.cache.write().await;
-                        *cache = Some(info);
+        if server.watermark_source == WatermarkSource::Bigtable {
+            let server_clone = server.clone();
+            tokio::spawn(async move {
+                loop {
+                    match v2::get_service_info(
+                        server_clone.client.clone(),
+                        server_clone.chain_id,
+                        server_clone.server_version.clone(),
+                        &server_clone.service_info_watermark_pipelines,
+                    )
+                    .await
+                    {
+                        Ok(info) => {
+                            server_clone.metrics.observe_served_service_info(&info);
+                            server_clone.cache.send_replace(Some(info));
+                        }
+                        Err(e) => error!("Failed to update service info cache: {:?}", e),
                     }
-                    Err(e) => error!("Failed to update service info cache: {:?}", e),
+                    sleep(Duration::from_millis(10)).await;
                 }
-                sleep(Duration::from_millis(10)).await;
-            }
-        });
+            });
+        }
 
         Ok(server)
     }
 
-    pub(crate) fn check_list_apis_enabled(&self) -> Result<(), tonic::Status> {
-        if self.list_apis_enabled {
-            Ok(())
-        } else {
-            Err(tonic::Status::unimplemented(
-                "the List APIs are not enabled on this instance",
-            ))
+    /// The readiness this replica reports on its `/health` endpoint.
+    pub fn health(&self) -> Health {
+        Health {
+            served: matches!(self.watermark_source, WatermarkSource::IndexerStreams(_))
+                .then(|| self.cache.subscribe()),
         }
     }
 
-    /// Start this server as a tonic gRPC service on the given address.
+    /// Start this server as a tonic gRPC service on the given address, and start following the
+    /// indexer watermark streams if `watermark_source` names them.
     /// Returns a `Service` handle for lifecycle management.
     pub async fn start_service(
         self,
@@ -541,6 +632,15 @@ impl KvRpcServer {
         config: ServerConfig,
     ) -> anyhow::Result<sui_futures::service::Service> {
         use sui_rpc_api::{RpcMetrics, grpc_method_paths_from_file_descriptor_sets};
+
+        // Started before the listeners, so that an invalid indexer URL fails startup before any
+        // address is bound.
+        let indexer_streams = match &self.watermark_source {
+            WatermarkSource::Bigtable => None,
+            WatermarkSource::IndexerStreams(indexer_urls) => {
+                Some(indexer_streams::follow(&self, indexer_urls)?)
+            }
+        };
 
         // Single source of truth for every encoded FileDescriptorSet that
         // backs a gRPC service mounted below. Consumed by both the
@@ -606,17 +706,141 @@ impl KvRpcServer {
             service = service.merge(plaintext_service);
         }
 
+        if let Some(indexer_streams) = indexer_streams {
+            service = service.attach(indexer_streams);
+        }
+
         Ok(service)
     }
 }
 
 /// Pipelines whose watermarks bound the checkpoint height reported by
-/// `GetServiceInfo`: the always-served set, plus the List API pipelines when
-/// those APIs are enabled.
-pub fn service_info_watermark_pipelines(enable_list_apis: bool) -> Vec<&'static str> {
+/// `GetServiceInfo`: the always-served set, plus the List API pipelines.
+pub fn service_info_watermark_pipelines() -> Vec<&'static str> {
     let mut pipelines = DEFAULT_SERVICE_INFO_WATERMARK_PIPELINES.to_vec();
-    if enable_list_apis {
-        pipelines.extend_from_slice(&LIST_API_SERVICE_INFO_WATERMARK_PIPELINES);
-    }
+    pipelines.extend_from_slice(&LIST_API_SERVICE_INFO_WATERMARK_PIPELINES);
     pipelines
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use sui_kvstore::WatermarkV1;
+    use sui_kvstore::tables::watermarks;
+    use sui_kvstore::testing::MockBigtableServer;
+    use tokio::time::timeout;
+
+    use super::*;
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    fn u64_be(value: u64) -> Bytes {
+        Bytes::copy_from_slice(&value.to_be_bytes())
+    }
+
+    /// Number of reads the mock has served from the watermarks table.
+    pub(crate) async fn watermark_reads(mock: &MockBigtableServer) -> usize {
+        mock.read_rows_calls()
+            .await
+            .iter()
+            .filter(|call| call.table == watermarks::NAME)
+            .count()
+    }
+
+    async fn wait_for_served_checkpoint(server: &KvRpcServer, checkpoint: i64) {
+        timeout(WAIT, async {
+            while server.metrics.served_checkpoint.get() != checkpoint {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("served checkpoint never reached {checkpoint}"));
+    }
+
+    #[tokio::test]
+    async fn polling_replica_is_healthy_before_its_first_refresh() {
+        let mock = MockBigtableServer::new();
+        let (addr, _mock_server) = mock.start().await.expect("start mock BigTable");
+        // Without watermark rows no refresh succeeds, so the served checkpoint stays unknown.
+        let server = KvRpcServer::new_local(addr.to_string(), "test".to_string(), None)
+            .await
+            .expect("start kv-rpc server");
+        sleep(Duration::from_millis(50)).await;
+        assert!(server.cache.borrow().is_none());
+        assert!(server.health().is_ready());
+    }
+
+    #[tokio::test]
+    async fn served_checkpoint_gauges_follow_refresh_and_survive_failed_refresh() {
+        let mock = MockBigtableServer::new();
+        let (addr, _mock_server) = mock.start().await.expect("start mock BigTable");
+        let mut client = BigTableClient::new_local(addr.to_string(), "test".to_string())
+            .await
+            .expect("connect to mock BigTable");
+
+        // The objects pipeline lags, so it bounds the served checkpoint, and the timestamp must
+        // come from its watermark rather than from a pipeline that is further ahead.
+        for pipeline in service_info_watermark_pipelines() {
+            let checkpoint = if pipeline == OBJECTS_PIPELINE { 20 } else { 25 };
+            client
+                .create_pipeline_watermark_if_absent(
+                    pipeline,
+                    &WatermarkV1 {
+                        epoch_hi_inclusive: 0,
+                        checkpoint_hi_inclusive: Some(checkpoint),
+                        tx_hi: 0,
+                        timestamp_ms_hi_inclusive: checkpoint * 1_000,
+                        reader_lo: 0,
+                        pruner_hi: 0,
+                        pruner_timestamp_ms: 0,
+                        bucket_start_cp: None,
+                    },
+                )
+                .await
+                .expect("seed watermark");
+        }
+
+        let server = KvRpcServer::new_local(addr.to_string(), "test".to_string(), None)
+            .await
+            .expect("start kv-rpc server");
+        timeout(WAIT, server.cache.subscribe().wait_for(Option::is_some))
+            .await
+            .expect("service info never refreshed")
+            .expect("service info sender dropped");
+        assert_eq!(server.metrics.served_checkpoint.get(), 20);
+        assert_eq!(server.metrics.served_checkpoint_timestamp_ms.get(), 20_000);
+
+        // Hide the objects watermark (checkpoint_hi_inclusive < reader_lo), so every refresh
+        // fails. Once a second watermark read arrives, the refresh behind the first has finished.
+        let objects_key = Bytes::from(watermarks::encode_key(OBJECTS_PIPELINE));
+        mock.insert_row(
+            watermarks::NAME,
+            objects_key.clone(),
+            [(watermarks::col::READER_LO, u64_be(21))],
+        )
+        .await;
+        mock.clear_read_rows_calls().await;
+        timeout(WAIT, async {
+            while watermark_reads(&mock).await < 2 {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("service info refresh stopped polling");
+        assert_eq!(server.metrics.served_checkpoint.get(), 20);
+        assert_eq!(server.metrics.served_checkpoint_timestamp_ms.get(), 20_000);
+
+        // Once the objects pipeline catches up past the others, they bound the served checkpoint.
+        mock.insert_row(
+            watermarks::NAME,
+            objects_key,
+            [
+                (watermarks::col::CHECKPOINT_HI, u64_be(30)),
+                (watermarks::col::TIMESTAMP_MS_HI, u64_be(30_000)),
+            ],
+        )
+        .await;
+        wait_for_served_checkpoint(&server, 25).await;
+        assert_eq!(server.metrics.served_checkpoint_timestamp_ms.get(), 25_000);
+    }
 }

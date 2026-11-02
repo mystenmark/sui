@@ -38,7 +38,7 @@ pub use mysten_common::assert_reachable_simtest;
 
 /// The minimum and maximum protocol versions supported by this build.
 const MIN_PROTOCOL_VERSION: u64 = 1;
-const MAX_PROTOCOL_VERSION: u64 = 138;
+const MAX_PROTOCOL_VERSION: u64 = 141;
 
 const TESTNET_USDC: &str =
     "0xa1ec7fc00a6f40db9693ad1415d0c193ad3906494428cf252621037bd7117e29::usdc::USDC";
@@ -76,7 +76,7 @@ const MAINNET_USDB: &str =
 //            hash module bytes individually before computing package digest.
 // Version 8: Disallow changing abilities and type constraints for type parameters in structs
 //            during upgrades.
-// Version 9: Limit the length of Move idenfitiers to 128.
+// Version 9: Limit the length of Move identifiers to 128.
 //            Disallow extraneous module bytes,
 //            advance_to_highest_supported_protocol_version,
 // Version 10:increase bytecode verifier `max_verifier_meter_ticks_per_function` and
@@ -410,6 +410,27 @@ const MAINNET_USDB: &str =
 // Version 138: Enable BumpOnly
 //              Enable check_object_funds_withdraw_in_execution on testnet.
 //              Disable effects transaction dependencies on testnet.
+//              Enable allowances on mainnet.
+//              Merge colliding deferred-transaction entries in the consensus handler
+//              instead of overwriting (which stranded the displaced transactions).
+//              Reduce the non-refundable storage fee from 1% to 0.01% on mainnet.
+// Version 139: Enable forwarding addresses on devnet.
+//              Enable ML-DSA-65 account signatures on devnet.
+//              Reduce the non-refundable storage fee from 1% to 0.01%.
+//              Allow random beacon DKG to complete after its timeout on devnet and testnet.
+//              Charge package inputs 1% of the per-byte object read cost.
+// Version 140: Add native vector bulk operations (keep_range, copy_range, replace_range
+//              and reverse) and their gas costs.
+//              Shuffle the block order within each round of a consensus commit on devnet.
+//              Disable the ID leak verifier.
+//              Enable check_object_funds_withdraw_in_execution on mainnet.
+//              Disable effects transaction dependencies on mainnet.
+//              Add the staggered-submission duplication signal thresholds.
+// Version 141: Abort with EInvalidVerifyingKey in groth16::verify_groth16_proof when the
+//              prepared verifying key length does not match the number of public inputs.
+//              Add `sui::clock::borrow`, which references the Clock without a Clock input.
+//              Add the `object::is_shared_input_impl` native and its cost.
+//              Reject an overflowing x-coordinate in `secp256r1_ecrecover`.
 
 #[derive(Copy, Clone, Debug, Hash, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ProtocolVersion(u64);
@@ -803,6 +824,15 @@ struct FeatureFlags {
     #[serde(skip_serializing_if = "is_false")]
     passkey_auth: bool,
 
+    // Enable ML-DSA-65 (FIPS 204) account signatures, standalone and as
+    // multisig members.
+    #[serde(skip_serializing_if = "is_false")]
+    mldsa65_auth: bool,
+
+    // Reject an overflowing x-coordinate r + n in `secp256r1_ecrecover` instead of wrapping it.
+    #[serde(skip_serializing_if = "is_false")]
+    secp256r1_ecrecover_checks_x_below_p: bool,
+
     // Use AuthorityCapabilitiesV2
     #[serde(skip_serializing_if = "is_false")]
     authority_capabilities_v2: bool,
@@ -1049,6 +1079,10 @@ struct FeatureFlags {
     #[serde(skip_serializing_if = "is_false")]
     always_advance_dkg_to_resolution: bool,
 
+    // If true, keep DKG pending after its timeout so that it can complete later in the epoch.
+    #[serde(skip_serializing_if = "is_false")]
+    allow_dkg_completion_after_timeout: bool,
+
     // Enable coin registry protocol
     #[serde(skip_serializing_if = "is_false")]
     enable_coin_registry: bool,
@@ -1149,6 +1183,10 @@ struct FeatureFlags {
     #[serde(skip_serializing_if = "is_false")]
     create_forwarding_address_registry: bool,
 
+    // If true, resolve forwarding addresses through the forwarding address registry.
+    #[serde(skip_serializing_if = "is_false")]
+    enable_forwarding_addresses: bool,
+
     // Corrects signature-to-signer mapping in CheckpointContentsV2.
     // Deprecated: must always be set to `true`.
     #[serde(skip_serializing_if = "is_false")]
@@ -1214,6 +1252,15 @@ struct FeatureFlags {
     #[serde(skip_serializing_if = "is_false")]
     allowed_proposers: bool,
 
+    // If true, validators turn on staggered submission when commits show too many
+    // duplicate copies of transactions without allowed proposers. Requires
+    // `allowed_proposers`. This flag coordinates the rollout across validators.
+    // `NodeConfig::enable_staggered_submission_signal` lets an operator disable it on
+    // one node. Staggering runs only when both are enabled.
+    #[serde(skip_serializing_if = "is_false")]
+    #[skip_protocol_config_accessor]
+    staggered_submission_signal: bool,
+
     #[serde(skip_serializing_if = "is_false")]
     randomize_checkpoint_tx_limit_in_tests: bool,
 
@@ -1254,6 +1301,12 @@ struct FeatureFlags {
     // MAX_PUBLIC_INPUTS public inputs.
     #[serde(skip_serializing_if = "is_false")]
     limit_groth16_pvk_inputs: bool,
+
+    // If true, groth16::verify_groth16_proof checks that the prepared verifying key has the
+    // length implied by the number of public inputs, and aborts with EInvalidVerifyingKey if it
+    // does not.
+    #[serde(skip_serializing_if = "is_false")]
+    check_groth16_pvk_length: bool,
 
     // If true, the funds-accumulator address-balance change invariant
     // (`TemporaryStore::check_address_balance_changes`) is enforced as a consensus check —
@@ -1297,6 +1350,23 @@ struct FeatureFlags {
     // Keep the effects wire representation, but stop collecting transaction dependencies.
     #[serde(skip_serializing_if = "is_false")]
     disable_effects_tx_dependencies: bool,
+
+    // If true, a deferred-transaction key collision in the consensus commit handler
+    // merges the colliding entries instead of overwriting the existing one, which
+    // silently dropped the displaced (finalized) transactions.
+    #[serde(skip_serializing_if = "is_false")]
+    merge_colliding_deferrals: bool,
+
+    // If true, consensus orders the blocks of each committed sub-dag within a round by a hash
+    // seeded from the leader block's digest, instead of by authority index. Rounds stay in
+    // ascending order, and transactions within a block keep their relative order.
+    #[serde(skip_serializing_if = "is_false")]
+    shuffle_consensus_commit_blocks: bool,
+
+    // If true, skip the Sui ID leak verifier, allowing an existing `UID` to be used as an objects
+    // id.
+    #[serde(skip_serializing_if = "is_false")]
+    disable_id_leak_verifier: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -1686,6 +1756,10 @@ pub struct ProtocolConfig {
     // Per-byte cost of reading an object during transaction execution
     obj_access_cost_read_per_byte: Option<u64>,
 
+    // Cost per KiB (1,024 bytes) of reading a non-system package input. When unset, packages are
+    // charged `obj_access_cost_read_per_byte` like other input objects.
+    obj_access_cost_read_per_package_kb: Option<u64>,
+
     // Per-byte cost of writing an object during transaction execution
     obj_access_cost_mutate_per_byte: Option<u64>,
 
@@ -1846,6 +1920,8 @@ pub struct ProtocolConfig {
     // Cost params for the Move native function
     // `record_new_uid_from_hash(parent: address, bytes: address)`
     object_record_new_uid_from_hash_cost_base: Option<u64>,
+    // Cost params for the Move native function `is_shared_input_impl(id: address): bool`
+    object_is_shared_input_cost_base: Option<u64>,
 
     // Transfer
     // Cost params for the Move native function `transfer_impl<T: key>(obj: T, recipient: address)`
@@ -1875,6 +1951,10 @@ pub struct ProtocolConfig {
     tx_context_gas_budget_cost_base: Option<u64>,
     tx_context_ids_created_cost_base: Option<u64>,
     tx_context_replace_cost_base: Option<u64>,
+
+    // `clock` module
+    // Cost params for the Move native function `native_borrow(): &Clock`
+    clock_borrow_cost_base: Option<u64>,
 
     // Types
     // Cost params for the Move native function `is_one_time_witness<T: drop>(_: &T): bool`
@@ -2074,6 +2154,14 @@ pub struct ProtocolConfig {
     vector_pop_back_base_cost: Option<u64>,
     vector_destroy_empty_base_cost: Option<u64>,
     vector_swap_base_cost: Option<u64>,
+    vector_reverse_base_cost: Option<u64>,
+    vector_reverse_per_elem_cost: Option<u64>,
+    vector_keep_range_base_cost: Option<u64>,
+    vector_keep_range_per_dropped_elem_cost: Option<u64>,
+    vector_keep_range_per_moved_elem_cost: Option<u64>,
+    vector_copy_range_base_cost: Option<u64>,
+    vector_replace_range_base_cost: Option<u64>,
+    vector_replace_range_per_elem_cost: Option<u64>,
     debug_print_base_cost: Option<u64>,
     debug_print_stack_trace_base_cost: Option<u64>,
 
@@ -2188,6 +2276,21 @@ pub struct ProtocolConfig {
     /// SIP-45: K in the formula `amplification_factor = max(0, gas_price / reference_gas_price - K)`.
     /// This is the threshold for activating consensus amplification.
     sip_45_consensus_amplification_threshold: Option<u64>,
+
+    /// Number of recent commits the staggered-submission signal looks at. It compares
+    /// excess copies of transactions without allowed proposers to unique user transactions.
+    staggered_submission_signal_window_commits: Option<u64>,
+    /// Average excess copies per commit in the window needed before the signal turns on.
+    staggered_submission_signal_min_excess_copies_per_commit: Option<u64>,
+    /// Number of commits the ratio must stay below a band's exit ratio before the
+    /// signal drops to a lower band.
+    staggered_submission_signal_exit_dwell_commits: Option<u64>,
+    /// Ratios to enter and exit each band, in basis points (bps) of the window's unique
+    /// user transactions. Band 1 delays submissions up to 1.6s and band 2 up to 4.8s.
+    staggered_submission_signal_band1_enter_ratio_bps: Option<u64>,
+    staggered_submission_signal_band1_exit_ratio_bps: Option<u64>,
+    staggered_submission_signal_band2_enter_ratio_bps: Option<u64>,
+    staggered_submission_signal_band2_exit_ratio_bps: Option<u64>,
 
     /// DEPRECATED: this was an ephemeral feature flag only used in per-epoch tables, which has now
     /// been deployed everywhere.
@@ -2332,6 +2435,16 @@ impl ProtocolConfig {
         if ret {
             // jwk updates required end-of-epoch transactions
             assert!(self.feature_flags.end_of_epoch_transaction_supported);
+        }
+        ret
+    }
+
+    pub fn staggered_submission_signal(&self) -> bool {
+        let ret = self.feature_flags.staggered_submission_signal;
+        if ret {
+            // The signal staggers transactions without allowed proposers. That
+            // distinction only exists when allowed_proposers is enabled.
+            assert!(self.feature_flags.allowed_proposers);
         }
         ret
     }
@@ -2689,6 +2802,7 @@ impl ProtocolConfig {
             base_tx_cost_per_byte: Some(0),
             package_publish_cost_per_byte: Some(80),
             obj_access_cost_read_per_byte: Some(15),
+            obj_access_cost_read_per_package_kb: None,
             obj_access_cost_mutate_per_byte: Some(40),
             obj_access_cost_delete_per_byte: Some(40),
             obj_access_cost_verify_per_byte: Some(200),
@@ -2782,6 +2896,9 @@ impl ProtocolConfig {
             // Cost params for the Move native function
             // `record_new_uid_from_hash(parent: address, bytes: address)`. Introduced in v131.
             object_record_new_uid_from_hash_cost_base: None,
+            // Cost params for the Move native function `is_shared_input_impl(id: address): bool`.
+            // Introduced in v141.
+            object_is_shared_input_cost_base: None,
 
             // `transfer` module
             // Cost params for the Move native function `transfer_impl<T: key>(obj: T, recipient: address)`
@@ -2809,6 +2926,9 @@ impl ProtocolConfig {
             tx_context_gas_budget_cost_base: None,
             tx_context_ids_created_cost_base: None,
             tx_context_replace_cost_base: None,
+
+            // `clock` module
+            clock_borrow_cost_base: None,
 
             // `types` module
             // Cost params for the Move native function `is_one_time_witness<T: drop>(_: &T): bool`
@@ -3001,6 +3121,14 @@ impl ProtocolConfig {
             vector_pop_back_base_cost: None,
             vector_destroy_empty_base_cost: None,
             vector_swap_base_cost: None,
+            vector_reverse_base_cost: None,
+            vector_reverse_per_elem_cost: None,
+            vector_keep_range_base_cost: None,
+            vector_keep_range_per_dropped_elem_cost: None,
+            vector_keep_range_per_moved_elem_cost: None,
+            vector_copy_range_base_cost: None,
+            vector_replace_range_base_cost: None,
+            vector_replace_range_per_elem_cost: None,
             debug_print_base_cost: None,
             debug_print_stack_trace_base_cost: None,
 
@@ -3077,6 +3205,13 @@ impl ProtocolConfig {
             gas_budget_based_txn_cost_absolute_cap_commit_count: None,
 
             sip_45_consensus_amplification_threshold: None,
+            staggered_submission_signal_window_commits: None,
+            staggered_submission_signal_min_excess_copies_per_commit: None,
+            staggered_submission_signal_exit_dwell_commits: None,
+            staggered_submission_signal_band1_enter_ratio_bps: None,
+            staggered_submission_signal_band1_exit_ratio_bps: None,
+            staggered_submission_signal_band2_enter_ratio_bps: None,
+            staggered_submission_signal_band2_exit_ratio_bps: None,
 
             use_object_per_epoch_marker_table_v2: None,
 
@@ -4780,10 +4915,63 @@ impl ProtocolConfig {
                 }
                 138 => {
                     cfg.gas_model_version = Some(15);
+                    cfg.feature_flags.enable_allowances = true;
                     if chain != Chain::Mainnet {
                         cfg.feature_flags.check_object_funds_withdraw_in_execution = true;
                         cfg.feature_flags.disable_effects_tx_dependencies = true;
                     }
+                    cfg.feature_flags.merge_colliding_deferrals = true;
+                    // Testnet already runs version 138, so it gets this change in version 139.
+                    if chain == Chain::Mainnet {
+                        cfg.storage_rebate_rate = Some(9999);
+                    }
+                }
+                139 => {
+                    if chain != Chain::Mainnet && chain != Chain::Testnet {
+                        cfg.feature_flags.enable_forwarding_addresses = true;
+                        cfg.feature_flags.mldsa65_auth = true;
+                    }
+                    cfg.storage_rebate_rate = Some(9999);
+                    if chain != Chain::Mainnet {
+                        cfg.feature_flags.allow_dkg_completion_after_timeout = true;
+                    }
+                    // Validators cache packages, so reading one costs far less than reading an object.
+                    cfg.obj_access_cost_read_per_package_kb = Some(154);
+                }
+                140 => {
+                    // Signal thresholds are set on every chain. They take effect only
+                    // where `staggered_submission_signal` is enabled.
+                    cfg.staggered_submission_signal_window_commits = Some(300);
+                    cfg.staggered_submission_signal_min_excess_copies_per_commit = Some(2);
+                    cfg.staggered_submission_signal_exit_dwell_commits = Some(6000);
+                    cfg.staggered_submission_signal_band1_enter_ratio_bps = Some(1000);
+                    cfg.staggered_submission_signal_band1_exit_ratio_bps = Some(500);
+                    cfg.staggered_submission_signal_band2_enter_ratio_bps = Some(5000);
+                    cfg.staggered_submission_signal_band2_exit_ratio_bps = Some(2500);
+
+                    cfg.vector_reverse_base_cost = Some(52);
+                    cfg.vector_reverse_per_elem_cost = Some(8);
+                    cfg.vector_keep_range_base_cost = Some(52);
+                    cfg.vector_keep_range_per_dropped_elem_cost = Some(1);
+                    cfg.vector_keep_range_per_moved_elem_cost = Some(8);
+                    cfg.vector_copy_range_base_cost = Some(52);
+                    cfg.vector_replace_range_base_cost = Some(52);
+                    cfg.vector_replace_range_per_elem_cost = Some(8);
+
+                    if chain != Chain::Mainnet && chain != Chain::Testnet {
+                        cfg.feature_flags.shuffle_consensus_commit_blocks = true;
+                    }
+
+                    cfg.feature_flags.allow_references_in_ptbs = true;
+                    cfg.feature_flags.disable_id_leak_verifier = true;
+                    cfg.feature_flags.check_object_funds_withdraw_in_execution = true;
+                    cfg.feature_flags.disable_effects_tx_dependencies = true;
+                }
+                141 => {
+                    cfg.clock_borrow_cost_base = Some(52);
+                    cfg.feature_flags.check_groth16_pvk_length = true;
+                    cfg.object_is_shared_input_cost_base = Some(52);
+                    cfg.feature_flags.secp256r1_ecrecover_checks_x_below_p = true;
                 }
                 // Use this template when making changes:
                 //
@@ -4896,6 +5084,7 @@ impl ProtocolConfig {
                 .map(|limit| limit as u128),
             deprecate_global_storage_ops,
             disable_entry_point_signature_check: self.disable_entry_point_signature_check(),
+            disable_id_leak_verifier: self.disable_id_leak_verifier(),
             switch_to_regex_reference_safety: false,
             framework_tx_context_mut_restrictions: self.framework_tx_context_mut_restrictions(),
             disallow_jump_orphans: self.disallow_jump_orphans(),
@@ -5244,6 +5433,46 @@ mod test {
             prot.max_arguments(),
             prot.max_arguments_as_option().unwrap()
         );
+    }
+
+    #[test]
+    fn vector_bulk_native_gas_costs_start_at_version_140() {
+        for chain in [Chain::Unknown, Chain::Mainnet, Chain::Testnet] {
+            let before = ProtocolConfig::get_for_version(ProtocolVersion::new(139), chain);
+            assert_eq!(before.vector_reverse_base_cost_as_option(), None);
+            assert_eq!(before.vector_reverse_per_elem_cost_as_option(), None);
+            assert_eq!(before.vector_keep_range_base_cost_as_option(), None);
+            assert_eq!(
+                before.vector_keep_range_per_dropped_elem_cost_as_option(),
+                None
+            );
+            assert_eq!(
+                before.vector_keep_range_per_moved_elem_cost_as_option(),
+                None
+            );
+            assert_eq!(before.vector_copy_range_base_cost_as_option(), None);
+            assert_eq!(before.vector_replace_range_base_cost_as_option(), None);
+            assert_eq!(before.vector_replace_range_per_elem_cost_as_option(), None);
+
+            let active = ProtocolConfig::get_for_version(ProtocolVersion::new(140), chain);
+            assert_eq!(active.vector_reverse_base_cost_as_option(), Some(52));
+            assert_eq!(active.vector_reverse_per_elem_cost_as_option(), Some(8));
+            assert_eq!(active.vector_keep_range_base_cost_as_option(), Some(52));
+            assert_eq!(
+                active.vector_keep_range_per_dropped_elem_cost_as_option(),
+                Some(1)
+            );
+            assert_eq!(
+                active.vector_keep_range_per_moved_elem_cost_as_option(),
+                Some(8)
+            );
+            assert_eq!(active.vector_copy_range_base_cost_as_option(), Some(52));
+            assert_eq!(active.vector_replace_range_base_cost_as_option(), Some(52));
+            assert_eq!(
+                active.vector_replace_range_per_elem_cost_as_option(),
+                Some(8)
+            );
+        }
     }
 
     #[test]

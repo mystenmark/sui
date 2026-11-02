@@ -53,7 +53,7 @@ use sui_types::{
     sui_system_state::epoch_start_sui_system_state::EpochStartSystemStateTrait,
     transaction::{
         InputObjectKind, PlainTransactionWithClaims, SenderSignedData, TransactionDataAPI,
-        TransactionKey, VerifiedTransaction, WithAliases,
+        TransactionKey, VerifiedTransaction, WithAliases, paid_proposer_count,
     },
 };
 use tokio::task::JoinSet;
@@ -82,7 +82,7 @@ use crate::{
     consensus_throughput_calculator::ConsensusThroughputCalculator,
     consensus_types::consensus_output_api::{ConsensusCommitAPI, ParsedTransaction},
     epoch::{
-        randomness::{DkgStatus, RandomnessManager},
+        randomness::{AdvanceDkgError, DkgStatus, RandomnessManager},
         reconfiguration::ReconfigState,
     },
     execution_cache::ObjectCacheRead,
@@ -715,6 +715,10 @@ impl CheckpointQueue {
     }
 }
 
+/// Runtime shutdown cancelled blocking work while a consensus commit was being processed.
+#[derive(Debug)]
+pub(crate) struct RuntimeShutdown;
+
 pub struct ConsensusHandler<C> {
     /// A store created for each epoch. ConsensusHandler is recreated each epoch, with the
     /// corresponding store. This store is also used to get the current epoch ID.
@@ -731,8 +735,11 @@ pub struct ConsensusHandler<C> {
     // TODO: ConsensusHandler doesn't really share metrics with AuthorityState. We could define
     // a new metrics type here if we want to.
     metrics: Arc<AuthorityMetrics>,
-    /// Lru cache to quickly discard transactions processed by consensus
-    processed_cache: LruCache<SequencedConsensusTransactionKey, ()>,
+    /// LRU cache of processed messages. Deduplication only checks whether a key is
+    /// present. The value counts how many copies of the message this validator has
+    /// seen, which feeds the local staggering signal. A count is lost on eviction or
+    /// restart. The next copy then starts a fresh count, so it is not charged as excess.
+    processed_cache: LruCache<SequencedConsensusTransactionKey, u64>,
     /// Using the throughput calculator to record the current consensus throughput
     throughput_calculator: Arc<ConsensusThroughputCalculator>,
 
@@ -930,14 +937,44 @@ struct CommitHandlerInput {
     transaction_deny_config_updates: Vec<(AuthorityName, SharedTransactionDenyConfig)>,
 }
 
+/// Copy counts from one commit for the staggered-submission duplication signal. They
+/// are counted before deduplication, so duplicates that get discarded still count.
+#[derive(Default)]
+struct StaggeringCommitCounts {
+    /// Copies beyond the number of proposers the transaction paid for. Only
+    /// transactions that do not restrict their proposers are counted. This is the
+    /// signal's numerator.
+    excess_copies: u64,
+    /// The number of distinct user transactions. This is the signal's denominator.
+    unique_user_txns: u64,
+    /// Duplicates the transaction paid for. The signal ignores them.
+    paid_duplicate_copies: u64,
+    /// Duplicates of transactions that restrict their proposers. The signal ignores them.
+    restricted_duplicate_copies: u64,
+}
+
+impl StaggeringCommitCounts {
+    /// Returns the counts keyed by their `staggered_submission_commit_copies` label.
+    fn by_kind(&self) -> [(&'static str, u64); 4] {
+        [
+            ("unique", self.unique_user_txns),
+            ("excess", self.excess_copies),
+            ("paid_duplicate", self.paid_duplicate_copies),
+            ("restricted_duplicate", self.restricted_duplicate_copies),
+        ]
+    }
+}
+
 struct CommitHandlerState {
     dkg_failed: bool,
     randomness_round: Option<RandomnessRound>,
     output: ConsensusCommitOutput,
     indirect_state_observer: Option<IndirectStateObserver>,
     initial_reconfig_state: ReconfigState,
-    // Occurrence counts for user transactions, used for unpaid amplification detection.
+    // Occurrence counts within this commit. Amplification deferral uses them, so they
+    // must be identical on every validator.
     occurrence_counts: HashMap<TransactionDigest, u32>,
+    staggering_counts: StaggeringCommitCounts,
     // Transactions involved in same commit owned object lock contention (double-spend),
     // mapped to conflict info (gas vs non-gas breakdown).
     contested_transaction_digests: HashMap<TransactionDigest, ConflictInfo>,
@@ -952,6 +989,7 @@ impl CommitHandlerState {
             indirect_state_observer: Some(IndirectStateObserver::new()),
             initial_reconfig_state: epoch_store.get_reconfig_state_read_lock_guard().clone(),
             occurrence_counts: HashMap::new(),
+            staggering_counts: StaggeringCommitCounts::default(),
             contested_transaction_digests: HashMap::new(),
         }
     }
@@ -978,9 +1016,9 @@ impl CommitHandlerState {
             let randomness_manager = randomness_manager
                 .as_mut()
                 .expect("randomness manager should exist if randomness is enabled");
-            match randomness_manager.dkg_status() {
+            match randomness_manager.dkg_status_for_commit_round(commit_info.round) {
                 DkgStatus::Pending => None,
-                DkgStatus::Failed => {
+                DkgStatus::TimedOut => {
                     dkg_failed = true;
                     None
                 }
@@ -1050,15 +1088,18 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
     ) {
         let transactions = consensus_commit.transactions();
         self.handle_consensus_commit(consensus_commit, transactions)
-            .await;
+            .await
+            .expect("runtime shutdown during test commit");
     }
 
+    /// Returns `Err(RuntimeShutdown)` if runtime shutdown cancelled work that the commit depends
+    /// on. The commit's output is then not persisted, and it is replayed after restart.
     #[instrument(level = "debug", skip_all, fields(epoch = self.epoch_store.epoch(), round = consensus_commit.leader_round()))]
     pub(crate) async fn handle_consensus_commit(
         &mut self,
         consensus_commit: impl ConsensusCommitAPI,
         transactions: ParsedConsensusTransactions,
-    ) {
+    ) -> Result<(), RuntimeShutdown> {
         // This may block until one of two conditions happens:
         // - Number of uncommitted transactions in the writeback cache goes below the
         //   backpressure threshold.
@@ -1162,7 +1203,7 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
             randomness_dkg_messages,
             randomness_dkg_confirmations,
         )
-        .await;
+        .await?;
 
         let mut execution_time_estimator = self
             .epoch_store
@@ -1191,7 +1232,7 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
         let make_checkpoint = should_accept_tx || final_round;
         if !make_checkpoint {
             // No need for any further processing
-            return;
+            return Ok(());
         }
 
         // If this is the final round, record execution time observations for storage in the
@@ -1304,6 +1345,7 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
         });
 
         fail_point!("crash");
+        Ok(())
     }
 
     fn handle_close_epoch(
@@ -1421,6 +1463,8 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
         let mut deferred_txns = BTreeMap::new();
         let mut cancelled_txns = BTreeMap::new();
 
+        self.record_duplication_signal(state);
+
         for transaction in ordered_txns {
             self.handle_deferral_and_cancellation(
                 state,
@@ -1472,6 +1516,72 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
                 .lock();
             for (key, txns) in deferred_txns.into_iter() {
                 total_deferred_txns += txns.len();
+                // Keys reloaded by this commit are still present in the map here
+                // (record_deferral_deletion runs after this function), but no key
+                // inserted here can equal one of them: reloads cover
+                // future_round <= round while re-deferrals use round + 1, and a
+                // randomness reload and a randomness re-deferral are mutually exclusive
+                // per commit. A re-deferral does keep its original deferred_from_round,
+                // though: a randomness-using transaction deferred at round F by a check
+                // that precedes the randomness check (unpaid amplification, owned-object
+                // double spend) gets ConsensusRound{F + 1, F}, and when reloaded at
+                // F + 1 without randomness it lands on Randomness{F} - the key still
+                // holding round F's fresh randomness deferrals. Overwriting that entry
+                // (in memory and in the write batch below) strands the displaced
+                // transactions: finalized but never reloaded or executed this epoch,
+                // with their owned inputs locked until epoch end.
+                debug_assert!(
+                    !state
+                        .output
+                        .get_deleted_deferred_txn_keys()
+                        .any(|deleted| deleted == key),
+                    "deferral key {key:?} was reloaded by this commit and must not be re-inserted"
+                );
+                let txns = if protocol_config.merge_colliding_deferrals() {
+                    match deferred_transactions.remove(&key) {
+                        Some(mut merged) => {
+                            assert_reachable_gated!(
+                                "Merged colliding deferral entries instead of displacing finalized transactions.",
+                                |pc| pc.merge_colliding_deferrals()
+                                    && (pc.defer_owned_object_double_spend()
+                                        || pc.defer_unpaid_amplification())
+                            );
+                            debug_assert!(
+                                {
+                                    let prev_digests: HashSet<_> =
+                                        merged.iter().map(|t| *t.tx().digest()).collect();
+                                    txns.iter().all(|t| !prev_digests.contains(t.tx().digest()))
+                                },
+                                "colliding deferral entries must not share transactions"
+                            );
+                            // Deterministic merge: previously deferred transactions keep
+                            // their position ahead of this commit's.
+                            merged.extend(txns);
+                            merged
+                        }
+                        None => txns,
+                    }
+                } else {
+                    if let Some(prev) = deferred_transactions.get(&key) {
+                        // Last-writer-wins semantics must be preserved bit for bit for
+                        // protocol versions without the fix; flag the stranding.
+                        let new_digests: HashSet<_> =
+                            txns.iter().map(|t| *t.tx().digest()).collect();
+                        let displaced: Vec<_> = prev
+                            .iter()
+                            .map(|t| *t.tx().digest())
+                            .filter(|d| !new_digests.contains(d))
+                            .collect();
+                        if !displaced.is_empty() {
+                            debug_fatal!(
+                                "Deferral key collision displaced finalized transactions: key {:?}, displaced {:?}",
+                                key,
+                                displaced
+                            );
+                        }
+                    }
+                    txns
+                };
                 deferred_transactions.insert(key, txns.clone());
                 state.output.defer_transactions(key, txns);
             }
@@ -1694,8 +1804,7 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
                 "Writing pending checkpoint",
             );
             self.epoch_store
-                .write_pending_checkpoint(&mut state.output, &pending_checkpoint)
-                .expect("failed to write pending checkpoint");
+                .write_pending_checkpoint(&mut state.output, &pending_checkpoint);
         }
 
         state.output.set_checkpoint_queue_drained(queue_drained);
@@ -1756,6 +1865,59 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
         ))
     }
 
+    /// Passes this commit's copy counts to the staggered-submission signal and updates
+    /// the signal metrics.
+    ///
+    /// The signal measures copies, not transactions, because copies are what waste
+    /// bandwidth. A copy counts as excess when the transaction has already reached
+    /// the number of proposers it paid for, or the free minimum if that is larger.
+    /// This count carries across commits while the transaction stays in the processed
+    /// cache. Copies are counted on arrival, so a deferred transaction counts as unique
+    /// only once.
+    ///
+    /// The signal always runs. It changes staggering only when both the protocol flag
+    /// and the node config enable it. Otherwise the metrics still show what it would do.
+    fn record_duplication_signal(&self, state: &CommitHandlerState) {
+        self.metrics
+            .staggered_submission_excess_copies
+            .observe(state.staggering_counts.excess_copies as f64);
+        // These counters let dashboards recompute the ratio over any time window.
+        for (kind, copies) in state.staggering_counts.by_kind() {
+            self.metrics
+                .staggered_submission_commit_copies
+                .with_label_values(&[kind])
+                .inc_by(copies);
+        }
+        let staggered = self.epoch_store.staggered_submission();
+        let outcome = staggered.record_commit(
+            state.staggering_counts.excess_copies,
+            state.staggering_counts.unique_user_txns,
+        );
+        let transition = outcome.transition;
+        self.metrics
+            .staggered_submission_duplication_ratio
+            .set(outcome.duplication_ratio);
+        // The gauges are set on every commit so they reset when a new epoch starts.
+        self.metrics
+            .staggered_submission_signal_band
+            .set(staggered.signal_band() as i64);
+        self.metrics
+            .staggered_submission_active
+            .set(staggered.is_active() as i64);
+        if let Some(band) = transition {
+            self.metrics
+                .staggered_submission_signal_transitions
+                .with_label_values(&[crate::staggered_submission::signal_band_label(band)])
+                .inc();
+            self.metrics
+                .staggered_submission_band_duration_commits
+                .with_label_values(&[crate::staggered_submission::signal_band_label(
+                    outcome.previous_band,
+                )])
+                .observe(outcome.commits_in_previous_band as f64);
+        }
+    }
+
     fn handle_deferral_and_cancellation(
         &self,
         state: &mut CommitHandlerState,
@@ -1772,7 +1934,7 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
         let tx_digest = *transaction.tx().digest();
 
         // Check for unpaid amplification before other deferral checks.
-        // SIP-45: Paid amplification allows (gas_price / RGP + 1) submissions.
+        // SIP-45: the gas price pays for `paid_proposer_count` submissions.
         // Transactions with more duplicates than paid for are deferred.
         //
         // A transaction that names its proposers has already had its amplification bounded by
@@ -1792,9 +1954,10 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
                 .copied()
                 .unwrap_or(0);
 
-            let rgp = self.epoch_store.reference_gas_price();
-            let gas_price = transaction.tx().transaction_data().gas_price();
-            let allowed_count = (gas_price / rgp.max(1)) + 1;
+            let allowed_count = paid_proposer_count(
+                transaction.tx().transaction_data().gas_price(),
+                self.epoch_store.reference_gas_price(),
+            );
 
             if occurrence_count as u64 > allowed_count {
                 self.metrics
@@ -1877,6 +2040,19 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
                         "Successfully deferred transaction attempting to double spend owned object.",
                         |pc| pc.defer_owned_object_double_spend()
                     );
+                    if transaction.tx().transaction_data().uses_randomness()
+                        && state.randomness_round.is_none()
+                    {
+                        // Precondition for the deferral-key collision flagged in
+                        // collect_transactions_to_schedule: at the next commit without
+                        // randomness this transaction re-defers to Randomness{original
+                        // round}, the key that round's fresh randomness deferrals are
+                        // stored under.
+                        assert_reachable_gated!(
+                            "Double-spend deferred a randomness-using transaction at a round without randomness.",
+                            |pc| pc.defer_owned_object_double_spend()
+                        );
+                    }
                     deferred_txns
                         .entry(deferral_key)
                         .or_default()
@@ -2025,7 +2201,6 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
                 &mut state.output,
                 commit_info.round,
             )
-            .expect("db error")
             .into_iter()
             .flat_map(|(key, txns)| txns.into_iter().map(move |tx| (key, tx)))
             .map(|(key, tx)| {
@@ -2042,7 +2217,6 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
             let txns: Vec<_> = self
                 .epoch_store
                 .load_deferred_transactions_for_randomness_v2(&mut state.output)
-                .expect("db error")
                 .into_iter()
                 .flat_map(|(key, txns)| txns.into_iter().map(move |tx| (key, tx)))
                 .map(|(key, tx)| {
@@ -2082,8 +2256,7 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
                     commit_info.round,
                     for_randomness,
                     txns,
-                )
-                .expect("db error"),
+                ),
             self.epoch_store.protocol_config(),
             for_randomness,
             self.congestion_logger.is_some(),
@@ -2210,7 +2383,7 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
         randomness_manager: Option<&mut RandomnessManager>,
         randomness_dkg_messages: Vec<(AuthorityName, Vec<u8>)>,
         randomness_dkg_confirmations: Vec<(AuthorityName, Vec<u8>)>,
-    ) {
+    ) -> Result<(), RuntimeShutdown> {
         if !self.epoch_store.randomness_state_enabled() {
             let num_dkg_messages = randomness_dkg_messages.len();
             let num_dkg_confirmations = randomness_dkg_confirmations.len();
@@ -2221,7 +2394,7 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
                     num_dkg_confirmations
                 );
             }
-            return;
+            return Ok(());
         }
 
         let randomness_manager =
@@ -2236,26 +2409,30 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
             randomness_dkg_confirmations,
         );
 
-        // Keep advancing the DKG state machine until it is resolved, regardless of
-        // whether new messages/confirmations were processed this commit. Preserve
-        // the mainnet epoch fallback until the protocol flag is active everywhere.
-        let always_advance_dkg_to_resolution = (self
-            .epoch_store
-            .protocol_config()
-            .always_advance_dkg_to_resolution()
-            || (self.epoch_store.get_chain() == Chain::Mainnet
-                && self.epoch_store.epoch() >= 1143))
+        let protocol_config = self.epoch_store.protocol_config();
+        // Once timeout failure is derived per commit, merge and completion can only make progress
+        // when new consensus material arrives.
+        let always_advance_dkg_to_resolution = !protocol_config
+            .allow_dkg_completion_after_timeout()
+            && (protocol_config.always_advance_dkg_to_resolution()
+                || (self.epoch_store.get_chain() == Chain::Mainnet
+                    && self.epoch_store.epoch() >= 1143))
             && randomness_manager.dkg_status() == DkgStatus::Pending;
 
         if randomness_dkg_updates
             || randomness_dkg_confirmation_updates
             || always_advance_dkg_to_resolution
         {
-            randomness_manager
+            match randomness_manager
                 .advance_dkg(&mut state.output, commit_info.round)
                 .await
-                .expect("epoch ended");
+            {
+                Ok(()) => {}
+                Err(AdvanceDkgError::RuntimeShutdown) => return Err(RuntimeShutdown),
+                Err(AdvanceDkgError::Sui(e)) => panic!("failed to advance randomness DKG: {e:?}"),
+            }
         }
+        Ok(())
     }
 
     fn process_randomness_dkg_messages(
@@ -2586,11 +2763,7 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
             }
             prefetch_refs.sort();
             prefetch_refs.dedup();
-            // On a read error fall back to an empty map (treat refs as unlocked) — the
-            // same lenient behavior the per-transaction read had.
-            self.epoch_store
-                .get_owned_object_locks_map(&prefetch_refs)
-                .unwrap_or_default()
+            self.epoch_store.get_owned_object_locks_map(&prefetch_refs)
         };
 
         for (block, parsed_transactions) in block_transactions {
@@ -2934,6 +3107,8 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
         transactions: Vec<(SequencedConsensusTransactionKind, u32)>,
     ) -> Vec<VerifiedSequencedConsensusTransaction> {
         let _scope = monitored_scope("ConsensusCommitHandler::deduplicate_consensus_txns");
+        let epoch = self.epoch_store.epoch();
+        let rgp = self.epoch_store.reference_gas_price().max(1);
         let mut all_transactions = Vec::new();
 
         // Track occurrence counts for each transaction key within this commit.
@@ -2987,7 +3162,38 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
             *count += 1;
             let in_commit = *count > 1;
 
-            let in_cache = self.processed_cache.put(key.clone(), ()).is_some();
+            let (total_occurrences, in_cache) = match self.processed_cache.get_mut(&key) {
+                Some(total) => {
+                    *total = total.saturating_add(1);
+                    (*total, true)
+                }
+                None => {
+                    // If the key was evicted during this commit, the commit's own count
+                    // is still correct. Only counts from earlier commits are lost.
+                    let total = u64::from(*count);
+                    self.processed_cache.put(key.clone(), total);
+                    (total, false)
+                }
+            };
+            let user_transaction = match &verified_transaction.0.transaction {
+                SequencedConsensusTransactionKind::External(transaction) => {
+                    transaction.kind.as_user_transaction()
+                }
+                SequencedConsensusTransactionKind::System(_) => None,
+            };
+            if let Some(transaction) = user_transaction {
+                let tx_data = transaction.data().transaction_data();
+                if !tx_data.expiration().restricts_proposers(epoch) {
+                    let allowance = paid_proposer_count(tx_data.gas_price(), rgp);
+                    if total_occurrences > allowance {
+                        state.staggering_counts.excess_copies += 1;
+                    } else if total_occurrences > 1 {
+                        state.staggering_counts.paid_duplicate_copies += 1;
+                    }
+                } else if total_occurrences > 1 {
+                    state.staggering_counts.restricted_duplicate_copies += 1;
+                }
+            }
             if in_commit || in_cache {
                 self.metrics.skipped_consensus_txns_cache_hit.inc();
                 continue;
@@ -3001,6 +3207,7 @@ impl<C: CheckpointServiceNotify + Send + Sync> ConsensusHandler<C> {
                 continue;
             }
 
+            state.staggering_counts.unique_user_txns += u64::from(user_transaction.is_some());
             first_commit_keys.insert(key.clone());
 
             state.output.record_consensus_message_processed(key);
@@ -3267,10 +3474,14 @@ impl MysticetiConsensusHandler {
                 let commit_index = consensus_commit.commit_ref.index;
                 if commit_index <= last_processed_commit_at_startup {
                     consensus_handler.handle_prior_consensus_commit(consensus_commit);
-                } else {
-                    consensus_handler
-                        .handle_consensus_commit(consensus_commit, transactions)
-                        .await;
+                } else if let Err(e) = consensus_handler
+                    .handle_consensus_commit(consensus_commit, transactions)
+                    .await
+                {
+                    info!(
+                        "Consensus commit {commit_index} was not handled ({e:?}); it will be replayed after restart"
+                    );
+                    break;
                 }
                 commit_consumer_monitor.set_highest_handled_commit(commit_index);
             }
@@ -3621,12 +3832,17 @@ impl CommitIntervalObserver {
 }
 
 #[cfg(test)]
+#[path = "unit_tests/staggered_submission_signal_tests.rs"]
+mod staggering_signal_tests;
+
+#[cfg(test)]
 mod tests {
     use consensus_core::{
         BlockAPI, CommitDigest, CommitRef, CommittedSubDag, TestBlock, Transaction, VerifiedBlock,
     };
     use futures::pin_mut;
     use prometheus::Registry;
+    use sui_macros::sim_test;
     use sui_protocol_config::{ConsensusTransactionOrdering, ProtocolConfig};
     use sui_types::{
         base_types::ExecutionDigests,
@@ -3645,6 +3861,10 @@ mod tests {
             CertifiedTransaction, TransactionData, TransactionDataAPI, VerifiedCertificate,
         },
     };
+
+    use sui_types::SUI_RANDOMNESS_STATE_OBJECT_ID;
+    use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
+    use sui_types::transaction::{ObjectArg, SharedObjectMutability};
 
     use super::*;
     use crate::{
@@ -3703,7 +3923,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[sim_test]
     async fn test_epoch_close_deadline_preserves_pre_deadline_blocking() {
         let state = TestAuthorityBuilder::new()
             .with_protocol_config(epoch_close_deadline_config(Some(100)))
@@ -3732,7 +3952,6 @@ mod tests {
         assert!(
             epoch_store
                 .get_pending_checkpoints(None)
-                .unwrap()
                 .iter()
                 .all(|(_, checkpoint)| !checkpoint.details.last_of_epoch)
         );
@@ -3747,7 +3966,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[sim_test]
     async fn test_epoch_close_deadline_none_preserves_indefinite_blocking() {
         let state = TestAuthorityBuilder::new()
             .with_protocol_config(epoch_close_deadline_config(None))
@@ -3775,7 +3994,7 @@ mod tests {
         assert!(!reconfig_state.is_reject_all_tx());
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[sim_test]
     async fn test_epoch_close_deadline_is_inert_without_deferred_transactions() {
         let state = TestAuthorityBuilder::new()
             .with_protocol_config(epoch_close_deadline_config(Some(100)))
@@ -3798,7 +4017,7 @@ mod tests {
                 .get_reconfig_state_read_lock_guard()
                 .is_reject_all_tx()
         );
-        let checkpoints = epoch_store.get_pending_checkpoints(None).unwrap();
+        let checkpoints = epoch_store.get_pending_checkpoints(None);
         assert!(checkpoints.last().unwrap().1.details.last_of_epoch);
         assert_eq!(
             setup
@@ -3811,7 +4030,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[sim_test]
     async fn test_epoch_close_deadline_counts_abandoned_transactions_and_closes_first() {
         let state = TestAuthorityBuilder::new()
             .with_protocol_config(epoch_close_deadline_config(Some(100)))
@@ -3842,7 +4061,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[sim_test]
     async fn test_epoch_close_deadline_does_not_report_transactions_drained_in_commit() {
         let state = TestAuthorityBuilder::new()
             .with_protocol_config(epoch_close_deadline_config(Some(100)))
@@ -3936,7 +4155,7 @@ mod tests {
             .await;
     }
 
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[sim_test]
     async fn test_consensus_commit_handler() {
         telemetry_subscribers::init_for_testing();
 
@@ -4127,7 +4346,7 @@ mod tests {
         state.execution_scheduler().check_empty_for_testing().await;
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[sim_test]
     async fn test_dropped_owned_object_lock_conflict_is_marked_processed() {
         telemetry_subscribers::init_for_testing();
 
@@ -4141,7 +4360,6 @@ mod tests {
 
         let state = TestAuthorityBuilder::new()
             .with_starting_objects(&all_objects)
-            .skip_genesis_owner_index()
             .build()
             .await;
         let epoch_store = state.epoch_store_for_testing();
@@ -4228,9 +4446,7 @@ mod tests {
             NotifyReadConsensusTxStatusResult::Status(ConsensusTxStatus::Dropped)
         ));
 
-        let locks = epoch_store
-            .get_owned_object_locks_map(&[owned_object_ref])
-            .unwrap();
+        let locks = epoch_store.get_owned_object_locks_map(&[owned_object_ref]);
         assert_eq!(locks.get(&owned_object_ref), Some(&winner_digest));
         assert!(
             epoch_store
@@ -4249,11 +4465,10 @@ mod tests {
             epoch_store.consensus_messages_processed_notify(vec![loser_key]),
         )
         .await
-        .expect("processed notification for dropped transaction should resolve")
-        .unwrap();
+        .expect("processed notification for dropped transaction should resolve");
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[sim_test]
     async fn test_rejected_transaction_sets_status_and_is_not_marked_processed() {
         telemetry_subscribers::init_for_testing();
 
@@ -4263,7 +4478,6 @@ mod tests {
 
         let state = TestAuthorityBuilder::new()
             .with_starting_objects(&[gas_object.clone(), owned_object.clone()])
-            .skip_genesis_owner_index()
             .build()
             .await;
         let epoch_store = state.epoch_store_for_testing();
@@ -4306,7 +4520,7 @@ mod tests {
         assert!(!epoch_store.is_consensus_message_processed(&key).unwrap());
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[sim_test]
     async fn test_user_transaction_ignored_at_epoch_close_sets_dropped_status() {
         telemetry_subscribers::init_for_testing();
 
@@ -4316,7 +4530,6 @@ mod tests {
 
         let state = TestAuthorityBuilder::new()
             .with_starting_objects(&[gas_object.clone(), owned_object.clone()])
-            .skip_genesis_owner_index()
             .build()
             .await;
         let epoch_store = state.epoch_store_for_testing();
@@ -4376,7 +4589,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[sim_test]
     async fn test_user_transaction_after_end_of_publish_sets_dropped_status() {
         telemetry_subscribers::init_for_testing();
 
@@ -4386,7 +4599,6 @@ mod tests {
 
         let state = TestAuthorityBuilder::new()
             .with_starting_objects(&[gas_object.clone(), owned_object.clone()])
-            .skip_genesis_owner_index()
             .build()
             .await;
         let epoch_store = state.epoch_store_for_testing();
@@ -4487,7 +4699,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[sim_test]
     async fn test_checkpoint_signature_dedup() {
         telemetry_subscribers::init_for_testing();
 
@@ -4602,7 +4814,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[sim_test]
     async fn test_verify_consensus_transaction_filters_mismatched_authorities() {
         telemetry_subscribers::init_for_testing();
 
@@ -4759,7 +4971,7 @@ mod tests {
     /// catching up can process commits without verifying every block. Updates are
     /// attributed to the consensus block author, so spoofed authority claims are
     /// still dropped.
-    #[tokio::test(flavor = "current_thread")]
+    #[sim_test]
     async fn test_deny_config_updates_applied_at_commit() {
         telemetry_subscribers::init_for_testing();
 
@@ -4848,6 +5060,120 @@ mod tests {
             !snapshot.contains_key(&AuthorityName::ZERO),
             "spoofed authority claim should be dropped"
         );
+    }
+
+    /// A transaction whose shared inputs include the randomness state object, so
+    /// `uses_randomness()` is true. Gas is random, so every call yields a new digest.
+    fn randomness_user_txn() -> VerifiedExecutableTransactionWithAliases {
+        let (committee, keypairs) = Committee::new_simple_test_committee();
+        let (sender, sender_keypair) = deterministic_random_account_key();
+        let mut builder = ProgrammableTransactionBuilder::new();
+        builder
+            .obj(ObjectArg::SharedObject {
+                id: SUI_RANDOMNESS_STATE_OBJECT_ID,
+                initial_shared_version: 1.into(),
+                mutability: SharedObjectMutability::Immutable,
+            })
+            .unwrap();
+        let tx = sui_types::transaction::Transaction::from_data_and_signer(
+            TransactionData::new_programmable(
+                sender,
+                vec![random_object_ref()],
+                builder.finish(),
+                1_000_000,
+                1_000,
+            ),
+            vec![&sender_keypair],
+        );
+        let tx = VerifiedExecutableTransaction::new_from_certificate(
+            VerifiedCertificate::new_unchecked(
+                CertifiedTransaction::new_from_keypairs_for_testing(
+                    tx.into_data(),
+                    &keypairs,
+                    &committee,
+                ),
+            ),
+        );
+        VerifiedExecutableTransactionWithAliases::no_aliases(tx)
+    }
+
+    /// Seeds the deferral-key collision: a randomness-using transaction deferred at
+    /// round 1 by a check that precedes the randomness check (owned-object double spend)
+    /// carries ConsensusRound{2, 1}. The test authority's DKG never completes, so no
+    /// commit generates randomness: reloaded at round 2, that transaction re-defers to
+    /// Randomness{1} - the key still holding round 1's fresh randomness deferrals.
+    /// Returns the digests of (parked randomness deferral, re-deferring transaction).
+    fn seed_deferral_key_collision(
+        epoch_store: &AuthorityPerEpochStore,
+    ) -> (TransactionDigest, TransactionDigest) {
+        let parked = randomness_user_txn();
+        let redeferred = randomness_user_txn();
+        let parked_digest = *parked.tx().digest();
+        let redeferred_digest = *redeferred.tx().digest();
+        // Round 1, no randomness generated: fresh randomness-using transactions were
+        // deferred under Randomness{1}...
+        epoch_store.insert_deferred_transactions_for_test(
+            DeferralKey::new_for_randomness(1),
+            vec![parked],
+        );
+        // ...while another randomness-using transaction won a contested owned-object
+        // lock in that commit and was double-spend-deferred under ConsensusRound{2, 1}.
+        epoch_store.insert_deferred_transactions_for_test(
+            DeferralKey::new_for_consensus_round(2, 1),
+            vec![redeferred],
+        );
+        (parked_digest, redeferred_digest)
+    }
+
+    /// With merge_colliding_deferrals enabled (current protocol version), the round 2
+    /// re-deferral merges into Randomness{1} instead of displacing its transactions.
+    #[sim_test]
+    async fn test_deferral_key_collision_merges_entries() {
+        let state = TestAuthorityBuilder::new().build().await;
+        let epoch_store = state.epoch_store_for_testing();
+        let (parked_digest, redeferred_digest) = seed_deferral_key_collision(&epoch_store);
+
+        let mid_epoch = epoch_store
+            .next_reconfiguration_timestamp_ms()
+            .saturating_sub(10_000);
+        let mut setup = setup_consensus_handler_for_testing(&state).await;
+        setup
+            .consensus_handler
+            .handle_consensus_commit_for_test(TestConsensusCommit::empty(2, mid_epoch, 1))
+            .await;
+
+        let deferred = epoch_store.get_all_deferred_transactions_for_test();
+        assert_eq!(deferred.len(), 1);
+        let (key, txns) = &deferred[0];
+        assert_eq!(*key, DeferralKey::new_for_randomness(1));
+        let digests: Vec<_> = txns.iter().map(|t| *t.tx().digest()).collect();
+        // Previously parked transactions keep their position ahead of the re-deferral.
+        assert_eq!(digests, vec![parked_digest, redeferred_digest]);
+    }
+
+    /// With merge_colliding_deferrals disabled, the last-writer-wins insert of older
+    /// protocol versions is preserved and the collision sensor flags the displaced
+    /// transactions (debug_fatal panics under test configuration).
+    #[tokio::test(flavor = "current_thread")]
+    #[should_panic(expected = "Deferral key collision displaced finalized transactions")]
+    async fn test_deferral_key_collision_displaces_randomness_deferrals() {
+        let mut protocol_config = ProtocolConfig::get_for_max_version_UNSAFE();
+        protocol_config.set_merge_colliding_deferrals_for_testing(false);
+        let state = TestAuthorityBuilder::new()
+            .with_protocol_config(protocol_config)
+            .build()
+            .await;
+        let epoch_store = state.epoch_store_for_testing();
+        seed_deferral_key_collision(&epoch_store);
+
+        let mid_epoch = epoch_store
+            .next_reconfiguration_timestamp_ms()
+            .saturating_sub(10_000);
+        let mut setup = setup_consensus_handler_for_testing(&state).await;
+        setup
+            .consensus_handler
+            .handle_consensus_commit_for_test(TestConsensusCommit::empty(2, mid_epoch, 1))
+            .await;
     }
 
     fn user_txn(gas_price: u64) -> VerifiedExecutableTransactionWithAliases {

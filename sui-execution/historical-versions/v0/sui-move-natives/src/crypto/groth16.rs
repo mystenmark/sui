@@ -77,14 +77,13 @@ pub fn prepare_verifying_key_internal(
     native_charge_gas_early_exit!(context, base_cost);
     let cost = context.gas_used();
 
-    let result;
-    if curve == BLS12381 {
-        result = fastcrypto_zkp::bls12381::api::prepare_pvk_bytes(&verifying_key);
+    let result = if curve == BLS12381 {
+        fastcrypto_zkp::bls12381::api::prepare_pvk_bytes(&verifying_key)
     } else if curve == BN254 {
-        result = fastcrypto_zkp::bn254::api::prepare_pvk_bytes(&verifying_key);
+        fastcrypto_zkp::bn254::api::prepare_pvk_bytes(&verifying_key)
     } else {
         return Ok(NativeResult::err(cost, INVALID_CURVE));
-    }
+    };
 
     match result {
         Ok(pvk) => Ok(NativeResult::ok(
@@ -193,44 +192,43 @@ pub fn verify_groth16_proof_internal(
     // Charge the arg size dependent costs
     native_charge_gas_early_exit!(
         context,
-        cost_per_public_input * (num_public_inputs as u64).into()
+        cost_per_public_input.saturating_mul(num_public_inputs as u64)
             + groth16_verify_groth16_proof_internal_cost_params
                 .groth16_verify_groth16_proof_internal_public_input_cost_per_byte
-                * (public_proof_inputs.len() as u64).into()
+                .saturating_mul(public_proof_inputs.len() as u64)
     );
 
     let cost = context.gas_used();
 
-    let result;
-    if curve == BLS12381 {
+    let result = if curve == BLS12381 {
         if public_proof_inputs.len()
             > fastcrypto::groups::bls12381::SCALAR_LENGTH * MAX_PUBLIC_INPUTS
         {
             return Ok(NativeResult::err(cost, TOO_MANY_PUBLIC_INPUTS));
         }
-        result = fastcrypto_zkp::bls12381::api::verify_groth16_in_bytes(
+        fastcrypto_zkp::bls12381::api::verify_groth16_in_bytes(
             &vk_gamma_abc_g1,
             &alpha_g1_beta_g2,
             &gamma_g2_neg_pc,
             &delta_g2_neg_pc,
             &public_proof_inputs,
             &proof_points,
-        );
+        )
     } else if curve == BN254 {
         if public_proof_inputs.len() > fastcrypto_zkp::bn254::api::SCALAR_SIZE * MAX_PUBLIC_INPUTS {
             return Ok(NativeResult::err(cost, TOO_MANY_PUBLIC_INPUTS));
         }
-        result = fastcrypto_zkp::bn254::api::verify_groth16_in_bytes(
+        fastcrypto_zkp::bn254::api::verify_groth16_in_bytes(
             &vk_gamma_abc_g1,
             &alpha_g1_beta_g2,
             &gamma_g2_neg_pc,
             &delta_g2_neg_pc,
             &public_proof_inputs,
             &proof_points,
-        );
+        )
     } else {
         return Ok(NativeResult::err(cost, INVALID_CURVE));
-    }
+    };
 
     Ok(NativeResult::ok(
         cost,

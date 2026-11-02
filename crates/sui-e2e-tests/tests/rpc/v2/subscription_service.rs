@@ -4,6 +4,7 @@
 use crate::transfer_coin;
 use prost::bytes::Bytes;
 use std::path::PathBuf;
+use std::time::Duration;
 use sui_macros::sim_test;
 use sui_rpc::Client;
 use sui_rpc::field::FieldMask;
@@ -13,6 +14,8 @@ use sui_rpc::proto::sui::rpc::v2::ExecutedTransaction;
 use sui_rpc::proto::sui::rpc::v2::SubscribeCheckpointsRequest;
 use sui_rpc::proto::sui::rpc::v2::ledger_service_client::LedgerServiceClient;
 use sui_rpc::proto::sui::rpc::v2::subscription_service_client::SubscriptionServiceClient;
+use sui_rpc_cursor::CursorKind;
+use sui_rpc_cursor::CursorToken;
 use sui_types::base_types::ObjectRef;
 use sui_types::base_types::SuiAddress;
 use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
@@ -887,6 +890,161 @@ async fn subscription_cursor_backfills_via_list() {
     );
 }
 
+/// Pins rendering parity between subscription payloads and the unary Get
+/// APIs clients use to backfill gaps: for the same read mask, a
+/// SubscribeTransactions payload equals GetTransaction's transaction and a
+/// SubscribeCheckpoints payload equals GetCheckpoint's checkpoint, including
+/// resolved effects object types and event JSON.
+#[sim_test]
+async fn subscription_payloads_match_unary_rendering() {
+    let cluster = subscription_cluster().await;
+    let sender = cluster.get_address_0();
+
+    let transaction_mask = FieldMask::from_paths([
+        "digest",
+        "effects.changed_objects",
+        "effects.status",
+        "events.events.event_type",
+        "events.events.json",
+    ]);
+    let checkpoint_mask = FieldMask::from_paths([
+        "sequence_number",
+        "transactions.digest",
+        "transactions.effects.changed_objects",
+        "transactions.effects.status",
+        "transactions.events.events.json",
+    ]);
+
+    let mut client = alpha_subscription_client(&cluster).await;
+    let mut request = v2::SubscribeTransactionsRequest::default();
+    request.read_mask = Some(transaction_mask.clone());
+    request.filter = Some(sender_tx_filter(sender, false));
+    let mut transaction_stream = client
+        .subscribe_transactions(request)
+        .await
+        .unwrap()
+        .into_inner();
+
+    let mut request = v2::SubscribeCheckpointsRequest::default();
+    request.read_mask = Some(checkpoint_mask.clone());
+    request.filter = Some(sender_tx_filter(sender, false));
+    let mut checkpoint_stream = client
+        .subscribe_checkpoints(request)
+        .await
+        .unwrap()
+        .into_inner();
+
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/rpc/data/ledger_history/event/emit_test_event");
+    let (pkg, _) = super::publish_package(&cluster, sender, path).await;
+    let mut builder = ProgrammableTransactionBuilder::new();
+    builder.programmable_move_call(
+        pkg,
+        move_core_types::identifier::Identifier::new("emit_test_event").unwrap(),
+        move_core_types::identifier::Identifier::new("emit_test_event").unwrap(),
+        vec![],
+        vec![],
+    );
+    let tx = execute_programmable(&cluster, sender, builder).await;
+    let expected_digest = tx.digest().to_owned();
+    let expected_checkpoint = tx.checkpoint.expect("executed tx has a checkpoint");
+
+    // The package publish also matches the sender filter; skip its payload
+    // along with progress-only frames.
+    let subscribed_transaction = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let frame = transaction_stream
+                .next()
+                .await
+                .expect("transaction subscription should remain open")
+                .unwrap();
+            let Some(transaction) = frame.transaction else {
+                continue;
+            };
+            if transaction.digest.as_deref() == Some(expected_digest.as_str()) {
+                break transaction;
+            }
+        }
+    })
+    .await
+    .expect("event transaction should arrive on the transaction subscription");
+
+    let subscribed_checkpoint = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let frame = checkpoint_stream
+                .next()
+                .await
+                .expect("checkpoint subscription should remain open")
+                .unwrap();
+            let Some(checkpoint) = frame.checkpoint else {
+                continue;
+            };
+            if checkpoint.sequence_number == Some(expected_checkpoint) {
+                break checkpoint;
+            }
+        }
+    })
+    .await
+    .expect("event transaction's checkpoint should arrive on the checkpoint subscription");
+
+    // Guard against an equality where both sides are trivially empty.
+    let changed_objects = &subscribed_transaction
+        .effects
+        .as_ref()
+        .expect("effects requested in read mask")
+        .changed_objects;
+    assert!(
+        changed_objects
+            .iter()
+            .any(|object| object.object_type.as_deref().is_some_and(|t| !t.is_empty())),
+        "subscribed effects should resolve changed object types: {changed_objects:?}"
+    );
+    let events = &subscribed_transaction
+        .events
+        .as_ref()
+        .expect("events requested in read mask")
+        .events;
+    assert!(!events.is_empty(), "transaction should emit a Move event");
+    assert!(
+        events.iter().all(|event| event.json.is_some()),
+        "every subscribed event should carry rendered json: {events:?}"
+    );
+
+    let mut ledger = LedgerServiceClient::connect(cluster.rpc_url().to_owned())
+        .await
+        .unwrap();
+
+    let mut request = v2::GetTransactionRequest::default();
+    request.digest = Some(expected_digest.clone());
+    request.read_mask = Some(transaction_mask);
+    let unary_transaction = ledger
+        .get_transaction(request)
+        .await
+        .unwrap()
+        .into_inner()
+        .transaction
+        .expect("GetTransaction should return the transaction");
+    assert_eq!(
+        subscribed_transaction, unary_transaction,
+        "SubscribeTransactions payload should match GetTransaction rendering"
+    );
+
+    let unary_checkpoint = ledger
+        .get_checkpoint(
+            v2::GetCheckpointRequest::by_sequence_number(expected_checkpoint)
+                .with_read_mask(checkpoint_mask),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .checkpoint
+        .expect("GetCheckpoint should return the checkpoint");
+    assert_eq!(
+        subscribed_checkpoint, unary_checkpoint,
+        "SubscribeCheckpoints payload should match GetCheckpoint rendering"
+    );
+}
+
 #[sim_test]
 async fn subscribe_transactions_unanchored_negation() {
     let cluster = subscription_cluster().await;
@@ -1200,4 +1358,217 @@ async fn subscription_payload_metric_excludes_progress_frames() {
         payload_message_count(&cluster, "checkpoint"),
         checkpoint_baseline
     );
+}
+
+/// `(checkpoint, transaction_index, event_index)`: an item's key, or a frame's
+/// `cursor_position` (the boundary right before the item with that key), with the indexes a
+/// stream does not use left at 0. Ordered lexicographically, as ledger positions are.
+type LedgerPoint = (u64, u64, u32);
+
+/// Checks the `cursor_position` of each frame of a subscription, an ascending scan, in stream
+/// order: an item frame resumes right after its item; a progress frame carries a Boundary cursor
+/// and sits at the start of a checkpoint; positions never regress; and every delivered item lies
+/// before each later frame's position.
+#[derive(Default)]
+struct SubscriptionPositions {
+    last_position: Option<LedgerPoint>,
+    last_item: Option<LedgerPoint>,
+    progress_frames: usize,
+}
+
+impl SubscriptionPositions {
+    /// Checks the next frame, carrying `watermark` and either the item keyed `item.0`, whose
+    /// next boundary is `item.1`, or no item. Returns the frame's position.
+    fn observe(
+        &mut self,
+        item: Option<(LedgerPoint, LedgerPoint)>,
+        watermark: &v2::Watermark,
+    ) -> LedgerPoint {
+        let cursor = watermark.cursor.as_ref().expect("frame cursor");
+        let token = CursorToken::decode(cursor).expect("cursor decodes");
+        let carried = token.public_position.map(|position| {
+            (
+                position.checkpoint,
+                position.transaction_index,
+                position.event_index,
+            )
+        });
+        let position = watermark
+            .cursor_position
+            .as_ref()
+            .map(|position| {
+                (
+                    position.checkpoint.unwrap_or(0),
+                    position.transaction_index.unwrap_or(0),
+                    position.event_index.unwrap_or(0),
+                )
+            })
+            .expect("every subscription frame carries a cursor_position");
+        match item {
+            Some((key, above_key)) => {
+                assert_eq!(
+                    position, above_key,
+                    "an item frame resumes right after its item {key:?}"
+                );
+                assert_eq!(
+                    carried,
+                    Some(key),
+                    "an item cursor carries its item's key: {token:?}"
+                );
+                if let Some(last_item) = self.last_item {
+                    assert!(
+                        key > last_item,
+                        "items arrive in ledger order: {last_item:?} then {key:?}"
+                    );
+                }
+                self.last_item = Some(key);
+            }
+            None => {
+                assert_eq!(
+                    token.kind,
+                    CursorKind::Boundary,
+                    "a progress frame carries a Boundary cursor: {token:?}"
+                );
+                assert_eq!(
+                    (position.1, position.2),
+                    (0, 0),
+                    "a progress frame sits at the start of a checkpoint: {position:?}"
+                );
+                assert_eq!(
+                    carried,
+                    Some(position),
+                    "a progress cursor carries the boundary it names: {token:?}"
+                );
+                self.progress_frames += 1;
+            }
+        }
+        if let Some(last_position) = self.last_position {
+            assert!(
+                position >= last_position,
+                "position regressed from {last_position:?} to {position:?}"
+            );
+        }
+        if let Some(last_item) = self.last_item {
+            assert!(
+                last_item < position,
+                "delivered item {last_item:?} lies at or past position {position:?}"
+            );
+        }
+        self.last_position = Some(position);
+        position
+    }
+}
+
+/// Every SubscribeTransactions and SubscribeEvents frame, filtered or not, carries a
+/// `cursor_position` that passes [`SubscriptionPositions::observe`].
+#[sim_test]
+async fn subscription_cursor_positions() {
+    let cluster = subscription_cluster().await;
+    let sender = cluster.get_address_0();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/rpc/data/ledger_history/event/emit_test_event");
+    let (pkg, _) = super::publish_package(&cluster, sender, path).await;
+    let module = format!("{}::emit_test_event", pkg.to_canonical_string(true));
+
+    let mut client = alpha_subscription_client(&cluster).await;
+    let mut transaction_streams = Vec::new();
+    for filter in [None, Some(sender_tx_filter(sender, false))] {
+        let mut request = v2::SubscribeTransactionsRequest::default();
+        request.read_mask = Some(FieldMask::from_paths([
+            "digest",
+            "checkpoint",
+            "transaction_index",
+        ]));
+        request.filter = filter;
+        let stream = client.subscribe_transactions(request).await.unwrap();
+        transaction_streams.push(stream.into_inner());
+    }
+    let mut event_streams = Vec::new();
+    for filter in [None, Some(emit_module_event_filter(&module))] {
+        let mut request = v2::SubscribeEventsRequest::default();
+        request.read_mask = Some(FieldMask::from_paths([
+            "checkpoint",
+            "transaction_digest",
+            "transaction_index",
+            "event_index",
+        ]));
+        request.filter = filter;
+        let stream = client.subscribe_events(request).await.unwrap();
+        event_streams.push(stream.into_inner());
+    }
+
+    // One transaction emitting two events.
+    let mut builder = ProgrammableTransactionBuilder::new();
+    for _ in 0..2 {
+        builder.programmable_move_call(
+            pkg,
+            move_core_types::identifier::Identifier::new("emit_test_event").unwrap(),
+            move_core_types::identifier::Identifier::new("emit_test_event").unwrap(),
+            vec![],
+            vec![],
+        );
+    }
+    let tx = execute_programmable(&cluster, sender, builder).await;
+    let digest = tx.digest().to_owned();
+    let tx_checkpoint = tx.checkpoint.expect("executed tx has a checkpoint");
+
+    // Read each stream until a position past the transaction's checkpoint.
+    for mut stream in transaction_streams {
+        let mut positions = SubscriptionPositions::default();
+        let mut delivered = false;
+        loop {
+            let frame = stream.next().await.expect("stream open").unwrap();
+            let watermark = frame.watermark.as_ref().expect("frame watermark");
+            let item = frame.transaction.as_ref().map(|transaction| {
+                delivered |= transaction.digest.as_deref() == Some(digest.as_str());
+                let key = (
+                    transaction.checkpoint.expect("checkpoint in read mask"),
+                    transaction.transaction_index.expect("index in read mask"),
+                    0,
+                );
+                (key, (key.0, key.1 + 1, 0))
+            });
+            if positions.observe(item, watermark).0 > tx_checkpoint {
+                break;
+            }
+        }
+        assert!(delivered, "the stream delivers the transaction {digest}");
+        assert!(
+            positions.progress_frames > 0,
+            "the stream sends progress frames"
+        );
+    }
+    for mut stream in event_streams {
+        let mut positions = SubscriptionPositions::default();
+        let mut delivered_event_indexes = Vec::new();
+        loop {
+            let frame = stream.next().await.expect("stream open").unwrap();
+            let watermark = frame.watermark.as_ref().expect("frame watermark");
+            let item = frame.event.as_ref().map(|event| {
+                let key = (
+                    event.checkpoint.expect("checkpoint in read mask"),
+                    event
+                        .transaction_index
+                        .expect("transaction index in read mask"),
+                    event.event_index.expect("event index in read mask"),
+                );
+                if event.transaction_digest.as_deref() == Some(digest.as_str()) {
+                    delivered_event_indexes.push(key.2);
+                }
+                (key, (key.0, key.1, key.2 + 1))
+            });
+            if positions.observe(item, watermark).0 > tx_checkpoint {
+                break;
+            }
+        }
+        assert_eq!(
+            delivered_event_indexes,
+            vec![0, 1],
+            "the stream delivers both events of {digest}"
+        );
+        assert!(
+            positions.progress_frames > 0,
+            "the stream sends progress frames"
+        );
+    }
 }

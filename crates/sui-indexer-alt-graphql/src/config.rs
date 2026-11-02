@@ -134,6 +134,10 @@ pub struct Limits {
     /// `max_batch_get_transactions`.
     pub max_batch_get_objects: u32,
 
+    /// Number of HTTP/2 connections each ledger gRPC (kv-rpc) reader spreads its requests over, so
+    /// concurrent calls are not capped by one connection's flow-control window.
+    pub ledger_grpc_num_connections: usize,
+
     /// Maximum (and default) number of object changes that can be returned in a single page of
     /// `TransactionEffects.objectChanges`.
     pub page_size_override_fx_object_changes: u32,
@@ -194,6 +198,7 @@ pub struct LimitsLayer {
     pub max_multi_get_size: Option<u32>,
     pub max_batch_get_transactions: Option<u32>,
     pub max_batch_get_objects: Option<u32>,
+    pub ledger_grpc_num_connections: Option<usize>,
     pub page_size_override_fx_object_changes: Option<u32>,
     pub page_size_override_packages: Option<u32>,
     pub max_type_argument_depth: Option<usize>,
@@ -277,7 +282,19 @@ pub struct SubscriptionConfig {
     /// reach that checkpoint; a far-future request would hold a connection open indefinitely, so it
     /// is rejected instead. Raising this admits starts further past the tip, at the cost of
     /// connections parked waiting longer.
+    ///
+    /// `afterCheckpoint` and cursors that name a checkpoint are checked when the subscription
+    /// starts. A cursor that names none (a legacy cursor without a checkpoint label, as
+    /// Postgres-backed pagination mints, or a ledger cursor GraphQL could not place) is not checked.
     pub max_start_checkpoints_ahead_of_tip: u64,
+
+    /// For a subscription that opted into progress (the `progress` argument), the number of
+    /// consecutive live checkpoints with no match after which it delivers a live progress edge (a
+    /// cursor with a `null` node), letting a client on a sparse filter resume from near the tip
+    /// instead of from its last match. Lower values advance the resume point sooner at the cost of
+    /// more payloads on sparse filters. 0 disables live progress edges; backfill still delivers one
+    /// per scan page that ends past its last match.
+    pub unmatched_checkpoints_before_progress: u64,
 
     /// Maximum number of concurrent subscriptions the server admits at once. A subscription opened
     /// while this many are already active is rejected so it can retry later.
@@ -294,6 +311,8 @@ impl Default for SubscriptionConfig {
             per_subscriber_max_output_nodes_per_second: 1_000_000,
             // About a minute at the average checkpoint rate.
             max_start_checkpoints_ahead_of_tip: 300,
+            // About a minute on mainnet.
+            unmatched_checkpoints_before_progress: 240,
             max_subscribers: 512,
         }
     }
@@ -308,6 +327,7 @@ pub struct SubscriptionLayer {
     pub max_concurrent_resolutions: Option<usize>,
     pub per_subscriber_max_output_nodes_per_second: Option<u32>,
     pub max_start_checkpoints_ahead_of_tip: Option<u64>,
+    pub unmatched_checkpoints_before_progress: Option<u64>,
     pub max_subscribers: Option<usize>,
 }
 
@@ -330,6 +350,9 @@ impl SubscriptionLayer {
             max_start_checkpoints_ahead_of_tip: self
                 .max_start_checkpoints_ahead_of_tip
                 .unwrap_or(base.max_start_checkpoints_ahead_of_tip),
+            unmatched_checkpoints_before_progress: self
+                .unmatched_checkpoints_before_progress
+                .unwrap_or(base.unmatched_checkpoints_before_progress),
             max_subscribers: self.max_subscribers.unwrap_or(base.max_subscribers),
         }
     }
@@ -503,6 +526,9 @@ impl LimitsLayer {
             max_batch_get_objects: self
                 .max_batch_get_objects
                 .unwrap_or(base.max_batch_get_objects),
+            ledger_grpc_num_connections: self
+                .ledger_grpc_num_connections
+                .unwrap_or(base.ledger_grpc_num_connections),
             page_size_override_fx_object_changes: self
                 .page_size_override_fx_object_changes
                 .unwrap_or(base.page_size_override_fx_object_changes),
@@ -597,6 +623,7 @@ impl From<Limits> for LimitsLayer {
             max_multi_get_size: Some(value.max_multi_get_size),
             max_batch_get_transactions: Some(value.max_batch_get_transactions),
             max_batch_get_objects: Some(value.max_batch_get_objects),
+            ledger_grpc_num_connections: Some(value.ledger_grpc_num_connections),
             page_size_override_fx_object_changes: Some(value.page_size_override_fx_object_changes),
             page_size_override_packages: Some(value.page_size_override_packages),
             max_type_argument_depth: Some(value.max_type_argument_depth),
@@ -652,6 +679,9 @@ impl From<SubscriptionConfig> for SubscriptionLayer {
                 value.per_subscriber_max_output_nodes_per_second,
             ),
             max_start_checkpoints_ahead_of_tip: Some(value.max_start_checkpoints_ahead_of_tip),
+            unmatched_checkpoints_before_progress: Some(
+                value.unmatched_checkpoints_before_progress,
+            ),
             max_subscribers: Some(value.max_subscribers),
         }
     }
@@ -705,6 +735,7 @@ impl Default for Limits {
             max_multi_get_size: 200,
             max_batch_get_transactions: MAX_BATCH_GET_TRANSACTIONS as u32,
             max_batch_get_objects: MAX_BATCH_GET_OBJECTS as u32,
+            ledger_grpc_num_connections: 4,
             // A much larger page size than the default, to make it unlikely that users need to
             // fetch a second page.
             page_size_override_fx_object_changes: 1024,

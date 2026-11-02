@@ -42,10 +42,18 @@ pub struct RpcConfig {
 
     /// Aggregate budget for Move-value JSON rendering across a single response.
     ///
-    /// Endpoints that render many Move values in one response (e.g. `GetCheckpoint`
-    /// with a `read_mask` that selects every event's `json` field) share this
-    /// budget across all per-item renders, so the response cannot multiply one
-    /// request into hundreds of MiB of materialized `prost_types::Value`.
+    /// Endpoints that render many Move values in one response share this budget
+    /// across all per-item renders, so the response cannot multiply one request
+    /// into hundreds of MiB of materialized `prost_types::Value`. The budget
+    /// covers one checkpoint in `GetCheckpoint`, `ListCheckpoints`, and
+    /// `SubscribeCheckpoints`, and one transaction frame in
+    /// `SubscribeTransactions`. Values rendered after the budget runs out have
+    /// no `json`.
+    ///
+    /// `GetTransaction`, `ListTransactions`, `ListEvents`, and `SubscribeEvents`
+    /// instead render each value with its own `max_json_move_value_size` budget
+    /// and no aggregate cap, so one transaction's event JSON can differ between
+    /// `SubscribeTransactions` and `GetTransaction`.
     ///
     /// Defaults to `16 MiB` if not specified.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -500,8 +508,9 @@ pub struct LedgerHistoryConfig {
     pub chunk_bucket_scan_budget: Option<usize>,
 
     /// Maximum total filter literals (bitmap dimensions) accepted in one filtered
-    /// request, across all DNF terms. Each literal becomes one bitmap leaf, so
-    /// this bounds a single filter's scan fanout. Must not exceed
+    /// request, across all DNF terms. Each literal becomes one bitmap leaf (an
+    /// `AffectedAddress` literal also scans the `Sender` dimension, so it becomes
+    /// two), so this bounds a single filter's scan fanout. Must not exceed
     /// `bitmap_bucket_scan_budget` (see [`LedgerHistoryConfig::validate`]).
     ///
     /// Defaults to `10` if not specified.
@@ -544,18 +553,20 @@ impl LedgerHistoryConfig {
             .unwrap_or(DEFAULT_MAX_BITMAP_FILTER_LITERALS)
     }
 
-    /// Reject configurations that cannot make forward progress. Each filter
-    /// literal becomes one bitmap leaf that must fetch at least one bucket to
-    /// emit its first watermark; if the per-request budget is below the literal
-    /// cap a `SCAN_LIMIT` can fire before any merged watermark reaches the wire,
-    /// leaving the client a cursorless `QueryEnd` it cannot resume from. Mirrors
-    /// the archival/BigTable side's `LedgerHistoryConfig::validate`.
+    /// Reject configurations that cannot make forward progress. Every filter
+    /// leaf must fetch at least one bucket to emit its first watermark. The
+    /// fullnode evaluator reserves each leaf's first bucket regardless of the
+    /// budget, so a query with more leaves than literals (an `AffectedAddress`
+    /// literal also scans the `Sender` dimension) still progresses; this check
+    /// keeps the per-request budget at or above the literal cap so ordinary
+    /// filters have room to page past their first buckets before `SCAN_LIMIT`.
+    /// Mirrors the archival/BigTable side's `LedgerHistoryConfig::validate`.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.bitmap_bucket_scan_budget() >= self.max_bitmap_filter_literals(),
             "ledger_history.bitmap_bucket_scan_budget ({}) must be >= \
-             max_bitmap_filter_literals ({}) so every filter leaf gets at least one \
-             bucket before SCAN_LIMIT",
+             max_bitmap_filter_literals ({}) so filtered scans can progress past \
+             each leaf's first bucket before SCAN_LIMIT",
             self.bitmap_bucket_scan_budget(),
             self.max_bitmap_filter_literals(),
         );

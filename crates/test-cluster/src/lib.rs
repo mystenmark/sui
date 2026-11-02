@@ -3,7 +3,6 @@
 
 use fastcrypto_zkp::bn254::zk_login::JwkId;
 use futures::future::join_all;
-use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use mysten_common::ZipDebugEqIteratorExt;
 use mysten_common::fatal;
 use rand::{Rng, distributions::*, rngs::OsRng, seq::SliceRandom};
@@ -14,7 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use sui_config::genesis::Genesis;
 use sui_config::node::FundsWithdrawSchedulerType;
-use sui_config::node::{AuthorityOverloadConfig, DBCheckpointConfig, RunWithRange};
+use sui_config::node::{
+    AuthorityOverloadConfig, ConsensusTransactionPoolConfig, DBCheckpointConfig, RunWithRange,
+};
 use sui_config::{Config, ExecutionCacheConfig, SUI_CLIENT_CONFIG, SUI_NETWORK_CONFIG};
 use sui_config::{NodeConfig, PersistedConfig, SUI_KEYSTORE_FILENAME};
 use sui_core::authority_aggregator::AuthorityAggregator;
@@ -27,7 +28,6 @@ use sui_rpc_api::Client;
 use sui_rpc_api::client::ExecutedTransaction;
 use sui_sdk::sui_client_config::{SuiClientConfig, SuiEnv};
 use sui_sdk::wallet_context::WalletContext;
-use sui_sdk::{SuiClient, SuiClientBuilder};
 use sui_swarm::memory::{Swarm, SwarmBuilder};
 use sui_swarm_config::genesis_config::{
     AccountConfig, DEFAULT_GAS_AMOUNT, GenesisConfig, ValidatorGenesisConfig,
@@ -60,7 +60,6 @@ use sui_types::sui_system_state::SuiSystemState;
 use sui_types::sui_system_state::SuiSystemStateTrait;
 use sui_types::sui_system_state::epoch_start_sui_system_state::EpochStartSystemStateTrait;
 use sui_types::supported_protocol_versions::SupportedProtocolVersions;
-use sui_types::traffic_control::{PolicyConfig, RemoteFirewallConfig};
 use sui_types::transaction::{Transaction, TransactionData};
 use tokio::sync::broadcast;
 use tokio::time::{Instant, timeout};
@@ -76,28 +75,17 @@ const TRANSACTION_FINALITY_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub struct FullNodeHandle {
     pub sui_node: SuiNodeHandle,
-    #[deprecated = "use grpc_client"]
-    pub sui_client: SuiClient,
-    #[deprecated = "use grpc_client"]
-    pub rpc_client: HttpClient,
     pub grpc_client: Client,
     pub rpc_url: String,
 }
 
 impl FullNodeHandle {
-    pub async fn new(sui_node: SuiNodeHandle, json_rpc_address: SocketAddr) -> Self {
-        let rpc_url = format!("http://{}", json_rpc_address);
-        let rpc_client = HttpClientBuilder::default().build(&rpc_url).unwrap();
-
-        let sui_client = SuiClientBuilder::default().build(&rpc_url).await.unwrap();
+    pub async fn new(sui_node: SuiNodeHandle, rpc_address: SocketAddr) -> Self {
+        let rpc_url = format!("http://{}", rpc_address);
         let grpc_client = Client::new(&rpc_url).unwrap();
 
         Self {
             sui_node,
-            #[allow(deprecated)]
-            sui_client,
-            #[allow(deprecated)]
-            rpc_client,
             grpc_client,
             rpc_url,
         }
@@ -111,18 +99,6 @@ pub struct TestCluster {
 }
 
 impl TestCluster {
-    #[deprecated = "use grpc_client()"]
-    pub fn rpc_client(&self) -> &HttpClient {
-        #[allow(deprecated)]
-        &self.fullnode_handle.rpc_client
-    }
-
-    #[deprecated = "use grpc_client()"]
-    pub fn sui_client(&self) -> &SuiClient {
-        #[allow(deprecated)]
-        &self.fullnode_handle.sui_client
-    }
-
     pub fn grpc_client(&self) -> Client {
         self.fullnode_handle.grpc_client.clone()
     }
@@ -224,6 +200,21 @@ impl TestCluster {
 
     pub fn stop_node(&self, name: &AuthorityName) {
         self.swarm.node(name).unwrap().stop();
+    }
+
+    /// See `sui_swarm::memory::Node::graceful_stop`.
+    #[cfg(msim)]
+    pub async fn graceful_stop_node(
+        &self,
+        name: &AuthorityName,
+        poll_budget: usize,
+        max_duration: Duration,
+    ) {
+        self.swarm
+            .node(name)
+            .unwrap()
+            .graceful_stop(poll_budget, max_duration)
+            .await;
     }
 
     pub async fn stop_all_validators(&self) {
@@ -949,8 +940,7 @@ impl TestCluster {
                     let checkpoint_seqs = state
                         .epoch_store_for_testing()
                         .transactions_executed_in_checkpoint_notify(digests.to_vec())
-                        .await
-                        .unwrap();
+                        .await;
 
                     // then wait until the highest of those checkpoints is executed on this node
                     let max_checkpoint_seq = checkpoint_seqs.into_iter().max().unwrap();
@@ -1148,6 +1138,8 @@ pub struct RandomNodeRestarter {
     kill_interval: Uniform<Duration>,
     // How long should we wait before restarting them.
     restart_delay: Uniform<Duration>,
+    // Stop nodes as SIGTERM would instead of killing them.
+    graceful: bool,
 
     task_handle: Mutex<Option<JoinHandle<()>>>,
 }
@@ -1158,6 +1150,7 @@ impl RandomNodeRestarter {
             test_cluster,
             kill_interval: Uniform::new(Duration::from_secs(10), Duration::from_secs(11)),
             restart_delay: Uniform::new(Duration::from_secs(1), Duration::from_secs(2)),
+            graceful: false,
             task_handle: Default::default(),
         }
     }
@@ -1172,10 +1165,17 @@ impl RandomNodeRestarter {
         self
     }
 
+    #[cfg(msim)]
+    pub fn with_graceful_shutdown(mut self) -> Self {
+        self.graceful = true;
+        self
+    }
+
     pub fn run(&self) {
         let test_cluster = self.test_cluster.clone();
         let kill_interval = self.kill_interval;
         let restart_delay = self.restart_delay;
+        let graceful = self.graceful;
         let validators = self.test_cluster.get_validator_pubkeys();
         let mut task_handle = self.task_handle.lock().unwrap();
         assert!(task_handle.is_none());
@@ -1186,8 +1186,13 @@ impl RandomNodeRestarter {
                 sleep(delay).await;
 
                 let validator = validators.choose(&mut OsRng).unwrap();
-                info!("Killing validator {:?}", validator.concise());
-                test_cluster.stop_node(validator);
+                if graceful {
+                    info!("Gracefully stopping validator {:?}", validator.concise());
+                    Self::graceful_stop(&test_cluster, validator).await;
+                } else {
+                    info!("Killing validator {:?}", validator.concise());
+                    test_cluster.stop_node(validator);
+                }
 
                 let delay = restart_delay.sample(&mut OsRng);
                 info!("Sleeping {delay:?} before restarting");
@@ -1196,6 +1201,24 @@ impl RandomNodeRestarter {
                 test_cluster.start_node(validator).await;
             }
         }));
+    }
+}
+
+impl RandomNodeRestarter {
+    #[cfg(msim)]
+    async fn graceful_stop(test_cluster: &TestCluster, validator: &AuthorityName) {
+        // A busy tokio worker checks for runtime shutdown once every 61 task polls (the default
+        // `event_interval`), so after shutdown begins it may poll up to 61 more tasks. The budget
+        // covers the polls that 8 busy workers can make before all of them stop.
+        let poll_budget = OsRng.gen_range(0..=61 * 8);
+        test_cluster
+            .graceful_stop_node(validator, poll_budget, Duration::from_secs(1))
+            .await;
+    }
+
+    #[cfg(not(msim))]
+    async fn graceful_stop(_: &TestCluster, _: &AuthorityName) {
+        unreachable!("graceful shutdown is only available in simtests");
     }
 }
 
@@ -1226,11 +1249,10 @@ pub struct TestClusterBuilder {
     config_dir: Option<PathBuf>,
     default_jwks: bool,
     authority_overload_config: Option<AuthorityOverloadConfig>,
+    consensus_transaction_pool_config: Option<ConsensusTransactionPoolConfig>,
     execution_cache_config: Option<ExecutionCacheConfig>,
     data_ingestion_dir: Option<PathBuf>,
     fullnode_run_with_range: Option<RunWithRange>,
-    fullnode_policy_config: Option<PolicyConfig>,
-    fullnode_fw_config: Option<RemoteFirewallConfig>,
 
     validator_global_state_hash_v2_enabled_config: GlobalStateHashV2EnabledConfig,
     validator_funds_withdraw_scheduler_type_config: FundsWithdrawSchedulerTypeConfig,
@@ -1275,11 +1297,10 @@ impl TestClusterBuilder {
             config_dir: None,
             default_jwks: false,
             authority_overload_config: None,
+            consensus_transaction_pool_config: None,
             execution_cache_config: None,
             data_ingestion_dir: None,
             fullnode_run_with_range: None,
-            fullnode_policy_config: None,
-            fullnode_fw_config: None,
             validator_global_state_hash_v2_enabled_config: GlobalStateHashV2EnabledConfig::Global(
                 true,
             ),
@@ -1354,16 +1375,6 @@ impl TestClusterBuilder {
         self
     }
 
-    pub fn with_fullnode_policy_config(mut self, config: Option<PolicyConfig>) -> Self {
-        self.fullnode_policy_config = config;
-        self
-    }
-
-    pub fn with_fullnode_fw_config(mut self, config: Option<RemoteFirewallConfig>) -> Self {
-        self.fullnode_fw_config = config;
-        self
-    }
-
     pub fn with_fullnode_rpc_port(mut self, rpc_port: u16) -> Self {
         self.fullnode_rpc_port = Some(rpc_port);
         self
@@ -1414,7 +1425,6 @@ impl TestClusterBuilder {
             perform_db_checkpoints_at_epoch_end: true,
             checkpoint_path: None,
             object_store_config: None,
-            perform_index_db_checkpoints_at_epoch_end: None,
             prune_and_compact_before_upload: None,
         };
         self
@@ -1425,7 +1435,6 @@ impl TestClusterBuilder {
             perform_db_checkpoints_at_epoch_end: true,
             checkpoint_path: None,
             object_store_config: None,
-            perform_index_db_checkpoints_at_epoch_end: None,
             prune_and_compact_before_upload: Some(true),
         };
         self
@@ -1533,6 +1542,15 @@ impl TestClusterBuilder {
     pub fn with_authority_overload_config(mut self, config: AuthorityOverloadConfig) -> Self {
         assert!(self.network_config.is_none());
         self.authority_overload_config = Some(config);
+        self
+    }
+
+    pub fn with_consensus_transaction_pool_config(
+        mut self,
+        config: ConsensusTransactionPoolConfig,
+    ) -> Self {
+        assert!(self.network_config.is_none());
+        self.consensus_transaction_pool_config = Some(config);
         self
     }
 
@@ -1710,9 +1728,7 @@ impl TestClusterBuilder {
                     .unwrap_or(self.validator_supported_protocol_versions_config.clone()),
             )
             .with_db_checkpoint_config(self.db_checkpoint_config_fullnodes.clone())
-            .with_fullnode_run_with_range(self.fullnode_run_with_range)
-            .with_fullnode_policy_config(self.fullnode_policy_config.clone())
-            .with_fullnode_fw_config(self.fullnode_fw_config.clone());
+            .with_fullnode_run_with_range(self.fullnode_run_with_range);
 
         if let Some(validators) = self.validators.take() {
             builder = builder.with_validators(validators);
@@ -1736,6 +1752,10 @@ impl TestClusterBuilder {
 
         if let Some(authority_overload_config) = self.authority_overload_config.take() {
             builder = builder.with_authority_overload_config(authority_overload_config);
+        }
+
+        if let Some(config) = self.consensus_transaction_pool_config.take() {
+            builder = builder.with_consensus_transaction_pool_config(config);
         }
 
         if let Some(execution_cache_config) = self.execution_cache_config.take() {

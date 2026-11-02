@@ -181,7 +181,8 @@ impl EpochState {
         let transaction_data = transaction.data().transaction_data();
         let (kind, signer, gas_data) = transaction_data.execution_parts();
         let system_object_versions =
-            sui_types::base_types::SystemObjectVersions::from_latest_in_store(
+            sui_types::base_types::SystemObjectVersions::from_inputs_or_latest_in_store(
+                checked_input_objects.inner(),
                 store.backing_store(),
             );
         let (inner_temp_store, gas_status, effects, _timings, result) = self
@@ -196,7 +197,7 @@ impl EpochState {
                 &self.epoch_start_state.epoch(),
                 self.epoch_start_state.epoch_start_timestamp_ms(),
                 checked_input_objects,
-                system_object_versions,
+                system_object_versions.clone(),
                 self.unsettled_object_withdrawals.as_ref() as &dyn UnsettledObjectFundsRead,
                 gas_data,
                 gas_status,

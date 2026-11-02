@@ -56,9 +56,6 @@ ignore = [
     # `proc-macro-error2` is unmaintained, no safe upgrade — transitive via
     # alloy-sol-macro (sui-bridge ethereum stack); waiting for alloy to migrate
     "RUSTSEC-2026-0173",
-    # `http-types` ASCII invariant notice, no safe upgrade — dev-dependency only,
-    # via wiremock 0.5 test mocks; not used to construct auth headers
-    "RUSTSEC-2026-0174",
     # quick-xml 0.38: quadratic duplicate-attribute check (0194) and unbounded
     # namespace-declaration allocation DoS (0195). Fixed only in quick-xml >= 0.41,
     # but quick-xml is transitive via object_store, whose latest release (0.14.0)
@@ -68,16 +65,35 @@ ignore = [
     # releases with quick-xml >= 0.41.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
-    # `bitmaps` is unmaintained (all versions). It is a transitive dependency of
-    # `imbl`, the RUSTSEC-recommended replacement for the unmaintained `im` crate
-    # (which Sui and fastcrypto have both migrated away from). Unmaintained-only
-    # advisory, no unsoundness. Revisit if imbl drops its bitmaps dependency.
-    "RUSTSEC-2026-0247",
     # `clear_on_drop` is unmaintained, and no safe upgrade is available. It is
     # transitive through bulletproofs 5.0.0 in fastcrypto. Review by 2027-03-14
     # or if bulletproofs releases a zeroize-based replacement. Upstream proposal:
     # https://github.com/zkcrypto/bulletproofs/pull/17
     "RUSTSEC-2026-0283",
+    # `unsafe-libyaml` is unmaintained. Transitive via serde_yaml 0.9 (itself
+    # deprecated), used only by the sui-metric-checker CLI to parse its own
+    # config file. Remove once sui-metric-checker moves off serde_yaml.
+    "RUSTSEC-2024-0449",
+    # crypto-bigint < 0.7.6: operations intended to be constant-time may branch on
+    # secret data. Fixed only in crypto-bigint 0.7.6; Sui pulls 0.4.x/0.5.x through
+    # the RustCrypto elliptic-curve 0.12/0.13 stack (k256, p256, p384, ecdsa,
+    # primeorder via fastcrypto and alloy-signer), so clearing it needs the
+    # elliptic-curve 0.14 / crypto-bigint 0.7 upgrade. Validator signing uses
+    # BLS12-381 and Ed25519, which do not use this stack.
+    # TODO: security sign-off on secp256k1/secp256r1 signing exposure, and link the
+    # tracking issue for the elliptic-curve 0.14 upgrade.
+    "RUSTSEC-2026-0387",
+    # zstd 0.13 / zstd-safe 7: stream data leaking across a reused context (0391)
+    # and uninitialized memory on failed legacy-frame streaming decompression
+    # (0403). Fixed only in zstd 0.14.3 / zstd-safe 8.2, but zstd 0.13 comes in
+    # transitively through tonic 0.14, parquet 57 and compression-codecs, none of
+    # which have a release on zstd 0.14 yet. external-crates/move is already on
+    # zstd 0.14.3.
+    # Remove once those dependencies move to zstd 0.14.
+    # TODO: security sign-off on decompression of untrusted input (gRPC zstd
+    # request decompression via tonic, remote checkpoint ingestion).
+    "RUSTSEC-2026-0391",
+    "RUSTSEC-2026-0403",
 ]
 # Threshold for security vulnerabilities, any vulnerability with a CVSS score
 # lower than the range specified will be ignored. Note that ignored advisories

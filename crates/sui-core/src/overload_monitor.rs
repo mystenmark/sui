@@ -166,27 +166,26 @@ fn check_overload_signals(
 ) -> (bool, u32) {
     // First, we calculate based on the current `txn_ready_rate` and `execution_rate`,
     // what's the percentage of traffic to shed from `txn_ready_rate`.
-    let additional_load_shedding_percentage;
-    if queueing_latency > config.execution_queue_latency_hard_limit {
-        let calculated_load_shedding_percentage =
-            calculate_load_shedding_percentage(txn_ready_rate, execution_rate);
+    let additional_load_shedding_percentage =
+        if queueing_latency > config.execution_queue_latency_hard_limit {
+            let calculated_load_shedding_percentage =
+                calculate_load_shedding_percentage(txn_ready_rate, execution_rate);
 
-        additional_load_shedding_percentage = if calculated_load_shedding_percentage > 0
-            || txn_ready_rate >= config.safe_transaction_ready_rate as f64
-        {
-            max(
-                calculated_load_shedding_percentage,
-                config.min_load_shedding_percentage_above_hard_limit,
-            )
+            if calculated_load_shedding_percentage > 0
+                || txn_ready_rate >= config.safe_transaction_ready_rate as f64
+            {
+                max(
+                    calculated_load_shedding_percentage,
+                    config.min_load_shedding_percentage_above_hard_limit,
+                )
+            } else {
+                0
+            }
+        } else if queueing_latency > config.execution_queue_latency_soft_limit {
+            calculate_load_shedding_percentage(txn_ready_rate, execution_rate)
         } else {
             0
         };
-    } else if queueing_latency > config.execution_queue_latency_soft_limit {
-        additional_load_shedding_percentage =
-            calculate_load_shedding_percentage(txn_ready_rate, execution_rate);
-    } else {
-        additional_load_shedding_percentage = 0;
-    }
 
     // Next, we calculate the new load shedding percentage.
     let load_shedding_percentage = if additional_load_shedding_percentage > 0 {
@@ -412,7 +411,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[sim_test]
     pub async fn test_check_authority_overload() {
         telemetry_subscribers::init_for_testing();
 
@@ -624,7 +623,7 @@ mod tests {
     }
 
     // Tests that when request generation rate is slower than execution rate, no requests should be dropped.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[sim_test]
     pub async fn test_workload_consistent_no_overload() {
         telemetry_subscribers::init_for_testing();
         run_consistent_workload_test(900.0, 1000.0, 0.0, 0.0).await;
@@ -632,7 +631,7 @@ mod tests {
 
     // Tests that when request generation rate is slightly above execution rate, a small portion of
     // requests should be dropped.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[sim_test]
     pub async fn test_workload_consistent_slightly_overload() {
         telemetry_subscribers::init_for_testing();
         // Dropping rate should be around 15%.
@@ -641,7 +640,7 @@ mod tests {
 
     // Tests that when request generation rate is much higher than execution rate, a large portion of
     // requests should be dropped.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[sim_test]
     pub async fn test_workload_consistent_overload() {
         telemetry_subscribers::init_for_testing();
         // Dropping rate should be around 70%.
@@ -649,7 +648,7 @@ mod tests {
     }
 
     // Tests that when there is a very short single spike, no request should be dropped.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[sim_test]
     pub async fn test_workload_single_spike() {
         telemetry_subscribers::init_for_testing();
         let (state, monitor_handle) = start_overload_monitor().await;

@@ -70,12 +70,10 @@ sui/
 │   ├── sui-node/                       # Validator node implementation
 │   ├── sui-framework/                  # Move system packages & stdlib
 │   ├── sui-types/                      # Core type definitions
-│   ├── sui-json-rpc/                   # JSON-RPC API server
 │   ├── sui-indexer-alt-graphql/        # GraphQL API server
 │   └── sui-indexer-alt/                # Blockchain data indexer
 ├── consensus/                          # Consensus mechanism (Mysticeti)
 ├── sui-execution/                      # Move execution layer with versions
-├── dapps/                              # Frontend applications
 └── external-crates/                    # Move compiler and VM
 ```
 
@@ -142,6 +140,12 @@ Note in the PR description which downstream consumers were updated.
 ### Raising a PR:
 
 When opening or updating a PR in this repo, always invoke the `/send-pr` skill.
+
+### Prose (including code comments)
+
+1. Prose should almost always be sentances that have a noun and a verb.
+2. Adjectives should be used only when they are necessary for correct meaning.
+3. Do not use analogies or metaphors.
 
 ### Comment Writing Guidelines
 

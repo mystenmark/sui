@@ -1577,7 +1577,7 @@ mod tests {
             unimplemented!("get_latest_rounds not implemented in mock")
         }
 
-        #[cfg(test)]
+        #[cfg(all(test, not(msim)))]
         async fn send_block(
             &self,
             _peer: AuthorityIndex,
@@ -1594,6 +1594,7 @@ mod tests {
             &self,
             _peer: crate::network::PeerId,
             _highest_round_per_authority: Vec<Round>,
+            _filter: crate::network::BlockStreamFilter,
             _timeout: Duration,
         ) -> ConsensusResult<crate::network::ObserverBlockStream> {
             unimplemented!("stream_blocks not implemented in mock")

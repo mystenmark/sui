@@ -20,6 +20,7 @@ use fastcrypto::{
     secp256r1::Secp256r1PublicKey,
     traits::{EncodeDecodeBase64, ToFromBytes, VerifyingKey},
 };
+use fastcrypto_pq::mldsa65::{MLDSA65PublicKey, MLDSA65Signature};
 use mysten_common::ZipDebugEqIteratorExt;
 use once_cell::sync::OnceCell;
 use schemars::JsonSchema;
@@ -144,6 +145,15 @@ impl AuthenticatorTrait for MultiSig {
             .into());
         }
 
+        // Gates membership, not just signing: an ML-DSA key in the committee
+        // is a BCS variant that older binaries cannot decode.
+        if self.multisig_pk.has_mldsa65_member() && !verify_params.accept_mldsa65_in_multisig {
+            return Err(SuiErrorKind::InvalidSignature {
+                error: "ML-DSA-65 member not supported inside multisig".to_string(),
+            }
+            .into());
+        }
+
         let mut weight_sum: u16 = 0;
         let mut hasher = DefaultHash::default();
         bcs::serialize_into(&mut hasher, &value).expect("Message serialization should not fail");
@@ -231,6 +241,33 @@ impl AuthenticatorTrait for MultiSig {
                         &digest,
                         &s.try_into().map_err(|_| SuiErrorKind::InvalidSignature {
                             error: "Invalid r1 signature bytes".to_string(),
+                        })?,
+                    )
+                }
+                CompressedSignature::MLDSA65(s) => {
+                    if verify_params.additional_multisig_checks
+                        && !matches!(subsig_pubkey.scheme(), SignatureScheme::MLDSA65)
+                    {
+                        return Err(SuiErrorKind::InvalidSignature {
+                            error: format!(
+                                "Invalid sig for pk={} address={:?} error=signature/pubkey type mismatch",
+                                subsig_pubkey.encode_base64(),
+                                SuiAddress::from(subsig_pubkey)
+                            ),
+                        }.into());
+                    }
+                    let pk =
+                        MLDSA65PublicKey::from_bytes(subsig_pubkey.as_ref()).map_err(|_| {
+                            SuiErrorKind::InvalidSignature {
+                                error: "Invalid mldsa65 pk bytes".to_string(),
+                            }
+                        })?;
+                    pk.verify(
+                        &digest,
+                        &MLDSA65Signature::from_bytes(&s.0).map_err(|_| {
+                            SuiErrorKind::InvalidSignature {
+                                error: "Invalid mldsa65 signature bytes".to_string(),
+                            }
                         })?,
                     )
                 }
@@ -343,9 +380,8 @@ impl MultiSig {
         }
     }
     /// This combines a list of [enum Signature] `flag || signature || pk` to a MultiSig.
-    /// The order of full_sigs must be the same as the order of public keys in
-    /// [enum MultiSigPublicKey]. e.g. for [pk1, pk2, pk3, pk4, pk5],
-    /// [sig1, sig2, sig5] is valid, but [sig2, sig1, sig5] is invalid.
+    /// `full_sigs` may come in any order. They are stored in the order of their public
+    /// keys in [enum MultiSigPublicKey], which is the order verification walks the bitmap in.
     pub fn combine(
         full_sigs: Vec<GenericSignature>,
         multisig_pk: MultiSigPublicKey,
@@ -363,7 +399,7 @@ impl MultiSig {
             .into());
         }
         let mut bitmap = 0;
-        let mut sigs = Vec::with_capacity(full_sigs.len());
+        let mut indexed_sigs = Vec::with_capacity(full_sigs.len());
         for s in full_sigs {
             let pk = s.to_public_key()?;
             let index = multisig_pk
@@ -378,11 +414,12 @@ impl MultiSig {
                 .into());
             }
             bitmap |= 1 << index;
-            sigs.push(s.to_compressed()?);
+            indexed_sigs.push((index, s.to_compressed()?));
         }
+        indexed_sigs.sort_by_key(|(index, _)| *index);
 
         Ok(MultiSig {
-            sigs,
+            sigs: indexed_sigs.into_iter().map(|(_, sig)| sig).collect(),
             bitmap,
             multisig_pk,
             bytes: OnceCell::new(),
@@ -448,6 +485,15 @@ impl MultiSig {
         self.sigs
             .iter()
             .any(|s| matches!(s, CompressedSignature::ZkLogin(_)))
+    }
+
+    /// Whether any committee key or signature is ML-DSA-65.
+    pub fn uses_mldsa65(&self) -> bool {
+        self.multisig_pk.has_mldsa65_member()
+            || self
+                .sigs
+                .iter()
+                .any(|s| matches!(s, CompressedSignature::MLDSA65(_)))
     }
 }
 
@@ -553,6 +599,12 @@ impl MultiSigPublicKey {
 
     pub fn pubkeys(&self) -> &Vec<(PublicKey, WeightUnit)> {
         &self.pk_map
+    }
+
+    pub fn has_mldsa65_member(&self) -> bool {
+        self.pk_map
+            .iter()
+            .any(|(pk, _)| matches!(pk, PublicKey::MLDSA65(_)))
     }
 
     pub fn validate(&self) -> Result<MultiSigPublicKey, FastCryptoError> {

@@ -47,7 +47,7 @@ use sui_types::{
     metrics::ExecutionMetrics,
     move_package::MovePackage,
     object::{MoveObject, Owner},
-    storage::{ObjectFundsResolver, ObjectFundsSufficiency, RuntimeObjectResolver},
+    storage::{ImplicitSystemObjectResolver, ObjectFundsSufficiency, RuntimeObjectResolver},
 };
 use tracing::error;
 
@@ -138,7 +138,13 @@ pub(crate) struct ObjectRuntimeState {
 #[derive(Tid)]
 pub struct ObjectRuntime<'a> {
     child_object_store: ChildObjectStore<'a>,
-    object_funds_resolver: &'a dyn ObjectFundsResolver,
+    system_object_resolver: &'a dyn ImplicitSystemObjectResolver,
+    /// The Clock pinned for this transaction, loaded on first borrow. References handed out by
+    /// `borrow_clock` point into it, so it lives as long as the runtime; it is kept outside
+    /// `ObjectRuntimeState`, which test scenarios reset at the end of every transaction.
+    // TODO: if another implicitly read system object becomes borrowable, group these loaded
+    // values in a struct instead of adding more fields here.
+    clock: Option<GlobalValue>,
     // inventories for test scenario
     pub(crate) test_inventories: TestInventories,
     // the internal state
@@ -187,7 +193,7 @@ impl ObjectFundsAvailable {
 impl<'a> ObjectRuntime<'a> {
     pub fn new(
         object_resolver: &'a dyn RuntimeObjectResolver,
-        object_funds_resolver: &'a dyn ObjectFundsResolver,
+        system_object_resolver: &'a dyn ImplicitSystemObjectResolver,
         input_objects: BTreeMap<ObjectID, InputObject>,
         is_metered: bool,
         protocol_config: &'a ProtocolConfig,
@@ -223,7 +229,8 @@ impl<'a> ObjectRuntime<'a> {
                 metrics.clone(),
                 epoch_id,
             ),
-            object_funds_resolver,
+            system_object_resolver,
+            clock: None,
             test_inventories: TestInventories::new(),
             state: ObjectRuntimeState {
                 input_objects: input_object_owners,
@@ -248,6 +255,41 @@ impl<'a> ObjectRuntime<'a> {
         }
     }
 
+    pub fn borrow_clock(&mut self, layout: &R::MoveTypeLayout) -> PartialVMResult<Value> {
+        if self.clock.is_none() {
+            let clock = self.system_object_resolver.clock().map_err(|e| {
+                PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                    .with_message(format!("Failed to read the Clock: {e}"))
+            })?;
+            let contents = clock
+                .data
+                .try_as_move()
+                .ok_or_else(|| {
+                    PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                        .with_message("The Clock is not a Move object".to_string())
+                })?
+                .contents();
+            let value = Value::simple_deserialize(contents, layout).ok_or_else(|| {
+                PartialVMError::new(StatusCode::FAILED_TO_DESERIALIZE_RESOURCE)
+                    .with_message("Failed to deserialize the Clock".to_string())
+            })?;
+            self.clock = Some(GlobalValue::create(value)?);
+        }
+        self.clock
+            .as_ref()
+            .ok_or_else(|| {
+                PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                    .with_message("The Clock was not loaded".to_string())
+            })
+            .and_then(|clock| clock.borrow_global())
+    }
+
+    /// Drops the loaded Clock so the next borrow reads the test store again. Live references
+    /// keep the old value alive.
+    pub fn clear_clock_for_testing(&mut self) {
+        self.clock = None;
+    }
+
     pub fn check_object_funds_sufficiency(
         &mut self,
         owner: SuiAddress,
@@ -262,7 +304,7 @@ impl<'a> ObjectRuntime<'a> {
             .or_insert_with(ObjectFundsAvailable::init);
         if entry.needs_store_read(amount) {
             let settled_available = match self
-                .object_funds_resolver
+                .system_object_resolver
                 .object_available_balance(owner, type_)
             {
                 Ok(balance) => balance,
@@ -327,9 +369,10 @@ impl<'a> ObjectRuntime<'a> {
         Ok(())
     }
 
-    /// Marks `id` as new via `new_id` and, when `parent` has a tracked root version, records the
-    /// same root version for `id`. When `parent` is untracked it must itself be newly created in
-    /// this transaction (and transitively to its root), so no root version is recorded.
+    /// Marks `id` as new via `new_id` and, when `parent` has a tracked root version and `id` does
+    /// not, records the same root version for `id`. When `parent` is untracked it must itself be
+    /// newly created in this transaction (and transitively to its root), so no root version is
+    /// recorded.
     pub fn new_id_from_hash(&mut self, parent: ObjectID, id: ObjectID) -> PartialVMResult<()> {
         self.new_id(id)?;
         self.child_object_store
@@ -733,6 +776,10 @@ impl<'a> ObjectRuntime<'a> {
 
     pub fn is_deleted(&self, id: &ObjectID) -> bool {
         self.state.deleted_ids.contains(id)
+    }
+
+    pub fn input_owner(&self, id: &ObjectID) -> Option<&Owner> {
+        self.state.input_objects.get(id)
     }
 
     pub fn is_transferred(&self, id: &ObjectID) -> Option<Owner> {

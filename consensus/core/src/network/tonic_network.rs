@@ -379,7 +379,7 @@ impl ValidatorNetworkClient for TonicValidatorClient {
         Ok((response.highest_received, response.highest_accepted))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(msim)))]
     async fn send_block(
         &self,
         peer: AuthorityIndex,
@@ -1097,7 +1097,7 @@ impl TonicManager {
 
         // Use the pre-calculated own address and override with observer port
         let observer_address = SocketAddr::new(self.own_address.ip(), observer_port);
-        let observer_service_proxy = ObserverServiceProxy::new(service);
+        let observer_service_proxy = ObserverServiceProxy::new(self.context.clone(), service);
 
         let observer_service_server = ObserverServiceServer::new(observer_service_proxy)
             .max_encoding_message_size(tonic_config.message_size_limit)

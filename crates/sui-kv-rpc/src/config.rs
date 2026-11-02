@@ -4,6 +4,7 @@
 //! Archival (BigTable) KV RPC configuration.
 
 use std::num::NonZeroU32;
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::time::Duration;
 
@@ -12,19 +13,26 @@ use serde::Deserialize;
 use serde::Serialize;
 use sui_inverted_index::SkipPolicy;
 use sui_kvstore::PoolConfig;
+use sui_kvstore::ReadRowsRetryConfig;
+
+use crate::WatermarkSource;
 
 const DEFAULT_LEDGER_HISTORY_METHOD_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_RENDER_AHEAD: usize = 4;
 const DEFAULT_BITMAP_BUCKET_BUDGET_TX: u64 = 4_000;
 const DEFAULT_BITMAP_BUCKET_BUDGET_EVENT: u64 = 4_000;
 const DEFAULT_MAX_BITMAP_FILTER_LITERALS: usize = 10;
+// Comfortably above how far a replica's served checkpoint trails other replicas': up to one 10ms
+// watermark refresh when polling Bigtable, or the delivery delay of the indexers' watermark streams
+// when following them. A replica slower than this is genuinely behind, and the client is better
+// off retrying elsewhere.
+const DEFAULT_MONOTONIC_READ_WAIT_TIMEOUT_MS: u64 = 100;
 const DEFAULT_BITMAP_DRAIN_PROBE_ROWS: u32 = 50;
+const DEFAULT_WATERMARK_BEACON_BUCKETS: NonZeroU64 = NonZeroU64::new(256).unwrap();
 const DEFAULT_REQUEST_BIGTABLE_CONCURRENCY: usize = 50;
-const DEFAULT_STAGE_CHUNK_SIZE: usize = 100;
-const DEFAULT_TX_SEQ_DIGEST_STAGE_CONCURRENCY: usize = 10;
-const DEFAULT_TRANSACTIONS_STAGE_CONCURRENCY: usize = 25;
-const DEFAULT_OBJECTS_STAGE_CONCURRENCY: usize = 50;
-const DEFAULT_CHECKPOINTS_STAGE_CONCURRENCY: usize = 10;
+// Largest `tx_seq_digest` read size measured: reads of up to 100 keys within
+// one or two buckets cost about one seek.
+const DEFAULT_MAX_KEYS_PER_READ: usize = 100;
 
 /// Built-in per-endpoint defaults. These differ per endpoint (e.g. checkpoints
 /// page smaller than transactions).
@@ -108,16 +116,33 @@ impl LedgerHistoryMethodConfig {
     }
 }
 
-/// One read pipeline stage, identified by the BigTable table it scans. The same
-/// stage is shared by every list method that reads that table, so its cost is a
-/// property of the table (e.g. object rows are large, `tx_seq_digest` rows tiny)
-/// rather than the calling method.
+/// One read pipeline stage. Most stages are identified by the BigTable table
+/// they read and are shared by every method that reads that table, so their
+/// cost is a property of the table (e.g. object rows are large,
+/// `tx_seq_digest` rows tiny) rather than the calling method. `TxCpResolve`
+/// also reads `tx_seq_digest`, but has its own settings because its reads run
+/// ahead of a limit they cannot see (see [`StagesConfig::tx_cp_resolve`]).
 #[derive(Clone, Copy, Debug)]
 pub enum PipelineStage {
     TxSeqDigest,
+    TxCpResolve,
     Transactions,
     Objects,
     Checkpoints,
+}
+
+impl PipelineStage {
+    /// Whether a seek on this stage is a bucket of 1,000 consecutive
+    /// transactions rather than a key. Both stages read `tx_seq_digest`, whose
+    /// rows for one bucket sit next to each other, so a read pays about one
+    /// seek per bucket, however many of its keys it carries; they cap keys
+    /// separately (`max-keys-per-read`).
+    pub fn counts_buckets(self) -> bool {
+        matches!(
+            self,
+            PipelineStage::TxSeqDigest | PipelineStage::TxCpResolve
+        )
+    }
 }
 
 /// Per-stage tunables. Every field is optional and falls back to a built-in
@@ -125,58 +150,143 @@ pub enum PipelineStage {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub struct StageConfig {
-    /// Items per multi-get batch issued to this stage's table. Defaults to `100`.
+    /// Most seeks one read of this stage may cost. A seek is one jump to a
+    /// place in the table: one per key looked up, except on `tx-seq-digest`
+    /// and `tx-cp-resolve`, where the `tx_seq_digest` rows of a bucket of
+    /// 1,000 consecutive transactions sit next to each other, so one seek
+    /// covers a bucket however many of its keys the read carries (those
+    /// stages cap keys with `max-keys-per-read`). Defaults to `25` on
+    /// `tx-seq-digest`, `tx-cp-resolve` and `transactions`, `100` elsewhere.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub chunk_size: Option<usize>,
+    pub max_seeks_per_read: Option<usize>,
 
-    /// Max in-flight chunk fetches for this stage. Independent of
+    /// Max in-flight reads for this stage. Independent of
     /// `request_bigtable_concurrency`, which still caps total concurrent reads
-    /// across all stages within a request. Defaults are table-specific; see
-    /// [`StagesConfig::stage`].
+    /// across all stages within a request. Defaults are stage-specific; see
+    /// [`StagesConfig`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<usize>,
+
+    /// When set, the work this stage has ready at once (a burst) is split over
+    /// its free `concurrency` slots: up to one read per free slot, each
+    /// costing at least this many seeks (unless the whole burst costs less)
+    /// and at most `max-seeks-per-read`, so a small burst is fetched by
+    /// parallel reads instead of one long multi-get. Unset, a burst goes out as
+    /// the fewest reads of at most `max-seeks-per-read` seeks, except where
+    /// `max-keys-per-read` ends reads early. Defaults to `4` on
+    /// `tx-seq-digest`, `tx-cp-resolve` and `transactions`, unset elsewhere;
+    /// on a stage with a default, set it to at least `max-seeks-per-read` to
+    /// stop splitting. Applies to every stage. On `objects`, a seek is an
+    /// object key the request has not already read or started reading, and
+    /// one transaction's or checkpoint's objects can be divided between reads.
+    /// On `transactions` it also covers the transaction reads of full-mask
+    /// `list_checkpoints` and `get_checkpoint`, one key per transaction, so a
+    /// checkpoint's transactions are split like any other burst, and those of
+    /// `list_events`, where a seek is a transaction the request has not
+    /// already read or started reading. On `checkpoints` it applies to
+    /// filtered `list_checkpoints`. A read never spans a watermark, and a read
+    /// that finds no free slot waits for one with its planned size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_seeks_per_split_read: Option<usize>,
+
+    /// Most keys one read may carry, on `tx-seq-digest` and `tx-cp-resolve`
+    /// only; rejected on other stages, where every key is its own seek and
+    /// `max-seeks-per-read` already caps keys. A key is one `tx_seq_digest`
+    /// row: one transaction, however many of its events `list_events` returns.
+    /// A read ends at the last bucket boundary before this cap; a bucket is
+    /// divided between reads only when it alone holds more keys, and then only
+    /// between transactions. Reads aim at near-equal shares of a burst's
+    /// seeks, so when this cap ends reads early, a burst can take more reads
+    /// than the fewest possible, some of them costing fewer seeks than
+    /// `min-seeks-per-split-read`. Defaults to `100`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_keys_per_read: Option<usize>,
 }
 
 /// A [`StageConfig`] with all defaults applied.
 #[derive(Clone, Copy, Debug)]
 pub struct ResolvedStageConfig {
-    pub chunk_size: usize,
+    pub max_seeks_per_read: usize,
     pub concurrency: usize,
+    pub min_seeks_per_split_read: Option<usize>,
+    /// Set only on the stages whose seeks are buckets
+    /// ([`PipelineStage::counts_buckets`]); elsewhere every key is a seek.
+    pub max_keys_per_read: Option<usize>,
+}
+
+/// Built-in settings of one stage, used for every field its config leaves
+/// unset.
+struct StageDefaults {
+    max_seeks_per_read: usize,
+    concurrency: usize,
+    min_seeks_per_split_read: Option<usize>,
 }
 
 impl StageConfig {
-    fn resolve(this: Option<&StageConfig>, default_concurrency: usize) -> ResolvedStageConfig {
+    fn resolve(
+        this: Option<&StageConfig>,
+        defaults: StageDefaults,
+        counts_buckets: bool,
+    ) -> ResolvedStageConfig {
         ResolvedStageConfig {
-            chunk_size: this
-                .and_then(|c| c.chunk_size)
-                .unwrap_or(DEFAULT_STAGE_CHUNK_SIZE),
+            max_seeks_per_read: this
+                .and_then(|c| c.max_seeks_per_read)
+                .unwrap_or(defaults.max_seeks_per_read),
             concurrency: this
                 .and_then(|c| c.concurrency)
-                .unwrap_or(default_concurrency),
+                .unwrap_or(defaults.concurrency),
+            min_seeks_per_split_read: this
+                .and_then(|c| c.min_seeks_per_split_read)
+                .or(defaults.min_seeks_per_split_read),
+            max_keys_per_read: counts_buckets.then(|| {
+                this.and_then(|c| c.max_keys_per_read)
+                    .unwrap_or(DEFAULT_MAX_KEYS_PER_READ)
+            }),
         }
     }
 }
 
-/// Per-table-stage pipeline tunables, shared across the list methods that read
-/// each table.
+/// Per-stage pipeline tunables, shared across the methods that run each stage.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub struct StagesConfig {
-    /// Reads of the `tx_seq_digest` table (sequence number -> digest/checkpoint).
-    /// Defaults to `10`.
+    /// Batched reads of the `tx_seq_digest` table by filtered `list_transactions`
+    /// and `list_events` (sequence number -> digest). Defaults:
+    /// `max-seeks-per-read` 25 (buckets), `max-keys-per-read` 100,
+    /// `concurrency` 20, `min-seeks-per-split-read` 4.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tx_seq_digest: Option<StageConfig>,
 
-    /// Reads of the `transactions` table (digest -> transaction body). Defaults
-    /// to `25`.
+    /// Batched transaction -> checkpoint lookups of filtered `list_checkpoints`,
+    /// which read the `tx_seq_digest` table (metric stage label
+    /// `tx_cp_resolve`). The page limit counts checkpoints, not the
+    /// transactions looked up, so lookups run ahead of it and those still in
+    /// flight when the page fills are cancelled; this stage's concurrency
+    /// bounds that overshoot independently of `tx_seq_digest`. The
+    /// per-watermark lookups of `list_events`, `list_transactions` and filtered
+    /// `list_checkpoints` share the metric label but are issued one at a time
+    /// and do not use this stage.
+    /// Defaults: `max-seeks-per-read` 25 (buckets), `max-keys-per-read` 100,
+    /// `concurrency` 4, `min-seeks-per-split-read` 4.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_cp_resolve: Option<StageConfig>,
+
+    /// Reads of the `transactions` table (digest -> transaction body).
+    /// `list_events` reads a transaction once however many of its events it
+    /// returns, so its reads are sized on the transactions still to read.
+    /// Defaults: `max-seeks-per-read` 25, `concurrency` 25,
+    /// `min-seeks-per-split-read` 4.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transactions: Option<StageConfig>,
 
-    /// Multi-get reads of the `objects` table. Defaults to `50`.
+    /// Multi-get reads of the `objects` table. A key the request has already
+    /// read, or is reading, is not read again, so reads are sized on the object
+    /// keys still to read. Defaults: `max-seeks-per-read` 100, `concurrency` 50.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub objects: Option<StageConfig>,
 
-    /// Reads of the `checkpoints` table. Defaults to `10`.
+    /// Reads of the `checkpoints` table. Defaults: `max-seeks-per-read` 100,
+    /// `concurrency` 10.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoints: Option<StageConfig>,
 }
@@ -185,23 +295,46 @@ impl StagesConfig {
     fn get(&self, stage: PipelineStage) -> Option<&StageConfig> {
         match stage {
             PipelineStage::TxSeqDigest => self.tx_seq_digest.as_ref(),
+            PipelineStage::TxCpResolve => self.tx_cp_resolve.as_ref(),
             PipelineStage::Transactions => self.transactions.as_ref(),
             PipelineStage::Objects => self.objects.as_ref(),
             PipelineStage::Checkpoints => self.checkpoints.as_ref(),
         }
     }
 
-    /// Resolved tunables for one pipeline stage. Unset stages use chunk size
-    /// `100` and table-specific concurrency: tx-sequence-to-digest `10`,
-    /// transactions `25`, objects `50`, and checkpoints `10`.
+    /// Resolved tunables for one pipeline stage: each unset field takes the
+    /// stage's default (see the fields of [`StagesConfig`]), and
+    /// `max-keys-per-read` defaults to `100` on the two stages whose seeks are
+    /// buckets.
     pub fn stage(&self, stage: PipelineStage) -> ResolvedStageConfig {
-        let default_concurrency = match stage {
-            PipelineStage::TxSeqDigest => DEFAULT_TX_SEQ_DIGEST_STAGE_CONCURRENCY,
-            PipelineStage::Transactions => DEFAULT_TRANSACTIONS_STAGE_CONCURRENCY,
-            PipelineStage::Objects => DEFAULT_OBJECTS_STAGE_CONCURRENCY,
-            PipelineStage::Checkpoints => DEFAULT_CHECKPOINTS_STAGE_CONCURRENCY,
+        let defaults = match stage {
+            PipelineStage::TxSeqDigest => StageDefaults {
+                max_seeks_per_read: 25,
+                concurrency: 20,
+                min_seeks_per_split_read: Some(4),
+            },
+            PipelineStage::TxCpResolve => StageDefaults {
+                max_seeks_per_read: 25,
+                concurrency: 4,
+                min_seeks_per_split_read: Some(4),
+            },
+            PipelineStage::Transactions => StageDefaults {
+                max_seeks_per_read: 25,
+                concurrency: 25,
+                min_seeks_per_split_read: Some(4),
+            },
+            PipelineStage::Objects => StageDefaults {
+                max_seeks_per_read: 100,
+                concurrency: 50,
+                min_seeks_per_split_read: None,
+            },
+            PipelineStage::Checkpoints => StageDefaults {
+                max_seeks_per_read: 100,
+                concurrency: 10,
+                min_seeks_per_split_read: None,
+            },
         };
-        StageConfig::resolve(self.get(stage), default_concurrency)
+        StageConfig::resolve(self.get(stage), defaults, stage.counts_buckets())
     }
 }
 
@@ -225,12 +358,17 @@ pub struct LedgerHistoryConfig {
     pub list_checkpoints: Option<LedgerHistoryMethodConfig>,
 
     /// Per-request evaluated-bucket budget for filtered tx-bitmap scans, shared
-    /// across all DNF dimensions of one query. Caps how many fetched buckets the
-    /// eval evaluates, NOT how many bucket reads BigTable receives — at
-    /// exhaustion each leaf stream may have fetched one additional bucket that is
-    /// discarded rather than evaluated, so observed reads can exceed this by up
-    /// to `max_bitmap_filter_literals`. Exhausting it ends the query with
-    /// `SCAN_LIMIT` and a resume cursor.
+    /// across all DNF dimensions of one query. A query with more unique leaves
+    /// than this budget is granted one bucket per leaf, so the effective budget
+    /// is the larger of this value and the query's unique leaf count. It caps
+    /// how many fetched buckets the eval evaluates, NOT how many bucket reads
+    /// BigTable receives — at exhaustion each Bigtable-backed leaf stream may
+    /// have fetched one additional bucket that is discarded rather than
+    /// evaluated, so observed reads can exceed the effective budget by up to the
+    /// number of Bigtable-backed leaves (at most twice
+    /// `max_bitmap_filter_literals`; the synthetic tx universe key is generated
+    /// in memory). Exhausting it ends the query with `SCAN_LIMIT` and a resume
+    /// cursor.
     ///
     /// Defaults to `4000` if not specified.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -248,15 +386,37 @@ pub struct LedgerHistoryConfig {
     /// Dead bucket rows drained from an open leaf scan per lag episode before
     /// abandoning the stream and reopening it past the gap. A fresh reopen is
     /// disabled by `0`; provably dead gaps still advance the resume cursor.
+    /// This is also what a reopen counts as toward `watermark-beacon-buckets`.
     ///
     /// Defaults to `50` if not specified.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bitmap_drain_probe_rows: Option<u32>,
 
+    /// How much a filtered List scan may scan without finding an item before
+    /// the bitmap evaluator emits its newest scan watermark, which becomes a
+    /// progress beacon. Scan work is counted in bucket rows: the rows charged
+    /// to the scan budget (`bitmap-bucket-budget-*`), plus
+    /// `bitmap-drain-probe-rows` for every gap catch-up step that reopened a
+    /// leaf scan, since each reopen is a new BigTable read. Each beacon costs
+    /// one BigTable read (`tx_cp_resolve`); items carry their own cursors, so
+    /// beacons only flow while a scan crosses stretches without matches. The
+    /// evaluator emits a watermark once this much work has been done since
+    /// its last item or watermark; the scan's first watermark is not held
+    /// back. A client cut off mid-scan can rescan more than this when it
+    /// resumes: later stages merge watermarks that arrive while they still
+    /// have frames ready, and items leave in chunks, so frames can trail the
+    /// scan.
+    ///
+    /// Defaults to `256` if not specified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub watermark_beacon_buckets: Option<NonZeroU64>,
+
     /// Maximum total filter literals (bitmap dimensions) accepted in one filtered
-    /// request, across all DNF terms. Each literal becomes one bitmap leaf, so
-    /// this bounds a single filter's scan fanout. Must not exceed either bitmap
-    /// budget (see [`LedgerHistoryConfig::validate`]).
+    /// request, across all DNF terms. Each literal becomes one bitmap leaf (a
+    /// transaction filter's `AffectedAddress` literal also scans the `Sender`
+    /// dimension, so it becomes two), so this bounds a single filter's scan
+    /// fanout. Must not exceed either bitmap budget (see
+    /// [`LedgerHistoryConfig::validate`]).
     ///
     /// Defaults to `10` if not specified.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -298,6 +458,11 @@ impl LedgerHistoryConfig {
                     .unwrap_or(DEFAULT_BITMAP_DRAIN_PROBE_ROWS),
             ),
         }
+    }
+
+    pub fn watermark_beacon_buckets(&self) -> NonZeroU64 {
+        self.watermark_beacon_buckets
+            .unwrap_or(DEFAULT_WATERMARK_BEACON_BUCKETS)
     }
 
     pub fn max_bitmap_filter_literals(&self) -> usize {
@@ -417,22 +582,44 @@ pub struct KvRpcConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bigtable_max_pool_size: Option<usize>,
 
-    /// Deprecated and ignored: the `GetServiceInfo` watermark set is derived
-    /// from `enable-list-apis` and can no longer be chosen per pipeline.
+    /// Detect stalled BigTable channels, quarantine them (cancelling their open
+    /// requests so reads retry on other channels), and replace ones that stay
+    /// unhealthy. Defaults to `true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bigtable_channel_health_check: Option<bool>,
+
+    /// Longest a BigTable ReadRows attempt may wait for its response headers
+    /// or its next response message before it is retried on another channel,
+    /// in milliseconds. Defaults to `5000`. The final attempt has no gap
+    /// timeout. A stall before the headers is retried only while
+    /// `bigtable-channel-timeout-ms`, which ends that wait on every attempt, is
+    /// longer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bigtable_read_rows_gap_timeout_ms: Option<u64>,
+
+    /// Attempts per BigTable ReadRows call, including the first. Defaults to
+    /// `3`; `1` turns off the gap timeout and retries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bigtable_read_rows_max_attempts: Option<u32>,
+
+    /// HTTP/2 receive window of each BigTable response stream, in bytes: the
+    /// most unread data one read can hold. Defaults to `262144` (256 KiB).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bigtable_http2_stream_window_bytes: Option<u32>,
+
+    /// HTTP/2 receive window of each BigTable connection, in bytes: the most
+    /// unread data all reads on one channel can hold together. While unread
+    /// data fills it, no read on that channel receives anything, so it should
+    /// be at least `bigtable-http2-stream-window-bytes` times the most reads a
+    /// channel carries at once. Defaults to `268435456` (256 MiB).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bigtable_http2_connection_window_bytes: Option<u32>,
+
+    /// Deprecated and ignored: the `GetServiceInfo` watermark set always
+    /// includes the List API pipelines and cannot be chosen per pipeline.
     /// Still parsed so existing config files keep loading.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub watermark_pipeline: Option<Vec<String>>,
-
-    /// Serve the List APIs (`ListCheckpoints`, `ListTransactions`,
-    /// `ListEvents`) and fold the pipelines backing them into the
-    /// `GetServiceInfo` checkpoint height. Defaults to `false`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enable_list_apis: Option<bool>,
-
-    /// Deprecated name for `enable-list-apis`. Used only when
-    /// `enable-list-apis` is unset.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub enable_experimental_query_apis: Option<bool>,
 
     /// Tunables for the ledger-history list APIs.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -446,7 +633,45 @@ pub struct KvRpcConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_bigtable_concurrency: Option<usize>,
 
-    /// Per-table-stage read pipeline tunables (chunk size and fan-out
+    /// How long a request carrying `x-sui-min-checkpoint` waits for this replica's watermark to
+    /// reach the requested checkpoint before being told to retry elsewhere. Applies to every method;
+    /// requests without that header never wait.
+    ///
+    /// Defaults to `100` if not specified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monotonic_read_wait_timeout_ms: Option<u64>,
+
+    /// gRPC URLs of kvstore indexers (for example `http://kvstore-1-grpc:7001`, the address an
+    /// indexer serves with `--rpc-listen-address`) whose watermark streams set the checkpoint this
+    /// instance serves. Each must be a plaintext `http://` URL with a host; startup fails
+    /// otherwise. When the list is not empty, each pipeline counts with the highest watermark
+    /// any indexer has streamed for it, and this instance serves up to the lowest of those across
+    /// the pipelines it serves. Bigtable's watermark rows are then never read: while every stream
+    /// is down, the served checkpoint keeps its last value until a stream delivers again. Unset or
+    /// empty polls Bigtable's watermark rows instead.
+    ///
+    /// This instance must read from the same Bigtable cluster that every listed indexer writes to:
+    /// its app profile must route reads to the cluster the indexers' app profile writes to. A
+    /// streamed watermark means the indexer's rows are durable in the cluster it wrote them to, and
+    /// Bigtable replicates them to other clusters only later, so a read routed to another cluster
+    /// can miss rows below the served checkpoint. Polling has no such requirement, because it reads
+    /// the watermark rows through this instance's own app profile.
+    ///
+    /// Requests that depend on the served checkpoint are answered `Unavailable`, and `/health`
+    /// answers 503, until every served pipeline has a watermark. An indexer's first response holds
+    /// every pipeline it runs that had a readable stored watermark row when it started or has
+    /// advanced since, so the first response from an indexer that runs every served pipeline is
+    /// enough, even during a chain halt. A served pipeline that no listed indexer runs keeps this
+    /// instance unavailable, and is named in a warning. In this mode `/health` reports readiness:
+    /// use it for a readiness probe, not a liveness probe, which would restart an instance that is
+    /// still waiting for watermarks.
+    ///
+    /// Streamed watermarks carry no `reader_lo`, so this mode assumes no pipeline has pruned past
+    /// its watermark; the kvstore does not prune.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexer_urls: Option<Vec<String>>,
+
+    /// Per-table-stage read pipeline tunables (read sizes and fan-out
     /// concurrency), shared by the point-get and list APIs. Bounded by
     /// `request_bigtable_concurrency` at runtime, which remains the request-wide
     /// read ceiling.
@@ -502,12 +727,6 @@ impl KvRpcConfig {
         self.bigtable_channel_timeout_ms.map(Duration::from_millis)
     }
 
-    pub fn enable_list_apis(&self) -> bool {
-        self.enable_list_apis
-            .or(self.enable_experimental_query_apis)
-            .unwrap_or(false)
-    }
-
     /// TLS identity, when both cert and key are set and non-empty.
     pub fn tls_identity(&self) -> anyhow::Result<Option<tonic::transport::Identity>> {
         let (Some(cert), Some(key)) = (self.tls_cert.as_deref(), self.tls_key.as_deref()) else {
@@ -530,7 +749,28 @@ impl KvRpcConfig {
                 .unwrap_or(base.initial_pool_size),
             min_pool_size: self.bigtable_min_pool_size.unwrap_or(base.min_pool_size),
             max_pool_size: self.bigtable_max_pool_size.unwrap_or(base.max_pool_size),
+            health_check: base
+                .health_check
+                .filter(|_| self.bigtable_channel_health_check.unwrap_or(true)),
+            http2_stream_window_bytes: self
+                .bigtable_http2_stream_window_bytes
+                .unwrap_or(base.http2_stream_window_bytes),
+            http2_connection_window_bytes: self
+                .bigtable_http2_connection_window_bytes
+                .unwrap_or(base.http2_connection_window_bytes),
             ..base
+        }
+    }
+
+    pub fn read_rows_retry(&self) -> ReadRowsRetryConfig {
+        let base = ReadRowsRetryConfig::default();
+        ReadRowsRetryConfig {
+            gap_timeout: self
+                .bigtable_read_rows_gap_timeout_ms
+                .map_or(base.gap_timeout, Duration::from_millis),
+            max_attempts: self
+                .bigtable_read_rows_max_attempts
+                .unwrap_or(base.max_attempts),
         }
     }
 
@@ -543,8 +783,24 @@ impl KvRpcConfig {
             .unwrap_or(DEFAULT_REQUEST_BIGTABLE_CONCURRENCY)
     }
 
+    pub fn monotonic_read_wait_timeout(&self) -> Duration {
+        Duration::from_millis(
+            self.monotonic_read_wait_timeout_ms
+                .unwrap_or(DEFAULT_MONOTONIC_READ_WAIT_TIMEOUT_MS),
+        )
+    }
+
     pub fn stages(&self) -> StagesConfig {
         self.stages.clone().unwrap_or_default()
+    }
+
+    /// Where this instance learns how far the data in Bigtable goes: the watermark streams of the
+    /// indexers in `indexer-urls` when it lists any, else Bigtable's watermark rows.
+    pub fn watermark_source(&self) -> WatermarkSource {
+        match self.indexer_urls.as_deref() {
+            Some(urls) if !urls.is_empty() => WatermarkSource::IndexerStreams(urls.to_vec()),
+            _ => WatermarkSource::Bigtable,
+        }
     }
 
     /// Reject configurations that cannot make forward progress. Validates the
@@ -561,21 +817,40 @@ impl KvRpcConfig {
             self.request_bigtable_concurrency() > 0,
             "request_bigtable_concurrency must be greater than zero",
         );
+        self.read_rows_retry().validate(self.channel_timeout())?;
+        self.pool_config().validate()?;
         let stages = self.stages();
         for stage in [
             PipelineStage::TxSeqDigest,
+            PipelineStage::TxCpResolve,
             PipelineStage::Transactions,
             PipelineStage::Objects,
             PipelineStage::Checkpoints,
         ] {
             let resolved = stages.stage(stage);
             anyhow::ensure!(
-                resolved.chunk_size > 0,
-                "stages.{stage:?} chunk_size must be greater than zero",
+                resolved.max_seeks_per_read > 0,
+                "stages.{stage:?} max_seeks_per_read must be greater than zero",
             );
             anyhow::ensure!(
                 resolved.concurrency > 0,
                 "stages.{stage:?} concurrency must be greater than zero",
+            );
+            anyhow::ensure!(
+                resolved.min_seeks_per_split_read != Some(0),
+                "stages.{stage:?} min_seeks_per_split_read must be greater than zero",
+            );
+            anyhow::ensure!(
+                resolved.max_keys_per_read != Some(0),
+                "stages.{stage:?} max_keys_per_read must be greater than zero",
+            );
+            anyhow::ensure!(
+                stage.counts_buckets()
+                    || stages
+                        .get(stage)
+                        .is_none_or(|c| c.max_keys_per_read.is_none()),
+                "stages.{stage:?} max_keys_per_read applies only to stages whose seeks are \
+                 buckets (TxSeqDigest, TxCpResolve)",
             );
         }
         self.ledger_history().validate()
@@ -643,24 +918,47 @@ stages:
   objects:
     concurrency: 4
   transactions:
-    chunk-size: 25
+    max-seeks-per-read: 50
+  tx-cp-resolve:
+    concurrency: 3
+  tx-seq-digest:
+    max-keys-per-read: 40
 "#;
         let cfg: KvRpcConfig = serde_yaml::from_str(yaml).unwrap();
         let stages = cfg.stages();
 
         let objects = stages.stage(PipelineStage::Objects);
         assert_eq!(objects.concurrency, 4);
-        // Unset sibling field on the same stage falls back to its default.
-        assert_eq!(objects.chunk_size, 100);
+        // Unset sibling fields on the same stage fall back to its defaults.
+        assert_eq!(objects.max_seeks_per_read, 100);
+        assert_eq!(objects.min_seeks_per_split_read, None);
 
         let transactions = stages.stage(PipelineStage::Transactions);
-        assert_eq!(transactions.chunk_size, 25);
+        assert_eq!(transactions.max_seeks_per_read, 50);
         assert_eq!(transactions.concurrency, 25);
+        assert_eq!(transactions.min_seeks_per_split_read, Some(4));
 
         // Untouched stage is fully default.
         let checkpoints = stages.stage(PipelineStage::Checkpoints);
-        assert_eq!(checkpoints.chunk_size, 100);
+        assert_eq!(checkpoints.max_seeks_per_read, 100);
         assert_eq!(checkpoints.concurrency, 10);
+
+        // ListCheckpoints' lookup stage is configured apart from the
+        // `tx_seq_digest` stage that reads the same table.
+        let tx_cp_resolve = stages.stage(PipelineStage::TxCpResolve);
+        assert_eq!(tx_cp_resolve.concurrency, 3);
+        assert_eq!(tx_cp_resolve.max_seeks_per_read, 25);
+        assert_eq!(tx_cp_resolve.min_seeks_per_split_read, Some(4));
+        assert_eq!(stages.stage(PipelineStage::TxSeqDigest).concurrency, 20);
+
+        // Stages whose seeks are buckets cap the keys per read (default 100);
+        // on the others every key is a seek, so there is no separate key cap.
+        assert_eq!(tx_cp_resolve.max_keys_per_read, Some(100));
+        assert_eq!(
+            stages.stage(PipelineStage::TxSeqDigest).max_keys_per_read,
+            Some(40)
+        );
+        assert_eq!(transactions.max_keys_per_read, None);
 
         cfg.validate().unwrap();
     }
@@ -670,21 +968,23 @@ stages:
         let cfg = KvRpcConfig {
             stages: Some(StagesConfig {
                 objects: Some(StageConfig {
-                    chunk_size: Some(0),
-                    concurrency: None,
+                    max_seeks_per_read: Some(0),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
             ..Default::default()
         };
-        let err = cfg.validate().expect_err("zero chunk_size must fail");
-        assert!(err.to_string().contains("chunk_size"), "{err}");
+        let err = cfg
+            .validate()
+            .expect_err("zero max_seeks_per_read must fail");
+        assert!(err.to_string().contains("max_seeks_per_read"), "{err}");
 
         let cfg = KvRpcConfig {
             stages: Some(StagesConfig {
                 transactions: Some(StageConfig {
-                    chunk_size: None,
                     concurrency: Some(0),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -692,6 +992,78 @@ stages:
         };
         let err = cfg.validate().expect_err("zero concurrency must fail");
         assert!(err.to_string().contains("concurrency"), "{err}");
+
+        let cfg = KvRpcConfig {
+            stages: Some(StagesConfig {
+                tx_seq_digest: Some(StageConfig {
+                    min_seeks_per_split_read: Some(0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("zero min_seeks_per_split_read must fail");
+        assert!(
+            err.to_string().contains("min_seeks_per_split_read"),
+            "{err}"
+        );
+
+        let cfg = KvRpcConfig {
+            stages: Some(StagesConfig {
+                tx_cp_resolve: Some(StageConfig {
+                    max_keys_per_read: Some(0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("zero max_keys_per_read must fail");
+        assert!(err.to_string().contains("max_keys_per_read"), "{err}");
+    }
+
+    #[test]
+    fn validate_rejects_max_keys_per_read_on_stage_counting_keys() {
+        let cfg = KvRpcConfig {
+            stages: Some(StagesConfig {
+                transactions: Some(StageConfig {
+                    max_keys_per_read: Some(50),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("max_keys_per_read on a stage whose seeks are keys must fail");
+        assert!(err.to_string().contains("max_keys_per_read"), "{err}");
+    }
+
+    #[test]
+    fn validate_accepts_min_seeks_per_split_read_on_objects() {
+        let cfg = KvRpcConfig {
+            stages: Some(StagesConfig {
+                objects: Some(StageConfig {
+                    min_seeks_per_split_read: Some(4),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.stages()
+                .stage(PipelineStage::Objects)
+                .min_seeks_per_split_read,
+            Some(4)
+        );
     }
 
     #[test]
@@ -775,52 +1147,56 @@ render-ahead = 3
     }
 
     #[test]
-    fn list_apis_off_by_default_and_bound_the_watermark_set() {
+    fn watermark_set_always_includes_the_list_api_pipelines() {
         let cfg = KvRpcConfig::default();
-        assert!(!cfg.enable_list_apis());
-        assert_eq!(
-            service_info_watermark_pipelines(cfg.enable_list_apis()),
-            DEFAULT_SERVICE_INFO_WATERMARK_PIPELINES.to_vec(),
-        );
-
-        let yaml = "enable-list-apis: true\n";
-        let cfg: KvRpcConfig = serde_yaml::from_str(yaml).unwrap();
-        assert!(cfg.enable_list_apis());
-        let pipelines = service_info_watermark_pipelines(cfg.enable_list_apis());
+        let pipelines = service_info_watermark_pipelines();
         for name in LIST_API_SERVICE_INFO_WATERMARK_PIPELINES {
             assert!(pipelines.contains(&name), "{name} must bound the height");
         }
+        cfg.validate().unwrap();
     }
 
     #[test]
-    fn deprecated_experimental_key_still_enables_list_apis() {
-        // Configs written before the rename must keep serving the List APIs.
-        let yaml = "enable-experimental-query-apis: true\n";
-        let cfg: KvRpcConfig = serde_yaml::from_str(yaml).unwrap();
-        assert!(cfg.enable_list_apis());
-
-        // The current name wins when both are present.
-        let yaml = "enable-list-apis: false\nenable-experimental-query-apis: true\n";
-        let cfg: KvRpcConfig = serde_yaml::from_str(yaml).unwrap();
-        assert!(!cfg.enable_list_apis());
-    }
-
-    #[test]
-    fn deprecated_watermark_pipeline_loads_but_is_ignored() {
-        // Existing configs pinning a pipeline set must still load, and must not
-        // change the watermark set the server reports.
+    fn deprecated_keys_load_but_are_ignored() {
+        // Existing configs pinning a pipeline set or switching the List APIs
+        // off must still load, and must not change the watermark set the
+        // server reports.
         let yaml = r#"
 watermark-pipeline:
   - kvstore_checkpoints
   - a_pipeline_that_no_longer_exists
-enable-list-apis: true
+enable-list-apis: false
+enable-experimental-query-apis: false
 "#;
         let cfg: KvRpcConfig = serde_yaml::from_str(yaml).expect("stale key must not hard-fail");
         cfg.validate().unwrap();
         assert_eq!(
-            service_info_watermark_pipelines(cfg.enable_list_apis()).len(),
+            service_info_watermark_pipelines().len(),
             DEFAULT_SERVICE_INFO_WATERMARK_PIPELINES.len()
                 + LIST_API_SERVICE_INFO_WATERMARK_PIPELINES.len(),
+        );
+    }
+
+    #[test]
+    fn watermark_source_polls_bigtable_unless_indexer_urls_lists_any() {
+        assert_eq!(
+            KvRpcConfig::default().watermark_source(),
+            WatermarkSource::Bigtable
+        );
+
+        let cfg: KvRpcConfig = toml::from_str("indexer-urls = []\n").unwrap();
+        assert_eq!(cfg.watermark_source(), WatermarkSource::Bigtable);
+
+        let config_toml = r#"
+indexer-urls = ["http://kvstore-0-grpc:7001", "http://kvstore-1-grpc:7001"]
+"#;
+        let cfg: KvRpcConfig = toml::from_str(config_toml).unwrap();
+        assert_eq!(
+            cfg.watermark_source(),
+            WatermarkSource::IndexerStreams(vec![
+                "http://kvstore-0-grpc:7001".to_string(),
+                "http://kvstore-1-grpc:7001".to_string(),
+            ])
         );
     }
 }

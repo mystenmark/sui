@@ -810,6 +810,7 @@ mod tests {
 
     #[async_trait]
     impl ValidatorNetworkClient for FakeNetworkClient {
+        #[cfg(not(msim))]
         async fn send_block(
             &self,
             _peer: AuthorityIndex,
@@ -872,6 +873,7 @@ mod tests {
             &self,
             _peer: crate::network::PeerId,
             _highest_round_per_authority: Vec<Round>,
+            _filter: crate::network::BlockStreamFilter,
             _timeout: Duration,
         ) -> ConsensusResult<crate::network::ObserverBlockStream> {
             unimplemented!("Unimplemented")
