@@ -17,6 +17,7 @@ use fastcrypto::hash::{HashFunction, Sha256};
 use fastcrypto::secp256k1::{Secp256k1PublicKey, Secp256k1Signature};
 use fastcrypto::secp256r1::{Secp256r1PublicKey, Secp256r1Signature};
 use fastcrypto::traits::{ToFromBytes, VerifyingKey};
+use fastcrypto_pq::mldsa65::{MLDSA65PublicKey, MLDSA65Signature};
 use fastcrypto_zkp::bn254::zk_login::OIDCProvider;
 /// The JWK types a [`Verifier`] is built from.
 pub use fastcrypto_zkp::bn254::zk_login::{JWK, JwkId};
@@ -26,7 +27,7 @@ use messages::signature::{CompressedSignature, MultiSig, PublicKey};
 use messages::transaction::{SenderSignedData, TransactionKind, TxState};
 use sui_protocol_config::{Chain, ProtocolConfig};
 
-use crate::signature::{ParsedSignature, Passkey, ZkLoginAuthenticator, zklogin};
+use crate::signature::{MLDSA65_SIG_LEN, ParsedSignature, Passkey, ZkLoginAuthenticator, zklogin};
 use crate::{Error, ErrorKind};
 
 /// What verification needs from the epoch, as the reference's
@@ -41,6 +42,8 @@ pub struct Verifier {
     verify_legacy_zklogin_address: bool,
     accept_zklogin_in_multisig: bool,
     accept_passkey_in_multisig: bool,
+    /// `mldsa65_auth`, which also gates simple ML-DSA-65 signatures.
+    accept_mldsa65_in_multisig: bool,
     zklogin_max_epoch_upper_bound_delta: Option<u64>,
     additional_multisig_checks: bool,
     validate_zklogin_public_identifier: bool,
@@ -76,6 +79,7 @@ impl Verifier {
             verify_legacy_zklogin_address: config.verify_legacy_zklogin_address(),
             accept_zklogin_in_multisig: config.accept_zklogin_in_multisig(),
             accept_passkey_in_multisig: config.accept_passkey_in_multisig(),
+            accept_mldsa65_in_multisig: config.mldsa65_auth(),
             zklogin_max_epoch_upper_bound_delta: config.zklogin_max_epoch_upper_bound_delta(),
             additional_multisig_checks: config.additional_multisig_checks(),
             validate_zklogin_public_identifier: config.validate_zklogin_public_identifier(),
@@ -369,6 +373,10 @@ fn signer_address(
         ParsedSignature::Simple(bytes) if bytes[0] == 0 && !parse_ed25519 => {
             (SuiAddress(blake2b(&[&[0], &bytes[65..]])), None)
         }
+        // So is an ML-DSA-65 key's, and any of its length parses.
+        ParsedSignature::Simple(bytes) if bytes[0] == 7 => {
+            (SuiAddress(blake2b(&[&[7], simple_parts(bytes).2])), None)
+        }
         ParsedSignature::Simple(bytes) => {
             let key = SimpleKey::parse(bytes[0], &bytes[65..])
                 .ok_or_else(|| invalid("cannot parse public key"))?;
@@ -433,6 +441,7 @@ fn key_flag_and_bytes<'k>(pk: &PublicKey<'k>) -> (u8, &'k [u8]) {
         PublicKey::Secp256r1(k) => (2, &k[..]),
         PublicKey::ZkLogin(k) => (5, k),
         PublicKey::Passkey(k) => (6, &k[..]),
+        PublicKey::MLDSA65(k) => (7, &k[..]),
     }
 }
 
@@ -487,7 +496,12 @@ fn verify_authenticator(
     key: Option<&SimpleKey>,
 ) -> Result<(), Error> {
     match sig {
-        ParsedSignature::Simple(bytes) => verify_simple(bytes, Some(author), digest, key),
+        ParsedSignature::Simple(bytes) => {
+            if bytes[0] == 7 && !verifier.accept_mldsa65_in_multisig {
+                return Err(invalid("ML-DSA-65 signatures not supported"));
+            }
+            verify_simple(bytes, Some(author), digest, key)
+        }
         ParsedSignature::MultiSig(m) | ParsedSignature::MultiSigLegacy { multisig: m, .. } => {
             for s in m.sigs {
                 if let CompressedSignature::ZkLogin(z) = s {
@@ -515,7 +529,7 @@ fn verify_simple(
     digest: &[u8; 32],
     parsed: Option<&SimpleKey>,
 ) -> Result<(), Error> {
-    let (flag, sig, pk) = (bytes[0], &bytes[1..65], &bytes[65..]);
+    let (flag, sig, pk) = simple_parts(bytes);
     let key_error = || Error::new(ErrorKind::KeyConversionError, "invalid public key");
     let sig_error = || invalid("cannot parse signature");
     macro_rules! check {
@@ -528,6 +542,15 @@ fn verify_simple(
                     &owned
                 }
             };
+            check!(@verify pk, $sig)
+        }};
+        // ML-DSA-65 keys are never parsed in advance.
+        (unparsed $pk:ty, $sig:ty) => {{
+            let pk = &<$pk>::from_bytes(pk).map_err(|_| key_error())?;
+            check!(@verify pk, $sig)
+        }};
+        (@verify $pk:ident, $sig:ty) => {{
+            let pk = $pk;
             let sig = <$sig>::from_bytes(sig).map_err(|_| sig_error())?;
             if let Some(author) = author
                 && SuiAddress(blake2b(&[&[flag], pk.as_bytes()])) != *author
@@ -541,8 +564,16 @@ fn verify_simple(
     match flag {
         0 => check!(Ed25519, Ed25519PublicKey, Ed25519Signature),
         1 => check!(Secp256k1, Secp256k1PublicKey, Secp256k1Signature),
-        _ => check!(Secp256r1, Secp256r1PublicKey, Secp256r1Signature),
+        2 => check!(Secp256r1, Secp256r1PublicKey, Secp256r1Signature),
+        _ => check!(unparsed MLDSA65PublicKey, MLDSA65Signature),
     }
+}
+
+/// A simple signature's flag, signature and key.
+fn simple_parts(bytes: &[u8]) -> (u8, &[u8], &[u8]) {
+    let sig_len = if bytes[0] == 7 { MLDSA65_SIG_LEN } else { 64 };
+    let (sig, pk) = bytes[1..].split_at(sig_len);
+    (bytes[0], sig, pk)
 }
 
 /// `MultiSig::verify_claims`.
@@ -576,6 +607,14 @@ fn verify_multisig(
             .any(|s| matches!(s, CompressedSignature::Passkey(_)))
     {
         return Err(invalid("passkey not accepted in multisig"));
+    }
+    if !verifier.accept_mldsa65_in_multisig
+        && m.multisig_pk
+            .pk_map
+            .iter()
+            .any(|(k, _)| matches!(k, PublicKey::MLDSA65(_)))
+    {
+        return Err(invalid("ML-DSA-65 member not supported inside multisig"));
     }
 
     // Signatures pair with the bitmap's set bits in order. The reference
@@ -616,6 +655,12 @@ fn verify_multisig(
                 }
                 let zk = parse_nested_zklogin(z)?;
                 verify_zklogin(&zk, &sub_author, digest, verifier).is_ok()
+            }
+            CompressedSignature::MLDSA65(s) => {
+                if !scheme_matches(7) {
+                    return Err(invalid("signature and key schemes differ"));
+                }
+                verify_raw::<MLDSA65PublicKey>(pk_bytes, &s[..], digest)?
             }
             // The reference checks no scheme here.
             CompressedSignature::Passkey(p) => {
@@ -711,6 +756,10 @@ fn verify_zklogin(
         if !verifier.supported_providers.contains(&provider) {
             return Err(invalid("provider not supported"));
         }
+    }
+    // zkLogin is classical, so its ephemeral key is too.
+    if zk.user_signature[0] == 7 {
+        return Err(invalid("zkLogin ephemeral signature scheme not supported"));
     }
     verify_simple(&zk.user_signature, None, digest, None)?;
 

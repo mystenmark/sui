@@ -23,24 +23,28 @@ pub struct ZkLoginAuthenticatorAsBytes(pub Vec<u8>);
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ZkLoginPublicIdentifier(pub Vec<u8>);
 
-/// Known gap: the reference has a `Passkey` variant at index 4 that the
-/// format snapshot omits, because the snapshot only samples this type.
+/// sui's format snapshot omits `Passkey`, which it never samples.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum CompressedSignature {
     Ed25519(#[serde(with = "super::byte_array")] [u8; 64]),
     Secp256k1(#[serde(with = "super::byte_array")] [u8; 64]),
     Secp256r1(#[serde(with = "super::byte_array")] [u8; 64]),
     ZkLogin(ZkLoginAuthenticatorAsBytes),
+    Passkey(#[serde(with = "serde_bytes")] Vec<u8>),
+    MLDSA65(#[serde(with = "super::byte_array")] [u8; 3309]),
 }
 
-/// Known gap: the reference has a `Passkey` variant at index 4 that the
-/// format snapshot omits, because the snapshot only samples this type.
+/// sui's format snapshot omits `Passkey`, which it never samples.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum PublicKey {
     Ed25519([u8; 32]),
     Secp256k1(#[serde(with = "super::byte_array")] [u8; 33]),
     Secp256r1(#[serde(with = "super::byte_array")] [u8; 33]),
     ZkLogin(ZkLoginPublicIdentifier),
+    Passkey(#[serde(with = "super::byte_array")] [u8; 33]),
+    MLDSA65(#[serde(with = "super::byte_array")] [u8; 1952]),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -80,74 +84,57 @@ impl From<&checkpoint_view::AuthorityQuorumSignInfo<'_>> for AuthorityQuorumSign
     }
 }
 
-/// A view held a `Passkey` variant, which the mirrors cannot hold until the
-/// snapshot has it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PasskeyUnsupported;
-
-impl TryFrom<&view::CompressedSignature<'_>> for CompressedSignature {
-    type Error = PasskeyUnsupported;
-
-    fn try_from(v: &view::CompressedSignature<'_>) -> Result<Self, PasskeyUnsupported> {
+impl From<&view::CompressedSignature<'_>> for CompressedSignature {
+    fn from(v: &view::CompressedSignature<'_>) -> Self {
         match v {
-            view::CompressedSignature::Ed25519(bytes) => Ok(CompressedSignature::Ed25519(**bytes)),
-            view::CompressedSignature::Secp256k1(bytes) => {
-                Ok(CompressedSignature::Secp256k1(**bytes))
+            view::CompressedSignature::Ed25519(bytes) => CompressedSignature::Ed25519(**bytes),
+            view::CompressedSignature::Secp256k1(bytes) => CompressedSignature::Secp256k1(**bytes),
+            view::CompressedSignature::Secp256r1(bytes) => CompressedSignature::Secp256r1(**bytes),
+            view::CompressedSignature::ZkLogin(bytes) => {
+                CompressedSignature::ZkLogin(ZkLoginAuthenticatorAsBytes(bytes.to_vec()))
             }
-            view::CompressedSignature::Secp256r1(bytes) => {
-                Ok(CompressedSignature::Secp256r1(**bytes))
+            view::CompressedSignature::Passkey(bytes) => {
+                CompressedSignature::Passkey(bytes.to_vec())
             }
-            view::CompressedSignature::ZkLogin(bytes) => Ok(CompressedSignature::ZkLogin(
-                ZkLoginAuthenticatorAsBytes(bytes.to_vec()),
-            )),
-            view::CompressedSignature::Passkey(_) => Err(PasskeyUnsupported),
+            view::CompressedSignature::MLDSA65(bytes) => CompressedSignature::MLDSA65(**bytes),
         }
     }
 }
 
-impl TryFrom<&view::PublicKey<'_>> for PublicKey {
-    type Error = PasskeyUnsupported;
-
-    fn try_from(v: &view::PublicKey<'_>) -> Result<Self, PasskeyUnsupported> {
+impl From<&view::PublicKey<'_>> for PublicKey {
+    fn from(v: &view::PublicKey<'_>) -> Self {
         match v {
-            view::PublicKey::Ed25519(bytes) => Ok(PublicKey::Ed25519(**bytes)),
-            view::PublicKey::Secp256k1(bytes) => Ok(PublicKey::Secp256k1(**bytes)),
-            view::PublicKey::Secp256r1(bytes) => Ok(PublicKey::Secp256r1(**bytes)),
+            view::PublicKey::Ed25519(bytes) => PublicKey::Ed25519(**bytes),
+            view::PublicKey::Secp256k1(bytes) => PublicKey::Secp256k1(**bytes),
+            view::PublicKey::Secp256r1(bytes) => PublicKey::Secp256r1(**bytes),
             view::PublicKey::ZkLogin(bytes) => {
-                Ok(PublicKey::ZkLogin(ZkLoginPublicIdentifier(bytes.to_vec())))
+                PublicKey::ZkLogin(ZkLoginPublicIdentifier(bytes.to_vec()))
             }
-            view::PublicKey::Passkey(_) => Err(PasskeyUnsupported),
+            view::PublicKey::Passkey(bytes) => PublicKey::Passkey(**bytes),
+            view::PublicKey::MLDSA65(bytes) => PublicKey::MLDSA65(**bytes),
         }
     }
 }
 
-impl TryFrom<&view::MultiSigPublicKey<'_>> for MultiSigPublicKey {
-    type Error = PasskeyUnsupported;
-
-    fn try_from(v: &view::MultiSigPublicKey<'_>) -> Result<Self, PasskeyUnsupported> {
-        let mut pk_map = Vec::with_capacity(v.pk_map.len());
-        for (key, weight) in v.pk_map {
-            pk_map.push((PublicKey::try_from(key)?, *weight));
-        }
-        Ok(MultiSigPublicKey {
-            pk_map,
+impl From<&view::MultiSigPublicKey<'_>> for MultiSigPublicKey {
+    fn from(v: &view::MultiSigPublicKey<'_>) -> Self {
+        MultiSigPublicKey {
+            pk_map: v
+                .pk_map
+                .iter()
+                .map(|(key, weight)| (PublicKey::from(key), *weight))
+                .collect(),
             threshold: v.threshold,
-        })
+        }
     }
 }
 
-impl TryFrom<&view::MultiSig<'_>> for MultiSig {
-    type Error = PasskeyUnsupported;
-
-    fn try_from(v: &view::MultiSig<'_>) -> Result<Self, PasskeyUnsupported> {
-        let mut sigs = Vec::with_capacity(v.sigs.len());
-        for sig in v.sigs {
-            sigs.push(CompressedSignature::try_from(sig)?);
-        }
-        Ok(MultiSig {
-            sigs,
+impl From<&view::MultiSig<'_>> for MultiSig {
+    fn from(v: &view::MultiSig<'_>) -> Self {
+        MultiSig {
+            sigs: v.sigs.iter().map(CompressedSignature::from).collect(),
             bitmap: v.bitmap,
-            multisig_pk: MultiSigPublicKey::try_from(&v.multisig_pk)?,
-        })
+            multisig_pk: MultiSigPublicKey::from(&v.multisig_pk),
+        }
     }
 }

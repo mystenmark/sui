@@ -273,7 +273,7 @@ impl<'a> TemporaryStore<'a> {
                     );
                     return None;
                 }
-                object.clone()
+                *object
             }
             None => self
                 .store

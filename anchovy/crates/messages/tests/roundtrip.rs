@@ -137,24 +137,37 @@ fn multisig() {
     );
 
     let message = Message::<MultiSig>::parse(bytes).unwrap();
-    assert_eq!(
-        build::signature::MultiSig::try_from(message.get()),
-        Ok(built)
-    );
+    assert_eq!(build::signature::MultiSig::from(message.get()), built);
 }
 
-/// The known gap: the views take a passkey, the snapshot-shaped mirrors do not.
 #[test]
-fn multisig_with_passkey() {
-    // One `Passkey` signature of no bytes, no bitmap bits, no keys.
-    let bytes = vec![1, 4, 0, 0, 0, 0, 0, 0];
-    assert!(bcs::from_bytes::<build::signature::MultiSig>(&bytes).is_err());
-
-    let message = Message::<MultiSig>::parse(bytes).unwrap();
+fn multisig_with_passkey_and_mldsa65() {
+    use build::signature::{CompressedSignature, MultiSigPublicKey, PublicKey};
+    let built = build::signature::MultiSig {
+        sigs: vec![
+            CompressedSignature::Passkey(vec![1; 10]),
+            CompressedSignature::MLDSA65([2; 3309]),
+        ],
+        bitmap: 0b11,
+        multisig_pk: MultiSigPublicKey {
+            pk_map: vec![
+                (PublicKey::Passkey([3; 33]), 1),
+                (PublicKey::MLDSA65([4; 1952]), 1),
+            ],
+            threshold: 2,
+        },
+    };
+    let bytes = bcs::to_bytes(&built).unwrap();
     assert_eq!(
-        build::signature::MultiSig::try_from(message.get()),
-        Err(build::signature::PasskeyUnsupported)
+        bytes.len(),
+        1 + (1 + 1 + 10) + (1 + 3309) + 2 + 1 + (1 + 33 + 1) + (1 + 1952 + 1) + 2
     );
+    assert_eq!(
+        bcs::from_bytes::<build::signature::MultiSig>(&bytes).unwrap(),
+        built
+    );
+    let message = Message::<MultiSig>::parse(bytes).unwrap();
+    assert_eq!(build::signature::MultiSig::from(message.get()), built);
 }
 
 /// A submitted `Transaction` is its `SenderSignedData`'s bytes, one

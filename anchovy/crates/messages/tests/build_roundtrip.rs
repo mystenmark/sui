@@ -1414,10 +1414,7 @@ fn multisig() {
     };
     let bytes = bcs::to_bytes(&multisig_pk).unwrap();
     let message = Message::<MultiSigPublicKey>::parse(bytes).unwrap();
-    assert_eq!(
-        sg::MultiSigPublicKey::try_from(message.get()),
-        Ok(multisig_pk.clone())
-    );
+    assert_eq!(sg::MultiSigPublicKey::from(message.get()), multisig_pk);
 
     let built = sg::MultiSig {
         sigs: vec![
@@ -1432,7 +1429,7 @@ fn multisig() {
     let bytes = bcs::to_bytes(&built).unwrap();
     assert_eq!(bcs::from_bytes::<sg::MultiSig>(&bytes).unwrap(), built);
     let message = Message::<MultiSig>::parse(bytes).unwrap();
-    assert_eq!(sg::MultiSig::try_from(message.get()), Ok(built));
+    assert_eq!(sg::MultiSig::from(message.get()), built);
 }
 
 /// `n` struct tags each holding the next as its one type parameter, by hand:

@@ -35,7 +35,7 @@ use messages::build::transaction::{
     TransactionDataV1, TransactionExpiration, TransactionKind, WithdrawFrom, WithdrawalTypeArg,
 };
 use messages::build::type_tag::{StructInput, TypeInput, TypeTag};
-use serde_reflection::{Registry, Samples, Tracer, TracerConfig};
+use serde_reflection::{ContainerFormat, Registry, Samples, Tracer, TracerConfig};
 
 fn sender_signed_data_sample() -> SenderSignedData {
     SenderSignedData(SenderSignedTransaction {
@@ -161,7 +161,15 @@ fn traced_registry() -> Registry {
     tracer.trace_type::<ObjectId>(&samples).unwrap();
     tracer.trace_type::<ProtocolVersion>(&samples).unwrap();
 
-    tracer.registry().unwrap()
+    let mut registry = tracer.registry().unwrap();
+    // sui's snapshot samples these two, and no sample is a passkey.
+    for name in ["CompressedSignature", "PublicKey"] {
+        let Some(ContainerFormat::Enum(variants)) = registry.get_mut(name) else {
+            panic!("{name} is an enum");
+        };
+        assert_eq!(variants.remove(&4).unwrap().name, "Passkey");
+    }
+    registry
 }
 
 fn snapshot_registry() -> Registry {

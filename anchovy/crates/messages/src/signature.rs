@@ -19,6 +19,7 @@ pub enum SignatureScheme {
     Bls12381 = 4,
     ZkLogin = 5,
     Passkey = 6,
+    MLDSA65 = 7,
 }
 
 impl SignatureScheme {
@@ -31,6 +32,7 @@ impl SignatureScheme {
             4 => SignatureScheme::Bls12381,
             5 => SignatureScheme::ZkLogin,
             6 => SignatureScheme::Passkey,
+            7 => SignatureScheme::MLDSA65,
             _ => return None,
         })
     }
@@ -45,6 +47,7 @@ pub enum CompressedSignature<'a> {
     Secp256r1(&'a [u8; 64]),
     ZkLogin(&'a [u8]),
     Passkey(&'a [u8]),
+    MLDSA65(&'a [u8; 3309]),
 }
 
 impl<'a> CompressedSignature<'a> {
@@ -58,6 +61,7 @@ impl<'a> CompressedSignature<'a> {
             2 => CompressedSignature::Secp256r1(r.array()?),
             3 => CompressedSignature::ZkLogin(r.byte_vec()?),
             4 => CompressedSignature::Passkey(r.byte_vec()?),
+            5 => CompressedSignature::MLDSA65(r.array()?),
             tag => {
                 return Err(ParseError::UnknownVariant {
                     ty: "CompressedSignature",
@@ -75,6 +79,7 @@ pub enum PublicKey<'a> {
     Secp256r1(&'a [u8; 33]),
     ZkLogin(&'a [u8]),
     Passkey(&'a [u8; 33]),
+    MLDSA65(&'a [u8; 1952]),
 }
 
 impl<'a> PublicKey<'a> {
@@ -85,6 +90,7 @@ impl<'a> PublicKey<'a> {
             2 => PublicKey::Secp256r1(r.array()?),
             3 => PublicKey::ZkLogin(r.byte_vec()?),
             4 => PublicKey::Passkey(r.array()?),
+            5 => PublicKey::MLDSA65(r.array()?),
             tag => {
                 return Err(ParseError::UnknownVariant {
                     ty: "PublicKey",

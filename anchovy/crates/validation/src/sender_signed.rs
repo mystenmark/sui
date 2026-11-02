@@ -6,6 +6,7 @@
 //! defers.
 
 use containers::Bump;
+use messages::signature::{CompressedSignature, MultiSig, PublicKey};
 use messages::transaction::{
     CallArg, SenderSignedData, TransactionExpiration, TransactionKind, TxState, WithdrawalTypeArg,
 };
@@ -36,11 +37,19 @@ pub fn validity_check<'a>(
     let config = ctx.config;
 
     for sig in signatures {
+        // Only ML-DSA-65 is gated among the simple schemes. An ML-DSA-65
+        // multisig member, signing or not, is a BCS variant older binaries
+        // cannot decode.
         let enabled = match sig {
-            ParsedSignature::MultiSig(_) => config.upgraded_multisig_supported(),
+            ParsedSignature::MultiSig(m) => {
+                config.upgraded_multisig_supported() && (config.mldsa65_auth() || !uses_mldsa65(m))
+            }
+            ParsedSignature::MultiSigLegacy { multisig, .. } => {
+                config.mldsa65_auth() || !uses_mldsa65(multisig)
+            }
             ParsedSignature::ZkLogin(_) => config.zklogin_auth(),
             ParsedSignature::Passkey(_) => config.passkey_auth(),
-            ParsedSignature::Simple(_) | ParsedSignature::MultiSigLegacy { .. } => true,
+            ParsedSignature::Simple(bytes) => bytes[0] != 7 || config.mldsa65_auth(),
         };
         if !enabled {
             return Err(Error::new(
@@ -83,6 +92,17 @@ pub fn validity_check<'a>(
         signatures,
         tx_size,
     })
+}
+
+/// `MultiSig::uses_mldsa65`: an ML-DSA-65 key or signature.
+fn uses_mldsa65(m: &MultiSig<'_>) -> bool {
+    m.multisig_pk
+        .pk_map
+        .iter()
+        .any(|(k, _)| matches!(k, PublicKey::MLDSA65(_)))
+        || m.sigs
+            .iter()
+            .any(|s| matches!(s, CompressedSignature::MLDSA65(_)))
 }
 
 /// What the reference rejects while deserializing a user transaction that
