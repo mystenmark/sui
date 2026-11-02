@@ -185,15 +185,37 @@ fn the_first_message_of_an_author_wins_even_if_invalid() {
 #[test]
 fn dkg_fails_past_the_timeout_round() {
     let network = network(&[2500, 2500, 2500, 2500]);
+    let mut config = network.config.clone();
+    config.set_allow_dkg_completion_after_timeout_for_testing(false);
     let mut dkg = Dkg::new(network.setup.clone());
-    let timeout = u64::from(network.config.random_beacon_dkg_timeout_round());
-    assert!(
-        dkg.handle(&network.config, vec![], timeout)
-            .status
-            .is_none()
-    );
-    let changes = dkg.handle(&network.config, vec![], timeout + 1);
+    let timeout = u64::from(config.random_beacon_dkg_timeout_round());
+    assert!(dkg.handle(&config, vec![], timeout).status.is_none());
+    let changes = dkg.handle(&config, vec![], timeout + 1);
     assert_eq!(changes.status, Some(DkgStatus::Failed));
+    assert!(!Dkg::timed_out(&config, timeout + 1));
+}
+
+#[test]
+fn dkg_completes_after_the_timeout_round() {
+    let network = network(&[2500, 2500, 2500, 2500]);
+    let config = &network.config;
+    assert!(config.allow_dkg_completion_after_timeout());
+    let encoded = messages(&network);
+    let mut dkg = Dkg::new(network.setup.clone());
+    let timeout = u64::from(config.random_beacon_dkg_timeout_round());
+    assert!(!Dkg::timed_out(config, timeout));
+    assert!(Dkg::timed_out(config, timeout + 1));
+    let traffic = (0..3).map(|i| message(&network, i, &encoded[i as usize]));
+    let changes = dkg.handle(config, traffic.collect(), timeout + 1);
+    assert_eq!(changes.used, Some(vec![0, 1, 2]));
+    assert!(changes.status.is_none());
+    assert_eq!(dkg.status(), &DkgStatus::Pending);
+
+    let (confirmations, key) = confirm(&network, &encoded, &[0, 1, 2]);
+    let traffic = (0..3).map(|i| confirmation(&network, i, &confirmations[i as usize]));
+    let changes = dkg.handle(config, traffic.collect(), timeout + 2);
+    assert_eq!(changes.status, Some(key.clone()));
+    assert_eq!(dkg.status(), &key);
 }
 
 #[test]
