@@ -127,6 +127,8 @@ base64ct = { version = "=1.8.0", features = ["alloc"] }
 # The random beacon's DKG and threshold signatures.
 fastcrypto-tbls = { git = "https://github.com/MystenLabs/fastcrypto", rev = "0a263279c31a45ba4bcd986a82b7e99c63ed16c0" }
 fastcrypto-zkp = { git = "https://github.com/MystenLabs/fastcrypto", rev = "0a263279c31a45ba4bcd986a82b7e99c63ed16c0", package = "fastcrypto-zkp" }
+# ML-DSA-65 account signatures, with the assembly backends sui-types enables.
+fastcrypto-pq = { git = "https://github.com/MystenLabs/fastcrypto", rev = "0a263279c31a45ba4bcd986a82b7e99c63ed16c0", features = ["native"] }
 roaring = "=0.11.4"
 # The map type fastcrypto-zkp takes JWKs in.
 imbl = "7"

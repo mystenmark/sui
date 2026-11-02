@@ -12209,6 +12209,7 @@ dependencies = [
  "containers",
  "ed25519-consensus",
  "fastcrypto",
+ "fastcrypto-pq",
  "fastcrypto-zkp",
  "flate2",
  "imbl",
