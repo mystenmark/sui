@@ -25,6 +25,9 @@ use sui_types::signature::GenericSignature;
 
 use crate::hex;
 
+/// Flag, signature, key.
+const MLDSA65_LEN: usize = 1 + 3309 + 1952;
+
 /// A BCS writer, for encodings serde cannot produce (arrays over 32).
 #[derive(Default, Clone)]
 struct W(Vec<u8>);
@@ -62,6 +65,7 @@ fn public_key(flag: u8, key: &[u8]) -> W {
         1 => 1,
         2 => 2,
         6 => 4,
+        7 => 5,
         _ => unreachable!(),
     };
     W::default().uleb(variant).raw(key)
@@ -130,7 +134,7 @@ pub fn vectors() -> String {
 
     add("empty", vec![]);
     for flag in [0u8, 1, 2, 4, 7, 0xff] {
-        for len in [96, 97, 98, 99] {
+        for len in [96, 97, 98, 99, 5261, 5262, 5263] {
             let mut b = vec![flag];
             b.resize(len, 0x33);
             add(&format!("simple_{flag}_{len}"), b);
@@ -737,6 +741,48 @@ pub fn vectors() -> String {
     let mut trailing = zk(&base, &simple_sig);
     trailing.push(0);
     add("zklogin_trailing", trailing);
+    let mut mldsa_sig = vec![7];
+    mldsa_sig.resize(MLDSA65_LEN, 0x33);
+    add("zklogin_sig_mldsa65", zk(&base, &mldsa_sig));
+    add(
+        "zklogin_sig_mldsa65_short",
+        zk(&base, &mldsa_sig[..MLDSA65_LEN - 1]),
+    );
+
+    // ML-DSA-65 keys and signatures parse on their lengths alone.
+    let mldsa_pk = public_key(7, &[0x77; 1952]);
+    let mldsa_compressed = W::default().uleb(5).raw(&[0x55; 3309]);
+    add(
+        "multisig_mldsa65",
+        multisig(
+            &[mldsa_compressed.clone()],
+            0b1,
+            &[(mldsa_pk.clone(), 1), (pk(2), 1)],
+            1,
+        ),
+    );
+    add(
+        "multisig_mldsa65_member",
+        multisig(&[compressed(0)], 0b10, &[(mldsa_pk, 1), (pk(2), 1)], 1),
+    );
+    add(
+        "multisig_mldsa65_short_sig",
+        multisig(&[W::default().uleb(5).raw(&[0x55; 3308])], 0b1, &two, 1),
+    );
+    let legacy_mldsa = vec![(b64(7, &[0x77; 1952]), 1), (b64(0, &ed), 1)];
+    add(
+        "legacy_mldsa65",
+        legacy(&[compressed(0)], &roaring(&[1]), &legacy_mldsa, 1),
+    );
+    add(
+        "legacy_mldsa65_short_key",
+        legacy(
+            &[compressed(0)],
+            &roaring(&[1]),
+            &[(b64(7, &[0x77; 1951]), 1), (b64(0, &ed), 1)],
+            1,
+        ),
+    );
 
     // A real single signature, for the length only.
     let (_, kp): (_, SuiKeyPair) = {

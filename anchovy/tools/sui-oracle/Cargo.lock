@@ -7261,6 +7261,7 @@ dependencies = [
  "bcs",
  "bs58 0.5.1",
  "fastcrypto",
+ "fastcrypto-pq",
  "fastcrypto-zkp",
  "flate2",
  "move-core-types",

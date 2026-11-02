@@ -87,6 +87,11 @@ pub(crate) fn cases() -> Vec<(String, Vec<u8>)> {
         "zklogin_vector_0",
         "zklogin_seed_over_modulus",
         "zklogin_header_hs256",
+        "simple_7_5262",
+        "multisig_mldsa65",
+        "multisig_mldsa65_member",
+        "legacy_mldsa65",
+        "zklogin_sig_mldsa65",
     ] {
         add(label, signed([0, 0, 0], &tx, &[&signature(label)]));
     }

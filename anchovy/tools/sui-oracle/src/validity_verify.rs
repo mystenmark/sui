@@ -65,6 +65,7 @@ fn params(config: &ProtocolConfig, chain: Chain) -> VerifyParams {
         config.additional_multisig_checks(),
         config.validate_zklogin_public_identifier(),
     )
+    .with_mldsa65_in_multisig(config.mldsa65_auth())
 }
 
 pub(crate) fn verdict(bytes: &[u8], config: &ProtocolConfig, chain: Chain, epoch: u64) -> String {
@@ -127,6 +128,8 @@ pub(crate) fn cases() -> Vec<(String, Vec<u8>)> {
     let k1 = SuiKeyPair::Secp256k1(get_key_pair_from_rng(&mut rng).1);
     let r1 = SuiKeyPair::Secp256r1(get_key_pair_from_rng(&mut rng).1);
     let other = SuiKeyPair::Ed25519(get_key_pair_from_rng(&mut rng).1);
+    let mldsa =
+        SuiKeyPair::MLDSA65(fastcrypto_pq::mldsa65::MLDSA65KeyPair::from_bytes(&[12; 32]).unwrap());
 
     let mut cases: Vec<(String, Vec<u8>)> = vec![];
     let mut add = |label: &str, data: &TransactionData, sigs: &[&[u8]]| {
@@ -134,7 +137,12 @@ pub(crate) fn cases() -> Vec<(String, Vec<u8>)> {
     };
 
     // Single keys.
-    for (label, key) in [("ed25519", &ed), ("k1", &k1), ("r1", &r1)] {
+    for (label, key) in [
+        ("ed25519", &ed),
+        ("k1", &k1),
+        ("r1", &r1),
+        ("mldsa65", &mldsa),
+    ] {
         let data = from(address(key));
         let sig = sign(&data, key);
         add(label, &data, &[&sig]);
@@ -240,6 +248,45 @@ pub(crate) fn cases() -> Vec<(String, Vec<u8>)> {
         &[&raw(vec![s_ed.clone(), s_r1.clone()], 0b1001)],
     );
     // The legacy format, converted by the reference before verifying.
+    // A hybrid committee: an ML-DSA-65 member is gated whether or not it signs.
+    let hybrid_pk =
+        MultiSigPublicKey::new(vec![mldsa.public(), ed.public()], vec![1, 1], 1).unwrap();
+    let hybrid = from(SuiAddress::from(&hybrid_pk));
+    let hybrid_member = |key: &SuiKeyPair| {
+        GenericSignature::Signature(Signature::new_secure(
+            &IntentMessage::new(Intent::sui_transaction(), &hybrid),
+            key,
+        ))
+    };
+    for (label, key) in [("mldsa65", &mldsa), ("ed25519", &ed)] {
+        let sig = MultiSig::combine(vec![hybrid_member(key)], hybrid_pk.clone()).unwrap();
+        add(
+            &format!("multisig_hybrid_{label}_signs"),
+            &hybrid,
+            &[&generic(&GenericSignature::MultiSig(sig))],
+        );
+    }
+    // A member signature over another transaction.
+    let stale = GenericSignature::Signature(Signature::new_secure(
+        &IntentMessage::new(Intent::sui_transaction(), &data),
+        &mldsa,
+    ));
+    add(
+        "multisig_hybrid_mldsa65_wrong_message",
+        &hybrid,
+        &[&generic(&GenericSignature::MultiSig(
+            MultiSig::combine(vec![stale], hybrid_pk.clone()).unwrap(),
+        ))],
+    );
+    let legacy_hybrid_pk =
+        MultiSigPublicKeyLegacy::new(vec![mldsa.public(), ed.public()], vec![1, 1], 1).unwrap();
+    add(
+        "multisig_legacy_hybrid",
+        &hybrid,
+        &[&generic(&GenericSignature::MultiSigLegacy(
+            MultiSigLegacy::combine(vec![hybrid_member(&ed)], legacy_hybrid_pk).unwrap(),
+        ))],
+    );
     let legacy_pk = MultiSigPublicKeyLegacy::new(pks.clone(), vec![1, 1, 1], 2).unwrap();
     let legacy = MultiSigLegacy::combine(vec![member(&ed), member(&r1)], legacy_pk).unwrap();
     add(
@@ -343,5 +390,10 @@ pub(crate) fn cases() -> Vec<(String, Vec<u8>)> {
         b
     };
     add("zklogin_bad_ephemeral_key", &data, &[&bad_ephemeral]);
+    add(
+        "zklogin_mldsa65_ephemeral_key",
+        &data,
+        &[&zk_sig(&data, &mldsa, 10)],
+    );
     cases
 }
