@@ -902,7 +902,10 @@ fn the_epoch_ends_with_a_checkpoint_closing_it() {
         .end_of_epoch_data
         .as_ref()
         .expect("the last checkpoint has end-of-epoch data");
-    assert_eq!(end.next_epoch_protocol_version, ProtocolVersion::MAX);
+    assert_eq!(
+        end.next_epoch_protocol_version,
+        ProtocolVersion::new(execution::upgrade::MAX_PROTOCOL_VERSION)
+    );
     assert_eq!(
         end.next_epoch_committee,
         network.sui_committee.voting_rights

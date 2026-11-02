@@ -54,6 +54,7 @@ pub fn refine_to_single_linkage<'a>(
     let mut base_linkage = linkage_analysis
         .config()
         .resolution_table_with_native_packages(package_store)?;
+    let mut seen_fixed_inputs = BTreeSet::new_in(linkage_analysis.config().bump());
 
     for (i, command) in txn.commands.iter().enumerate() {
         analyze_command(command, &mut base_linkage, package_store, protocol_config)
@@ -62,6 +63,7 @@ pub fn refine_to_single_linkage<'a>(
             command.arguments(),
             &txn.inputs,
             &mut base_linkage,
+            &mut seen_fixed_inputs,
             package_store,
             protocol_config,
         )
@@ -132,6 +134,7 @@ fn add_used_input_linkage<'a>(
     arguments: impl IntoIterator<Item = &'a Argument>,
     inputs: &Inputs<'_>,
     resolution_table: &mut ResolutionTable<'_>,
+    seen_fixed_inputs: &mut BTreeSet<'_, u16>,
     store: &VerifiedPackageStore<'_>,
     protocol_config: &ProtocolConfig,
 ) -> Result<(), ExecutionError<'static>> {
@@ -142,6 +145,7 @@ fn add_used_input_linkage<'a>(
     for argument in arguments {
         if let Argument::Input(i) = argument
             && let Some((_, InputType::Fixed(ty))) = inputs.get(*i as usize)
+            && seen_fixed_inputs.insert(*i)
         {
             add_type_packages(resolution_table, std::iter::once(ty), store)?;
         }
@@ -501,16 +505,13 @@ fn add_type_packages<'a>(
     store: &VerifiedPackageStore<'_>,
 ) -> Result<(), ExecutionError<'static>> {
     let bump = resolution_table.config.bump();
-    for type_defining_id in types.into_iter().flat_map(|ty| ty.all_addresses(bump)) {
-        add_package(
-            &object_id(&type_defining_id),
-            store,
-            resolution_table,
-            VersionConstraint::at_least,
-            VersionConstraint::at_least,
-        )?;
-    }
-    Ok(())
+    resolution_table.add_type_linkages_to_table(
+        types
+            .into_iter()
+            .flat_map(|ty| ty.all_addresses(bump))
+            .map(|address| object_id(&address)),
+        store,
+    )
 }
 
 /// Add a package and its transitive dependencies to the resolution table. The package itself

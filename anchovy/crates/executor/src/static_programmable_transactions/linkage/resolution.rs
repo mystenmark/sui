@@ -5,7 +5,7 @@ use crate::{
     data_store::{PackageMetadata, PackageStore},
     static_programmable_transactions::linkage::config::ResolutionConfig,
 };
-use containers::{BTreeMap, btree_map::Entry};
+use containers::{BTreeMap, BTreeSet, btree_map::Entry};
 use exec_types::error::{ExecutionError, ExecutionErrorKind};
 use messages::base::ObjectId;
 use std::borrow::Borrow;
@@ -38,6 +38,8 @@ pub struct PackageResolution {
 pub(crate) struct ResolutionTable<'a> {
     pub(crate) config: ResolutionConfig<'a>,
     pub(crate) resolution_table: BTreeMap<'a, ObjectId, VersionConstraint>,
+    /// Type-defining packages whose linkage tables have already been expanded.
+    seen_type_packages: BTreeSet<'a, ObjectId>,
     /// For every version of every package that we have seen, a mapping of the ObjectID for that
     /// package to its runtime ID.
     pub(crate) all_versions_resolution_table: BTreeMap<'a, ObjectId, PackageResolution>,
@@ -48,6 +50,7 @@ impl<'a> ResolutionTable<'a> {
         Self {
             config,
             resolution_table: BTreeMap::new_in(config.bump()),
+            seen_type_packages: BTreeSet::new_in(config.bump()),
             all_versions_resolution_table: BTreeMap::new_in(config.bump()),
         }
     }
@@ -66,6 +69,9 @@ impl<'a> ResolutionTable<'a> {
         I::Item: Borrow<ObjectId>,
     {
         for id in ids {
+            if !self.seen_type_packages.insert(*id.borrow()) {
+                continue;
+            }
             let pkg = get_package(id.borrow(), store)?;
             let package_id = pkg.version_id();
             // The reference fetches `package_id` again; when it is the ID just fetched, that

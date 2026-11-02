@@ -122,7 +122,9 @@ pub trait BackingStore<'a>: RuntimeObjectResolver<'a> + ObjectStore<'a> {}
 
 impl<'a, T> BackingStore<'a> for T where T: RuntimeObjectResolver<'a> + ObjectStore<'a> {}
 
-/// Resolves the balance available for object-funds withdrawals during execution.
-pub trait ObjectFundsResolver {
+/// Resolves what execution reads of implicitly read system objects.
+pub trait ImplicitSystemObjectResolver<'a> {
     fn object_available_balance(&self, owner: SuiAddress, type_: &TypeTag<'_>) -> SuiResult<u128>;
+
+    fn clock(&self) -> SuiResult<Object<'a>>;
 }

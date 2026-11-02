@@ -143,7 +143,7 @@ pub fn build_with(
     let mut builder = Builder::new()
         .with_parameters(GenesisCeremonyParameters {
             chain_start_timestamp_ms: 0,
-            protocol_version: ProtocolVersion::MAX,
+            protocol_version: ProtocolVersion::new(execution::upgrade::MAX_PROTOCOL_VERSION),
             epoch_duration_ms,
             ..GenesisCeremonyParameters::new()
         })

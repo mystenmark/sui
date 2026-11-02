@@ -428,7 +428,12 @@ impl Reference {
             &self.epoch,
             self.epoch_start_timestamp_ms,
             inputs,
-            SystemObjectVersions::new(accumulator_version),
+            SystemObjectVersions::from_map(
+                accumulator_version
+                    .map(|v| (sui_types::SUI_ACCUMULATOR_ROOT_OBJECT_ID, v))
+                    .into_iter()
+                    .collect(),
+            ),
             &ReferenceUnsettled(unsettled),
             data.gas_data().clone(),
             gas_status,

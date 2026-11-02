@@ -10,12 +10,15 @@
 
 use messages::base::ObjectId;
 use messages::effects::GasCostSummary;
+use move_core_types::gas_algebra::InternalGas;
 use move_core_types::vm_status::StatusCode;
 use sui_protocol_config::ProtocolConfig;
 
 use crate::error::{ExecutionError, ExecutionErrorKind};
 use crate::gas::SuiGasStatusAPI;
-use crate::gas_model::gas_common::{StorageGas, half_digits_rounding, sender_rebate};
+use crate::gas_model::gas_common::{
+    StorageGas, half_digits_rounding, package_read_internal_gas, sender_rebate,
+};
 use crate::gas_model::gas_predicates::cost_table_for_version;
 use crate::gas_model::tables::{GasStatus, ZERO_COST_SCHEDULE};
 use crate::gas_model::units_types::CostTable;
@@ -28,6 +31,8 @@ pub struct SuiCostTable {
     package_publish_per_byte_cost: u64,
     /// Per byte cost to read objects from the store.
     object_read_per_byte_cost: u64,
+    /// Cost per KiB to read package inputs, or `None` to charge them the object rate.
+    package_read_per_kb_cost: Option<u64>,
     /// Unit cost of a byte in the storage.
     storage_per_byte_cost: u64,
     /// Execution cost table to be used.
@@ -47,6 +52,7 @@ impl SuiCostTable {
         Self {
             package_publish_per_byte_cost: c.package_publish_cost_per_byte(),
             object_read_per_byte_cost: c.obj_access_cost_read_per_byte(),
+            package_read_per_kb_cost: c.obj_access_cost_read_per_package_kb_as_option(),
             storage_per_byte_cost: c.obj_data_cost_refundable(),
             execution_cost_table: cost_table_for_version(c.gas_model_version()),
             max_gas_price_rgp_factor_for_aborted_transactions: c
@@ -58,6 +64,7 @@ impl SuiCostTable {
         Self {
             package_publish_per_byte_cost: 0,
             object_read_per_byte_cost: 0,
+            package_read_per_kb_cost: None,
             storage_per_byte_cost: 0,
             execution_cost_table: &ZERO_COST_SCHEDULE,
             max_gas_price_rgp_factor_for_aborted_transactions: None,
@@ -92,6 +99,27 @@ pub struct SuiGasStatus {
 }
 
 impl SuiGasStatus {
+    /// Charge reading a package input.
+    pub fn charge_package_object_read(
+        &mut self,
+        size: usize,
+    ) -> Result<(), ExecutionError<'static>> {
+        if let Some(cost_per_kb) = self.cost_table.package_read_per_kb_cost {
+            self.gas_status
+                .deduct_gas(InternalGas::new(package_read_internal_gas(
+                    size,
+                    cost_per_kb,
+                )))
+                .map_err(|e| {
+                    debug_assert_eq!(e.major_status(), StatusCode::OUT_OF_GAS);
+                    ExecutionErrorKind::InsufficientGas.into()
+                })
+        } else {
+            // Without a package rate, packages are charged exactly as other input objects.
+            self.charge_storage_read(size)
+        }
+    }
+
     /// The reference's private `new`, renamed: here `SuiGasStatus::new` is the public
     /// constructor that its version-dispatching wrapper had.
     fn from_parts(

@@ -31,7 +31,9 @@ use exec_types::base::{move_address, object_id};
 use exec_types::error::{ExecutionError, ExecutionErrorKind, SafeIndex, command_argument_error};
 use exec_types::execution::DynamicallyLoadedObjectMetadata;
 use exec_types::object::{Object, get_owner_address, original_package_id};
-use exec_types::storage::{BackingPackageStore, ObjectFundsResolver, RuntimeObjectResolver};
+use exec_types::storage::{
+    BackingPackageStore, ImplicitSystemObjectResolver, RuntimeObjectResolver,
+};
 use exec_types::tx_context::TxContext;
 use exec_types::type_tags::{
     move_object_type_all_addresses, move_object_type_of, move_object_type_struct_tag_in,
@@ -73,7 +75,6 @@ use serde::Deserialize;
 use std::{cell::RefCell, fmt, rc::Rc, sync::Arc};
 use sui_protocol_config::ProtocolConfig;
 use sui_types::{
-    accumulator_root::SETTLEMENT_MAX_TYPE_INSTANTIATION_NODES,
     base_types::{RESOLVED_ASCII_STR, RESOLVED_UTF8_STR},
     metrics::ExecutionMetrics,
     move_package::UpgradePolicy,
@@ -363,7 +364,7 @@ unsafe fn state_view_for_object_runtime<'s, 'a>(
     state_view: &'s (dyn ExecutionState<'a> + 's),
 ) -> (
     &'a dyn RuntimeObjectResolver<'a>,
-    &'a dyn ObjectFundsResolver,
+    &'a dyn ImplicitSystemObjectResolver<'a>,
 ) {
     // SAFETY: the caller upholds the contract above; the layout of the reference is unchanged.
     let state_view: &'a (dyn ExecutionState<'a> + 'a) = unsafe {
@@ -481,12 +482,12 @@ where
         };
         // SAFETY: the state view is borrowed by `env` for the context's lifetime, and the
         // resolvers live only in the native extensions, which go with the context.
-        let (child_resolver, object_funds_resolver) =
+        let (child_resolver, system_object_resolver) =
             unsafe { state_view_for_object_runtime(&*env.state_view) };
         let native_extensions = adapter::new_native_extensions(
             bump,
             child_resolver,
-            object_funds_resolver,
+            system_object_resolver,
             input_object_map,
             !gas_charger.is_unmetered(),
             env.protocol_config,
@@ -1209,12 +1210,6 @@ where
                         .map_err(|e| self.env.convert_linked_vm_error(e, &function.linkage))
                 })
                 .collect::<Result<std::vec::Vec<_>, ExecutionError<'a>>>()?;
-            let max_type_nodes = accumulator_root::is_settle_u128_call(
-                function.original_mid.address(),
-                function.original_mid.name(),
-                function.name,
-            )
-            .then_some(SETTLEMENT_MAX_TYPE_INSTANTIATION_NODES);
             let function_name = IdentStr::new(function.name).map_err(|e| {
                 make_invariant_violation!("Invalid function name {}: {e}", function.name)
             })?;
@@ -1225,7 +1220,6 @@ where
                 ty_args,
                 args,
                 &function.linkage,
-                max_type_nodes,
             )?;
             self.take_user_events(
                 vm,
@@ -1246,18 +1240,16 @@ where
         ty_args: std::vec::Vec<VMType>,
         args: Vec<'a, CtxValue>,
         linkage: &ExecutableLinkage<'_>,
-        max_type_nodes: Option<u64>,
     ) -> Result<Vec<'a, CtxValue>, ExecutionError<'a>> {
         let gas_status = self.gas_charger.move_gas_status_mut();
         let values = vm
-            .execute_function_bypass_visibility_with_max_type_nodes(
+            .execute_function_bypass_visibility(
                 original_mid,
                 function_name,
                 ty_args,
                 args.into_iter().map(|v| v.0.into()).collect(),
                 &mut SuiGasMeter(gas_status),
                 None,
-                max_type_nodes,
             )
             .map_err(|e| self.env.convert_linked_vm_error(e, linkage))?;
         let mut results = Vec::with_capacity_in(values.len(), self.env.bump);
@@ -1495,7 +1487,6 @@ where
                 vec![],
                 args,
                 linkage,
-                None,
             )?;
 
             // The reference takes the name from `module.self_id()` again.
