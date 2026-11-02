@@ -209,11 +209,8 @@ impl Sharder {
     #[inline]
     pub fn pick(&self, key: &[u8; 32], slots: usize) -> usize {
         let mut h = self.seed;
-        for word in key.chunks_exact(8) {
-            h = fold(
-                h ^ u64::from_le_bytes(word.try_into().expect("eight bytes")),
-                self.multiplier,
-            );
+        for word in key.as_chunks::<8>().0 {
+            h = fold(h ^ u64::from_le_bytes(*word), self.multiplier);
         }
         ((u128::from(h) * slots as u128) >> 64) as usize
     }

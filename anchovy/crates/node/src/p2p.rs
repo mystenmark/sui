@@ -483,6 +483,8 @@ async fn call_raw<T: serde::Serialize>(
 
 /// Pushes a peer's signatures to the running epoch's collector, answering
 /// once it has taken them; dropped if the peer is not a member.
+// anemo's routes return its `Status`.
+#[allow(clippy::result_large_err)]
 async fn send_signatures(
     current: CurrentEpoch,
     request: Request<SendSignaturesRequest>,

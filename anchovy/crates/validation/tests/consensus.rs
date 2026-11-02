@@ -34,8 +34,7 @@ fn decodes_what_sui_decodes() {
         };
         let bump = Bump::with_capacity(1 << 16);
         let ours = Message::<ConsensusTransaction<'static>>::parse(unhex(hex))
-            .ok()
-            .is_some_and(|m| validation::consensus::decode_checks(m.get(), &bump).is_ok());
+            .is_ok_and(|m| validation::consensus::decode_checks(m.get(), &bump).is_ok());
         if ours != (verdict == "ok") {
             mismatches.push(format!("{label}: sui {verdict}, ours {ours}"));
         }

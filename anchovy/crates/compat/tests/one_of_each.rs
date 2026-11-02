@@ -1911,6 +1911,7 @@ fn the_composite_workload_runs_alike() {
     use sui_benchmark::workloads::adversarial::AdversarialPayloadCfg;
     use sui_benchmark::workloads::composite::*;
     use sui_benchmark::workloads::expected_failure::ExpectedFailurePayloadCfg;
+    use sui_benchmark::workloads::gas_double_spend::GasDoubleSpendSubmission;
     use sui_benchmark::workloads::workload::ExpectedFailureType;
     use sui_benchmark::workloads::workload_configuration::{
         WorkloadConfig, WorkloadConfiguration, WorkloadWeights,
@@ -2027,7 +2028,7 @@ fn the_composite_workload_runs_alike() {
             num_contested_objects: 2,
             randomized_transaction_concurrency: 4,
             gas_double_spend_copies: 2,
-            gas_double_spend_submission: Default::default(),
+            gas_double_spend_submission: GasDoubleSpendSubmission::default(),
             target_qps: 20,
             in_flight_ratio: 2,
             duration: Interval::from_str("unbounded").unwrap(),
