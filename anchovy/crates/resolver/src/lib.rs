@@ -116,27 +116,7 @@ pub fn object_keys(
                 _ => {}
             }
         }
-        packages.clear();
-        for command in pt.commands {
-            match command {
-                MoveCommand::MoveCall(call) => {
-                    packages.push(*call.package);
-                    for t in call.type_arguments {
-                        type_packages(t, packages);
-                    }
-                }
-                MoveCommand::Publish(_, deps) => packages.extend_from_slice(deps),
-                MoveCommand::Upgrade(_, deps, package, _) => {
-                    packages.extend_from_slice(deps);
-                    packages.push(**package);
-                }
-                MoveCommand::MakeMoveVec(Some(t), _) => type_packages(t, packages),
-                _ => {}
-            }
-        }
-        packages.sort_unstable();
-        packages.dedup();
-        keys.extend(packages.iter().map(|id| InputKey::Package(*id)));
+        package_keys(pt.commands, keys, packages);
     }
     keys.extend(
         data.gas_data()
@@ -148,6 +128,36 @@ pub fn object_keys(
                 version: r.version.get(),
             }),
     );
+}
+
+/// Pushes the keys of the packages `commands` name, each once (gathered in
+/// `packages`): those of the reference's `input_objects`.
+pub fn package_keys(
+    commands: &[MoveCommand<'_>],
+    keys: &mut Vec<InputKey>,
+    packages: &mut Vec<ObjectId>,
+) {
+    packages.clear();
+    for command in commands {
+        match command {
+            MoveCommand::MoveCall(call) => {
+                packages.push(*call.package);
+                for t in call.type_arguments {
+                    type_packages(t, packages);
+                }
+            }
+            MoveCommand::Publish(_, deps) => packages.extend_from_slice(deps),
+            MoveCommand::Upgrade(_, deps, package, _) => {
+                packages.extend_from_slice(deps);
+                packages.push(**package);
+            }
+            MoveCommand::MakeMoveVec(Some(t), _) => type_packages(t, packages),
+            _ => {}
+        }
+    }
+    packages.sort_unstable();
+    packages.dedup();
+    keys.extend(packages.iter().map(|id| InputKey::Package(*id)));
 }
 
 /// Pushes `data`'s withdrawals to `amounts`, one per account, summed and
