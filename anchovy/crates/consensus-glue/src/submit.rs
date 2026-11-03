@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use consensus::{BlockStatus, Priority, TransactionsGuard};
 use tokio::sync::{mpsc, oneshot};
@@ -29,6 +30,10 @@ pub(crate) async fn forward(
     }
 }
 
+/// How long a garbage-collected system message waits to be submitted again:
+/// the reference's `RETRY_DELAY_STEP`.
+const RESUBMIT_DELAY: Duration = Duration::from_secs(1);
+
 async fn submit(
     client: Arc<consensus_core::TransactionClient>,
     guard: TransactionsGuard,
@@ -38,25 +43,47 @@ async fn submit(
         Priority::Normal => consensus_core::Priority::Normal,
         Priority::High => consensus_core::Priority::High,
     };
-    let Ok((block, indices, status)) = client.submit(guard.transactions, priority).await else {
-        return;
-    };
-    let (sender, receiver) = oneshot::channel();
-    if guard
-        .included_in_block_ack
-        .send((block_ref(&block), indices, receiver))
-        .is_err()
-    {
-        return;
-    }
-    if let Ok(status) = status.await {
-        let _ = sender.send(match status {
+    let TransactionsGuard {
+        transactions,
+        included_in_block_ack,
+        until_sequenced,
+    } = guard;
+    let mut ack = Some(included_in_block_ack);
+    loop {
+        let Ok((block, indices, status)) = client.submit(transactions.clone(), priority).await
+        else {
+            return;
+        };
+        // The first inclusion is acknowledged; later ones are retries.
+        let mut answer = None;
+        if let Some(ack) = ack.take() {
+            let (sender, receiver) = oneshot::channel();
+            if ack.send((block_ref(&block), indices, receiver)).is_err() && !until_sequenced {
+                return;
+            }
+            answer = Some(sender);
+        }
+        let Ok(status) = status.await else {
+            return;
+        };
+        let status = match status {
             consensus_core::BlockStatus::Sequenced(block) => {
                 BlockStatus::Sequenced(block_ref(&block))
             }
             consensus_core::BlockStatus::GarbageCollected(block) => {
                 BlockStatus::GarbageCollected(block_ref(&block))
             }
-        });
+        };
+        if let Some(answer) = answer {
+            let _ = answer.send(status);
+        }
+        if !until_sequenced || matches!(status, BlockStatus::Sequenced(_)) {
+            return;
+        }
+        tracing::debug!(
+            ?status,
+            "a system message's block was garbage collected; resubmitting"
+        );
+        tokio::time::sleep(RESUBMIT_DELAY).await;
     }
 }

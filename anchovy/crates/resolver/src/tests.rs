@@ -833,9 +833,14 @@ fn a_withdrawing_transaction_waits_on_its_reservations_instead_of_its_inputs() {
         .collect();
 
     // The reservations go to `FundsReserver`, in consensus order...
-    let Some(FundsCommand::Reserve(withdrawals)) = funds.try_pop() else {
+    let Some(FundsCommand::Reserve {
+        version: chunk_version,
+        withdrawals,
+    }) = funds.try_pop()
+    else {
         panic!("a reservation");
     };
+    assert_eq!(chunk_version, AccumulatorVersion(7));
     assert!(funds.try_pop().is_none());
     let [withdrawal] = &withdrawals[..] else {
         panic!("one withdrawal");

@@ -280,10 +280,13 @@ impl Processor for VersionResolver {
         if !batch.is_empty() {
             self.inputs.push(Command::Wait(batch), "input waiter");
         }
-        if !withdrawals.is_empty() {
-            self.withdrawals
-                .push(FundsCommand::Reserve(withdrawals), "funds reserver");
-        }
+        self.withdrawals.push(
+            FundsCommand::Reserve {
+                version,
+                withdrawals,
+            },
+            "funds reserver",
+        );
         None
     }
 }

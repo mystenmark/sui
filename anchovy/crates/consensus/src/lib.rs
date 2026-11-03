@@ -101,6 +101,9 @@ pub enum ClientError {
 pub struct TransactionsGuard {
     pub transactions: Vec<Vec<u8>>,
     pub included_in_block_ack: oneshot::Sender<Included>,
+    /// Submitted again each time its block is garbage collected, until a
+    /// block holding it is sequenced: the reference's `submit_to_consensus`.
+    pub until_sequenced: bool,
 }
 
 /// Submits transactions to consensus: consensus-core's `TransactionClient`.
@@ -145,6 +148,7 @@ impl TransactionClient {
             .send(TransactionsGuard {
                 transactions,
                 included_in_block_ack: ack,
+                until_sequenced: false,
             })
             .await
             .map_err(|_| ClientError::ConsensusShuttingDown)?;
@@ -153,22 +157,24 @@ impl TransactionClient {
             .map_err(|_| ClientError::ConsensusShuttingDown)
     }
 
-    /// `submit` for a caller on a plain thread that need not learn where the
-    /// transactions were included: blocks while the lane is full, not until
-    /// inclusion. Must not be called from within an async runtime.
-    pub fn submit_blocking(
+    /// Submits a system message's `transactions`, again each time the block
+    /// holding them is garbage collected, until one is sequenced or consensus
+    /// shuts down. For a caller on a plain thread: blocks while the lane is
+    /// full, not until inclusion. Must not be called from within an async
+    /// runtime.
+    pub fn submit_until_sequenced(
         &self,
         transactions: Vec<Vec<u8>>,
         priority: Priority,
-    ) -> Result<oneshot::Receiver<Included>, ClientError> {
-        let (ack, included) = oneshot::channel();
+    ) -> Result<(), ClientError> {
+        let (ack, _) = oneshot::channel();
         self.lane(priority)
             .blocking_send(TransactionsGuard {
                 transactions,
                 included_in_block_ack: ack,
+                until_sequenced: true,
             })
-            .map_err(|_| ClientError::ConsensusShuttingDown)?;
-        Ok(included)
+            .map_err(|_| ClientError::ConsensusShuttingDown)
     }
 
     fn lane(&self, priority: Priority) -> &mpsc::Sender<TransactionsGuard> {

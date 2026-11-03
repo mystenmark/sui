@@ -447,6 +447,112 @@ fn a_double_spend_using_randomness_joins_the_randomness_deferrals_of_its_round()
     );
 }
 
+/// A committee of one, its DKG set up, and its member's party.
+fn one_member_dkg(
+    epoch: &EpochParams,
+) -> (
+    Vec<([u8; 96], u64)>,
+    Arc<validator::consensus::dkg::DkgSetup>,
+    fastcrypto_tbls::dkg_v1::Party<
+        fastcrypto::groups::bls12381::G2Element,
+        fastcrypto::groups::bls12381::G2Element,
+    >,
+) {
+    use fastcrypto::serde_helpers::ToFromByteArray as _;
+    use fastcrypto::traits::{KeyPair as _, ToFromBytes as _};
+    let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(1);
+    let key = fastcrypto::bls12381::min_sig::BLS12381KeyPair::generate(&mut rng);
+    let committee = vec![(
+        <[u8; 96]>::try_from(key.public().as_bytes()).unwrap(),
+        10_000,
+    )];
+    let setup = Arc::new(validator::consensus::dkg::DkgSetup::new(
+        &committee,
+        &epoch.config,
+        &[0; 32],
+        0,
+    ));
+    let secret = fastcrypto::groups::bls12381::Scalar::from_byte_array(
+        key.copy().private().as_bytes().try_into().unwrap(),
+    )
+    .unwrap();
+    let party = fastcrypto_tbls::dkg_v1::Party::new(
+        fastcrypto_tbls::ecies_v1::PrivateKey::from(secret),
+        setup.nodes().clone(),
+        setup.threshold(),
+        setup.random_oracle().clone(),
+        &mut rng,
+    )
+    .unwrap();
+    (committee, setup, party)
+}
+
+/// Transactions using randomness reloaded together: one a double spend's
+/// winner, deferred a round, and others deferred for randomness. As the
+/// reference, those deferred for randomness come first.
+#[test]
+fn randomness_deferred_for_randomness_runs_before_randomness_deferred_a_round() {
+    use sui_types::messages_consensus::{VersionedDkgConfirmation, VersionedDkgMessage};
+    use validator::consensus::dkg::{DkgPayload, DkgTraffic};
+    let bump = containers::Bump::default();
+    let epoch = epoch();
+    let (committee, setup, party) = one_member_dkg(&epoch);
+    let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(2);
+    let message = party.create_message(&mut rng).unwrap();
+    let processed = party.process_message(message.clone(), &mut rng).unwrap();
+    let (confirmation, _) = party.merge(&[processed]).unwrap();
+    let traffic = vec![
+        DkgTraffic {
+            author: 0,
+            payload: DkgPayload::Message(
+                setup
+                    .message(
+                        0,
+                        &bcs::to_bytes(&VersionedDkgMessage::V1(message)).unwrap(),
+                    )
+                    .map(Box::new),
+            ),
+        },
+        DkgTraffic {
+            author: 0,
+            payload: DkgPayload::Confirmation(setup.confirmation(
+                0,
+                &bcs::to_bytes(&VersionedDkgConfirmation::V1(confirmation)).unwrap(),
+            )),
+        },
+    ];
+
+    let sender = Sender::new();
+    let object = random_object_ref();
+    let winner = using_randomness(&sender, random_object_ref(), &[object]);
+    let loser = sender.transaction(random_object_ref(), &[object]);
+    let waiting: Vec<Tx> = (0..2)
+        .map(|_| using_randomness(&sender, random_object_ref(), &[]))
+        .collect();
+    let (output, _dir) = consensus_output();
+    let mut handler =
+        CommitHandler::new(output, 0, committee, &epoch.config, None).with_randomness(1, setup);
+    // Commit 1 completes DKG only after taking its randomness round: none.
+    let mut first = commit(
+        1,
+        &[
+            (&winner, &[]),
+            (&loser, &[]),
+            (&waiting[0], &[]),
+            (&waiting[1], &[]),
+        ],
+    );
+    first.dkg = traffic;
+    let decided = handler.handle(&epoch, first, &bump).unwrap();
+    assert!(scheduled(&decided).is_empty());
+    // Commit 2 has one, and reloads both deferrals.
+    let decided = handler.handle(&epoch, commit(2, &[]), &bump).unwrap();
+    assert_eq!(
+        scheduled(&decided),
+        vec![digest(&waiting[0]), digest(&waiting[1]), digest(&winner)]
+    );
+}
+
 /// The keys a commit's authenticator state update adds.
 fn updated_keys(handled: &HandledCommit) -> Vec<String> {
     handled

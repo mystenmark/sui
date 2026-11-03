@@ -281,7 +281,7 @@ impl Processor for SummaryBuilder {
             // consensus shuts down, when nothing is left to sign for.
             let _ = self
                 .consensus
-                .submit_blocking(vec![signature], Priority::High);
+                .submit_until_sequenced(vec![signature], Priority::High);
         }
         Some(())
     }
