@@ -50,7 +50,8 @@ use crate::pipeline::backpressure::Backpressure;
 use crate::pipeline::chunk_lock::{ChunkLock, Cut};
 use crate::pipeline::items::{
     AliasVersions, Chunk, EpochClose, ExecutableTransaction, GateWaits, GatedChunk, OutputThrough,
-    OutputWaits, PendingCheckpoint, PendingUpdate, ScheduledEntry, SystemKind, SystemTransaction,
+    OutputWaits, PendingCheckpoint, PendingUpdate, RegistryRead, ScheduledEntry, SystemKind,
+    SystemTransaction,
 };
 use crate::pipeline::keys::{
     AccumulatorVersion, CheckpointProgress, ChunkSettled, GateKey, StreamId, TxDigest,
@@ -90,6 +91,10 @@ pub struct HandledCommit<'b> {
     /// observer's, folded with the estimates the commit observed (the
     /// reference's `IndirectStateObserver`).
     pub state_digest: [u8; 32],
+    /// The forwarding address registry each scheduled user transaction
+    /// reads if execution reads it implicitly, by schedule position; empty
+    /// if the epoch has no registry to read.
+    pub forwarding_registry: containers::Vec<'b, Option<RegistryRead>>,
     /// The epoch's last commit: its time is up and no deferred transaction
     /// remains, or the close deadline passed.
     pub final_commit: bool,
@@ -133,6 +138,9 @@ pub struct CommitHandler {
     /// The authenticator state's initial shared version, if the epoch
     /// agrees keys: the reference's `authenticator_state_enabled`.
     authenticator: Option<u64>,
+    /// The forwarding address registry, if the protocol lets execution read
+    /// it and it existed as the epoch started.
+    forwarding_registry: Option<RegistryStart>,
     /// When the epoch's time is up, by commit timestamp.
     epoch_end_ms: u64,
     /// A commit at or past `epoch_end_ms` was handled: later commits' user
@@ -186,13 +194,15 @@ impl CommitHandler {
     /// A handler of `committee`'s commits (each member's name and stake, by
     /// index), that has handled those through `last_commit`, with what the
     /// commits written observed and voted for restored. `authenticator` is
-    /// the authenticator state's initial shared version, if it exists.
+    /// the authenticator state's initial shared version, if it exists, and
+    /// `forwarding_registry` the registry, likewise.
     pub fn new(
         output: ConsensusOutput,
         last_commit: u32,
         committee: Vec<([u8; 96], u64)>,
         config: &ProtocolConfig,
         authenticator: Option<u64>,
+        forwarding_registry: Option<RegistryStart>,
     ) -> CommitHandler {
         let mut execution_times = ExecutionTimeEstimator::new(committee.clone(), config);
         for (generation, author, estimates) in output.execution_time_observations() {
@@ -225,6 +235,8 @@ impl CommitHandler {
             commit_times: CommitIntervalObserver::default(),
             new_jwks,
             authenticator: authenticator.filter(|_| config.enable_jwk_consensus_updates()),
+            forwarding_registry: forwarding_registry
+                .filter(|_| config.enable_forwarding_addresses()),
             epoch_end_ms: u64::MAX,
             certs_closed: false,
             randomness: None,
@@ -722,6 +734,7 @@ impl CommitHandler {
         let mut schedule =
             self.sequencer
                 .schedule(prologue, update, randomness_update, admitted, bump);
+        let forwarding_registry = self.registry_reads(&schedule, bump);
         self.link(schedule.all_accesses_mut());
         Some(HandledCommit {
             commit_index: commit.commit_index,
@@ -732,6 +745,7 @@ impl CommitHandler {
             deferred: deferred_here,
             dropped,
             state_digest: self.commit_times.digest(&indirect_state_digest(observed)),
+            forwarding_registry,
             final_commit,
             upgrade,
             cache_hits: commit.cache_hits,
@@ -867,6 +881,40 @@ impl CommitHandler {
         Ok(())
     }
 
+    /// The forwarding address registry each user transaction of `schedule`
+    /// reads if execution reads it (`registry_reads`); empty if the epoch has
+    /// no registry to read.
+    fn registry_reads<'b>(
+        &self,
+        schedule: &Schedule<'_>,
+        bump: &'b Bump,
+    ) -> containers::Vec<'b, Option<RegistryRead>> {
+        let Some(start) = self.forwarding_registry else {
+            return containers::Vec::new_in(bump);
+        };
+        let stream = StreamId {
+            id: FORWARDING_ADDRESS_REGISTRY,
+            initial_shared_version: start.initial_shared_version,
+        };
+        let transactions = schedule
+            .transactions
+            .iter()
+            .enumerate()
+            .map(|(i, scheduled)| {
+                (
+                    matches!(scheduled, Scheduled::User(_)),
+                    schedule.accesses(i),
+                )
+            });
+        registry_reads(
+            transactions,
+            stream,
+            self.output.stream(&stream),
+            start.version,
+            bump,
+        )
+    }
+
     /// Sets each generation-0 access's base, the stream's last generation
     /// from an earlier round, and records the generations exclusive writes
     /// produce. Accesses are in schedule order.
@@ -908,6 +956,48 @@ impl CommitHandler {
             }
         }
     }
+}
+
+/// The registry on `stream` each of `transactions` (in schedule order, each
+/// whether it is a user transaction, and its shared accesses) reads if
+/// execution reads it without its naming it (the reference's
+/// `SystemObjectVersions`). A user transaction that does not name it reads
+/// the generation it would read had it named it, as `CommitHandler::link`
+/// would place it, from `last`, the stream's last generation before the
+/// commit; or, if no transaction touched the registry this epoch before it,
+/// the registry at `start_version`, as the epoch started, which is what a
+/// first toucher records as generation 0. A read takes no generation of its
+/// own, so no transaction waits for it.
+fn registry_reads<'b, 's>(
+    transactions: impl ExactSizeIterator<Item = (bool, &'s [SharedAccess])>,
+    stream: StreamId,
+    mut last: Option<(u32, u32)>,
+    start_version: u64,
+    bump: &'b Bump,
+) -> containers::Vec<'b, Option<RegistryRead>> {
+    let mut reads = containers::Vec::with_capacity_in(transactions.len(), bump);
+    for (user, accesses) in transactions {
+        let names = accesses.iter().any(|a| a.stream() == stream);
+        reads.push((user && !names).then_some(match last {
+            Some((round, generation)) => RegistryRead::Generation {
+                stream,
+                round,
+                generation,
+            },
+            None => RegistryRead::At(start_version),
+        }));
+        for access in accesses.iter().filter(|a| a.stream() == stream) {
+            let round = access.ordinal.round;
+            let generation = access.ordinal.writes_before;
+            if generation == 0 && last.is_none() {
+                last = Some((round, 0));
+            }
+            if access.mutability == messages::transaction::SharedObjectMutability::Mutable {
+                last = Some((round, generation + 1));
+            }
+        }
+    }
+    reads
 }
 
 /// A transaction cancelled for congestion on `congested`: each of its
@@ -953,6 +1043,9 @@ fn dkg_failed_inputs(transaction: &VerifiedTransaction) -> Vec<CancelledInput> {
 
 /// The randomness state (`SUI_RANDOMNESS_STATE_OBJECT_ID`).
 const RANDOMNESS_STATE: messages::base::ObjectId = messages::base::ObjectId::from_u16(0x8);
+/// `SUI_FORWARDING_ADDRESS_REGISTRY_OBJECT_ID`.
+const FORWARDING_ADDRESS_REGISTRY: messages::base::ObjectId =
+    messages::base::ObjectId::from_u16(0xfa);
 
 /// The system state object, which the change-epoch transaction writes, and
 /// the version its sharing started at.
@@ -1014,10 +1107,19 @@ pub struct EpochStart {
     pub accumulator_root_version: u64,
     /// The Clock's version as the epoch starts.
     pub clock_version: u64,
+    /// The forwarding address registry, if it exists as the epoch starts.
+    pub forwarding_registry: Option<RegistryStart>,
     /// The epoch ends with the first commit at or past
     /// `epoch_start_timestamp_ms + epoch_duration_ms`.
     pub epoch_start_timestamp_ms: u64,
     pub epoch_duration_ms: u64,
+}
+
+/// A system object's stream and its version as the epoch starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegistryStart {
+    pub initial_shared_version: u64,
+    pub version: u64,
 }
 
 /// What `CommitStage` decided about one commit, in emission order.
@@ -1120,6 +1222,7 @@ impl CommitStage {
             committee,
             &epoch.config,
             start.authenticator_initial_shared_version,
+            start.forwarding_registry,
         )
         .with_end(
             start
@@ -1257,6 +1360,7 @@ impl CommitStage {
             mut aliases,
             dropped,
             state_digest,
+            forwarding_registry,
             final_commit,
             upgrade,
             ..
@@ -1348,6 +1452,7 @@ impl CommitStage {
                             .map(|input| (input.id, input.marker))
                             .collect(),
                         clock_version,
+                        forwarding_registry: None,
                     });
                     continue;
                 }
@@ -1363,6 +1468,7 @@ impl CommitStage {
                 aliases: claim,
                 cancelled: Vec::new(),
                 clock_version,
+                forwarding_registry: forwarding_registry.get(i).copied().flatten(),
             });
         }
         // The update, left out, stood at the randomness part's start.
@@ -2078,6 +2184,110 @@ fn system_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const REGISTRY: StreamId = StreamId {
+        id: FORWARDING_ADDRESS_REGISTRY,
+        initial_shared_version: 5,
+    };
+
+    fn registry_access(round: u32, writes_before: u32, mutable: bool) -> SharedAccess {
+        use messages::transaction::SharedObjectMutability;
+        SharedAccess {
+            id: REGISTRY.id,
+            initial_shared_version: REGISTRY.initial_shared_version,
+            mutability: if mutable {
+                SharedObjectMutability::Mutable
+            } else {
+                SharedObjectMutability::Immutable
+            },
+            ordinal: SharedOrdinal {
+                round,
+                writes_before,
+            },
+            base: None,
+        }
+    }
+
+    fn generation(round: u32, generation: u32) -> RegistryRead {
+        RegistryRead::Generation {
+            stream: REGISTRY,
+            round,
+            generation,
+        }
+    }
+
+    #[test]
+    fn an_untouched_registry_is_read_as_the_epoch_started() {
+        let bump = Bump::default();
+        let none: &[SharedAccess] = &[];
+        let reads = registry_reads(
+            [(false, none), (true, none), (true, none)].into_iter(),
+            REGISTRY,
+            None,
+            7,
+            &bump,
+        );
+        // The prologue reads nothing implicitly; users read version 7.
+        assert_eq!(
+            reads.as_slice(),
+            [None, Some(RegistryRead::At(7)), Some(RegistryRead::At(7))]
+        );
+    }
+
+    #[test]
+    fn a_registry_read_follows_the_writes_sequenced_before_it() {
+        let bump = Bump::default();
+        let none: &[SharedAccess] = &[];
+        let write = [registry_access(3, 0, true)];
+        let second_write = [registry_access(3, 1, true)];
+        let reads = registry_reads(
+            [
+                (true, none),
+                (true, &write[..]),
+                (true, none),
+                (true, &second_write[..]),
+                (true, none),
+            ]
+            .into_iter(),
+            REGISTRY,
+            Some((2, 4)),
+            7,
+            &bump,
+        );
+        // Before any write this round, the last generation of round 2; a
+        // writer, naming the registry, reads it as an input; after each
+        // write, the generation it produced.
+        assert_eq!(
+            reads.as_slice(),
+            [
+                Some(generation(2, 4)),
+                None,
+                Some(generation(3, 1)),
+                None,
+                Some(generation(3, 2)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_live_read_this_epoch_names_the_generation_it_records() {
+        let bump = Bump::default();
+        let none: &[SharedAccess] = &[];
+        let read = [registry_access(3, 0, false)];
+        let reads = registry_reads(
+            [(true, none), (true, &read[..]), (true, none)].into_iter(),
+            REGISTRY,
+            None,
+            7,
+            &bump,
+        );
+        // Before the registry's first toucher, as the epoch started; after
+        // it, the generation 0 it records, which is that version too.
+        assert_eq!(
+            reads.as_slice(),
+            [Some(RegistryRead::At(7)), None, Some(generation(3, 0))]
+        );
+    }
 
     fn heights(flushed: &[Flushed]) -> Vec<(u64, Vec<u64>, u64)> {
         flushed

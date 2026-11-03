@@ -119,6 +119,30 @@ fn generations_are_written_once_their_producer_commits() {
     assert_eq!(table.get(stream(4), 3, 0), Some(version(8)));
 }
 
+/// A wait for a generation returns once a recording thread records it,
+/// whichever way it is recorded.
+#[test]
+fn a_wait_for_a_generation_ends_once_it_is_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _, _) = EpochStore::open(dir.path(), 0);
+    let table = GenerationTable::new(store);
+    std::thread::scope(|s| {
+        let waits: Vec<_> = (1..=3)
+            .map(|n| {
+                s.spawn({
+                    let table = &table;
+                    move || table.wait(stream(n), 3, 1)
+                })
+            })
+            .collect();
+        table.record(stream(1), 3, 1, version(2), tx(1), false);
+        table.record(stream(2), 3, 1, version(4), tx(2), true);
+        table.get_or_record(stream(3), 3, 1, || version(6));
+        let found: Vec<_> = waits.into_iter().map(|w| w.join().unwrap()).collect();
+        assert_eq!(found, [version(2), version(4), version(6)]);
+    });
+}
+
 /// A transaction digest, as computed.
 fn tx(n: u8) -> Hashed {
     Hashed::of("TransactionData", &[n])

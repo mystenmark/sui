@@ -177,7 +177,7 @@ impl NativeExecution {
         transaction: &[u8],
         provided: &[(ObjectId, Input<'_>)],
         funds: Funds,
-        implicit: crate::Implicit,
+        implicit: crate::Implicit<'_>,
         unsettled: &dyn Unsettled,
         awaited: &dyn Awaited,
     ) -> Result<Outcome> {
@@ -218,7 +218,7 @@ impl NativeExecution {
         transaction: &[u8],
         provided: &[(ObjectId, Input<'_>)],
         funds: Funds,
-        implicit: crate::Implicit,
+        implicit: crate::Implicit<'_>,
         unsettled: &dyn Unsettled,
         awaited: &dyn Awaited,
     ) -> Result<Outcome> {
@@ -249,7 +249,8 @@ impl NativeExecution {
             receiving_refs.leak(),
             accumulator_version,
             implicit.clock,
-        );
+        )
+        .with_forwarding_registry(implicit.forwarding_registry);
 
         let gas_data = *data.gas_data();
         let gas_status = if is_system_tx(data.kind()) {

@@ -32,7 +32,8 @@ pub enum Generation {
 
 /// Stream generations by `(stream, round, generation)`. Written by
 /// `Executor` (owner: the exec-pool work), read by the input waiter's
-/// availability check and by `Executor` to resolve exact versions.
+/// availability check and by `Executor` to resolve exact versions, and
+/// waited on during execution for an implicit read (`wait`).
 ///
 /// A generation names an object a transaction wrote, so it is in memory
 /// until that transaction's checkpoint commits, as the object is in the
@@ -44,6 +45,8 @@ pub struct GenerationTable {
     /// Makes `get_or_record`'s read and write one step.
     recording: Mutex<()>,
     uncommitted: Mutex<Uncommitted>,
+    /// Notified, under `uncommitted`, once a generation is recorded.
+    recorded: std::sync::Condvar,
 }
 
 type GenerationKey = (StreamId, u32, u32);
@@ -61,6 +64,7 @@ impl GenerationTable {
             store,
             recording: Mutex::new(()),
             uncommitted: Mutex::default(),
+            recorded: std::sync::Condvar::new(),
         }
     }
 
@@ -79,6 +83,8 @@ impl GenerationTable {
         if committed {
             self.store
                 .put_generations(&[(stream, round, generation, value)]);
+            let _uncommitted = lock(&self.uncommitted);
+            self.recorded.notify_all();
             return;
         }
         let mut uncommitted = lock(&self.uncommitted);
@@ -89,6 +95,7 @@ impl GenerationTable {
             .entry(producer)
             .or_default()
             .push(key);
+        self.recorded.notify_all();
     }
 
     /// Generation `generation` of `stream` in `round`: the one recorded, or
@@ -109,7 +116,31 @@ impl GenerationTable {
         let value = value();
         self.store
             .put_generations(&[(stream, round, generation, value)]);
+        let _uncommitted = lock(&self.uncommitted);
+        self.recorded.notify_all();
         value
+    }
+
+    /// Generation `generation` of `stream` in `round`, once recorded. A
+    /// transaction sequenced earlier records it, and causal admission runs
+    /// that transaction, so the wait ends.
+    pub fn wait(&self, stream: StreamId, round: u32, generation: u32) -> Generation {
+        let key = (stream, round, generation);
+        let mut uncommitted = lock(&self.uncommitted);
+        loop {
+            // Both are checked under the lock a recording notifies under, so
+            // a generation recorded after the check wakes this.
+            if let Some(found) = uncommitted.generations.get(&key) {
+                return *found;
+            }
+            if let Some(found) = self.store.generation(&stream, round, generation) {
+                return found;
+            }
+            uncommitted = self
+                .recorded
+                .wait(uncommitted)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
     }
 
     /// Generation `generation` of `stream` in `round`, if recorded.

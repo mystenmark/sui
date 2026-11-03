@@ -114,6 +114,13 @@ impl<'a> LoadedInput<'a> {
     }
 }
 
+/// A version execution may need, found only when asked: a read that waits for
+/// the transaction producing the version, so a transaction that never asks
+/// waits for nothing.
+pub trait LazyVersion: Sync {
+    fn version(&self) -> SequenceNumber;
+}
+
 /// A transaction's inputs, loaded. Nothing here changes during execution.
 pub struct ExecutionInputs<'a> {
     /// In the transaction's order (`TransactionData::input_objects`).
@@ -133,9 +140,11 @@ pub struct ExecutionInputs<'a> {
     receiving: &'a [ObjectRef],
     lamport_timestamp: SequenceNumber,
     /// `SystemObjectVersions`: the accumulator root's and the Clock's versions assigned to this
-    /// transaction, which execution reads implicitly.
+    /// transaction, which execution reads implicitly; the forwarding address registry's below.
     accumulator_version: Option<SequenceNumber>,
     clock_version: Option<SequenceNumber>,
+    /// The forwarding address registry's, found if execution reads it.
+    forwarding_registry: Option<&'a dyn LazyVersion>,
 }
 
 impl<'a> ExecutionInputs<'a> {
@@ -201,7 +210,19 @@ impl<'a> ExecutionInputs<'a> {
             lamport_timestamp,
             accumulator_version,
             clock_version,
+            forwarding_registry: None,
         }
+    }
+
+    /// The inputs, with the forwarding address registry's version to read if
+    /// execution reads the registry without its being an input.
+    #[must_use]
+    pub fn with_forwarding_registry(
+        mut self,
+        forwarding_registry: Option<&'a dyn LazyVersion>,
+    ) -> ExecutionInputs<'a> {
+        self.forwarding_registry = forwarding_registry;
+        self
     }
 
     pub fn loaded(&self) -> &[LoadedInput<'a>] {
@@ -257,6 +278,13 @@ impl<'a> ExecutionInputs<'a> {
         match *object_id {
             exec_types::base::SUI_ACCUMULATOR_ROOT_OBJECT_ID => self.accumulator_version,
             exec_types::base::SUI_CLOCK_OBJECT_ID => self.clock_version,
+            // Declared, the registry is read at its input's version, which is
+            // the one consensus assigns.
+            exec_types::base::SUI_FORWARDING_ADDRESS_REGISTRY_OBJECT_ID => self
+                .objects
+                .get(object_id)
+                .map(|object| object.version())
+                .or_else(|| self.forwarding_registry.map(|lazy| lazy.version())),
             _ => panic!("{object_id} is not an implicitly read system object"),
         }
     }
