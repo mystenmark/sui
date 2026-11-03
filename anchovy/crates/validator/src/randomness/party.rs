@@ -130,7 +130,7 @@ impl DkgParty {
         let consensus = self.consensus.clone();
         std::thread::spawn(move || {
             // Failing only as consensus shuts down, when the epoch is over.
-            let _ = consensus.submit_blocking(vec![bytes], consensus::Priority::Normal);
+            let _ = consensus.submit_until_sequenced(vec![bytes], consensus::Priority::Normal);
         });
     }
 }

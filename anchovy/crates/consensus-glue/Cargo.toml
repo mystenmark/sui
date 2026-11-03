@@ -20,6 +20,7 @@ node.workspace = true
 prometheus.workspace = true
 sui-protocol-config.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 validator.workspace = true
 workqueue.workspace = true
 
