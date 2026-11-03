@@ -580,15 +580,21 @@ impl CommitHandler {
         }
 
         // 6. The transactions deferred to this round, then the commit's, in
-        //    protocol order: `merge_and_reorder_transactions`.
+        //    protocol order: `merge_and_reorder_transactions`. Those using
+        //    randomness that were deferred a round (a double spend's winner,
+        //    or congestion) follow those deferred for randomness, as the
+        //    reference moves them to the end of its randomness list.
         let mut previously_deferred = containers::message_map(bump, 0);
         let mut transactions = containers::Vec::with_capacity_in(accepted.len(), bump);
+        let mut randomness_after = containers::Vec::new_in(bump);
         let mut due = self.output.take_deferred(DeferralKey::due_by(round));
+        // The keys before this one were deferred to a round.
+        let for_randomness = due.len();
         if randomness_round.is_some() || dkg_failed {
             due.extend(self.output.take_deferred(DeferralKey::randomness()));
         }
         let loaded_deferred = !due.is_empty();
-        for (key, deferred) in due {
+        for (i, (key, deferred)) in due.into_iter().enumerate() {
             for deferred in decode_deferred(&deferred) {
                 let hashed = *deferred.transaction.get().0.digest();
                 previously_deferred.insert(hashed, key);
@@ -596,9 +602,14 @@ impl CommitHandler {
                 if let Some(aliases) = deferred.aliases {
                     claims.insert(hashed, aliases);
                 }
-                transactions.push(deferred.transaction);
+                if i < for_randomness && uses_randomness(&deferred.transaction) {
+                    randomness_after.push(deferred.transaction);
+                } else {
+                    transactions.push(deferred.transaction);
+                }
             }
         }
+        transactions.extend(randomness_after);
         transactions.extend(accepted);
         let ordered = self.sequencer.order(config, transactions, bump);
 

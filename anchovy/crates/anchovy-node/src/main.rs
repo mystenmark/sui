@@ -31,12 +31,21 @@ fn main() -> anyhow::Result<()> {
     tracing::info!(address = %config.network_address, "anchovy is running");
     runtime.block_on(async {
         // The certified checkpoints this node's aggregator makes are a
-        // probe for tests; serving peers reads the store.
+        // probe for tests; serving peers reads the store. The highest is
+        // logged for those that read the log.
         let mut drain = tokio::time::interval(Duration::from_secs(1));
         let mut node = running.node;
         loop {
             tokio::select! {
-                _ = drain.tick() => while running.certified.try_pop().is_some() {},
+                _ = drain.tick() => {
+                    let mut highest = None;
+                    while let Some(certified) = running.certified.try_pop() {
+                        highest = Some(certified.seq);
+                    }
+                    if let Some(seq) = highest {
+                        tracing::info!("anchovy certified checkpoint {seq}");
+                    }
+                }
                 result = &mut node => return result.map_err(anyhow::Error::from),
             }
         }

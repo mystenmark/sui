@@ -651,14 +651,29 @@ fn withdrawal(n: u8, version: u64, amounts: &[(u16, u64)]) -> Withdrawal {
     }
 }
 
-/// A reserver, and the input waiter commands it sends.
+/// A reserver whose first settled version is 10, with the root at version
+/// 3, and the input waiter commands it sends.
 fn reserver(store: Arc<store::Store>) -> (FundsReserver, Inbox<InputCommand>) {
     let (inputs_q, inputs) = workqueue::queue(8);
-    (FundsReserver::new(store, inputs_q), inputs)
+    let mut reserver = FundsReserver::new(store, inputs_q);
+    reserver.process(
+        FundsCommand::Settle(vec![settled(10, 3, &[], 0)]),
+        &mut workqueue::Bump::default(),
+    );
+    (reserver, inputs)
+}
+
+/// The reservations of the chunk of `version`.
+fn reserve(version: u64, withdrawals: Vec<Withdrawal>) -> FundsCommand {
+    FundsCommand::Reserve {
+        version: AccumulatorVersion(version),
+        withdrawals,
+    }
 }
 
 /// Each transaction whose reservations resolved, by its digest's first
-/// byte, with how they resolved, as resolved in the input waiter.
+/// byte, with how they resolved, in digest order: the order resolutions
+/// reach the input waiter does not matter.
 fn released(inputs: &Inbox<InputCommand>) -> Vec<(u8, ReservationStatus)> {
     let mut released = Vec::new();
     while let Some(command) = inputs.try_pop() {
@@ -672,6 +687,7 @@ fn released(inputs: &Inbox<InputCommand>) -> Vec<(u8, ReservationStatus)> {
             released.push((digest.bytes[0], status));
         }
     }
+    released.sort_unstable_by_key(|(n, _)| *n);
     released
 }
 
@@ -686,24 +702,23 @@ fn reservations_resolve_in_consensus_order_against_the_settled_balance() {
     write(&store, ObjectId(support::id(b)), 3, account_object(50));
     write(&store, ObjectId(support::id(a)), 4, account_object(1));
     let (mut reserver, inputs) = reserver(store);
-    reserver.process(
-        FundsCommand::Settle(vec![settled(10, 3, &[], 0)]),
-        &mut workqueue::Bump::default(),
-    );
 
     reserver.process(
-        FundsCommand::Reserve(vec![
-            withdrawal(1, 10, &[(a, 60)]),
-            // 40 left in `a`.
-            withdrawal(2, 10, &[(a, 50)]),
-            // `b` falls short, but `a` is charged anyway, as in the reference.
-            withdrawal(3, 10, &[(a, 40), (b, 60)]),
-            withdrawal(4, 10, &[(a, 1)]),
-            withdrawal(5, 10, &[(b, 50)]),
-            // An account never funded holds nothing.
-            withdrawal(6, 10, &[(c, 0)]),
-            withdrawal(7, 10, &[(c, 1)]),
-        ]),
+        reserve(
+            10,
+            vec![
+                withdrawal(1, 10, &[(a, 60)]),
+                // 40 left in `a`.
+                withdrawal(2, 10, &[(a, 50)]),
+                // `b` falls short, but `a` is charged anyway, as in the reference.
+                withdrawal(3, 10, &[(a, 40), (b, 60)]),
+                withdrawal(4, 10, &[(a, 1)]),
+                withdrawal(5, 10, &[(b, 50)]),
+                // An account never funded holds nothing.
+                withdrawal(6, 10, &[(c, 0)]),
+                withdrawal(7, 10, &[(c, 1)]),
+            ],
+        ),
         &mut workqueue::Bump::default(),
     );
     assert_eq!(
@@ -728,17 +743,16 @@ fn a_transaction_waits_for_all_its_reservations() {
     let (a, b) = (0x3001, 0x3002);
     write(&store, ObjectId(support::id(a)), 3, account_object(100));
     let (mut reserver, inputs) = reserver(store);
-    reserver.process(
-        FundsCommand::Settle(vec![settled(10, 3, &[], 0)]),
-        &mut workqueue::Bump::default(),
-    );
 
     // Version 11 is unsettled: `a` is certain, `b` (empty) is not.
     reserver.process(
-        FundsCommand::Reserve(vec![
-            withdrawal(1, 11, &[(a, 30), (b, 5)]),
-            withdrawal(2, 11, &[(a, 30)]),
-        ]),
+        reserve(
+            11,
+            vec![
+                withdrawal(1, 11, &[(a, 30), (b, 5)]),
+                withdrawal(2, 11, &[(a, 30)]),
+            ],
+        ),
         &mut workqueue::Bump::default(),
     );
     assert_eq!(released(&inputs), [(2, Fulfilled)]);
@@ -755,7 +769,7 @@ fn a_transaction_waits_for_all_its_reservations() {
 
     // Version 12: `b` will hold at least 5 − 5; this waits for settlement.
     reserver.process(
-        FundsCommand::Reserve(vec![withdrawal(3, 12, &[(b, 1)])]),
+        reserve(12, vec![withdrawal(3, 12, &[(b, 1)])]),
         &mut workqueue::Bump::default(),
     );
     assert!(released(&inputs).is_empty());
@@ -784,17 +798,14 @@ fn unwithdrawn_reservations_are_credited_to_later_versions() {
     let (a, b) = (0x3001, 0x3002);
     write(&store, ObjectId(support::id(a)), 3, account_object(100));
     let (mut reserver, inputs) = reserver(store);
-    reserver.process(
-        FundsCommand::Settle(vec![settled(10, 3, &[], 0)]),
-        &mut workqueue::Bump::default(),
-    );
 
     // `a` is certain at 11, `b` (empty) is not; 12 has nothing left of `a`.
     reserver.process(
-        FundsCommand::Reserve(vec![
-            withdrawal(1, 11, &[(a, 100), (b, 5)]),
-            withdrawal(2, 12, &[(a, 50)]),
-        ]),
+        reserve(11, vec![withdrawal(1, 11, &[(a, 100), (b, 5)])]),
+        &mut workqueue::Bump::default(),
+    );
+    reserver.process(
+        reserve(12, vec![withdrawal(2, 12, &[(a, 50)])]),
         &mut workqueue::Bump::default(),
     );
     assert!(released(&inputs).is_empty());
@@ -809,7 +820,7 @@ fn unwithdrawn_reservations_are_credited_to_later_versions() {
     // L(13) = 100 − 50: a reservation of 90 waits until the second's
     // transaction turns out to have withdrawn only 10.
     reserver.process(
-        FundsCommand::Reserve(vec![withdrawal(3, 13, &[(a, 90)])]),
+        reserve(13, vec![withdrawal(3, 13, &[(a, 90)])]),
         &mut workqueue::Bump::default(),
     );
     assert!(released(&inputs).is_empty());
@@ -819,6 +830,43 @@ fn unwithdrawn_reservations_are_credited_to_later_versions() {
             40,
             AccumulatorVersion(12),
         )]),
+        &mut workqueue::Bump::default(),
+    );
+    assert_eq!(released(&inputs), [(3, Fulfilled)]);
+}
+
+/// A chunk whose transactions ran from certified checkpoints settles from
+/// their stored effects, possibly before its reservations arrive: they are
+/// still decided against the balance at their version.
+#[test]
+fn reservations_arriving_after_their_chunk_settled_are_decided_against_its_balance() {
+    use ReservationStatus::{Cancelled, Fulfilled};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(store::Store::open(dir.path()).unwrap());
+    let a = 0x3001;
+    write(&store, ObjectId(support::id(a)), 3, account_object(100));
+    write(&store, ObjectId(support::id(a)), 4, account_object(500));
+    let (mut reserver, inputs) = reserver(store);
+
+    // Version 10's chunk settles into 11 before its reservations arrive.
+    reserver.process(
+        FundsCommand::Settle(vec![settled(11, 4, &[], 0)]),
+        &mut workqueue::Bump::default(),
+    );
+    reserver.process(
+        reserve(
+            10,
+            vec![
+                withdrawal(1, 10, &[(a, 150)]),
+                withdrawal(2, 10, &[(a, 100)]),
+            ],
+        ),
+        &mut workqueue::Bump::default(),
+    );
+    assert_eq!(released(&inputs), [(1, Cancelled), (2, Fulfilled)]);
+    // Then 11, which the held settlement left at 500.
+    reserver.process(
+        reserve(11, vec![withdrawal(3, 11, &[(a, 500)])]),
         &mut workqueue::Bump::default(),
     );
     assert_eq!(released(&inputs), [(3, Fulfilled)]);

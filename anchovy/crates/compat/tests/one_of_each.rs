@@ -1602,11 +1602,13 @@ fn randomness_waits_for_its_round_alike() {
 
 /// Without DKG, a transaction using randomness waits until DKG times out,
 /// then is cancelled, reading the randomness state as unavailable, alike:
-/// timed out before any confirmation can be committed.
+/// timed out before any confirmation can be committed, and not allowed to
+/// complete later.
 #[test]
 fn randomness_is_cancelled_alike_once_dkg_fails() {
     let _timeout = ProtocolConfig::apply_overrides_for_testing(|_, mut config| {
         config.set_random_beacon_dkg_timeout_round_for_testing(1);
+        config.set_allow_dkg_completion_after_timeout_for_testing(false);
         config
     });
     let mut network = Network::new();
@@ -1630,6 +1632,32 @@ fn randomness_is_cancelled_alike_once_dkg_fails() {
     }
     let later = network.transfer(0);
     network.execute(&later);
+    drop(network.runtime);
+}
+
+/// DKG timed out but allowed to complete later: transactions using
+/// randomness are cancelled until it completes, then run, alike.
+#[test]
+fn randomness_resumes_alike_once_dkg_completes_late() {
+    let _timeout = ProtocolConfig::apply_overrides_for_testing(|_, mut config| {
+        config.set_random_beacon_dkg_timeout_round_for_testing(1);
+        config
+    });
+    let mut network = Network::new();
+    let package = network.object_basics(0);
+    for attempt in 0.. {
+        assert!(attempt < 100, "randomness never resumed");
+        let random = network.use_random(1, package, None);
+        let outcome = network.outcomes_together(&[&random]).remove(0);
+        match outcome.status() {
+            ExecutionStatus::Success => break,
+            ExecutionStatus::Failure(ExecutionFailure {
+                error: ExecutionErrorKind::ExecutionCancelledDueToRandomnessUnavailable,
+                ..
+            }) => {}
+            status => panic!("{status:?}"),
+        }
+    }
     drop(network.runtime);
 }
 
@@ -1963,6 +1991,19 @@ fn a_certificate_that_consensus_contradicts_aborts() {
 /// checkpoint the quorum does, alike.
 #[test]
 fn the_composite_workload_runs_alike() {
+    composite_workload(false);
+}
+
+/// `the_composite_workload_runs_alike`, with anchovy stalled: it starts
+/// each epoch late, catching up on certified checkpoints, and its
+/// consensus sometimes lags mid-epoch.
+#[test]
+fn the_composite_workload_runs_alike_through_stalls() {
+    composite_workload(true);
+}
+
+fn composite_workload(stalls: bool) {
+    use rand::Rng as _;
     use std::str::FromStr as _;
     use sui_benchmark::bank::BenchmarkBank;
     use sui_benchmark::drivers::Interval;
@@ -2117,11 +2158,36 @@ fn the_composite_workload_runs_alike() {
             .unwrap();
         bench
     });
-    // Anchovy moves into each next epoch only as it is polled.
+    // Anchovy moves into each next epoch only as it is polled. With
+    // `stalls`, it is not polled for a while once sui's validators are in an
+    // epoch it is not, and its consensus is held now and then.
+    let mut rng = rand::thread_rng();
+    let (mut unpolled_until, mut held_until) = (Instant::now(), Instant::now());
+    let mut stalled_in = 0;
     while !workload.is_finished() {
-        network.anchovy.poll();
+        let now = Instant::now();
+        if stalls {
+            let sui_epoch = network.sui().load_epoch_store_one_call_per_task().epoch();
+            if sui_epoch > stalled_in && sui_epoch > network.anchovy.epoch() {
+                stalled_in = sui_epoch;
+                unpolled_until = now + Duration::from_secs(rng.gen_range(20..90));
+            }
+            let held = now < held_until;
+            if !held && rng.gen_ratio(1, 200) {
+                held_until = now + Duration::from_secs(rng.gen_range(2..20));
+            }
+            network
+                .anchovy
+                .runner
+                .held
+                .store(now < held_until, Ordering::SeqCst);
+        }
+        if !stalls || now >= unpolled_until {
+            network.anchovy.poll();
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
+    network.anchovy.runner.held.store(false, Ordering::SeqCst);
     let bench = network.runtime.block_on(workload).unwrap();
     tracing::info!(?bench, "composite workload done");
 
@@ -2134,7 +2200,16 @@ fn the_composite_workload_runs_alike() {
         .map(|c| *c.sequence_number())
         .unwrap();
     network.wait_for_certified(last);
-    assert!(network.anchovy.epoch() >= 2, "epochs ended under load");
+    // Stalled, anchovy misses an epoch's DKG; deferred randomness then
+    // holds sui's epoch close to its deadline, so fewer epochs end.
+    let sui_epoch = network.sui().load_epoch_store_one_call_per_task().epoch();
+    assert!(
+        sui_epoch >= if stalls { 1 } else { 2 },
+        "epochs ended under load"
+    );
+    network.wait_for("anchovy in sui's epoch", |network| {
+        (network.anchovy.epoch() >= sui_epoch).then_some(())
+    });
 
     let metrics = metrics.lock().unwrap();
     let sum = metrics.sum_all();

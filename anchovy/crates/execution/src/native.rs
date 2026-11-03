@@ -456,6 +456,14 @@ fn rewrite_coin_reservations<'a>(
     if !pt.inputs.iter().any(|input| reservation(input).is_some()) {
         return (kind, None);
     }
+    // The fields at `version` are written by the settlements of the chunk
+    // before, which run before its barrier writes the root at `version`: a
+    // reservation fulfilled ahead of that settlement waits here.
+    if let Some(version) = version {
+        reads
+            .await_version(&exec_types::base::SUI_ACCUMULATOR_ROOT_OBJECT_ID, version)
+            .expect("the store reads");
+    }
     let mut inputs = containers::Vec::with_capacity_in(pt.inputs.len(), bump);
     let mut rewritten = containers::Vec::with_capacity_in(pt.inputs.len(), bump);
     for input in pt.inputs {

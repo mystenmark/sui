@@ -198,7 +198,7 @@ fn announce_capabilities(
     let consensus = consensus.clone();
     std::thread::spawn(move || {
         // Failing only as consensus shuts down, when the epoch is over.
-        let _ = consensus.submit_blocking(vec![notification], consensus::Priority::Normal);
+        let _ = consensus.submit_until_sequenced(vec![notification], consensus::Priority::Normal);
     });
 }
 

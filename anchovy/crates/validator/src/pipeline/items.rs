@@ -336,7 +336,12 @@ pub enum Settle {
 /// what resolves them.
 #[derive(Debug)]
 pub enum FundsCommand {
-    Reserve(Vec<Withdrawal>),
+    /// A chunk's withdrawals, all against its `version`; sent for every
+    /// chunk, so that the chunk's reservations are known to be complete.
+    Reserve {
+        version: AccumulatorVersion,
+        withdrawals: Vec<Withdrawal>,
+    },
     Settle(Vec<Settle>),
 }
 

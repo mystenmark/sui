@@ -52,6 +52,15 @@ impl<'a> StoreReads<'a> {
         self
     }
 
+    /// Returns once `id` is at `version` in the store, waiting on `awaited`
+    /// if it is not yet.
+    pub fn await_version(&self, id: &ObjectId, version: u64) -> Result<(), store::Error> {
+        if self.store.object(id, version)?.is_none() {
+            self.awaited.wait(id, version);
+        }
+        Ok(())
+    }
+
     fn keep(
         &self,
         object: Option<messages::Message<messages::object::Object<'static>>>,

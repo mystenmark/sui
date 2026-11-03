@@ -1,0 +1,89 @@
+# Copyright (c) Mysten Labs, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# A derp run file (https://github.com/mlogan/derp): three sui validators,
+# anchovy as the fourth, a fullnode, and the stress client sending
+# transactions through the fullnode, each on a host of its own. Anchovy is
+# crashed now and then and restarted over its database; with a quarter of
+# the stake it is not needed for progress, so it catches up each time.
+# Start it with ./run.sh, which builds the binaries, makes the genesis
+# (cluster/) and links them into bin/.
+seed: 1
+stop-after: 420s
+# stress builds Move packages from the sui checkout, at paths fixed when it
+# was compiled; a relative entry is resolved from this file.
+allow: [../../..]
+env:
+  RUST_BACKTRACE: 1
+  RUST_LOG: info
+  RPC_WORKER_THREAD: 12
+  NEW_CHECKPOINT_WARNING_TIMEOUT_MS: 30000
+  NEW_CHECKPOINT_PANIC_TIMEOUT_MS: 300000
+  TOKIO_WORKER_THREADS: 4
+hosts:
+  - name: validator1
+    files: [cluster/validator1/node.yaml, cluster/genesis.blob]
+    processes:
+      - argv: [bin/sui-node, --config-path, node.yaml]
+        env: { SUI_DB_SYNC_TO_DISK: true }
+        daemon: true
+  - name: validator2
+    files: [cluster/validator2/node.yaml, cluster/genesis.blob]
+    processes:
+      - argv: [bin/sui-node, --config-path, node.yaml]
+        env: { SUI_DB_SYNC_TO_DISK: true }
+        daemon: true
+  - name: validator3
+    files: [cluster/validator3/node.yaml, cluster/genesis.blob]
+    processes:
+      - argv: [bin/sui-node, --config-path, node.yaml]
+        env: { SUI_DB_SYNC_TO_DISK: true }
+        daemon: true
+  - name: validator4
+    files: [cluster/validator4/node.yaml, cluster/genesis.blob]
+    processes:
+      - argv: [bin/anchovy-node, --config-path, node.yaml]
+        daemon: true
+        restart: on-failure
+        restart-delay: 1s..10s
+        crash:
+          every: 20s..90s
+  - name: fullnode1
+    files: [cluster/fullnode1/node.yaml, cluster/genesis.blob]
+    processes:
+      - argv: [bin/sui-node, --config-path, node.yaml]
+        daemon: true
+  # stress fails until the fullnode answers and is restarted; it ends the
+  # run after its workload.
+  - name: stress
+    files: [cluster/genesis.blob, sui.keystore]
+    processes:
+      - argv: [bin/stress,
+               --staggered-start-max-multiplier, 0,
+               --fullnode-rpc-addresses, "fullnode1:9000",
+               --use-fullnode-for-execution, true,
+               --num-client-threads, 24,
+               --num-server-threads, 1,
+               --num-transfer-accounts, 2,
+               --primary-gas-owner-id, "0x9b1b191f7df4f55c0f73e7638606ca4029fd52a2735b98f2d5674038affe3481",
+               --genesis-blob-path, genesis.blob,
+               --keystore-path, sui.keystore,
+               --benchmark-stats-path, bench_result.json,
+               --run-duration, 300s,
+               bench,
+               --target-qps, 15,
+               --in-flight-ratio, 30,
+               --shared-counter, 2,
+               --transfer-object, 2,
+               --randomness, 5,
+               --delegation, 0,
+               --randomized-transaction, 5,
+               --batch-payment, 1,
+               --batch-payment-size, 15,
+               --adversarial, 0,
+               --composite, 5,
+               --client-metric-host, 0.0.0.0,
+               --num-workers, 24]
+        restart: on-failure
+        restart-delay: 10s
+        max-restarts: 30
