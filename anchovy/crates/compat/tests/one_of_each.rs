@@ -2172,7 +2172,16 @@ fn composite_workload(stalls: bool) {
         .map(|c| *c.sequence_number())
         .unwrap();
     network.wait_for_certified(last);
-    assert!(network.anchovy.epoch() >= 2, "epochs ended under load");
+    // Stalled, anchovy misses an epoch's DKG; deferred randomness then
+    // holds sui's epoch close to its deadline, so fewer epochs end.
+    let sui_epoch = network.sui().load_epoch_store_one_call_per_task().epoch();
+    assert!(
+        sui_epoch >= if stalls { 1 } else { 2 },
+        "epochs ended under load"
+    );
+    network.wait_for("anchovy in sui's epoch", |network| {
+        (network.anchovy.epoch() >= sui_epoch).then_some(())
+    });
 
     let metrics = metrics.lock().unwrap();
     let sum = metrics.sum_all();
