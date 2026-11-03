@@ -83,12 +83,10 @@ impl Ledger {
     /// `Reserve(account, amount, version)`. Resolutions, this one's or any
     /// it unblocks, are pushed to `out`.
     ///
-    /// A reservation against a version below σ is `Fulfilled` without being
-    /// counted: its commit has settled, so its transaction executed before
-    /// and is being replayed.
-    ///
     /// # Panics
-    /// If reservations come out of version order.
+    /// If reservations come out of version order, or below σ: every
+    /// reservation of a version must arrive before the version after it
+    /// settles.
     pub fn reserve(
         &mut self,
         ticket: Ticket,
@@ -104,10 +102,11 @@ impl Ledger {
             self.reserved
         );
         self.reserved = version;
-        if self.settled.is_some_and(|settled| version < settled) {
-            out.push((ticket, ReservationStatus::Fulfilled));
-            return;
-        }
+        assert!(
+            self.settled.is_none_or(|settled| version >= settled),
+            "a reservation against {version}, below the settled {:?}",
+            self.settled
+        );
         let settled = self.settled;
         let state = self.account(account, base);
         let level = state.versions.entry(version).or_default();
@@ -198,15 +197,9 @@ impl Ledger {
             // An account the settlement did not change keeps `S(v − 1)`.
             state.base.get_or_insert_with(|| base(account));
             let above = state.versions.split_off(&version);
-            // Only before the first settlement can a version below it hold
-            // reservations: replayed, as in `reserve`.
+            // Every reservation below σ resolved when its version settled.
             for level in std::mem::replace(&mut state.versions, above).into_values() {
-                out.extend(
-                    level
-                        .queue
-                        .into_iter()
-                        .map(|(_, ticket)| (ticket, ReservationStatus::Fulfilled)),
-                );
+                assert!(level.queue.is_empty(), "a reservation below σ unresolved");
             }
             drain(state, version, out);
             state.versions.retain(|&v, level| {

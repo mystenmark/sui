@@ -169,11 +169,11 @@ fn before_the_first_settlement_everything_waits() {
 }
 
 #[test]
-fn reservations_against_settled_versions_are_replays() {
+#[should_panic(expected = "a reservation against 5, below the settled Some(6)")]
+fn no_reservation_comes_below_the_settled_version() {
     let mut case = Case::new(5, &[(1, 0)]);
     case.settle(6, &[]);
     case.reserve(1, 1, 1000, 5);
-    assert_eq!(case.take(), [(1, Fulfilled)]);
 }
 
 #[test]

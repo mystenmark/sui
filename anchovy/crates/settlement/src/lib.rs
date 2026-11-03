@@ -8,7 +8,7 @@ pub mod causal;
 pub mod funds;
 pub mod settle;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use containers::{Bump, HeapHashMap};
@@ -577,11 +577,16 @@ struct Waiting {
 /// fulfilled.
 ///
 /// Inward:
-/// - `VersionResolver`: `FundsCommand::Reserve` of each transaction that
-///   withdraws funds, in consensus order;
+/// - `VersionResolver`: `FundsCommand::Reserve` of each chunk's
+///   transactions that withdraw funds, in consensus order;
 /// - `Executor`: `Settle::Deposit` of each deposit a transaction made, and
 ///   `Settle::Credit` of what each fulfilled reservation did not withdraw;
 /// - `SettlementScheduler`: `Settle::Settled` of each version settled.
+///
+/// A version settles here only once the version before it has all its
+/// reservations: a chunk whose transactions ran from certified checkpoints
+/// settles from their stored effects, possibly before its resolver sends
+/// its reservations, which must still be decided against its balances.
 ///
 /// A cancelled transaction withdraws nothing: its fulfilled reservations
 /// are credited back here, at once.
@@ -600,6 +605,10 @@ pub struct FundsReserver {
     ledger: Ledger,
     /// The root's version at the settled version.
     root_version: Option<u64>,
+    /// The highest version whose reservations have all arrived.
+    reserved_through: Option<u64>,
+    /// Settlements waiting for the reservations of the version before them.
+    held: VecDeque<Settle>,
     next_ticket: Ticket,
     /// Each unresolved reservation's transaction, by the transaction's
     /// first ticket, and its index there.
@@ -615,6 +624,8 @@ impl FundsReserver {
             inputs,
             ledger: Ledger::new(),
             root_version: None,
+            reserved_through: None,
+            held: VecDeque::new(),
             next_ticket: 0,
             owners: HeapHashMap::default(),
             waiting: HeapHashMap::default(),
@@ -658,7 +669,30 @@ impl FundsReserver {
         );
     }
 
+    /// Records that every reservation against `version` has arrived, then
+    /// applies the settlements that waited for that.
+    fn reserved_through(&mut self, version: AccumulatorVersion) {
+        self.reserved_through = Some(version.0);
+        while let Some(Settle::Settled { version: next, .. }) = self.held.front() {
+            if next.0 > version.0 + 1 {
+                break;
+            }
+            let settle = self.held.pop_front().expect("a held settlement");
+            self.apply(settle);
+        }
+    }
+
     fn settle(&mut self, settle: Settle) {
+        if let Settle::Settled { version, .. } = &settle
+            && (!self.held.is_empty() || self.reserved_through.is_none_or(|r| r + 1 < version.0))
+        {
+            self.held.push_back(settle);
+            return;
+        }
+        self.apply(settle);
+    }
+
+    fn apply(&mut self, settle: Settle) {
         if let Settle::Settled { root_version, .. } = &settle {
             self.root_version = Some(*root_version);
         }
@@ -740,10 +774,14 @@ impl Processor for FundsReserver {
 
     fn process(&mut self, command: FundsCommand, _bump: &mut Bump) -> Option<()> {
         match command {
-            FundsCommand::Reserve(withdrawals) => {
+            FundsCommand::Reserve {
+                version,
+                withdrawals,
+            } => {
                 for withdrawal in withdrawals {
                     self.reserve(withdrawal);
                 }
+                self.reserved_through(version);
             }
             FundsCommand::Settle(settles) => {
                 for settle in settles {
