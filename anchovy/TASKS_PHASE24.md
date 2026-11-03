@@ -34,3 +34,9 @@ The user's list after phase 23:
 - [ ] Verify the fixes over many stalled seeds; the plain workload too.
 - [ ] Sweep the rest of the compat suite.
 - [ ] Crash recovery under derp.
+- [ ] After the above (the user's request): built-in logging in the
+  processor framework (`workqueue`, `waiter`). Every processor logs when an
+  item is enqueued, dispatched and finished; every waiter logs when a wait
+  is registered and when it is satisfied. Items log through a trait of
+  their own, a short summary (a transaction's digest, not its full `Debug`),
+  rather than `Debug`.
