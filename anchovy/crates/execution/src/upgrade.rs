@@ -151,7 +151,7 @@ pub fn system_package_bytes(
 
 /// The highest protocol version anchovy implements; the reference's may be
 /// higher.
-pub const MAX_PROTOCOL_VERSION: u64 = 138;
+pub const MAX_PROTOCOL_VERSION: u64 = 139;
 
 /// The versions this binary supports on `chain`: those from the first its
 /// executor runs to `MAX_PROTOCOL_VERSION`. Announcing more would vote for upgrades it
