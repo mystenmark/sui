@@ -1655,7 +1655,7 @@ fn randomness_resumes_alike_once_dkg_completes_late() {
                 error: ExecutionErrorKind::ExecutionCancelledDueToRandomnessUnavailable,
                 ..
             }) => {}
-            status => panic!("{status:?}"),
+            status @ ExecutionStatus::Failure(_) => panic!("{status:?}"),
         }
     }
     drop(network.runtime);
