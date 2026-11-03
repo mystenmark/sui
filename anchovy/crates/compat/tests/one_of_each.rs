@@ -1602,11 +1602,13 @@ fn randomness_waits_for_its_round_alike() {
 
 /// Without DKG, a transaction using randomness waits until DKG times out,
 /// then is cancelled, reading the randomness state as unavailable, alike:
-/// timed out before any confirmation can be committed.
+/// timed out before any confirmation can be committed, and not allowed to
+/// complete later.
 #[test]
 fn randomness_is_cancelled_alike_once_dkg_fails() {
     let _timeout = ProtocolConfig::apply_overrides_for_testing(|_, mut config| {
         config.set_random_beacon_dkg_timeout_round_for_testing(1);
+        config.set_allow_dkg_completion_after_timeout_for_testing(false);
         config
     });
     let mut network = Network::new();
@@ -1630,6 +1632,32 @@ fn randomness_is_cancelled_alike_once_dkg_fails() {
     }
     let later = network.transfer(0);
     network.execute(&later);
+    drop(network.runtime);
+}
+
+/// DKG timed out but allowed to complete later: transactions using
+/// randomness are cancelled until it completes, then run, alike.
+#[test]
+fn randomness_resumes_alike_once_dkg_completes_late() {
+    let _timeout = ProtocolConfig::apply_overrides_for_testing(|_, mut config| {
+        config.set_random_beacon_dkg_timeout_round_for_testing(1);
+        config
+    });
+    let mut network = Network::new();
+    let package = network.object_basics(0);
+    for attempt in 0.. {
+        assert!(attempt < 100, "randomness never resumed");
+        let random = network.use_random(1, package, None);
+        let outcome = network.outcomes_together(&[&random]).remove(0);
+        match outcome.status() {
+            ExecutionStatus::Success => break,
+            ExecutionStatus::Failure(ExecutionFailure {
+                error: ExecutionErrorKind::ExecutionCancelledDueToRandomnessUnavailable,
+                ..
+            }) => {}
+            status => panic!("{status:?}"),
+        }
+    }
     drop(network.runtime);
 }
 
