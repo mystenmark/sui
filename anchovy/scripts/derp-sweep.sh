@@ -52,6 +52,12 @@ run_seed() {
     else
         echo "seed $seed FAIL: $dir"
     fi
+    # derp rewrites the binary for each run (about 380 MB); a replay
+    # rewrites it again.
+    local f
+    for f in "$OUT"/one_of_each.rw*; do
+        [[ "$f" =~ /one_of_each\.rw[0-9]+-$seed-[0-9]+of ]] && rm -f "$f"
+    done
 }
 export -f run_seed
 export OUT DERP
