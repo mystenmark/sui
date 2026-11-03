@@ -1781,6 +1781,67 @@ fn a_lagging_consensus_follows_certified_checkpoints_alike() {
     drop(network.runtime);
 }
 
+/// Whether `effects` record the Clock as read but not declared.
+fn reads_the_clock_implicitly(effects: &TransactionEffects) -> bool {
+    effects
+        .unchanged_consensus_objects()
+        .iter()
+        .any(|(id, kind)| {
+            *id == sui_types::SUI_CLOCK_OBJECT_ID
+                && matches!(
+                    kind,
+                    sui_types::effects::UnchangedConsensusKind::ReadOnlyRoot(_)
+                )
+        })
+}
+
+/// Transactions borrowing the Clock without its being an input read it at
+/// the version their commit's prologue writes, alike, commit after commit.
+#[test]
+fn the_clock_borrowed_without_an_input_reads_alike() {
+    let mut network = Network::new();
+    let package = network.object_basics(0);
+    let sender = network.sender;
+    for i in 1..3 {
+        let create = network.call(
+            i,
+            package,
+            "object_basics",
+            "create_with_clock_timestamp",
+            vec![CallArg::Pure(bcs::to_bytes(&sender).unwrap())],
+        );
+        let effects = network.execute(&create);
+        assert!(reads_the_clock_implicitly(&effects), "{effects:?}");
+    }
+    drop(network.runtime);
+}
+
+/// While anchovy's consensus lags, a transaction borrowing the Clock runs
+/// from its certificate at the Clock version its effects record, alike.
+#[test]
+fn a_lagging_consensus_borrows_the_clock_alike() {
+    let mut network = Network::new();
+    let package = network.object_basics(0);
+    let sender = network.sender;
+    network.anchovy.runner.held.store(true, Ordering::SeqCst);
+    let create = network.call(
+        1,
+        package,
+        "object_basics",
+        "create_with_clock_timestamp",
+        vec![CallArg::Pure(bcs::to_bytes(&sender).unwrap())],
+    );
+    network.submit_through_sui(&[&create]);
+    let effects = network.committed(&create);
+    assert!(effects.status().is_ok(), "{:?}", effects.status());
+    assert!(reads_the_clock_implicitly(&effects), "{effects:?}");
+
+    network.anchovy.runner.held.store(false, Ordering::SeqCst);
+    let later = network.transfer(2);
+    network.execute(&later);
+    drop(network.runtime);
+}
+
 /// Anchovy's consensus is held while sui's validators pass the epoch's end:
 /// it finishes the epoch on certified checkpoints alone, the last with its
 /// change-epoch transaction, then follows consensus in the next.

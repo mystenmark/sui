@@ -161,13 +161,13 @@ impl NativeExecution {
             transaction,
             &[],
             Funds::MaybeSufficient,
-            None,
+            crate::Implicit::default(),
             &crate::NoneUnsettled,
             &crate::NoneAwaited,
         )
     }
 
-    /// `execute`, but with inputs, funds and the accumulator root's version as
+    /// `execute`, but with inputs, funds and implicit versions as
     /// `Reference::execute_at` takes them. A system transaction runs
     /// unmetered.
     pub fn execute_at<S: TxState + HasDigest>(
@@ -177,7 +177,7 @@ impl NativeExecution {
         transaction: &[u8],
         provided: &[(ObjectId, Input<'_>)],
         funds: Funds,
-        assigned_accumulator: Option<u64>,
+        implicit: crate::Implicit,
         unsettled: &dyn Unsettled,
         awaited: &dyn Awaited,
     ) -> Result<Outcome> {
@@ -196,7 +196,7 @@ impl NativeExecution {
             transaction,
             provided,
             funds,
-            assigned_accumulator,
+            implicit,
             unsettled,
             awaited,
         );
@@ -218,7 +218,7 @@ impl NativeExecution {
         transaction: &[u8],
         provided: &[(ObjectId, Input<'_>)],
         funds: Funds,
-        assigned_accumulator: Option<u64>,
+        implicit: crate::Implicit,
         unsettled: &dyn Unsettled,
         awaited: &dyn Awaited,
     ) -> Result<Outcome> {
@@ -239,11 +239,17 @@ impl NativeExecution {
         let accumulator_version = if self.config.enable_accumulators() {
             reads
                 .live(&exec_types::base::SUI_ACCUMULATOR_ROOT_OBJECT_ID)?
-                .map(|live| assigned_accumulator.unwrap_or(live.version))
+                .map(|live| implicit.accumulator.unwrap_or(live.version))
         } else {
             None
         };
-        let inputs = ExecutionInputs::new(bump, loaded, receiving_refs.leak(), accumulator_version);
+        let inputs = ExecutionInputs::new(
+            bump,
+            loaded,
+            receiving_refs.leak(),
+            accumulator_version,
+            implicit.clock,
+        );
 
         let gas_data = *data.gas_data();
         let gas_status = if is_system_tx(data.kind()) {
@@ -276,7 +282,7 @@ impl NativeExecution {
                 *data.kind(),
                 data.sender(),
                 &self.chain_identifier,
-                assigned_accumulator,
+                implicit.accumulator,
             )
         } else {
             (*data.kind(), None)

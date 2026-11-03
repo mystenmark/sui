@@ -156,6 +156,7 @@ impl EpochCloser {
                     origin: None,
                     aliases: None,
                     cancelled: Vec::new(),
+                    clock_version: None,
                 }],
             },
             "resolver",

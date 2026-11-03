@@ -100,6 +100,7 @@ impl Processor for RandomnessGate {
                         origin: None,
                         aliases: None,
                         cancelled: Vec::new(),
+                        clock_version: None,
                     },
                 );
             }

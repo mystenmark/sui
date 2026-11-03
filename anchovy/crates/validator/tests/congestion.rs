@@ -264,6 +264,7 @@ fn the_prologue_lists_cancelled_transactions() {
         authenticator_initial_shared_version: None,
         randomness_initial_shared_version: None,
         accumulator_root_version: 1,
+        clock_version: 1,
         epoch_start_timestamp_ms: 0,
         epoch_duration_ms: u64::MAX,
     };

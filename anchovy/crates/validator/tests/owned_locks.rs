@@ -127,6 +127,7 @@ async fn the_stage_records_each_committed_transaction_s_status() {
             authenticator_initial_shared_version: None,
             randomness_initial_shared_version: None,
             accumulator_root_version: 1,
+            clock_version: 1,
             epoch_start_timestamp_ms: 0,
             epoch_duration_ms: u64::MAX,
         },
@@ -321,6 +322,7 @@ fn a_deferred_transaction_outlives_a_restart() {
         next_seq: 2,
         last_built_timestamp: 0,
         root_version: 1,
+        clock_version: 1,
         closed: false,
         certs_closed: false,
     };
@@ -403,6 +405,7 @@ fn a_double_spend_using_randomness_joins_the_randomness_deferrals_of_its_round()
         next_seq: u64::from(index) + 1,
         last_built_timestamp: 0,
         root_version: 1,
+        clock_version: 1,
         closed: false,
         certs_closed: false,
     };
@@ -511,6 +514,7 @@ fn a_key_a_quorum_voted_for_is_added_by_the_next_commit_across_a_restart() {
         next_seq: 2,
         last_built_timestamp: 0,
         root_version: 1,
+        clock_version: 1,
         closed: false,
         certs_closed: false,
     };
@@ -768,6 +772,7 @@ fn the_stage_leaves_dropped_transactions_out_of_its_chunks() {
             authenticator_initial_shared_version: None,
             randomness_initial_shared_version: None,
             accumulator_root_version: 1,
+            clock_version: 1,
             epoch_start_timestamp_ms: 0,
             epoch_duration_ms: u64::MAX,
         },

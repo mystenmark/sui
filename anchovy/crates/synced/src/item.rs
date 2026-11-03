@@ -12,6 +12,7 @@ use messages::effects::{ObjectIn, UnchangedConsensusKind, VersionedEffects};
 use messages::execution_status::{ExecutionErrorKind, ExecutionStatus};
 use messages::object::Owner;
 use messages::transaction::{CallArg, ObjectArg, Transaction, TransactionKind};
+use messages::tx_index::SUI_CLOCK_OBJECT_ID;
 use validator::checks;
 use validator::pipeline::items::{Executable, ExecutableTransaction, ScheduledEntry, Synced};
 use validator::pipeline::keys::{AccumulatorVersion, CausalIndex, InputKey, StreamId};
@@ -80,7 +81,18 @@ pub fn executable(
         }
     }
     let (mut ended, mut cancelled) = (Vec::new(), Vec::new());
+    let mut clock_version = None;
     for &(id, kind) in effects.unchanged_consensus_objects {
+        // The Clock, borrowed without being an input, at the version the
+        // effects record (the reference's `SystemObjectVersions::from_effects`).
+        if *id == SUI_CLOCK_OBJECT_ID
+            && let UnchangedConsensusKind::ReadOnlyRoot(version, _) = kind
+        {
+            clock_version = Some(version);
+            if !accessed(id) {
+                keys.push(InputKey::ObjectVersion { id: *id, version });
+            }
+        }
         if !accessed(id) {
             continue;
         }
@@ -119,6 +131,7 @@ pub fn executable(
             origin: None,
             aliases: None,
             cancelled,
+            clock_version,
         },
         inputs: Vec::new(),
         synced: Some(Box::new(Synced {
