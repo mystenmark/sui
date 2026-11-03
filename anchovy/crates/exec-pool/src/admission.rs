@@ -202,6 +202,7 @@ mod tests {
                 aliases: None,
                 cancelled: Vec::new(),
                 clock_version: None,
+                forwarding_registry: None,
             },
             inputs: Vec::new(),
             synced: None,

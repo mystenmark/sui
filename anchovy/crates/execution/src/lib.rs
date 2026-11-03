@@ -90,14 +90,27 @@ pub trait Unsettled: Sync {
     fn withdrawn(&self, account: &messages::base::ObjectId, version: u64) -> u128;
 }
 
+pub use executor::inputs::LazyVersion;
+
 /// The versions consensus assigned a transaction of the system objects
 /// execution reads without their being inputs (the reference's
 /// `SystemObjectVersions`): the accumulator root's, the live one if none,
-/// and the Clock's.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Implicit {
+/// the Clock's, and the forwarding address registry's, found only if read.
+#[derive(Clone, Copy, Default)]
+pub struct Implicit<'r> {
     pub accumulator: Option<u64>,
     pub clock: Option<u64>,
+    pub forwarding_registry: Option<&'r dyn LazyVersion>,
+}
+
+impl std::fmt::Debug for Implicit<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Implicit")
+            .field("accumulator", &self.accumulator)
+            .field("clock", &self.clock)
+            .field("forwarding_registry", &self.forwarding_registry.is_some())
+            .finish()
+    }
 }
 
 /// Where execution waits for an implicitly read system object (the
@@ -204,7 +217,7 @@ impl Execution {
         transaction: &[u8],
         provided: &[(messages::base::ObjectId, Input<'_>)],
         funds: Funds,
-        implicit: Implicit,
+        implicit: Implicit<'_>,
         unsettled: &dyn Unsettled,
         awaited: &dyn Awaited,
     ) -> Result<Outcome> {
@@ -365,7 +378,7 @@ impl Reference {
         transaction: &[u8],
         provided: &[(messages::base::ObjectId, Input<'_>)],
         funds: Funds,
-        implicit: Implicit,
+        implicit: Implicit<'_>,
         unsettled: &dyn Unsettled,
     ) -> Result<Outcome> {
         let signed: SenderSignedData = bcs::from_bytes(transaction)?;
@@ -433,6 +446,9 @@ impl Reference {
             &self.epoch,
             self.epoch_start_timestamp_ms,
             inputs,
+            // The forwarding address registry is left out: sui assigns its
+            // version eagerly, and finding it here would wait on every
+            // transaction. Nothing in sui reads it implicitly yet.
             SystemObjectVersions::from_map(
                 accumulator_version
                     .map(|v| (sui_types::SUI_ACCUMULATOR_ROOT_OBJECT_ID, v))

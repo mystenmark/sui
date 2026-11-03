@@ -128,6 +128,7 @@ async fn the_stage_records_each_committed_transaction_s_status() {
             randomness_initial_shared_version: None,
             accumulator_root_version: 1,
             clock_version: 1,
+            forwarding_registry: None,
             epoch_start_timestamp_ms: 0,
             epoch_duration_ms: u64::MAX,
         },
@@ -262,7 +263,7 @@ fn new_handler(output: validator::epoch_store::ConsensusOutput) -> CommitHandler
         sui_protocol_config::ProtocolVersion::MAX,
         sui_protocol_config::Chain::Unknown,
     );
-    CommitHandler::new(output, 0, vec![([0; 96], 10_000)], &config, None)
+    CommitHandler::new(output, 0, vec![([0; 96], 10_000)], &config, None, None)
 }
 
 #[test]
@@ -331,7 +332,14 @@ fn a_deferred_transaction_outlives_a_restart() {
     drop((handler, commits));
 
     let (_, output, _) = EpochStore::open(dir.path(), 0);
-    let mut handler = CommitHandler::new(output, 1, vec![([0; 96], 10_000)], &epoch.config, None);
+    let mut handler = CommitHandler::new(
+        output,
+        1,
+        vec![([0; 96], 10_000)],
+        &epoch.config,
+        None,
+        None,
+    );
     let decided = handler.handle(&epoch, commit(2, &[]), &bump).unwrap();
     assert_eq!(scheduled(&decided), vec![digest(&first)]);
 }
@@ -396,7 +404,7 @@ fn a_double_spend_using_randomness_joins_the_randomness_deferrals_of_its_round()
     let dir = tempfile::tempdir().unwrap();
     let (_, output, _) = EpochStore::open(dir.path(), 0);
     let commits = output.output_commits();
-    let mut handler = CommitHandler::new(output, 0, committee.clone(), &epoch.config, None)
+    let mut handler = CommitHandler::new(output, 0, committee.clone(), &epoch.config, None, None)
         .with_randomness(1, setup.clone());
     let record = |index: u32| validator::consensus::commit::CommitRecord {
         commit_index: index,
@@ -530,8 +538,8 @@ fn randomness_deferred_for_randomness_runs_before_randomness_deferred_a_round() 
         .map(|_| using_randomness(&sender, random_object_ref(), &[]))
         .collect();
     let (output, _dir) = consensus_output();
-    let mut handler =
-        CommitHandler::new(output, 0, committee, &epoch.config, None).with_randomness(1, setup);
+    let mut handler = CommitHandler::new(output, 0, committee, &epoch.config, None, None)
+        .with_randomness(1, setup);
     // Commit 1 completes DKG only after taking its randomness round: none.
     let mut first = commit(
         1,
@@ -594,7 +602,8 @@ fn a_key_a_quorum_voted_for_is_added_by_the_next_commit_across_a_restart() {
             alg: "RS256".to_owned(),
         },
     };
-    let handler = |output| CommitHandler::new(output, 0, members.clone(), &epoch.config, Some(1));
+    let handler =
+        |output| CommitHandler::new(output, 0, members.clone(), &epoch.config, Some(1), None);
     let with_votes = |index: u32, votes: Vec<JwkVote>| {
         let mut commit = commit(index, &[]);
         commit.jwks = votes;
@@ -631,7 +640,7 @@ fn a_key_a_quorum_voted_for_is_added_by_the_next_commit_across_a_restart() {
     // Restarted: commit 2 adds "a", and a second vote makes "b" active,
     // which commit 3 adds.
     let (_, output, _) = EpochStore::open(dir.path(), 0);
-    let mut second = CommitHandler::new(output, 1, members.clone(), &epoch.config, Some(1));
+    let mut second = CommitHandler::new(output, 1, members.clone(), &epoch.config, Some(1), None);
     let decided = second
         .handle(&epoch, with_votes(2, vec![vote(2, "b")]), &bump)
         .unwrap();
@@ -879,6 +888,7 @@ fn the_stage_leaves_dropped_transactions_out_of_its_chunks() {
             randomness_initial_shared_version: None,
             accumulator_root_version: 1,
             clock_version: 1,
+            forwarding_registry: None,
             epoch_start_timestamp_ms: 0,
             epoch_duration_ms: u64::MAX,
         },

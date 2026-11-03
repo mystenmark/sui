@@ -14,8 +14,13 @@ use messages::object::Owner;
 use messages::transaction::{CallArg, ObjectArg, Transaction, TransactionKind};
 use messages::tx_index::SUI_CLOCK_OBJECT_ID;
 use validator::checks;
-use validator::pipeline::items::{Executable, ExecutableTransaction, ScheduledEntry, Synced};
+use validator::pipeline::items::{
+    Executable, ExecutableTransaction, RegistryRead, ScheduledEntry, Synced,
+};
 use validator::pipeline::keys::{AccumulatorVersion, CausalIndex, InputKey, StreamId};
+
+/// `SUI_FORWARDING_ADDRESS_REGISTRY_OBJECT_ID`.
+const FORWARDING_ADDRESS_REGISTRY: ObjectId = ObjectId::from_u16(0xfa);
 
 /// The executable for certified transaction `t`, of a chunk whose
 /// transactions read the accumulator root at `root_version`, with its input
@@ -82,7 +87,18 @@ pub fn executable(
     }
     let (mut ended, mut cancelled) = (Vec::new(), Vec::new());
     let mut clock_version = None;
+    let mut forwarding_registry = None;
     for &(id, kind) in effects.unchanged_consensus_objects {
+        // The forwarding address registry, read without being an input,
+        // likewise. The effects say it is read, so its version is waited for
+        // here: an earlier transaction of the checkpoint may write it.
+        if *id == FORWARDING_ADDRESS_REGISTRY
+            && !accessed(id)
+            && let UnchangedConsensusKind::ReadOnlyRoot(version, _) = kind
+        {
+            forwarding_registry = Some(RegistryRead::At(version));
+            keys.push(InputKey::ObjectVersion { id: *id, version });
+        }
         // The Clock, borrowed without being an input, at the version the
         // effects record (the reference's `SystemObjectVersions::from_effects`).
         if *id == SUI_CLOCK_OBJECT_ID
@@ -132,6 +148,7 @@ pub fn executable(
             aliases: None,
             cancelled,
             clock_version,
+            forwarding_registry,
         },
         inputs: Vec::new(),
         synced: Some(Box::new(Synced {

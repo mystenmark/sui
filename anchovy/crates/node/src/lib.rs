@@ -27,7 +27,7 @@ use messages::transaction::DigestPending;
 use state_hasher::StateHashes;
 use tokio::sync::watch;
 use validator::consensus::cache::ConsensusTxCache;
-use validator::consensus::commit::{CommitRecord, EpochStart};
+use validator::consensus::commit::{CommitRecord, EpochStart, RegistryStart};
 use validator::consensus::decode::CommitRequest;
 use validator::consensus::dkg::DkgSetup;
 use validator::consensus::status::ConsensusTxStatusCache;
@@ -163,10 +163,24 @@ fn epoch_start(
         )
         .expect("the Clock exists")
         .version;
+    let forwarding_registry = objects
+        .forwarding_address_registry
+        .map(|initial_shared_version| RegistryStart {
+            initial_shared_version,
+            version: epoch_store
+                .start_version(
+                    store,
+                    &messages::base::ObjectId::from_u16(0xfa),
+                    initial_shared_version,
+                )
+                .expect("the forwarding address registry exists")
+                .version,
+        });
     EpochStart {
         previous_checkpoint: checkpoint.seq,
         accumulator_root_version,
         clock_version,
+        forwarding_registry,
         accumulator_root_initial_shared_version: initial_shared_version,
         authenticator_initial_shared_version: objects.authenticator_state,
         randomness_initial_shared_version: objects.randomness_state,

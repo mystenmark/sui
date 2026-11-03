@@ -280,3 +280,54 @@ fn inputs_match_reference() {
         run(seed);
     }
 }
+
+/// A forwarding registry version that counts how often it is found.
+struct Counted(std::sync::atomic::AtomicU32, u64);
+
+impl executor::inputs::LazyVersion for Counted {
+    fn version(&self) -> u64 {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.1
+    }
+}
+
+/// The forwarding registry's implicit version is found only when asked for,
+/// and a declared registry is read at its input's version instead.
+#[test]
+fn the_forwarding_registry_s_version_is_found_only_when_read() {
+    let bump = Bump::default();
+    let registry = exec_types::base::SUI_FORWARDING_ADDRESS_REGISTRY_OBJECT_ID;
+    let lazy = Counted(std::sync::atomic::AtomicU32::new(0), 9);
+    let calls = || lazy.0.load(std::sync::atomic::Ordering::Relaxed);
+
+    let undeclared = ExecutionInputs::new(&bump, containers::Vec::new_in(&bump), &[], None, None)
+        .with_forwarding_registry(Some(&lazy));
+    assert_eq!(calls(), 0);
+    assert_eq!(undeclared.system_object_version(&registry), Some(9));
+    assert_eq!(calls(), 1);
+
+    let mut rng = Rng(1);
+    let id = sui_types::base_types::ObjectID::new(registry.0);
+    let initial_shared_version = SequenceNumber::from(2);
+    let object = coin(
+        &mut rng,
+        id,
+        4,
+        Owner::Shared {
+            initial_shared_version,
+        },
+    );
+    let mut loaded = containers::Vec::new_in(&bump);
+    loaded.push(LoadedInput::new(
+        PortKind::SharedMoveObject {
+            id: registry,
+            initial_shared_version: initial_shared_version.value(),
+            mutability: PortMutability::Mutable,
+        },
+        InputState::Object(stored_object(&bump, &object)),
+    ));
+    let declared =
+        ExecutionInputs::new(&bump, loaded, &[], None, None).with_forwarding_registry(Some(&lazy));
+    assert_eq!(declared.system_object_version(&registry), Some(4));
+    assert_eq!(calls(), 1);
+}

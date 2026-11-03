@@ -67,7 +67,14 @@ fn consensus_output() -> (ConsensusOutput, tempfile::TempDir) {
 }
 
 fn handler(epoch: &EpochParams, output: ConsensusOutput) -> CommitHandler {
-    CommitHandler::new(output, 0, vec![([0; 96], 10_000)], &epoch.config, None)
+    CommitHandler::new(
+        output,
+        0,
+        vec![([0; 96], 10_000)],
+        &epoch.config,
+        None,
+        None,
+    )
 }
 
 fn object(n: u8) -> ObjectID {
@@ -265,6 +272,7 @@ fn the_prologue_lists_cancelled_transactions() {
         randomness_initial_shared_version: None,
         accumulator_root_version: 1,
         clock_version: 1,
+        forwarding_registry: None,
         epoch_start_timestamp_ms: 0,
         epoch_duration_ms: u64::MAX,
     };

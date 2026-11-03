@@ -119,6 +119,7 @@ fn system(shared: Vec<SharedAccess>) -> ScheduledEntry {
         aliases: None,
         cancelled: Vec::new(),
         clock_version: None,
+        forwarding_registry: None,
     }
 }
 
@@ -146,6 +147,7 @@ fn signed(data: TransactionData, key: &AccountKeyPair) -> ScheduledEntry {
         aliases: None,
         cancelled: Vec::new(),
         clock_version: None,
+        forwarding_registry: None,
     }
 }
 
@@ -173,7 +175,14 @@ fn generation(stream: StreamId, round: u32, generation: u32) -> InputKey {
 fn handler() -> (CommitHandler, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let (_, output, _) = EpochStore::open(dir.path(), 0);
-    let handler = CommitHandler::new(output, 0, vec![([0; 96], 10_000)], &epoch().config, None);
+    let handler = CommitHandler::new(
+        output,
+        0,
+        vec![([0; 96], 10_000)],
+        &epoch().config,
+        None,
+        None,
+    );
     (handler, dir)
 }
 

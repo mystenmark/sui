@@ -160,7 +160,7 @@ fn new_handler(output: validator::epoch_store::ConsensusOutput) -> CommitHandler
         sui_protocol_config::ProtocolVersion::MAX,
         sui_protocol_config::Chain::Unknown,
     );
-    CommitHandler::new(output, 0, vec![([0; 96], 10_000)], &config, None)
+    CommitHandler::new(output, 0, vec![([0; 96], 10_000)], &config, None, None)
 }
 
 #[test]

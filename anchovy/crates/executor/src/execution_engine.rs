@@ -6,6 +6,7 @@
 //! (`ExecutionInputs`); effects come out as `messages::fast` bytes.
 
 use crate::accumulator_root::sui_type;
+use crate::accumulator_settlement;
 use crate::adapter::new_move_runtime;
 use crate::data_store::cached_package_store::PackageCache;
 use crate::error::{ExecutionError, ExecutionErrorKind};
@@ -959,23 +960,14 @@ fn execution_loop<'a, Mode: ExecutionMode>(
             options,
         ),
         TransactionKind::ProgrammableSystemTransaction(pt) => {
-            SPT::execute_with_options::<execution_mode::System>(
+            accumulator_settlement::execute(
                 bump,
                 protocol_config,
-                metrics,
-                move_vm,
                 temporary_store,
-                store,
-                tx_ctx,
-                gas_charger,
-                None,
+                &tx_ctx.borrow(),
                 pt,
-                SPT::ExecuteOptions {
-                    type_cache: None,
-                    ..options
-                },
             )
-            .map_err(|(e, _)| (e, no_timings()))?;
+            .map_err(|e| (e, no_timings()))?;
             Ok(((), no_timings()))
         }
         TransactionKind::RandomnessStateUpdate(randomness_state_update) => {

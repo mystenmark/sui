@@ -85,6 +85,27 @@ pub struct ScheduledEntry {
     /// The Clock's version a user transaction reads if it borrows the Clock
     /// without its being an input (the reference's `SystemObjectVersions`).
     pub clock_version: Option<u64>,
+    /// The forwarding address registry a user transaction reads if execution
+    /// reads it without its being an input, likewise.
+    pub forwarding_registry: Option<RegistryRead>,
+}
+
+/// Which forwarding address registry a transaction reads if execution reads
+/// it implicitly. Resolved only then, so a transaction that does not read it
+/// waits for nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegistryRead {
+    /// This version: the registry as the epoch started, if no transaction
+    /// sequenced before touched it this epoch, or as effects record.
+    At(u64),
+    /// Generation `generation` of the registry's stream in `round`, which a
+    /// transaction sequenced earlier produces or records. Causal admission
+    /// runs that transaction, so waiting for it ends.
+    Generation {
+        stream: StreamId,
+        round: u32,
+        generation: u32,
+    },
 }
 
 /// A checkpoint chunk's transactions, in schedule order.
