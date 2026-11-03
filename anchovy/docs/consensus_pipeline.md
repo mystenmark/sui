@@ -438,6 +438,8 @@ on, so they change when outcomes are known, never what they are.
   applies the rules there. Reservations arrive in version order: all of
   `v`'s before any of `v + 1`'s. They are kept in arrival order (consensus
   order), so a reservation key `(account, r, v)` need not be unique.
+  `VersionResolver` sends each chunk's reservations at once, even none,
+  which marks `v`'s as complete. None ever arrives below σ.
 - **`Deposit(account, d, v)`** is sent by `Executor` once a transaction of
   the chunk of version `v − 1` deposits `d`. If `v > σ`, then `D(v) += d`, raising `L` at
   `v` and at every later unsettled version. The rules are then reapplied
@@ -448,7 +450,12 @@ on, so they change when outcomes are known, never what they are.
   cancelled transaction. If `v ≥ σ`, then `C(v) += c`, raising `L` from
   `v + 1` on. The rules are then reapplied there.
 - **`Settled(balances, v)`**, with `v = σ + 1`, is sent by
-  `SettlementScheduler` after the chunk of version `v − 1` settles.
+  `SettlementScheduler` after the chunk of version `v − 1` settles. It is
+  held until `v − 1`'s reservations are complete: a chunk whose
+  transactions ran from certified checkpoints settles from their stored
+  effects, possibly before its resolver sends its reservations, and those
+  must still be decided against `S(v − 1)`. The first, sent for the first
+  chunk seen, sets σ to that chunk's version.
   - It sets `σ = v` and `S(v)`: given for each account the settlement
     changed, and `S(v − 1)` for the others.
   - It applies the rules at `v` until `v`'s queue is empty; R1 or R2 always
