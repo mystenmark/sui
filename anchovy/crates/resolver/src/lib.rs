@@ -14,6 +14,7 @@ use messages::object::Object;
 use messages::transaction::{CallArg, Command as MoveCommand, ObjectArg, TransactionKind};
 use messages::transaction::{Reservation, TransactionData, TxState};
 use messages::transaction::{WithdrawFrom, WithdrawalTypeArg};
+use messages::tx_index::SUI_CLOCK_OBJECT_ID;
 use messages::type_tag::TypeTag;
 use validator::consensus::sequence::SharedAccess;
 use validator::epoch::EpochParams;
@@ -77,6 +78,17 @@ impl VersionResolver {
             let data = transaction.get().0.data();
             object_keys(data, &mut self.keys, &mut self.packages);
             funds_withdrawals(data, chain_identifier, &mut self.amounts, bump);
+        }
+        // The Clock a transaction may borrow without its being an input: as
+        // the version is known, its prologue's write is waited for here,
+        // rather than in execution.
+        if let Some(version) = entry.clock_version
+            && !entry.shared.iter().any(|a| a.id == SUI_CLOCK_OBJECT_ID)
+        {
+            self.keys.push(InputKey::ObjectVersion {
+                id: SUI_CLOCK_OBJECT_ID,
+                version,
+            });
         }
     }
 }

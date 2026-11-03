@@ -155,9 +155,18 @@ fn epoch_start(
         .start_version(store, &root, initial_shared_version)
         .expect("the accumulator root exists")
         .version;
+    let clock_version = epoch_store
+        .start_version(
+            store,
+            &messages::tx_index::SUI_CLOCK_OBJECT_ID,
+            sui_types::SUI_CLOCK_OBJECT_SHARED_VERSION.value(),
+        )
+        .expect("the Clock exists")
+        .version;
     EpochStart {
         previous_checkpoint: checkpoint.seq,
         accumulator_root_version,
+        clock_version,
         accumulator_root_initial_shared_version: initial_shared_version,
         authenticator_initial_shared_version: objects.authenticator_state,
         randomness_initial_shared_version: objects.randomness_state,

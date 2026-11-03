@@ -196,6 +196,7 @@ fn chunk(round: u32, transactions: &[Planned]) -> Chunk {
                 origin: None,
                 aliases: None,
                 cancelled: Vec::new(),
+                clock_version: None,
             }
         })
         .collect();

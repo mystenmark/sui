@@ -118,6 +118,7 @@ fn system(shared: Vec<SharedAccess>) -> ScheduledEntry {
         origin: None,
         aliases: None,
         cancelled: Vec::new(),
+        clock_version: None,
     }
 }
 
@@ -144,6 +145,7 @@ fn signed(data: TransactionData, key: &AccountKeyPair) -> ScheduledEntry {
         origin: None,
         aliases: None,
         cancelled: Vec::new(),
+        clock_version: None,
     }
 }
 
