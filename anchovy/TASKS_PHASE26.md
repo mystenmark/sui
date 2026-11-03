@@ -12,7 +12,9 @@
   the same manifest, it fails every time.
 - sweep-v1 seed 13 (phase 24): macOS Security framework exception in the
   sui node's JWK fetch (`CSSMERR_CSSM_FUNCTION_FAILED`), not anchovy.
+- Sweeps with the fix: composite and composite-through-stalls, seeds 1-24
+  each, all pass. `derp-sweep.sh` now removes each seed's rewritten binary
+  (about 380 MB), which had filled the disk.
 
 ## Remaining
-- Sweeps: composite and composite-through-stalls, seeds 1-24 each.
 - #28520 (consensus-pool owned-version validation) for anchovy admission.
