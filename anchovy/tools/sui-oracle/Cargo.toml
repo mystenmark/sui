@@ -13,9 +13,10 @@ publish = false
 sui-types = { path = "../../../crates/sui-types" }
 sui-protocol-config = { path = "../../../crates/sui-protocol-config" }
 nonempty = "0.9"
-fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "076bf5ad8cea140dc7cf5c5861c24a36acdf64ce" }
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "0a263279c31a45ba4bcd986a82b7e99c63ed16c0" }
 roaring = "=0.11.4"
-fastcrypto-zkp = { git = "https://github.com/MystenLabs/fastcrypto", rev = "076bf5ad8cea140dc7cf5c5861c24a36acdf64ce", package = "fastcrypto-zkp" }
+fastcrypto-zkp = { git = "https://github.com/MystenLabs/fastcrypto", rev = "0a263279c31a45ba4bcd986a82b7e99c63ed16c0", package = "fastcrypto-zkp" }
+fastcrypto-pq = { git = "https://github.com/MystenLabs/fastcrypto", rev = "0a263279c31a45ba4bcd986a82b7e99c63ed16c0" }
 shared-crypto = { path = "../../../crates/shared-crypto" }
 base64ct = { version = "=1.8.0", features = ["alloc"] }
 rand = "0.8.5"

@@ -175,7 +175,13 @@ fn store<'a>(
     let backing_store = containers::leak(bump, backing_store);
     let inputs = containers::leak(
         bump,
-        ExecutionInputs::new(bump, containers::vec_from_slice(bump, inputs), &[], None),
+        ExecutionInputs::new(
+            bump,
+            containers::vec_from_slice(bump, inputs),
+            &[],
+            None,
+            None,
+        ),
     );
     let protocol_config = containers::leak(bump, ProtocolConfig::get_for_max_version_UNSAFE());
     TemporaryStore::new_for_genesis_state_update(

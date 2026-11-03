@@ -3,6 +3,7 @@
 
 use self::{
     address::{AddressFromBytesCostParams, AddressFromU256CostParams, AddressToU256CostParams},
+    clock::ClockBorrowCostParams,
     config::ConfigReadSettingImplCostParams,
     crypto::{bls12381, ecdsa_k1, ecdsa_r1, ecvrf, ed25519, groth16, hash, hmac},
     crypto::{
@@ -27,7 +28,9 @@ use self::{
         DynamicFieldHashTypeAndKeyCostParams, DynamicFieldRemoveChildObjectCostParams,
     },
     event::EventEmitCostParams,
-    object::{BorrowUidCostParams, DeleteImplCostParams, RecordNewIdCostParams},
+    object::{
+        BorrowUidCostParams, DeleteImplCostParams, IsSharedInputCostParams, RecordNewIdCostParams,
+    },
     package::PackageVersioningOriginalPackageIdImplCostParams,
     scratch::{
         ScratchAddCostParams, ScratchExistsCostParams, ScratchExistsWithTypeCostParams,
@@ -84,6 +87,7 @@ use transfer::TransferReceiveObjectInternalCostParams;
 
 mod accumulator;
 mod address;
+mod clock;
 mod config;
 mod crypto;
 mod dynamic_field;
@@ -112,6 +116,9 @@ pub struct NativesCostTable {
     pub address_from_bytes_cost_params: AddressFromBytesCostParams,
     pub address_to_u256_cost_params: AddressToU256CostParams,
     pub address_from_u256_cost_params: AddressFromU256CostParams,
+
+    // Clock: cost params for the Move native function `native_borrow(): &Clock`
+    pub clock_borrow_cost_params: ClockBorrowCostParams,
 
     // Config
     pub config_read_setting_impl_cost_params: ConfigReadSettingImplCostParams,
@@ -147,6 +154,7 @@ pub struct NativesCostTable {
     pub borrow_uid_cost_params: BorrowUidCostParams,
     pub delete_impl_cost_params: DeleteImplCostParams,
     pub record_new_id_cost_params: RecordNewIdCostParams,
+    pub is_shared_input_cost_params: IsSharedInputCostParams,
 
     // Transfer
     pub transfer_transfer_internal_cost_params: TransferInternalCostParams,
@@ -244,6 +252,11 @@ impl NativesCostTable {
                 address_from_u256_cost_base: protocol_config.address_from_u256_cost_base().into(),
             },
 
+            clock_borrow_cost_params: ClockBorrowCostParams {
+                clock_borrow_cost_base: protocol_config
+                    .clock_borrow_cost_base_as_option()
+                    .map(Into::into),
+            },
             config_read_setting_impl_cost_params: ConfigReadSettingImplCostParams {
                 config_read_setting_impl_cost_base: protocol_config
                     .config_read_setting_impl_cost_base_as_option()
@@ -403,6 +416,11 @@ impl NativesCostTable {
                     .into(),
                 object_record_new_uid_from_hash_cost_base: protocol_config
                     .object_record_new_uid_from_hash_cost_base_as_option()
+                    .map(Into::into),
+            },
+            is_shared_input_cost_params: IsSharedInputCostParams {
+                object_is_shared_input_cost_base: protocol_config
+                    .object_is_shared_input_cost_base_as_option()
                     .map(Into::into),
             },
 
@@ -889,6 +907,17 @@ pub fn make_stdlib_gas_params_for_protocol_config(
             debug_assert!(
                 protocol_config.version.as_u64() < 53 || protocol_config.$name().is_some()
             );
+            protocol_config
+                .$name()
+                .map(Into::into)
+                .unwrap_or(0u64.into())
+        }};
+    }
+    macro_rules! get_gas_cost_or_default_since {
+        ($name: ident, $version: expr) => {{
+            debug_assert!(
+                protocol_config.version.as_u64() < $version || protocol_config.$name().is_some()
+            );
             protocol_config.$name().map(Into::into).unwrap_or(0.into())
         }};
     }
@@ -984,6 +1013,34 @@ pub fn make_stdlib_gas_params_for_protocol_config(
             swap: MSN::vector::SwapGasParameters {
                 base: get_gas_cost_or_default!(vector_swap_base_cost_as_option),
             },
+            reverse: MSN::vector::ReverseGasParameters {
+                base: get_gas_cost_or_default_since!(vector_reverse_base_cost_as_option, 140),
+                per_elem: get_gas_cost_or_default_since!(
+                    vector_reverse_per_elem_cost_as_option,
+                    140
+                ),
+            },
+            keep_range: MSN::vector::KeepRangeGasParameters {
+                base: get_gas_cost_or_default_since!(vector_keep_range_base_cost_as_option, 140),
+                per_dropped_elem: get_gas_cost_or_default_since!(
+                    vector_keep_range_per_dropped_elem_cost_as_option,
+                    140
+                ),
+                per_moved_elem: get_gas_cost_or_default_since!(
+                    vector_keep_range_per_moved_elem_cost_as_option,
+                    140
+                ),
+            },
+            copy_range: MSN::vector::CopyRangeGasParameters {
+                base: get_gas_cost_or_default_since!(vector_copy_range_base_cost_as_option, 140),
+            },
+            replace_range: MSN::vector::ReplaceRangeGasParameters {
+                base: get_gas_cost_or_default_since!(vector_replace_range_base_cost_as_option, 140),
+                per_elem: get_gas_cost_or_default_since!(
+                    vector_replace_range_per_elem_cost_as_option,
+                    140
+                ),
+            },
         },
     )
 }
@@ -1024,6 +1081,7 @@ pub fn all_natives(silent: bool, protocol_config: &ProtocolConfig) -> NativeFunc
             "hash_type_and_key",
             make_native!(dynamic_field::hash_type_and_key),
         ),
+        ("clock", "native_borrow", make_native!(clock::borrow)),
         (
             "config",
             "read_setting_impl",
@@ -1204,6 +1262,11 @@ pub fn all_natives(silent: bool, protocol_config: &ProtocolConfig) -> NativeFunc
             "object",
             "record_new_uid_from_hash",
             make_native!(object::record_new_uid_from_hash),
+        ),
+        (
+            "object",
+            "is_shared_input_impl",
+            make_native!(object::is_shared_input_impl),
         ),
         (
             "transfer",
@@ -1498,4 +1561,35 @@ pub(crate) fn abstract_size(
         include_vector_size: true,
         traverse_references: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sui_protocol_config::{Chain, ProtocolVersion};
+
+    #[test]
+    fn vector_bulk_native_gas_mapping_is_protocol_gated() {
+        let before = ProtocolConfig::get_for_version(ProtocolVersion::new(139), Chain::Unknown);
+        let before = make_stdlib_gas_params_for_protocol_config(&before);
+        assert_eq!(before.vector.reverse.base, 0.into());
+        assert_eq!(before.vector.reverse.per_elem, 0.into());
+        assert_eq!(before.vector.keep_range.base, 0.into());
+        assert_eq!(before.vector.keep_range.per_dropped_elem, 0.into());
+        assert_eq!(before.vector.keep_range.per_moved_elem, 0.into());
+        assert_eq!(before.vector.copy_range.base, 0.into());
+        assert_eq!(before.vector.replace_range.base, 0.into());
+        assert_eq!(before.vector.replace_range.per_elem, 0.into());
+
+        let active = ProtocolConfig::get_for_version(ProtocolVersion::new(140), Chain::Unknown);
+        let active = make_stdlib_gas_params_for_protocol_config(&active);
+        assert_eq!(active.vector.reverse.base, 52.into());
+        assert_eq!(active.vector.reverse.per_elem, 8.into());
+        assert_eq!(active.vector.keep_range.base, 52.into());
+        assert_eq!(active.vector.keep_range.per_dropped_elem, 1.into());
+        assert_eq!(active.vector.keep_range.per_moved_elem, 8.into());
+        assert_eq!(active.vector.copy_range.base, 52.into());
+        assert_eq!(active.vector.replace_range.base, 52.into());
+        assert_eq!(active.vector.replace_range.per_elem, 8.into());
+    }
 }

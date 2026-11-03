@@ -23,10 +23,14 @@ const MAX_ROARING_CARDINALITY: u64 = 150;
 /// Flag, signature, key: the lengths of the single-key schemes.
 const ED25519_SIGNATURE_LEN: usize = 1 + 64 + 32;
 const SECP256_SIGNATURE_LEN: usize = 1 + 64 + 33;
+pub(crate) const MLDSA65_SIGNATURE_LEN: usize = 1 + MLDSA65_SIG_LEN + MLDSA65_KEY_LEN;
+pub(crate) const MLDSA65_SIG_LEN: usize = 3309;
+pub(crate) const MLDSA65_KEY_LEN: usize = 1952;
 
 #[derive(Clone, Copy, Debug)]
 pub enum ParsedSignature<'a> {
-    /// Ed25519, Secp256k1 or Secp256r1: `flag || signature || public key`.
+    /// Ed25519, Secp256k1, Secp256r1 or ML-DSA-65: `flag || signature ||
+    /// public key`.
     Simple(&'a [u8]),
     MultiSig(MultiSig<'a>),
     /// The pre-2023 multisig format, converted: keys decoded, the roaring
@@ -83,7 +87,8 @@ pub fn parse<'a>(bytes: &'a [u8], bump: &'a Bump) -> Result<(ParsedSignature<'a>
     let parsed = match flag {
         0 if bytes.len() == ED25519_SIGNATURE_LEN => ParsedSignature::Simple(bytes),
         1 | 2 if bytes.len() == SECP256_SIGNATURE_LEN => ParsedSignature::Simple(bytes),
-        0..=2 => return Err(malformed("signature of the wrong length")),
+        7 if bytes.len() == MLDSA65_SIGNATURE_LEN => ParsedSignature::Simple(bytes),
+        0..=2 | 7 => return Err(malformed("signature of the wrong length")),
         // The new format is tried first; anything it rejects is read as
         // the legacy one.
         3 => match multisig(&bytes[1..], bump) {
@@ -152,6 +157,8 @@ pub(crate) fn zklogin(body: &[u8]) -> Option<ZkLoginAuthenticator> {
     let sig_len_ok = match zk.user_signature.first() {
         Some(0) => zk.user_signature.len() == ED25519_SIGNATURE_LEN,
         Some(1 | 2) => zk.user_signature.len() == SECP256_SIGNATURE_LEN,
+        // Verification rejects it as an ephemeral key.
+        Some(7) => zk.user_signature.len() == MLDSA65_SIGNATURE_LEN,
         _ => false,
     };
     if !sig_len_ok {
@@ -313,7 +320,7 @@ fn decode_legacy_key<'a>(encoded: &str, bump: &'a Bump) -> Option<PublicKey<'a>>
     use base64ct::Encoding as _;
     // The longest key and its flag. A longer string fails here where the
     // reference fails on the key's length: both reject.
-    let mut buf = [0u8; 34];
+    let mut buf = [0u8; 1 + MLDSA65_KEY_LEN];
     let bytes = base64ct::Base64::decode(encoded, &mut buf).ok()?;
     let (&flag, key) = bytes.split_first()?;
     // The reference keeps the key as fastcrypto re-encodes it, which is
@@ -336,6 +343,8 @@ fn decode_legacy_key<'a>(encoded: &str, bump: &'a Bump) -> Option<PublicKey<'a>>
             canonical.copy_from_slice(k.as_bytes());
             &canonical
         }
+        // Any key of the length parses, and encodes as given.
+        7 if key.len() == MLDSA65_KEY_LEN => key,
         _ => return None,
     };
     let copy = |key: &[u8]| -> &'a [u8] {
@@ -347,7 +356,8 @@ fn decode_legacy_key<'a>(encoded: &str, bump: &'a Bump) -> Option<PublicKey<'a>>
         0 => PublicKey::Ed25519(copy(key).try_into().ok()?),
         1 => PublicKey::Secp256k1(copy(key).try_into().ok()?),
         2 => PublicKey::Secp256r1(copy(key).try_into().ok()?),
-        _ => PublicKey::Passkey(copy(key).try_into().ok()?),
+        6 => PublicKey::Passkey(copy(key).try_into().ok()?),
+        _ => PublicKey::MLDSA65(copy(key).try_into().ok()?),
     })
 }
 

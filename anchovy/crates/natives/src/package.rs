@@ -58,8 +58,10 @@ pub fn original_package_id_impl(
     };
     native_charge_gas_early_exit!(
         context,
-        package_original_package_id_impl_cost_per_byte
-            * checked_as!(move_package_size(package.try_as_package().unwrap()), u64)?.into()
+        package_original_package_id_impl_cost_per_byte.saturating_mul(checked_as!(
+            move_package_size(package.try_as_package().unwrap()),
+            u64
+        )?)
     );
     let original_id = move_address(&original_package_id(package.try_as_package().unwrap()));
 

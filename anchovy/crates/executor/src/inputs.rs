@@ -132,9 +132,10 @@ pub struct ExecutionInputs<'a> {
     consensus_stream_ended: VecMap<'a, ObjectId, SequenceNumber>,
     receiving: &'a [ObjectRef],
     lamport_timestamp: SequenceNumber,
-    /// `SystemObjectVersions`: the accumulator root's version assigned to this transaction,
-    /// which execution reads implicitly.
+    /// `SystemObjectVersions`: the accumulator root's and the Clock's versions assigned to this
+    /// transaction, which execution reads implicitly.
     accumulator_version: Option<SequenceNumber>,
+    clock_version: Option<SequenceNumber>,
 }
 
 impl<'a> ExecutionInputs<'a> {
@@ -145,6 +146,7 @@ impl<'a> ExecutionInputs<'a> {
         loaded: Vec<'a, LoadedInput<'a>>,
         receiving: &'a [ObjectRef],
         accumulator_version: Option<SequenceNumber>,
+        clock_version: Option<SequenceNumber>,
     ) -> ExecutionInputs<'a> {
         let mut objects = Vec::with_capacity_in(loaded.len(), bump);
         let mut exclusive_mutable_inputs = Vec::with_capacity_in(loaded.len(), bump);
@@ -198,6 +200,7 @@ impl<'a> ExecutionInputs<'a> {
             receiving,
             lamport_timestamp,
             accumulator_version,
+            clock_version,
         }
     }
 
@@ -251,10 +254,10 @@ impl<'a> ExecutionInputs<'a> {
     /// # Panics
     /// For an object that is not implicitly read.
     pub fn system_object_version(&self, object_id: &ObjectId) -> Option<SequenceNumber> {
-        if *object_id == exec_types::base::SUI_ACCUMULATOR_ROOT_OBJECT_ID {
-            self.accumulator_version
-        } else {
-            panic!("{object_id} is not an implicitly read system object")
+        match *object_id {
+            exec_types::base::SUI_ACCUMULATOR_ROOT_OBJECT_ID => self.accumulator_version,
+            exec_types::base::SUI_CLOCK_OBJECT_ID => self.clock_version,
+            _ => panic!("{object_id} is not an implicitly read system object"),
         }
     }
 

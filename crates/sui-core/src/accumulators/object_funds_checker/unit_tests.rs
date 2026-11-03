@@ -4,6 +4,7 @@
 //! Unit tests for the implementation of the object funds withdraw scheduler.
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use sui_macros::sim_test;
 
 use sui_test_transaction_builder::TestTransactionBuilder;
 use sui_types::{
@@ -248,6 +249,20 @@ async fn test_settle_accumulator_version() {
 }
 
 #[tokio::test]
+async fn test_settle_accumulator_version_out_of_order() {
+    let checker = ObjectFundsCheckerDEPRECATED::new_for_testing(
+        SequenceNumber::from_u64(0),
+        Arc::new(ObjectFundsCheckerMetrics::new(&prometheus::Registry::new())),
+    );
+    checker.settle_accumulator_version(SequenceNumber::from_u64(2));
+    checker.settle_accumulator_version(SequenceNumber::from_u64(1));
+    assert_eq!(
+        checker.get_current_accumulator_version(),
+        SequenceNumber::from_u64(2)
+    );
+}
+
+#[tokio::test]
 async fn test_account_version_ahead_of_schedule() {
     let account = ObjectID::random();
     let funds_read = Arc::new(MockFundsRead::new(
@@ -380,7 +395,7 @@ async fn test_commit() {
     assert!(checker.unsettled().is_empty());
 }
 
-#[tokio::test]
+#[sim_test]
 async fn test_should_commit_early_exits() {
     let checker = ObjectFundsCheckerDEPRECATED::new_for_testing(
         SequenceNumber::from_u64(0),
@@ -398,18 +413,22 @@ async fn test_should_commit_early_exits() {
     let withdraws = BTreeMap::from([(AccumulatorObjId::new_unchecked(account), 100)]);
 
     // Normal path that triggers object funds check. Should not commit since insufficient funds.
-    assert!(!checker.should_commit_object_funds_withdraws(
-        &tx,
-        &TestEffectsBuilder::new(tx.data()).build(),
-        &withdraws,
-        &ExecutionEnv::new().with_assigned_versions(AssignedVersions::new_for_testing(
-            vec![],
-            Some(SequenceNumber::from_u64(0))
-        )),
-        state.get_account_funds_read(),
-        state.execution_scheduler(),
-        &epoch_store,
-    ));
+    assert!(
+        !checker.should_commit_object_funds_withdraws(
+            &tx,
+            &TestEffectsBuilder::new(tx.data()).build(),
+            &withdraws,
+            &ExecutionEnv::new()
+                .with_assigned_versions(AssignedVersions::new_for_testing(
+                    vec![],
+                    Some(SequenceNumber::from_u64(0))
+                ))
+                .with_causal_index(1),
+            state.get_account_funds_read(),
+            state.execution_scheduler(),
+            &epoch_store,
+        )
+    );
 
     // Failed execution should always commit.
     assert!(
@@ -422,10 +441,12 @@ async fn test_should_commit_early_exits() {
                 )))
                 .build(),
             &withdraws,
-            &ExecutionEnv::new().with_assigned_versions(AssignedVersions::new_for_testing(
-                vec![],
-                Some(SequenceNumber::from_u64(0))
-            )),
+            &ExecutionEnv::new()
+                .with_assigned_versions(AssignedVersions::new_for_testing(
+                    vec![],
+                    Some(SequenceNumber::from_u64(0))
+                ))
+                .with_causal_index(1),
             state.get_account_funds_read(),
             state.execution_scheduler(),
             &epoch_store,
@@ -433,7 +454,7 @@ async fn test_should_commit_early_exits() {
     );
 }
 
-#[tokio::test]
+#[sim_test]
 async fn test_should_commit_ignores_zero_net_withdraws() {
     // A zero-amount withdraw emits a single Split(0) accumulator event, which survives
     // effects folding as a Split but creates no running max entry. It must be skipped
@@ -481,18 +502,22 @@ async fn test_should_commit_ignores_zero_net_withdraws() {
         ])
         .build();
 
-    assert!(checker.should_commit_object_funds_withdraws(
-        &tx,
-        &effects,
-        &running_max_withdraws,
-        &ExecutionEnv::new().with_assigned_versions(AssignedVersions::new_for_testing(
-            vec![],
-            Some(SequenceNumber::from_u64(0))
-        )),
-        &funds_read,
-        state.execution_scheduler(),
-        &epoch_store,
-    ));
+    assert!(
+        checker.should_commit_object_funds_withdraws(
+            &tx,
+            &effects,
+            &running_max_withdraws,
+            &ExecutionEnv::new()
+                .with_assigned_versions(AssignedVersions::new_for_testing(
+                    vec![],
+                    Some(SequenceNumber::from_u64(0))
+                ))
+                .with_causal_index(1),
+            &funds_read,
+            state.execution_scheduler(),
+            &epoch_store,
+        )
+    );
 }
 
 #[tokio::test]

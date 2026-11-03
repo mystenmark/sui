@@ -29,8 +29,8 @@ use exec_types::base::{EpochId, SUI_DENY_LIST_OBJECT_ID, SUI_SYSTEM_STATE_OBJECT
 use exec_types::execution::DynamicallyLoadedObjectMetadata;
 use exec_types::object::Object;
 use exec_types::storage::{
-    BackingPackageStore, BackingStore, ObjectFundsResolver, RuntimeObjectResolver, SuiError,
-    SuiResult,
+    BackingPackageStore, BackingStore, ImplicitSystemObjectResolver, RuntimeObjectResolver,
+    SuiError, SuiResult,
 };
 use messages::base::{ObjectId, SequenceNumber, SuiAddress, TransactionDigest};
 use messages::effects::{AccumulatorOperation, AccumulatorValue, Event, GasCostSummary};
@@ -258,11 +258,29 @@ impl<'a> TemporaryStore<'a> {
             );
             return None;
         };
-        let object = self
-            .store
-            // If this transaction needs to read an implicit system object,
-            // the version must be assigned before execution.
-            .load_implicitly_read_system_object(object_id, version)?;
+        let object = match self.inputs.objects().get(object_id) {
+            // A declared input is the object this transaction was sequenced against, so it is
+            // the same object the implicit read must see.
+            Some(object) => {
+                if object.version() != version {
+                    // The reference reports this through `debug_fatal!`.
+                    debug_assert!(
+                        false,
+                        "declared input {object_id:?} at version {:?} disagrees with its implicit \
+                         read version {:?}",
+                        object.version(),
+                        version
+                    );
+                    return None;
+                }
+                *object
+            }
+            None => self
+                .store
+                // If this transaction needs to read an implicit system object,
+                // the version must be assigned before execution.
+                .load_implicitly_read_system_object(object_id, version)?,
+        };
         // Record the read version so it can be emitted into effects as a read-only consensus object and
         // reproduced on replay.
         self.loaded_system_objects
@@ -1183,7 +1201,7 @@ impl<'a> RuntimeObjectResolver<'a> for TemporaryStore<'a> {
     }
 }
 
-impl ObjectFundsResolver for TemporaryStore<'_> {
+impl<'a> ImplicitSystemObjectResolver<'a> for TemporaryStore<'a> {
     /// Loads the object balance at the required version and subtracts withdrawals from the same
     /// checkpoint that have not settled yet.
     /// This function is expected never to fail; an error indicates an invariant violation.
@@ -1202,6 +1220,12 @@ impl ObjectFundsResolver for TemporaryStore<'_> {
         );
         settled
             .checked_sub(unsettled)
+            .ok_or_else(|| SuiError("ExecutionInvariantViolation".to_string()))
+    }
+
+    /// This function is expected never to fail; an error indicates an invariant violation.
+    fn clock(&self) -> SuiResult<Object<'a>> {
+        self.load_implicitly_read_system_object(&exec_types::base::SUI_CLOCK_OBJECT_ID)
             .ok_or_else(|| SuiError("ExecutionInvariantViolation".to_string()))
     }
 }

@@ -82,6 +82,9 @@ pub struct ScheduledEntry {
     /// A transaction cancelled for congestion: each consensus object input
     /// and the marker version it reads as instead (then `shared` is empty).
     pub cancelled: Vec<(ObjectId, u64)>,
+    /// The Clock's version a user transaction reads if it borrows the Clock
+    /// without its being an input (the reference's `SystemObjectVersions`).
+    pub clock_version: Option<u64>,
 }
 
 /// A checkpoint chunk's transactions, in schedule order.

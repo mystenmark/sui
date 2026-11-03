@@ -319,17 +319,19 @@ impl CommitHandler {
 
     /// The reference's `init_randomness`, before the commit's DKG traffic:
     /// the commit's randomness round, if DKG succeeded and the last round's
-    /// commit was long enough ago, and whether DKG failed.
+    /// commit was long enough ago, and whether DKG failed or, at leader
+    /// `round`, timed out.
     fn reserve_randomness(
         &mut self,
         config: &ProtocolConfig,
         timestamp_ms: u64,
+        round: u64,
     ) -> (Option<u64>, bool) {
         let Some(randomness) = &mut self.randomness else {
             return (None, false);
         };
         match randomness.dkg.status() {
-            DkgStatus::Pending => (None, false),
+            DkgStatus::Pending => (None, Dkg::timed_out(config, round)),
             DkgStatus::Failed => (None, true),
             DkgStatus::Successful(_) => {
                 if randomness.last_round_ms.is_some_and(|last| {
@@ -486,7 +488,8 @@ impl CommitHandler {
         // The reference's `observe_commit`, before anything is estimated.
         self.observe_prior(config, commit.timestamp_ms);
         // The commit's randomness round, as DKG stood before its traffic.
-        let (randomness_round, dkg_failed) = self.reserve_randomness(config, commit.timestamp_ms);
+        let (randomness_round, dkg_failed) =
+            self.reserve_randomness(config, commit.timestamp_ms, round);
         let randomness_deferrable = self.randomness.is_some() && randomness_round.is_none();
         self.handle_dkg(config, commit.dkg, round);
 
@@ -687,7 +690,11 @@ impl CommitHandler {
             )
         });
         for (key, transactions) in deferred {
-            self.output.defer(key, encode_deferred(&transactions));
+            self.output.defer(
+                key,
+                encode_deferred(&transactions),
+                config.merge_colliding_deferrals(),
+            );
         }
 
         // 8. The schedule: the prologue, the update, then the transactions,
@@ -956,6 +963,7 @@ pub struct CommitRecord {
     /// The timestamp of the last checkpoint cut, for the interval cuts.
     pub last_built_timestamp: u64,
     pub root_version: u64,
+    pub clock_version: u64,
     /// The epoch's last commit is decided.
     pub closed: bool,
     /// The epoch's certificates have closed (`CommitHandler::with_end`).
@@ -993,6 +1001,8 @@ pub struct EpochStart {
     /// The root's version the epoch's first chunk reads: where version
     /// assignment starts it (`Store::start_version`).
     pub accumulator_root_version: u64,
+    /// The Clock's version as the epoch starts.
+    pub clock_version: u64,
     /// The epoch ends with the first commit at or past
     /// `epoch_start_timestamp_ms + epoch_duration_ms`.
     pub epoch_start_timestamp_ms: u64,
@@ -1057,6 +1067,10 @@ pub struct CommitStage {
     /// barrier, its root's one exclusive writer and with the root its only
     /// input, writes the next version.
     root_version: u64,
+    /// The Clock's version as the last commit's prologue wrote it. Each
+    /// prologue, the Clock's one writer and with it its only input, writes
+    /// the next.
+    clock_version: u64,
     gate_out: GateWaits,
     checkpoints_out: workqueue::Queue<waiter::Command<ChunkSettled, PendingCheckpoint>>,
     statuses: Arc<ConsensusTxStatusCache>,
@@ -1111,6 +1125,7 @@ impl CommitStage {
             last_commit: record.map(|r| r.commit_index),
             closed: record.is_some_and(|r| r.closed),
             root_version: record.map_or(start.accumulator_root_version, |r| r.root_version),
+            clock_version: record.map_or(start.clock_version, |r| r.clock_version),
             gate_out: gate,
             checkpoints_out: checkpoints,
             statuses,
@@ -1264,7 +1279,10 @@ impl CommitStage {
 
         // 2. Each transaction with its shared accesses, in schedule order.
         //    The randomness state update's bytes are not known yet: it is
-        //    left out, for the randomness gate to put in.
+        //    left out, for the randomness gate to put in. User transactions
+        //    follow the prologue, so they read the Clock it writes.
+        self.clock_version += 1;
+        let clock_version = Some(self.clock_version);
         let randomness_start = schedule.randomness_start;
         let transactions =
             std::mem::replace(&mut schedule.transactions, containers::Vec::new_in(bump));
@@ -1318,9 +1336,14 @@ impl CommitStage {
                             .iter()
                             .map(|input| (input.id, input.marker))
                             .collect(),
+                        clock_version,
                     });
                     continue;
                 }
+            };
+            let clock_version = match transaction {
+                ExecutableTransaction::User(_) => clock_version,
+                ExecutableTransaction::System(_) => None,
             };
             entries.push(ScheduledEntry {
                 transaction,
@@ -1328,6 +1351,7 @@ impl CommitStage {
                 origin,
                 aliases: claim,
                 cancelled: Vec::new(),
+                clock_version,
             });
         }
         // The update, left out, stood at the randomness part's start.
@@ -1604,6 +1628,7 @@ impl CommitStage {
             next_seq: self.queue.next_seq,
             last_built_timestamp: self.queue.last_built_timestamp,
             root_version: self.root_version,
+            clock_version: self.clock_version,
             closed: self.closed,
             certs_closed: self.handler.certs_closed(),
         };

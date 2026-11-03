@@ -65,10 +65,6 @@ pub trait GlobalStateHashStore: ObjectStore + Send + Sync {
         epoch: EpochId,
     ) -> SuiResult<Option<(CheckpointSequenceNumber, GlobalStateHash)>>;
 
-    fn get_root_state_hash_for_highest_epoch(
-        &self,
-    ) -> SuiResult<Option<(EpochId, (CheckpointSequenceNumber, GlobalStateHash))>>;
-
     fn insert_state_hash_for_epoch(
         &self,
         epoch: EpochId,
@@ -104,12 +100,6 @@ impl GlobalStateHashStore for InMemoryStorage {
         &self,
         _epoch: EpochId,
     ) -> SuiResult<Option<(CheckpointSequenceNumber, GlobalStateHash)>> {
-        unreachable!("not used for testing")
-    }
-
-    fn get_root_state_hash_for_highest_epoch(
-        &self,
-    ) -> SuiResult<Option<(EpochId, (CheckpointSequenceNumber, GlobalStateHash))>> {
         unreachable!("not used for testing")
     }
 
@@ -180,34 +170,19 @@ where
     let mut acc = GlobalStateHash::default();
 
     // process insertions to the set
-    acc.insert_all(
-        effects
-            .iter()
-            .flat_map(|fx| {
-                fx.all_changed_objects()
-                    .into_iter()
-                    .map(|(oref, _, _)| oref.2)
-            })
-            .collect::<Vec<ObjectDigest>>(),
-    );
+    acc.insert_all(effects.iter().flat_map(|fx| {
+        fx.all_changed_objects()
+            .into_iter()
+            .map(|(oref, _, _)| oref.2)
+    }));
 
     // insert wrapped tombstones. We use a custom struct in order to contain the tombstone
     // against the object id and sequence number, as the tombstone by itself is not unique.
-    acc.insert_all(
-        effects
-            .iter()
-            .flat_map(|fx| {
-                fx.wrapped()
-                    .iter()
-                    .map(|oref| {
-                        bcs::to_bytes(&WrappedObject::new(oref.0, oref.1))
-                            .unwrap()
-                            .to_vec()
-                    })
-                    .collect::<Vec<Vec<u8>>>()
-            })
-            .collect::<Vec<Vec<u8>>>(),
-    );
+    acc.insert_all(effects.iter().flat_map(|fx| {
+        fx.wrapped()
+            .into_iter()
+            .map(|oref| bcs::to_bytes(&WrappedObject::new(oref.0, oref.1)).unwrap())
+    }));
 
     let all_unwrapped = effects
         .iter()
@@ -254,7 +229,7 @@ where
         })
         .collect();
 
-    let modified_at_digests: Vec<_> = store
+    let modified_at_digests = store
         .multi_get_objects_by_key(&modified_at_version_keys.clone())
         .into_iter()
         .zip_debug_eq(modified_at_version_keys)
@@ -262,8 +237,7 @@ where
             obj.unwrap_or_else(|| panic!("Object for key {:?} from modified_at_versions effects does not exist in objects table", key))
                 .compute_object_reference()
                 .2
-        })
-        .collect();
+        });
     acc.remove_all(modified_at_digests);
 
     // Process unwrapped and unwrapped_then_deleted effects, which need to be
@@ -273,7 +247,7 @@ where
     // seek the version prior to the unwrapped version from the objects table directly.
     // If the tombstone is not found, then assume this is a newly created wrapped object hence
     // we don't expect to find it in the table.
-    let wrapped_objects_to_remove: Vec<WrappedObject> = all_unwrapped
+    let wrapped_objects_to_remove = all_unwrapped
         .iter()
         .filter_map(|(_tx_digest, id, seq_num)| {
             let objref = store
@@ -288,15 +262,9 @@ where
                 );
                 WrappedObject::new(id, version)
             })
-        })
-        .collect();
+        });
 
-    acc.remove_all(
-        wrapped_objects_to_remove
-            .iter()
-            .map(|wrapped| bcs::to_bytes(wrapped).unwrap().to_vec())
-            .collect::<Vec<Vec<u8>>>(),
-    );
+    acc.remove_all(wrapped_objects_to_remove.map(|wrapped| bcs::to_bytes(&wrapped).unwrap()));
 
     acc
 }
@@ -309,16 +277,11 @@ where
     let mut acc = GlobalStateHash::default();
 
     // process insertions to the set
-    acc.insert_all(
-        effects
-            .iter()
-            .flat_map(|fx| {
-                fx.all_changed_objects()
-                    .into_iter()
-                    .map(|(oref, _, _)| oref.2)
-            })
-            .collect::<Vec<ObjectDigest>>(),
-    );
+    acc.insert_all(effects.iter().flat_map(|fx| {
+        fx.all_changed_objects()
+            .into_iter()
+            .map(|(oref, _, _)| oref.2)
+    }));
 
     // Collect keys from modified_at_versions to remove from the hasher.
     let modified_at_version_keys: Vec<_> = effects
@@ -330,7 +293,7 @@ where
         })
         .collect();
 
-    let modified_at_digests: Vec<_> = store
+    let modified_at_digests = store
         .multi_get_objects_by_key(&modified_at_version_keys.clone())
         .into_iter()
         .zip_debug_eq(modified_at_version_keys)
@@ -338,8 +301,7 @@ where
             obj.unwrap_or_else(|| panic!("Object for key {:?} from modified_at_versions effects does not exist in objects table", key))
                 .compute_object_reference()
                 .2
-        })
-        .collect();
+        });
     acc.remove_all(modified_at_digests);
 
     acc
@@ -347,31 +309,16 @@ where
 
 fn accumulate_effects_v3(effects: &[TransactionEffects]) -> GlobalStateHash {
     let mut acc = GlobalStateHash::default();
-
-    // process insertions to the set
-    acc.insert_all(
-        effects
-            .iter()
-            .flat_map(|fx| {
-                fx.all_changed_objects()
-                    .into_iter()
-                    .map(|(object_ref, _, _)| object_ref.2)
-            })
-            .collect::<Vec<ObjectDigest>>(),
-    );
-
-    // process modified objects to the set
-    acc.remove_all(
-        effects
-            .iter()
-            .flat_map(|fx| {
-                fx.old_object_metadata()
-                    .into_iter()
-                    .map(|(object_ref, _owner)| object_ref.2)
-            })
-            .collect::<Vec<ObjectDigest>>(),
-    );
-
+    acc.insert_all(effects.iter().flat_map(|fx| {
+        fx.all_changed_objects()
+            .into_iter()
+            .map(|(object_ref, _, _)| object_ref.2)
+    }));
+    acc.remove_all(effects.iter().flat_map(|fx| {
+        fx.old_object_metadata()
+            .into_iter()
+            .map(|(object_ref, _owner)| object_ref.2)
+    }));
     acc
 }
 
@@ -400,22 +347,22 @@ impl GlobalStateHasher {
         effects: &[TransactionEffects],
         checkpoint_seq_num: CheckpointSequenceNumber,
         epoch_store: &AuthorityPerEpochStore,
-    ) -> SuiResult<GlobalStateHash> {
+    ) -> GlobalStateHash {
         let _scope = monitored_scope("AccumulateCheckpoint");
-        if let Some(acc) = epoch_store.get_state_hash_for_checkpoint(&checkpoint_seq_num)? {
-            return Ok(acc);
+        if let Some(acc) = epoch_store.get_state_hash_for_checkpoint(&checkpoint_seq_num) {
+            return acc;
         }
 
         let acc = self.accumulate_effects(effects, epoch_store.protocol_config());
 
-        epoch_store.insert_state_hash_for_checkpoint(&checkpoint_seq_num, &acc)?;
+        epoch_store.insert_state_hash_for_checkpoint(&checkpoint_seq_num, &acc);
         debug!("Accumulated checkpoint {}", checkpoint_seq_num);
 
         epoch_store
             .checkpoint_state_notify_read
             .notify(&checkpoint_seq_num, &acc);
 
-        Ok(acc)
+        acc
     }
 
     pub fn accumulate_cached_live_object_set_for_testing(
@@ -484,12 +431,15 @@ impl GlobalStateHasher {
         assert!(checkpoint_seq_num > 0);
 
         // Check if this is the first checkpoint of the new epoch, in which case
-        // there is nothing to wait for.
-        if self
-            .store
-            .get_root_state_hash_for_highest_epoch()?
-            .map(|(_, (last_checkpoint_prev_epoch, _))| last_checkpoint_prev_epoch)
-            == Some(checkpoint_seq_num - 1)
+        // there is nothing to wait for. Look up the previous epoch explicitly: when
+        // this checkpoint is rebuilt after a restart, the root of the current epoch
+        // may already be stored.
+        if let Some(prev_epoch) = epoch_store.epoch().checked_sub(1)
+            && self
+                .store
+                .get_root_state_hash_for_epoch(prev_epoch)?
+                .map(|(last_checkpoint_prev_epoch, _)| last_checkpoint_prev_epoch)
+                == Some(checkpoint_seq_num - 1)
         {
             return Ok(());
         }
@@ -513,7 +463,7 @@ impl GlobalStateHasher {
         }
 
         if let Some(prior_running_root) =
-            epoch_store.get_running_root_state_hash(checkpoint_seq_num - 1)?
+            epoch_store.get_running_root_state_hash(checkpoint_seq_num - 1)
         {
             return Ok(prior_running_root);
         }
@@ -548,7 +498,7 @@ impl GlobalStateHasher {
 
         // Idempotency.
         if epoch_store
-            .get_running_root_state_hash(checkpoint_seq_num)?
+            .get_running_root_state_hash(checkpoint_seq_num)
             .is_some()
         {
             debug!(
@@ -564,7 +514,6 @@ impl GlobalStateHasher {
         let checkpoint_acc = checkpoint_acc.unwrap_or_else(|| {
             epoch_store
                 .get_state_hash_for_checkpoint(&checkpoint_seq_num)
-                .expect("Failed to get checkpoint accumulator from disk")
                 .expect("Expected checkpoint accumulator to exist")
         });
         running_root.union(&checkpoint_acc);
@@ -583,7 +532,7 @@ impl GlobalStateHasher {
     ) -> SuiResult<GlobalStateHash> {
         let _scope = monitored_scope("AccumulateEpochV2");
         let running_root = epoch_store
-            .get_running_root_state_hash(last_checkpoint_of_epoch)?
+            .get_running_root_state_hash(last_checkpoint_of_epoch)
             .expect("Expected running root accumulator to exist up to last checkpoint of epoch");
 
         self.store.insert_state_hash_for_epoch(

@@ -90,6 +90,16 @@ pub trait Unsettled: Sync {
     fn withdrawn(&self, account: &messages::base::ObjectId, version: u64) -> u128;
 }
 
+/// The versions consensus assigned a transaction of the system objects
+/// execution reads without their being inputs (the reference's
+/// `SystemObjectVersions`): the accumulator root's, the live one if none,
+/// and the Clock's.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Implicit {
+    pub accumulator: Option<u64>,
+    pub clock: Option<u64>,
+}
+
 /// Where execution waits for an implicitly read system object (the
 /// accumulator root) to reach the version a transaction requires, which
 /// another transaction's execution writes. Causal admission ensures the
@@ -178,7 +188,7 @@ impl Execution {
             transaction,
             &[],
             Funds::MaybeSufficient,
-            None,
+            Implicit::default(),
             &NoneUnsettled,
             &NoneAwaited,
         )
@@ -194,7 +204,7 @@ impl Execution {
         transaction: &[u8],
         provided: &[(messages::base::ObjectId, Input<'_>)],
         funds: Funds,
-        assigned_accumulator: Option<u64>,
+        implicit: Implicit,
         unsettled: &dyn Unsettled,
         awaited: &dyn Awaited,
     ) -> Result<Outcome> {
@@ -206,20 +216,15 @@ impl Execution {
             transaction,
             provided,
             funds,
-            assigned_accumulator,
+            implicit,
             unsettled,
             awaited,
         )?;
         #[cfg(feature = "testing")]
         assert_same(
-            &self.reference.execute_at(
-                store,
-                transaction,
-                provided,
-                funds,
-                assigned_accumulator,
-                unsettled,
-            )?,
+            &self
+                .reference
+                .execute_at(store, transaction, provided, funds, implicit, unsettled)?,
             &outcome,
         );
         Ok(outcome)
@@ -343,16 +348,16 @@ impl Reference {
             transaction,
             &[],
             Funds::MaybeSufficient,
-            None,
+            Implicit::default(),
             &NoneUnsettled,
         )
     }
 
     /// `execute`, but each input named in `provided` is as given there
     /// rather than read from the store at its live version, `funds` says
-    /// whether its withdrawals were reserved, and `assigned_accumulator` is
-    /// the accumulator root's version the transaction is assigned (the
-    /// reference's `SystemObjectVersions`), if not the live one. A system
+    /// whether its withdrawals were reserved, and `implicit` are the
+    /// versions the transaction is assigned of the system objects it reads
+    /// implicitly. A system
     /// transaction runs unmetered, as the reference runs it.
     pub fn execute_at(
         &self,
@@ -360,7 +365,7 @@ impl Reference {
         transaction: &[u8],
         provided: &[(messages::base::ObjectId, Input<'_>)],
         funds: Funds,
-        assigned_accumulator: Option<u64>,
+        implicit: Implicit,
         unsettled: &dyn Unsettled,
     ) -> Result<Outcome> {
         let signed: SenderSignedData = bcs::from_bytes(transaction)?;
@@ -376,7 +381,7 @@ impl Reference {
         };
         let accumulator_version = if self.config.enable_accumulators() {
             accumulator_version(&view)?.map(|live| ConsensusObjectVersion {
-                version: assigned_accumulator.map_or(
+                version: implicit.accumulator.map_or(
                     live.version,
                     sui_types::base_types::SequenceNumber::from_u64,
                 ),
@@ -428,7 +433,21 @@ impl Reference {
             &self.epoch,
             self.epoch_start_timestamp_ms,
             inputs,
-            SystemObjectVersions::new(accumulator_version),
+            SystemObjectVersions::from_map(
+                accumulator_version
+                    .map(|v| (sui_types::SUI_ACCUMULATOR_ROOT_OBJECT_ID, v))
+                    .into_iter()
+                    .chain(implicit.clock.map(|version| {
+                        (
+                            sui_types::SUI_CLOCK_OBJECT_ID,
+                            ConsensusObjectVersion {
+                                initial_shared_version: sui_types::SUI_CLOCK_OBJECT_SHARED_VERSION,
+                                version: sui_types::base_types::SequenceNumber::from_u64(version),
+                            },
+                        )
+                    }))
+                    .collect(),
+            ),
             &ReferenceUnsettled(unsettled),
             data.gas_data().clone(),
             gas_status,

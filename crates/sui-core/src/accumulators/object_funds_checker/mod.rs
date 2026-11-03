@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use mysten_common::debug_fatal;
+use mysten_common::{debug_fatal, sync::high_water_mark::HighWaterMark};
 use sui_protocol_config::assert_reachable_gated;
 use sui_types::{
     accumulator_root::AccumulatorObjId,
@@ -16,10 +16,7 @@ use sui_types::{
     execution_params::FundsWithdrawStatus,
     transaction::TransactionDataAPI,
 };
-use tokio::{
-    sync::{oneshot, watch},
-    time::Instant,
-};
+use tokio::{sync::oneshot, time::Instant};
 use tracing::{debug, instrument};
 
 use crate::{
@@ -47,10 +44,9 @@ pub enum ObjectFundsWithdrawStatus {
 }
 
 pub struct ObjectFundsCheckerDEPRECATED {
-    /// Watchers to keep track the last settled accumulator version.
+    /// The last settled accumulator version.
     /// This is updated whenever the settlement barrier transaction is executed.
-    last_settled_version_sender: watch::Sender<SequenceNumber>,
-    last_settled_version_receiver: watch::Receiver<SequenceNumber>,
+    last_settled_version: HighWaterMark<SequenceNumber>,
     unsettled: Arc<UnsettledObjectWithdrawals>,
     metrics: Arc<metrics::ObjectFundsCheckerMetrics>,
 }
@@ -61,11 +57,8 @@ impl ObjectFundsCheckerDEPRECATED {
         unsettled: Arc<UnsettledObjectWithdrawals>,
         metrics: Arc<metrics::ObjectFundsCheckerMetrics>,
     ) -> Self {
-        let (last_settled_version_sender, last_settled_version_receiver) =
-            watch::channel(starting_accumulator_version);
         Self {
-            last_settled_version_sender,
-            last_settled_version_receiver,
+            last_settled_version: HighWaterMark::new(starting_accumulator_version),
             unsettled,
             metrics,
         }
@@ -86,6 +79,11 @@ impl ObjectFundsCheckerDEPRECATED {
     #[cfg(test)]
     fn unsettled(&self) -> &Arc<UnsettledObjectWithdrawals> {
         &self.unsettled
+    }
+
+    #[cfg(test)]
+    pub(crate) fn metrics(&self) -> &Arc<metrics::ObjectFundsCheckerMetrics> {
+        &self.metrics
     }
 
     #[instrument(level = "debug", skip_all, fields(tx_digest = ?certificate.digest()))]
@@ -203,6 +201,15 @@ impl ObjectFundsCheckerDEPRECATED {
                 let pending_metrics = self.metrics.clone();
                 let scheduler = execution_scheduler.clone();
                 let cert = certificate.clone();
+                // This env clone carries the transaction's causal index, so the retry
+                // re-submits under the original index (the driver keeps it live on a
+                // RetryLater outcome) - a freshly assigned, higher index could be
+                // unreachable for admission while earlier-enqueued transactions block
+                // waiting on this one.
+                debug_assert!(
+                    execution_env.causal_index.is_some(),
+                    "funds-withdraw retry requires an indexed env: execute via the scheduler"
+                );
                 let mut execution_env = execution_env.clone();
                 let epoch_store = epoch_store.clone();
                 tokio::task::spawn(async move {
@@ -271,8 +278,7 @@ impl ObjectFundsCheckerDEPRECATED {
         accumulator_version: SequenceNumber,
         funds_read: &dyn AccountFundsRead,
     ) -> ObjectFundsWithdrawStatus {
-        let last_settled_version = *self.last_settled_version_receiver.borrow();
-        if accumulator_version <= last_settled_version {
+        if accumulator_version <= self.last_settled_version.current() {
             // If the version we are withdrawing from is already settled, we have all the information
             // we need to determine if the funds are sufficient or not.
             if self.try_withdraw(
@@ -292,16 +298,12 @@ impl ObjectFundsCheckerDEPRECATED {
 
         // Spawn a task to wait for the last settled version to become accumulator_version,
         // before we could check again.
-        let last_settled_version_sender = self.last_settled_version_sender.clone();
+        let settled = self.last_settled_version.wait_for(accumulator_version);
         let (sender, receiver) = oneshot::channel();
         tokio::spawn(async move {
-            let mut version_receiver = last_settled_version_sender.subscribe();
             // The wait is guaranteed to be notified because we update version after executing each settlement transaction,
             // and every settlement transaction must eventually be executed.
-            let res = version_receiver
-                .wait_for(|v| *v >= accumulator_version)
-                .await;
-            if res.is_err() {
+            if settled.await.is_none() {
                 // This shouldn't happen, but just to be safe.
                 tracing::error!("Last settled accumulator version receiver channel closed");
                 return;
@@ -352,18 +354,22 @@ impl ObjectFundsCheckerDEPRECATED {
         true
     }
 
+    /// Barriers can call this out of order: barrier N+1 starts as soon as barrier N writes the
+    /// root object, and may finish first. A later barrier having executed implies every earlier
+    /// version is settled, so the settled version only ever moves forward.
     pub fn settle_accumulator_version(&self, next_accumulator_version: SequenceNumber) {
-        // unwrap is safe because a receiver is always alive as part of self.
-        self.last_settled_version_sender
-            .send(next_accumulator_version)
-            .unwrap();
-        self.metrics
-            .highest_settled_version
-            .set(next_accumulator_version.value() as i64);
+        if self
+            .last_settled_version
+            .advance_to(next_accumulator_version)
+        {
+            self.metrics
+                .highest_settled_version
+                .set(next_accumulator_version.value() as i64);
+        }
     }
 
     #[cfg(test)]
     pub fn get_current_accumulator_version(&self) -> SequenceNumber {
-        *self.last_settled_version_receiver.borrow()
+        self.last_settled_version.current()
     }
 }

@@ -296,6 +296,7 @@ impl Executor {
                 &provided,
                 funds,
                 executable.root_version,
+                entry.clock_version,
                 bump,
             ),
         };
@@ -414,6 +415,7 @@ impl Executor {
                 &provided,
                 funds,
                 executable.root_version,
+                executable.entry.clock_version,
                 bump,
             )
         };
@@ -536,6 +538,7 @@ impl Executor {
         provided: &[(messages::base::ObjectId, Input<'_>)],
         funds: Funds,
         root_version: u64,
+        clock_version: Option<u64>,
         bump: &'b Bump,
     ) -> (Message<TransactionEffects<'static>>, WrittenObjects<'b>) {
         let outcome = self
@@ -546,7 +549,10 @@ impl Executor {
                 bytes,
                 provided,
                 funds,
-                Some(root_version),
+                execution::Implicit {
+                    accumulator: Some(root_version),
+                    clock: clock_version,
+                },
                 &*self.unsettled,
                 match &self.roots {
                     Some(roots) => &**roots,
@@ -1012,6 +1018,7 @@ mod tests {
                 origin: None,
                 aliases: None,
                 cancelled: Vec::new(),
+                clock_version: None,
             },
             inputs: vec![],
             synced: None,

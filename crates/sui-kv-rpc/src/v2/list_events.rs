@@ -13,9 +13,11 @@ use sui_inverted_index::ScanDirection;
 use sui_inverted_index::ScanStop;
 use sui_inverted_index::event_seq;
 use sui_kvstore::BitmapIndexSpec;
+use sui_kvstore::RowFilter;
 use sui_kvstore::TransactionData;
 use sui_kvstore::TxSeqDigestData;
 use sui_kvstore::tables::transactions::col;
+use sui_kvstore::tables::tx_seq_digest;
 use sui_rpc::field::FieldMask;
 use sui_rpc::field::FieldMaskTree;
 use sui_rpc::field::FieldMaskUtil;
@@ -28,13 +30,15 @@ use sui_rpc::proto::sui::rpc::v2::QueryEndReason;
 use sui_rpc::proto::sui::rpc::v2::Watermark;
 use sui_rpc_api::ErrorReason;
 use sui_rpc_api::RpcError;
+use sui_rpc_api::ledger_history::checkpoint_positions::CheckpointPositions;
+use sui_rpc_api::ledger_history::ledger_point::LedgerPoint;
 use sui_rpc_api::ledger_history::query_options::IntraTxCoordinate;
 use sui_rpc_api::ledger_history::query_options::IntraTxScanBounds;
 use sui_rpc_api::ledger_history::query_options::QueryOptions;
-use sui_rpc_api::ledger_history::query_options::RangeExhaustion;
 use sui_rpc_api::ledger_history::query_options::ResolvedCheckpointRange;
 use sui_rpc_api::ledger_history::query_options::ResolvedScan;
 use sui_rpc_api::ledger_history::query_options::validate_checkpoint_bounds;
+use sui_rpc_api::ledger_history::watermark::RangeEnd;
 use sui_rpc_api::ledger_history::watermark::ScanTerminal;
 use sui_rpc_api::ledger_history::watermark::advance_covered_bound_before_checkpoint;
 use sui_rpc_api::ledger_history::watermark::boundary_watermark;
@@ -50,17 +54,22 @@ use tracing::info;
 use crate::PackageResolver;
 use crate::bigtable_client::BigTableClient;
 use crate::config::PipelineStage;
+use crate::config::ResolvedStageConfig;
 use crate::operation::QueryContext;
 use crate::pipeline::InputOrderEmitter;
+use crate::pipeline::PlacedFrontier;
 use crate::pipeline::RenderAheadError;
 use crate::pipeline::ResolvedScanStop;
 use crate::pipeline::ResolvedWatermarked;
+use crate::pipeline::SeekUnit;
 use crate::pipeline::Watermarked;
 use crate::pipeline::pipelined_chunks;
+use crate::pipeline::pipelined_keyed_batches;
 use crate::pipeline::render_ahead;
 use crate::pipeline::resolve_scan_watermarks;
 use crate::pipeline::take_items;
 use crate::render::render_json;
+use crate::request_cache::CacheFetcher;
 
 const EVENT_READ_MASK_DEFAULT: &str = sui_rpc_api::read_mask_defaults::EVENT;
 
@@ -85,12 +94,20 @@ pub(crate) async fn list_events(
     let transactions_stage = ctx.stage(PipelineStage::Transactions);
 
     validate_checkpoint_bounds(request.start_checkpoint, request.end_checkpoint)?;
+    let positions = CheckpointPositions::from_events_request(&request)?;
     let read_mask = Arc::new(validate_event_read_mask(request.read_mask)?);
     let options = QueryOptions::events_from_proto(
         request.options.as_ref(),
         endpoint.default_limit_items,
         endpoint.max_limit_items,
     )?;
+    // Compiled before the range resolves, so an invalid filter is `InvalidArgument` even for a
+    // request that leaves nothing to scan.
+    let filter_query = request
+        .filter
+        .as_ref()
+        .map(|filter| ctx.event_filter_query(filter))
+        .transpose()?;
     let checkpoint_range = ResolvedCheckpointRange::from_request(
         request.start_checkpoint,
         request.end_checkpoint,
@@ -103,13 +120,12 @@ pub(crate) async fn list_events(
     let wants_json = read_mask.contains(ProtoEvent::JSON_FIELD.name);
     let resolution = event_resolution(wants_json);
 
-    let event_range = resolve_event_range(&client, checkpoint_range, &options)
-        .instrument(debug_span!("resolve_event_range"))
-        .await?;
+    let (event_range, range_end) =
+        resolve_event_range(&client, checkpoint_range, &positions, &options)
+            .instrument(debug_span!("resolve_event_range"))
+            .await?;
     let exhaustion = event_range.exhaustion;
     let entry_checkpoint = event_range.entry_checkpoint;
-    let range_end_checkpoint = event_range.end_checkpoint;
-    let range_end_position = event_range.end_position;
     let event_bounds = event_range.bounds;
 
     if event_range.is_empty() {
@@ -122,14 +138,10 @@ pub(crate) async fn list_events(
             elapsed_ms = started.elapsed().as_millis(),
             "list_events: empty range"
         );
-        // Empty resolved ranges still surface their terminal cursor, but
-        // natural completion claims no checkpoint.
-        let terminal_position = Position::Events {
-            checkpoint: range_end_checkpoint,
-            tx_seq: range_end_position.tx_seq,
-            event_index: range_end_position.index,
-        };
-        let response = range_end_response(&options, exhaustion, terminal_position, None, true).0;
+        // An empty scan still surfaces its terminal cursor. Its natural end claims the window's
+        // edge, which the cursor that left nothing to scan vouches for, unless the window itself
+        // is empty.
+        let response = range_end_response(range_end, None)?.0;
         return Ok(async_stream::try_stream! {
             ctx.inc_stream_watermark_frames();
             ctx.observe_stream_first_frame_latency(resolution, started.elapsed());
@@ -153,8 +165,7 @@ pub(crate) async fn list_events(
     let event_ref_stream: BoxStream<
         'static,
         Result<Watermarked<EventRef, IntraTxCoordinate>, ScanStop>,
-    > = if let Some(filter) = &request.filter {
-        let query = ctx.event_filter_query(filter)?;
+    > = if let Some(query) = filter_query {
         client
             .eval_bitmap_query_stream(
                 query,
@@ -163,6 +174,7 @@ pub(crate) async fn list_events(
                 options.scan_direction(),
                 scan_budget,
                 ctx.bitmap_skip_policy(),
+                ctx.watermark_pacing(exhaustion),
                 ctx.bitmap_scan_observer(),
             )
             .map_ok(|m| {
@@ -192,8 +204,18 @@ pub(crate) async fn list_events(
     > = if filtered {
         pipelined_chunks(
             ref_stream,
-            tx_seq_digest_stage.chunk_size,
+            tx_seq_digest_stage.max_seeks_per_read,
             tx_seq_digest_stage.concurrency,
+            tx_seq_digest_stage.min_seeks_per_split_read,
+            // A transaction's events share its `tx_seq_digest` row, so they
+            // count as one key and are never split between reads.
+            SeekUnit::BucketRun {
+                group: |event: &EventRef| tx_seq_digest::forward_bucket_id(event.position.tx_seq),
+                key: |event: &EventRef| event.position.tx_seq,
+                max_keys_per_read: tx_seq_digest_stage
+                    .max_keys_per_read
+                    .expect("tx-seq-digest reads have a key cap"),
+            },
             {
                 let client = client.clone();
                 move |refs| {
@@ -211,28 +233,9 @@ pub(crate) async fn list_events(
         ref_stream
     };
 
-    let columns: Arc<[&'static str]> = Arc::from([col::EVENTS, col::CHECKPOINT_NUMBER]);
-
-    // Stage C: Watermarked<EventRef> -> Watermarked<(EventRef, TransactionData)>.
-    let tx_ref_stream = pipelined_chunks(
-        ref_with_digest_stream,
-        transactions_stage.chunk_size,
-        transactions_stage.concurrency,
-        {
-            let client = client.clone();
-            let columns = columns.clone();
-            move |refs| {
-                let client = client.clone();
-                let columns = columns.clone();
-                async move {
-                    fetch_txs_for_refs(client, columns, refs)
-                        .await
-                        .map(|s| s.map_err(ScanStop::Fault).boxed())
-                        .map_err(ScanStop::Fault)
-                }
-            }
-        },
-    );
+    // Stage C: Watermarked<EventRef> -> Watermarked<(EventRef, Arc<TransactionData>)>.
+    let tx_ref_stream =
+        event_transactions(ref_with_digest_stream, client.clone(), transactions_stage);
 
     let event_stream = resolve_scan_watermarks(
         tx_ref_stream,
@@ -263,7 +266,7 @@ pub(crate) async fn list_events(
             async move {
                 let render_started = Instant::now();
                 let rendered =
-                    render_event(event_ref, tx, &read_mask, &resolver, wants_json).await?;
+                    render_event(event_ref, &tx, &read_mask, &resolver, wants_json).await?;
                 Ok::<_, RpcError>((rendered, render_started.elapsed()))
             }
         }
@@ -275,18 +278,7 @@ pub(crate) async fn list_events(
         let mut covered_checkpoint_bound: Option<u64> = None;
         let terminal_reason = loop {
             let Some(item) = ctx.next_response_item(resolution, &mut rendered_stream).await else {
-                let terminal_position = Position::Events {
-                    checkpoint: range_end_checkpoint,
-                    tx_seq: range_end_position.tx_seq,
-                    event_index: range_end_position.index,
-                };
-                let (response, reason) = range_end_response(
-                    &options,
-                    exhaustion,
-                    terminal_position,
-                    covered_checkpoint_bound,
-                    false,
-                );
+                let (response, reason) = range_end_response(range_end, covered_checkpoint_bound)?;
                 ctx.inc_stream_watermark_frames();
                 if !first_frame_emitted {
                     ctx.observe_stream_first_frame_latency(resolution, started.elapsed());
@@ -311,6 +303,12 @@ pub(crate) async fn list_events(
                             tx_seq: rendered.position.tx_seq,
                             event_index: rendered.position.index,
                         },
+                        LedgerPoint::event(
+                            item_checkpoint,
+                            rendered.tx_offset as u64,
+                            rendered.position.index,
+                        ),
+                        direction,
                         covered_checkpoint_bound,
                     );
                     emitted += 1;
@@ -334,17 +332,14 @@ pub(crate) async fn list_events(
                         break QueryEndReason::ItemLimit;
                     }
                 }
-                Ok(ResolvedWatermarked::Watermark {
-                    position,
-                    cp: checkpoint_at_frontier,
-                }) => {
+                Ok(ResolvedWatermarked::Watermark { position, frontier }) => {
                     let watermark = event_frontier_watermark(
                         &options,
                         direction,
                         entry_checkpoint,
                         &mut covered_checkpoint_bound,
                         position,
-                        Some(checkpoint_at_frontier),
+                        Some(frontier),
                     )?;
                     let response = watermark_response(watermark);
                     ctx.inc_stream_watermark_frames();
@@ -461,85 +456,136 @@ async fn attach_tx_seq_digests(
     .boxed())
 }
 
-/// Stage C: fetch transactions for a chunk of refs, emitting
-/// `(EventRef, TransactionData)` in input ref-index order.
-async fn fetch_txs_for_refs(
+/// Stage C's output: each event with its transaction's row.
+type EventTransactions = BoxStream<
+    'static,
+    Result<Watermarked<(EventRef, Arc<TransactionData>), IntraTxCoordinate>, ScanStop>,
+>;
+
+/// Stage C: emit each event, in input order, with the `transactions` row of
+/// its transaction, read with the columns events are rendered from.
+///
+/// The reads are planned in transactions, not events: each event lists its
+/// transaction's digest as its one key of [`pipelined_keyed_batches`], so a
+/// read carries up to `max-seeks-per-read` transactions the request has not
+/// already read or started reading. An event whose transaction an earlier event
+/// already covers adds nothing to a read's size, so a transaction is read once
+/// however many events, reads or bursts its events span. Bursts close at
+/// `concurrency × max-seeks-per-read` events.
+fn event_transactions(
+    events: BoxStream<'static, Result<Watermarked<EventRef, IntraTxCoordinate>, ScanStop>>,
     client: BigTableClient,
-    columns: Arc<[&'static str]>,
-    refs: Vec<EventRef>,
-) -> Result<BoxStream<'static, Result<(EventRef, TransactionData), anyhow::Error>>, anyhow::Error> {
-    if refs.is_empty() {
-        return Ok(futures::stream::empty().boxed());
-    }
-
-    let mut unique_digests: Vec<TransactionDigest> = Vec::new();
-    let mut seen_digests: std::collections::HashSet<TransactionDigest> =
-        std::collections::HashSet::new();
-    let mut indices_by_digest: HashMap<TransactionDigest, Vec<usize>> = HashMap::new();
-    for (i, p) in refs.iter().enumerate() {
-        let row = p.tx_seq_digest.ok_or_else(|| {
-            anyhow::anyhow!(
-                "list_events: selected event {}/{} is missing transaction digest",
-                p.position.tx_seq,
-                p.position.index
-            )
-        })?;
-        if seen_digests.insert(row.digest) {
-            unique_digests.push(row.digest);
-        }
-        indices_by_digest.entry(row.digest).or_default().push(i);
-    }
-
-    let column_filter = BigTableClient::column_filter(&columns);
-    let tx_stream = client
-        .get_transactions_stream(unique_digests, Some(column_filter))
-        .await?;
-    Ok(async_stream::try_stream! {
-        let input_indices: Vec<usize> = (0..refs.len()).collect();
-        let mut emitter: InputOrderEmitter<usize, (EventRef, TransactionData)> =
-            InputOrderEmitter::new(input_indices);
-        futures::pin_mut!(tx_stream);
-        while let Some(row) = tx_stream.next().await {
-            let (digest, tx) = row?;
-            // All refs sharing this digest become ready at once. We clone
-            // `tx` per ref so each event from the same tx has its own
-            // `TransactionData`; downstream consumes by-value when reading
-            // `tx.events.data[event_idx]`.
-            let idxs = indices_by_digest.remove(&digest).ok_or_else(|| {
-                anyhow::anyhow!("list_events: unexpected transaction body row {digest}")
-            })?;
-            for idx in idxs {
-                for v in emitter.push(
-                    idx,
-                    (refs[idx], tx.clone()),
-                    "list_events: transaction body lookup for selected event",
-                )? {
-                    yield v;
+    transactions_stage: ResolvedStageConfig,
+) -> EventTransactions {
+    let keyed_events = events
+        .map(|frame| -> Result<_, ScanStop> {
+            Ok(match frame? {
+                Watermarked::Item(event) => {
+                    let digest = transaction_digest(&event)?;
+                    Watermarked::Item((event, vec![digest]))
                 }
+                Watermarked::Watermark(position) => Watermarked::Watermark(position),
+            })
+        })
+        .boxed();
+    let fetcher: Arc<dyn CacheFetcher<TransactionDigest, Arc<TransactionData>>> =
+        Arc::new(EventTransactionFetcher {
+            client,
+            column_filter: BigTableClient::column_filter(&[col::EVENTS, col::CHECKPOINT_NUMBER]),
+        });
+    pipelined_keyed_batches(
+        keyed_events,
+        transactions_stage.max_seeks_per_read,
+        transactions_stage.concurrency,
+        transactions_stage.min_seeks_per_split_read,
+        fetcher,
+    )
+    .map(|frame| -> Result<_, ScanStop> {
+        Ok(match frame? {
+            Watermarked::Item((event, transactions)) => {
+                // `transactions` holds the row of every key the event listed:
+                // its transaction's.
+                let digest = transaction_digest(&event)?;
+                Watermarked::Item((event, transactions[&digest].clone()))
             }
-        }
-        for v in emitter.finish("list_events: missing selected event transaction body")? {
-            yield v;
-        }
-    }
-    .boxed())
+            Watermarked::Watermark(position) => Watermarked::Watermark(position),
+        })
+    })
+    .boxed()
 }
 
-/// Carries the rendered `Event` plus the checkpoint and event position the main
-/// loop needs to update the watermark.
+/// The digest of `event`'s transaction. Every ref reaching stage C carries
+/// its `tx_seq_digest` row: unfiltered discovery reads it, and stage B
+/// attaches it to filtered refs.
+fn transaction_digest(event: &EventRef) -> Result<TransactionDigest, anyhow::Error> {
+    event.tx_seq_digest.map(|row| row.digest).ok_or_else(|| {
+        anyhow::anyhow!(
+            "list_events: selected event {}/{} is missing transaction digest",
+            event.position.tx_seq,
+            event.position.index
+        )
+    })
+}
+
+/// Reads `transactions` rows with the columns events are rendered from.
+struct EventTransactionFetcher {
+    client: BigTableClient,
+    column_filter: RowFilter,
+}
+
+#[async_trait::async_trait]
+impl CacheFetcher<TransactionDigest, Arc<TransactionData>> for EventTransactionFetcher {
+    async fn fetch(
+        &self,
+        digests: Vec<TransactionDigest>,
+    ) -> Result<
+        BoxStream<'static, Result<(TransactionDigest, Arc<TransactionData>), RpcError>>,
+        RpcError,
+    > {
+        let stream = self
+            .client
+            .get_transactions_stream(digests, Some(self.column_filter.clone()))
+            .await?;
+        Ok(stream
+            .map(|row| {
+                row.map(|(digest, tx)| (digest, Arc::new(tx)))
+                    .map_err(RpcError::from)
+            })
+            .boxed())
+    }
+}
+
+/// Carries the rendered `Event` plus the checkpoint, position in its
+/// checkpoint, and event position the main loop needs to update the
+/// watermark.
 struct RenderedEvent {
     event: ProtoEvent,
     checkpoint_number: u64,
+    /// The index of the event's transaction in its checkpoint.
+    tx_offset: u32,
     position: IntraTxCoordinate,
 }
 
 async fn render_event(
     event_ref: EventRef,
-    tx: TransactionData,
+    tx: &TransactionData,
     read_mask: &FieldMaskTree,
     resolver: &PackageResolver,
     wants_json: bool,
 ) -> Result<RenderedEvent, RpcError> {
+    // Stage C requires every ref's `tx_seq_digest` row (see `transaction_digest`).
+    let tx_offset = event_ref
+        .tx_seq_digest
+        .map(|row| row.tx_offset)
+        .ok_or_else(|| {
+            RpcError::new(
+                tonic::Code::Internal,
+                format!(
+                    "list_events: selected event {}/{} is missing its transaction index",
+                    event_ref.position.tx_seq, event_ref.position.index
+                ),
+            )
+        })?;
     let tx_events = tx.events.as_ref().ok_or_else(|| {
         RpcError::new(
             tonic::Code::Internal,
@@ -580,7 +626,7 @@ async fn render_event(
         proto_event.transaction_digest = Some(tx.digest.to_string());
     }
     if read_mask.contains(ProtoEvent::TRANSACTION_INDEX_FIELD.name) {
-        proto_event.transaction_index = event_ref.tx_seq_digest.map(|row| row.tx_offset as u64);
+        proto_event.transaction_index = Some(tx_offset as u64);
     }
     if read_mask.contains(ProtoEvent::EVENT_INDEX_FIELD.name) {
         proto_event.event_index = Some(event_ref.position.index);
@@ -589,6 +635,7 @@ async fn render_event(
     Ok(RenderedEvent {
         event: proto_event,
         checkpoint_number: tx.checkpoint_number,
+        tx_offset,
         position: event_ref.position,
     })
 }
@@ -603,35 +650,34 @@ fn end_response(watermark: Watermark, reason: QueryEndReason) -> ListEventsRespo
     response
 }
 
-/// Trailing terminal frame for range exhaustion. Reason and watermark derive
-/// from one `ScanTerminal`, so they cannot disagree. Natural completion of an
-/// empty interval retains its cursor but claims no checkpoint.
+/// Trailing terminal frame for range exhaustion at `range_end`. Reason and
+/// watermark derive from one `ScanTerminal`, so they cannot disagree. Natural
+/// completion claims the range end's natural end claim, which is `None` when
+/// the window has no checkpoint. Fails only for a terminal that ends with no
+/// `QueryEnd` (a serving floor), which this backend never resolves.
 fn range_end_response(
-    options: &QueryOptions,
-    exhaustion: RangeExhaustion,
-    position: Position,
+    range_end: RangeEnd,
     covered_checkpoint_bound: Option<u64>,
-    interval_empty: bool,
-) -> (ListEventsResponse, QueryEndReason) {
-    let terminal = ScanTerminal::from_range_exhaustion(exhaustion, position, interval_empty);
-    let reason = terminal.reason();
-    (
-        end_response(
-            terminal.into_watermark(options, covered_checkpoint_bound),
-            reason,
-        ),
+) -> Result<(ListEventsResponse, QueryEndReason), RpcError> {
+    let terminal = range_end.terminal();
+    let reason = terminal.reason()?;
+    Ok((
+        end_response(terminal.into_watermark(covered_checkpoint_bound), reason),
         reason,
-    )
+    ))
 }
 
+/// The Boundary watermark of an event scan frontier at `position`, placed as
+/// `frontier` (see [`ResolvedScanStop`]).
 fn event_frontier_watermark(
     options: &QueryOptions,
     direction: ScanDirection,
     entry_checkpoint: u64,
     covered_checkpoint_bound: &mut Option<u64>,
     position: IntraTxCoordinate,
-    checkpoint_at_frontier: Option<u64>,
+    frontier: Option<PlacedFrontier>,
 ) -> Result<Watermark, RpcError> {
+    let checkpoint_at_frontier = frontier.map(|frontier| frontier.checkpoint);
     if let Some(checkpoint) = checkpoint_at_frontier {
         *covered_checkpoint_bound = advance_covered_bound_before_checkpoint(
             *covered_checkpoint_bound,
@@ -658,6 +704,11 @@ fn event_frontier_watermark(
             tx_seq: position.tx_seq,
             event_index: position.index,
         },
+        // Unplaced only at the genesis or numeric-edge frontier, which starts its checkpoint.
+        frontier.map_or(
+            LedgerPoint::checkpoint_start(cursor_checkpoint),
+            |frontier| frontier.point,
+        ),
         *covered_checkpoint_bound,
     ))
 }
@@ -669,7 +720,7 @@ fn terminal_response_from_scan_stop(
     entry_checkpoint: u64,
     covered_checkpoint_bound: &mut Option<u64>,
 ) -> Result<ListEventsResponse, RpcError> {
-    let (position, checkpoint) = stop.into_scan_limit()?;
+    let (position, frontier) = stop.into_scan_limit()?;
     let terminal = ScanTerminal::ScanLimit {
         watermark: event_frontier_watermark(
             options,
@@ -677,12 +728,12 @@ fn terminal_response_from_scan_stop(
             entry_checkpoint,
             covered_checkpoint_bound,
             position,
-            checkpoint,
+            frontier,
         )?,
     };
-    let reason = terminal.reason();
+    let reason = terminal.reason()?;
     Ok(end_response(
-        terminal.into_watermark(options, *covered_checkpoint_bound),
+        terminal.into_watermark(*covered_checkpoint_bound),
         reason,
     ))
 }
@@ -807,22 +858,27 @@ fn validate_event_read_mask(read_mask: Option<FieldMask>) -> Result<FieldMaskTre
 }
 
 /// Resolve the explicit event-coordinate scan window from the logical checkpoint
-/// bounds. Filtered scans are additionally bounded at runtime by the per-request
-/// bitmap bucket budget; that limit surfaces as SCAN_LIMIT, not as an up-front
-/// cp-range clamp.
+/// bounds, narrowed to the request's `positions`, along with where the scan
+/// ends (see [`ResolvedScan::range_end`]). Filtered scans are additionally
+/// bounded at runtime by the per-request bitmap bucket budget; that limit
+/// surfaces as SCAN_LIMIT, not as an up-front cp-range clamp.
 async fn resolve_event_range(
     client: &BigTableClient,
     cp_range: ResolvedCheckpointRange,
+    positions: &CheckpointPositions,
     options: &QueryOptions,
-) -> Result<ResolvedScan<IntraTxCoordinate>, RpcError> {
-    let tx_range = client
-        .checkpoint_to_tx_range(cp_range.range.clone())
+) -> Result<(ResolvedScan<IntraTxCoordinate>, RangeEnd), RpcError> {
+    let boundary = client
+        .checkpoint_tx_boundaries(positions.boundary_checkpoints(&cp_range.range))
         .await?;
-    Ok(ResolvedScan::<IntraTxCoordinate>::resolve(
-        cp_range,
-        IntraTxCoordinate::tx_window(tx_range),
-        options,
-    ))
+    let window = positions.event_window(&cp_range.range, boundary)?;
+    let resolved = ResolvedScan::<IntraTxCoordinate>::resolve(cp_range, window.clone(), options)?;
+    let range_end = resolved.range_end(&window, options, |checkpoint, position| Position::Events {
+        checkpoint,
+        tx_seq: position.tx_seq,
+        event_index: position.index,
+    });
+    Ok((resolved, range_end))
 }
 
 #[cfg(test)]
@@ -834,13 +890,52 @@ mod tests {
     use crate::v2::test_utils::query_context_with_mock_and_registry as metric_context;
     use crate::v2::test_utils::{
         ascending_options, assert_list_metric_absent, list_counter, list_histogram,
-        query_context_with_registry,
+        query_context_with_registry, unparseable_event_filter,
     };
     use move_core_types::ident_str;
     use sui_rpc::proto::sui::rpc::v2 as proto;
     use sui_rpc_cursor::CursorToken;
     use sui_types::test_checkpoint_data_builder::TestCheckpointBuilder;
     use sui_types::{base_types::ObjectID, event::Event, gas_coin::GAS};
+
+    /// A filter that does not compile is `InvalidArgument` even when the request leaves nothing
+    /// to scan: a window starting past the tip, or an `after` cursor past it.
+    #[tokio::test]
+    async fn unparseable_filter_is_invalid_with_nothing_to_scan() {
+        // The ledger holds checkpoint 0, so the request's range resolves and only its filter
+        // can make it fail.
+        let (ctx, _registry, mock, server) = metric_context("list_events", 1).await;
+        let checkpoint = TestCheckpointBuilder::new(0)
+            .start_transaction(1)
+            .finish_transaction()
+            .build_checkpoint();
+        insert_checkpoint_rows(&mock, &checkpoint).await;
+        let after_past_tip = CursorToken::boundary(Position::Events {
+            checkpoint: 1_000,
+            tx_seq: 1_000_000,
+            event_index: 0,
+        })
+        .encode();
+        for (start_checkpoint, after) in [(Some(1_000), None), (None, Some(after_past_tip))] {
+            let mut options = ascending_options();
+            options.after = after;
+            let mut request = ListEventsRequest::default();
+            request.read_mask = Some(FieldMask::from_paths(["event_type"]));
+            request.start_checkpoint = start_checkpoint;
+            request.options = Some(options);
+            request.filter = Some(unparseable_event_filter());
+            let status = match list_events(ctx.clone(), request).await {
+                Ok(_) => panic!("accepted with start_checkpoint {start_checkpoint:?}"),
+                Err(error) => tonic::Status::from(error),
+            };
+            assert_eq!(
+                status.code(),
+                tonic::Code::InvalidArgument,
+                "start_checkpoint {start_checkpoint:?}: {status:?}"
+            );
+        }
+        server.abort();
+    }
 
     fn resolution(request: &mut ListEventsRequest, path: &str) -> &'static str {
         request.read_mask = Some(FieldMask::from_paths([path]));
@@ -974,6 +1069,135 @@ mod tests {
         assert_event_metrics(2).await;
     }
 
+    /// A checkpoint of three transactions with three events each.
+    fn three_transactions_of_three_events() -> sui_types::full_checkpoint_content::Checkpoint {
+        let event = Event::new(
+            &ObjectID::ZERO,
+            ident_str!("chunks"),
+            TestCheckpointBuilder::derive_address(1),
+            GAS::type_(),
+            vec![],
+        );
+        let mut builder = TestCheckpointBuilder::new(0);
+        for sender in 1..=3 {
+            builder = builder
+                .start_transaction(sender)
+                .with_events(vec![event.clone(); 3])
+                .finish_transaction();
+        }
+        builder.build_checkpoint()
+    }
+
+    #[tokio::test]
+    async fn reads_each_transaction_once_when_its_events_span_bursts() {
+        // The test stages take bursts of at most 2 events (1 slot,
+        // `max-seeks-per-read` 2), so bursts end inside these 3-event
+        // transactions; each transaction's row is still read once.
+        let checkpoint = three_transactions_of_three_events();
+        let (ctx, _registry, mock, server) = metric_context("list_events", 1).await;
+        insert_checkpoint_rows(&mock, &checkpoint).await;
+        let mut request = ListEventsRequest::default();
+        request.read_mask = Some(FieldMask::from_paths(["event_type"]));
+        request.options = Some(ascending_options());
+
+        let responses: Vec<_> = list_events(ctx, request)
+            .await
+            .expect("construct event stream")
+            .try_collect()
+            .await
+            .expect("collect event stream");
+        server.abort();
+
+        assert_eq!(
+            responses.iter().filter(|r| r.event.is_some()).count(),
+            9,
+            "every event is returned"
+        );
+        let mut reads_per_transaction = HashMap::new();
+        for call in mock.read_rows_calls().await {
+            if call.table == sui_kvstore::tables::transactions::NAME {
+                for key in call.row_keys {
+                    *reads_per_transaction.entry(key).or_insert(0usize) += 1;
+                }
+            }
+        }
+        assert_eq!(reads_per_transaction.len(), 3, "{reads_per_transaction:?}");
+        assert!(
+            reads_per_transaction.values().all(|&reads| reads == 1),
+            "a transaction's row was read more than once: {reads_per_transaction:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_count_transactions_not_events() {
+        // Nine events of three transactions, all ready at once. With
+        // `max-seeks-per-read` 2 and 4 slots, the first burst (8 events) needs
+        // the 3 transactions, read as 1 + 2; the ninth event's transaction is
+        // already claimed, so its burst reads nothing.
+        let checkpoint = three_transactions_of_three_events();
+        let (ctx, _registry, mock, server) = metric_context("list_events", 1).await;
+        insert_checkpoint_rows(&mock, &checkpoint).await;
+        let events: Vec<EventRef> = checkpoint
+            .transactions
+            .iter()
+            .enumerate()
+            .flat_map(|(tx_seq, transaction)| {
+                let row = TxSeqDigestData {
+                    tx_sequence_number: tx_seq as u64,
+                    digest: transaction.transaction.digest(),
+                    event_count: 3,
+                    tx_offset: 0,
+                    checkpoint_number: 0,
+                };
+                (0..3).map(move |index| EventRef {
+                    position: IntraTxCoordinate {
+                        tx_seq: row.tx_sequence_number,
+                        index,
+                    },
+                    tx_seq_digest: Some(row),
+                })
+            })
+            .collect();
+        let stage = ResolvedStageConfig {
+            max_seeks_per_read: 2,
+            concurrency: 4,
+            min_seeks_per_split_read: None,
+            max_keys_per_read: None,
+        };
+
+        let upstream = futures::stream::iter(events.clone())
+            .map(|event| Ok(Watermarked::Item(event)))
+            .boxed();
+        let emitted: Vec<(EventRef, TransactionDigest)> =
+            event_transactions(upstream, ctx.client().clone(), stage)
+                .map_ok(|frame| match frame {
+                    Watermarked::Item((event, transaction)) => (event, transaction.digest),
+                    Watermarked::Watermark(_) => panic!("no watermark was sent"),
+                })
+                .try_collect()
+                .await
+                .expect("read event transactions");
+        server.abort();
+
+        let expected: Vec<(EventRef, TransactionDigest)> = events
+            .iter()
+            .map(|event| (*event, event.tx_seq_digest.unwrap().digest))
+            .collect();
+        assert_eq!(
+            emitted, expected,
+            "each event, in order, with its own transaction"
+        );
+        let mut read_sizes: Vec<usize> = mock
+            .read_rows_calls()
+            .await
+            .into_iter()
+            .filter(|call| call.table == sui_kvstore::tables::transactions::NAME)
+            .map(|call| call.row_keys.len())
+            .collect();
+        read_sizes.sort();
+        assert_eq!(read_sizes, [1, 2]);
+    }
+
     #[tokio::test]
     async fn empty_ledger_metric_coverage_records_event_terminal_frame_metrics() {
         let (ctx, registry, server) = query_context_with_registry("list_events", 0).await;
@@ -1005,6 +1229,7 @@ mod tests {
             tx_seq: 0,
             event_index: 0,
         })
+        .with_public_position(Some(sui_rpc_cursor::PublicPosition::default()))
         .encode();
         assert_eq!(watermark.cursor.as_ref(), Some(&expected_cursor));
         assert_eq!(watermark.checkpoint, None);

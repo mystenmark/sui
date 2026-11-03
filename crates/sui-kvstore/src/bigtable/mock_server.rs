@@ -10,12 +10,27 @@
 //! - `ReadRows`: explicit row-key lookups with an optional row limit. Supports
 //!   the column filters this crate builds (`None`, `CellsPerColumnLimitFilter(1)`,
 //!   `ColumnQualifierRegexFilter`, and `Chain`s of those plus an optional
-//!   `FamilyNameRegexFilter`), records each call for assertions, and can emit
-//!   rows in reverse request order and ascending row-range scans.
-//!   Reverse scans are unsupported.
+//!   `FamilyNameRegexFilter`). A `Chain` may also hold one `Condition` filter,
+//!   placed before any column qualifier filter, whose predicate is the CAS
+//!   helper shape (`Chain` of family regex, column qualifier regex, optional
+//!   cells-per-column limit, and optional value range) with a
+//!   `PassAllFilter(true)` true branch and no false branch. Rows failing a
+//!   `Condition` predicate, and rows the column qualifier filter leaves with no
+//!   cells, are dropped before `rows_limit` is applied, mirroring BigTable where
+//!   the limit counts emitted rows. Records each call for
+//!   assertions, can emit rows in reverse request order, can stream a response
+//!   one row per message with a fixed delay before each row, and serves
+//!   row-range scans in either direction (reversed scans are range-only).
 //! - `CheckAndMutateRow`: `PassAllFilter(true)` and the CAS helper shape used
 //!   by this crate (`Chain` of family regex, column qualifier regex, optional
 //!   value range, and optional cells-per-column limit).
+//! - `PingAndWarm`: succeeds unless `ping_should_fail` (answer with an error)
+//!   or `ping_should_stall` (never answer) is set.
+//! - Fault injection: per-connection stalls, where `ReadRows` and `PingAndWarm`
+//!   calls from a stalled peer never get response headers; per-connection
+//!   failures, where those calls fail at once with `Unavailable`; and one-shot
+//!   `ReadRows` interruptions that stall or fail a response after a number of
+//!   complete rows plus the first chunk of the next row.
 //!
 //! Anything outside that subset should return `UNIMPLEMENTED` so tests do not
 //! accidentally rely on BigTable behavior this mock does not model.
@@ -66,6 +81,7 @@ use crate::bigtable::proto::bigtable::v2::mutate_rows_response::Entry;
 use crate::bigtable::proto::bigtable::v2::mutation;
 use crate::bigtable::proto::bigtable::v2::read_rows_response::CellChunk;
 use crate::bigtable::proto::bigtable::v2::read_rows_response::cell_chunk::RowStatus;
+use crate::bigtable::proto::bigtable::v2::row_filter;
 use crate::bigtable::proto::bigtable::v2::row_filter::Filter;
 use crate::bigtable::proto::bigtable::v2::value_range::EndValue;
 use crate::bigtable::proto::bigtable::v2::value_range::StartValue;
@@ -82,11 +98,14 @@ pub struct ExpectedCall {
 }
 
 /// A single recorded `ReadRows` call: the resolved table name (suffix after
-/// `/tables/`) and the row keys selected by the request.
+/// `/tables/`), the row keys selected by the request, and the column
+/// qualifiers its filter restricts the read to (sorted; `None` when the
+/// filter has no column qualifier restriction).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadRowsCall {
     pub table: String,
     pub row_keys: Vec<Bytes>,
+    pub column_qualifiers: Option<Vec<Bytes>>,
 }
 
 /// Order in which `ReadRows` emits matching rows relative to the request's
@@ -97,6 +116,22 @@ pub enum ReadRowsResponseOrder {
     #[default]
     RequestOrder,
     ReverseRequestOrder,
+}
+
+/// Fault for one `ReadRows` response: after `after_rows` complete rows and the
+/// first chunk of the next row (if any), apply `fault`.
+#[derive(Clone, Debug)]
+pub struct ReadRowsInterruption {
+    pub after_rows: usize,
+    pub fault: ReadRowsFault,
+}
+
+#[derive(Clone, Debug)]
+pub enum ReadRowsFault {
+    /// Keep the response stream open without sending anything more.
+    Stall,
+    /// End the response stream with this status.
+    Fail(Status),
 }
 
 struct Cell {
@@ -207,6 +242,17 @@ struct MockState {
     read_rows_calls: Vec<ReadRowsCall>,
     /// Order in which `ReadRows` emits matching rows.
     read_rows_response_order: ReadRowsResponseOrder,
+    /// Delay before each row of a `ReadRows` response; when nonzero, rows
+    /// are sent one message each, so tests can model backend latency.
+    read_rows_latency: std::time::Duration,
+    /// Remote addresses whose `ReadRows` and `PingAndWarm` calls never respond.
+    stalled_peers: HashSet<SocketAddr>,
+    /// Remote addresses whose `ReadRows` and `PingAndWarm` calls fail with `Unavailable`.
+    failing_peers: HashSet<SocketAddr>,
+    /// Remote address of every `PingAndWarm` call, in arrival order.
+    ping_peers: Vec<SocketAddr>,
+    /// Faults for upcoming `ReadRows` calls, one per call, in order.
+    read_rows_interruptions: VecDeque<ReadRowsInterruption>,
 }
 
 /// Mock BigTable server with injectable failures and call recording.
@@ -215,6 +261,8 @@ pub struct MockBigtableServer {
     state: Arc<Mutex<MockState>>,
     /// When true, PingAndWarm returns an error.
     pub ping_should_fail: Arc<AtomicBool>,
+    /// When true, PingAndWarm never responds.
+    pub ping_should_stall: Arc<AtomicBool>,
     /// Total number of requests received across all RPCs.
     pub request_count: Arc<AtomicUsize>,
     /// Total number of MutateRows requests received.
@@ -229,6 +277,7 @@ impl MockBigtableServer {
         Self {
             state: Arc::new(Mutex::new(MockState::default())),
             ping_should_fail: Arc::new(AtomicBool::new(false)),
+            ping_should_stall: Arc::new(AtomicBool::new(false)),
             request_count: Arc::new(AtomicUsize::new(0)),
             mutate_rows_count: Arc::new(AtomicUsize::new(0)),
             check_and_mutate_failures: Arc::new(AtomicUsize::new(0)),
@@ -359,6 +408,68 @@ impl MockBigtableServer {
         self.state.lock().await.read_rows_response_order = order;
     }
 
+    /// Stream every subsequent `ReadRows` response one row per message, each
+    /// sent `latency` after the previous one, so tests can model a backend
+    /// that returns rows over time. The delay is a tokio sleep, so it follows
+    /// a paused test clock.
+    pub async fn set_read_rows_latency(&self, latency: std::time::Duration) {
+        self.state.lock().await.read_rows_latency = latency;
+    }
+
+    /// Never respond to `ReadRows` or `PingAndWarm` calls arriving from `peer`:
+    /// the handler waits forever before sending response headers.
+    pub async fn stall_peer(&self, peer: SocketAddr) {
+        self.state.lock().await.stalled_peers.insert(peer);
+    }
+
+    /// Answer calls from `peer` again. Calls already stalled stay stalled.
+    pub async fn unstall_peer(&self, peer: SocketAddr) {
+        self.state.lock().await.stalled_peers.remove(&peer);
+    }
+
+    /// Fail `ReadRows` and `PingAndWarm` calls from `peer` at once with `Unavailable`.
+    pub async fn fail_peer(&self, peer: SocketAddr) {
+        self.state.lock().await.failing_peers.insert(peer);
+    }
+
+    /// Remote address of every `PingAndWarm` call so far, in arrival order.
+    pub async fn ping_peers(&self) -> Vec<SocketAddr> {
+        self.state.lock().await.ping_peers.clone()
+    }
+
+    /// Queue `interruption` for a later `ReadRows` call: each call the mock accepts takes the
+    /// oldest queued interruption, if any. A call rejected first, by a stalled or failing peer or
+    /// as an unsupported request, leaves the queue alone.
+    pub async fn interrupt_next_read_rows(&self, interruption: ReadRowsInterruption) {
+        self.state
+            .lock()
+            .await
+            .read_rows_interruptions
+            .push_back(interruption);
+    }
+
+    /// Apply the faults injected for the peer that sent `request`: never answer if it is
+    /// stalled, fail with `Unavailable` if it is failing.
+    async fn apply_peer_faults<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        let Some(peer) = request.remote_addr() else {
+            return Ok(());
+        };
+        let (stalled, failing) = {
+            let state = self.state.lock().await;
+            (
+                state.stalled_peers.contains(&peer),
+                state.failing_peers.contains(&peer),
+            )
+        };
+        if stalled {
+            std::future::pending::<()>().await;
+        }
+        if failing {
+            return Err(Status::unavailable("injected peer failure"));
+        }
+        Ok(())
+    }
+
     /// Start the mock server on a random available port.
     /// Returns the socket address the server is listening on.
     pub async fn start(&self) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
@@ -367,7 +478,17 @@ impl MockBigtableServer {
         let mock = self.clone();
 
         let handle = tokio::spawn(async move {
-            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            // Responses streamed as several small messages (see
+            // `set_read_rows_latency`) would otherwise stall on Nagle's
+            // algorithm and delayed ACKs, arriving in bursts.
+            let incoming = tokio_stream::StreamExt::map(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                |stream| {
+                    let stream = stream?;
+                    stream.set_nodelay(true)?;
+                    Ok::<_, std::io::Error>(stream)
+                },
+            );
             Server::builder()
                 .add_service(BigtableServer::new(mock))
                 .serve_with_incoming(incoming)
@@ -408,13 +529,25 @@ fn extract_qualifier_alternation(pattern: &[u8]) -> Option<Vec<Vec<u8>>> {
     Some(inner.split(|&b| b == b'|').map(|s| s.to_vec()).collect())
 }
 
-/// Parse a `ReadRows` row filter into the set of allowed column qualifiers.
-/// `Ok(None)` means no qualifier restriction (all cells pass); `Ok(Some(set))`
-/// restricts emitted cells to those qualifiers. Only the filter shapes this
-/// crate builds are supported: `None`, `CellsPerColumnLimitFilter(1)`,
+/// The parsed form of a `ReadRows` row filter: an optional restriction on
+/// emitted column qualifiers (`None` means every qualifier passes) and an
+/// optional row-selecting `Condition` predicate.
+struct ReadFilter {
+    allowed_qualifiers: Option<HashSet<Vec<u8>>>,
+    condition: Option<RowPredicate>,
+}
+
+/// Parse a `ReadRows` row filter. Only the filter shapes this crate builds are
+/// supported: `None`, `CellsPerColumnLimitFilter(1)`,
 /// `ColumnQualifierRegexFilter`, and a `Chain` of those plus an optional
-/// `FamilyNameRegexFilter` matching [`crate::tables::FAMILY`].
-fn parse_read_filter(filter: Option<Filter>) -> Result<Option<HashSet<Vec<u8>>>, Status> {
+/// `FamilyNameRegexFilter` matching [`crate::tables::FAMILY`] and at most one
+/// `Condition` (see [`parse_read_condition`]).
+///
+/// The mock evaluates a `Condition` predicate against the full stored row.
+/// BigTable feeds each `Chain` element the output of the previous one, so a
+/// `Condition` after a column qualifier filter would only see the surviving
+/// cells; that ordering is rejected rather than modeled.
+fn parse_read_filter(filter: Option<Filter>) -> Result<ReadFilter, Status> {
     fn qualifiers_from_regex(pattern: &Bytes) -> Result<HashSet<Vec<u8>>, Status> {
         extract_qualifier_alternation(pattern.as_ref())
             .map(|quals| quals.into_iter().collect())
@@ -424,18 +557,21 @@ fn parse_read_filter(filter: Option<Filter>) -> Result<Option<HashSet<Vec<u8>>>,
                 )
             })
     }
+    let mut parsed = ReadFilter {
+        allowed_qualifiers: None,
+        condition: None,
+    };
     match filter {
-        None | Some(Filter::CellsPerColumnLimitFilter(1)) => Ok(None),
+        None | Some(Filter::CellsPerColumnLimitFilter(1)) => {}
         Some(Filter::ColumnQualifierRegexFilter(pattern)) => {
-            Ok(Some(qualifiers_from_regex(&pattern)?))
+            parsed.allowed_qualifiers = Some(qualifiers_from_regex(&pattern)?);
         }
         Some(Filter::Chain(chain)) => {
-            let mut allowed: Option<HashSet<Vec<u8>>> = None;
             for f in chain.filters {
                 match f.filter {
                     Some(Filter::CellsPerColumnLimitFilter(1)) | None => {}
                     Some(Filter::ColumnQualifierRegexFilter(pattern)) => {
-                        allowed = Some(qualifiers_from_regex(&pattern)?);
+                        parsed.allowed_qualifiers = Some(qualifiers_from_regex(&pattern)?);
                     }
                     Some(Filter::FamilyNameRegexFilter(family)) => {
                         let family = Bytes::from(family.into_bytes());
@@ -445,6 +581,19 @@ fn parse_read_filter(filter: Option<Filter>) -> Result<Option<HashSet<Vec<u8>>>,
                             ));
                         }
                     }
+                    Some(Filter::Condition(condition)) => {
+                        if parsed.condition.is_some() {
+                            return Err(Status::unimplemented(
+                                "mock ReadRows supports at most one Condition per Chain",
+                            ));
+                        }
+                        if parsed.allowed_qualifiers.is_some() {
+                            return Err(Status::unimplemented(
+                                "mock ReadRows does not support a Condition after a column qualifier filter",
+                            ));
+                        }
+                        parsed.condition = Some(parse_read_condition(*condition)?);
+                    }
                     _ => {
                         return Err(Status::unimplemented(
                             "mock ReadRows Chain filter contains an unsupported sub-filter",
@@ -452,10 +601,42 @@ fn parse_read_filter(filter: Option<Filter>) -> Result<Option<HashSet<Vec<u8>>>,
                     }
                 }
             }
-            Ok(allowed)
         }
-        Some(_) => Err(Status::unimplemented(
-            "mock ReadRows only supports column-qualifier / cells-per-column / chain filters",
+        Some(_) => {
+            return Err(Status::unimplemented(
+                "mock ReadRows only supports column-qualifier / cells-per-column / chain filters",
+            ));
+        }
+    }
+    Ok(parsed)
+}
+
+/// Parse a `ReadRows` `Condition` filter whose predicate is the CAS helper
+/// shape into a [`RowPredicate`]. The true branch must pass all cells and no
+/// false branch is supported — anything else is unsupported.
+fn parse_read_condition(condition: row_filter::Condition) -> Result<RowPredicate, Status> {
+    let row_filter::Condition {
+        predicate_filter,
+        true_filter,
+        false_filter,
+    } = condition;
+    if false_filter.is_some() {
+        return Err(Status::unimplemented(
+            "mock ReadRows Condition does not support a false_filter",
+        ));
+    }
+    match true_filter.as_ref().and_then(|f| f.filter.as_ref()) {
+        Some(Filter::PassAllFilter(true)) => {}
+        _ => {
+            return Err(Status::unimplemented(
+                "mock ReadRows Condition only supports PassAllFilter(true) as the true_filter",
+            ));
+        }
+    }
+    match predicate_filter.map(|f| f.filter) {
+        Some(Some(Filter::Chain(chain))) => parse_predicate_chain(chain),
+        _ => Err(Status::unimplemented(
+            "mock ReadRows Condition only supports a CAS-style Chain predicate",
         )),
     }
 }
@@ -486,6 +667,68 @@ fn value_in_range(value: &Bytes, vr: &crate::bigtable::proto::bigtable::v2::Valu
         None => true,
     };
     lo_ok && hi_ok
+}
+
+/// A parsed CAS-style predicate chain: optional family, required column
+/// qualifier, optional value range. Both `CheckAndMutateRow` and `ReadRows`
+/// `Condition` filters use this shape.
+struct RowPredicate {
+    family: Option<String>,
+    column: Vec<u8>,
+    value_range: Option<crate::bigtable::proto::bigtable::v2::ValueRange>,
+}
+
+/// Parse the CAS predicate chain into a [`RowPredicate`]. The CAS helpers in
+/// this crate build a `Chain` with at least a FamilyNameRegex +
+/// ColumnQualifierRegex, optionally followed by a ValueRangeFilter (ignoring a
+/// no-op CellsPerColumnLimitFilter if present). Anything else is unsupported.
+fn parse_predicate_chain(
+    chain: crate::bigtable::proto::bigtable::v2::row_filter::Chain,
+) -> Result<RowPredicate, Status> {
+    let mut family: Option<String> = None;
+    let mut column: Option<Bytes> = None;
+    let mut value_range: Option<crate::bigtable::proto::bigtable::v2::ValueRange> = None;
+    for f in chain.filters {
+        match f.filter {
+            Some(Filter::FamilyNameRegexFilter(s)) => family = Some(s),
+            Some(Filter::ColumnQualifierRegexFilter(q)) => column = Some(q),
+            Some(Filter::ValueRangeFilter(vr)) => value_range = Some(vr),
+            Some(Filter::CellsPerColumnLimitFilter(1)) => {}
+            Some(Filter::CellsPerColumnLimitFilter(_)) => {
+                return Err(Status::unimplemented(
+                    "mock CAS predicate only supports CellsPerColumnLimitFilter(1)",
+                ));
+            }
+            _ => {
+                return Err(Status::unimplemented(
+                    "mock only supports Chain of Family/ColumnQualifier/ValueRange",
+                ));
+            }
+        }
+    }
+    let Some(column) = column else {
+        return Err(Status::unimplemented(
+            "mock CAS predicate chain requires a ColumnQualifierRegex",
+        ));
+    };
+    // The production helpers emit `^<literal>$`; strip anchors for exact match.
+    Ok(RowPredicate {
+        family,
+        column: strip_regex_anchors(&column).to_vec(),
+        value_range,
+    })
+}
+
+/// Whether any cell in `row` satisfies the parsed predicate.
+fn row_satisfies(row: &Row, predicate: &RowPredicate) -> bool {
+    row.iter().any(|((fam, col), cell)| {
+        predicate.family.as_deref().is_none_or(|f| fam == f)
+            && col.as_ref() == predicate.column.as_slice()
+            && predicate
+                .value_range
+                .as_ref()
+                .is_none_or(|vr| value_in_range(&cell.value, vr))
+    })
 }
 
 /// Stream type for streaming responses.
@@ -635,6 +878,7 @@ impl Bigtable for MockBigtableServer {
         request: Request<ReadRowsRequest>,
     ) -> Result<Response<Self::ReadRowsStream>, Status> {
         self.request_count.fetch_add(1, Ordering::Relaxed);
+        self.apply_peer_faults(&request).await?;
         let req = request.into_inner();
         let mut state = self.state.lock().await;
 
@@ -650,15 +894,14 @@ impl Bigtable for MockBigtableServer {
                 "mock ReadRows does not support negative rows_limit",
             ));
         }
-        // Parse the column filter into an optional set of allowed qualifiers.
-        // `None` means every qualifier passes; `Some(set)` restricts emitted
-        // cells to those qualifiers. Only the filter shapes this crate builds
-        // are supported (see `BigTableClient::column_filter` /
-        // `build_multi_get_request`).
-        let allowed_qualifiers = match parse_read_filter(req.filter.and_then(|f| f.filter)) {
-            Ok(set) => set,
-            Err(status) => return Err(status),
-        };
+        // Parse the row filter into an optional set of allowed qualifiers and
+        // an optional row-selecting predicate. Only the filter shapes this
+        // crate builds are supported (see `BigTableClient::column_filter` /
+        // `build_multi_get_request` / `range_scan_internal`).
+        let ReadFilter {
+            allowed_qualifiers,
+            condition,
+        } = parse_read_filter(req.filter.and_then(|f| f.filter))?;
         let Some(row_set) = req.rows else {
             return Err(Status::unimplemented(
                 "mock ReadRows requires row_keys or row_ranges",
@@ -667,6 +910,11 @@ impl Bigtable for MockBigtableServer {
         if !row_set.row_keys.is_empty() && !row_set.row_ranges.is_empty() {
             return Err(Status::unimplemented(
                 "mock ReadRows does not support mixing row_keys and row_ranges",
+            ));
+        }
+        if req.reversed && !row_set.row_keys.is_empty() {
+            return Err(Status::unimplemented(
+                "mock ReadRows supports reversed scans only for row ranges",
             ));
         }
 
@@ -686,12 +934,37 @@ impl Bigtable for MockBigtableServer {
                 requested_keys.reverse();
             }
         }
+
+        // Rows are selected server-side before `rows_limit` is applied, mirroring BigTable where
+        // the limit counts rows actually emitted after filtering: a row is dropped if it fails
+        // the `Condition` predicate or if the column qualifier filter leaves it with no cells.
+        // Missing rows stay in the recorded request unless a `Condition` is present.
+        requested_keys.retain(|key| {
+            let Some(row) = state.rows.get(&(table.clone(), key.clone())) else {
+                return condition.is_none();
+            };
+            condition
+                .as_ref()
+                .is_none_or(|predicate| row_satisfies(row, predicate))
+                && allowed_qualifiers.as_ref().is_none_or(|allowed| {
+                    row.keys()
+                        .any(|(_, qualifier)| allowed.contains(qualifier.as_ref()))
+                })
+        });
         if req.rows_limit != 0 {
             requested_keys.truncate(req.rows_limit as usize);
         }
         state.read_rows_calls.push(ReadRowsCall {
             table: table.clone(),
             row_keys: requested_keys.clone(),
+            column_qualifiers: allowed_qualifiers.as_ref().map(|allowed| {
+                let mut qualifiers: Vec<Bytes> = allowed
+                    .iter()
+                    .map(|qualifier| Bytes::copy_from_slice(qualifier))
+                    .collect();
+                qualifiers.sort_unstable();
+                qualifiers
+            }),
         });
         if ranges.is_empty()
             && state.read_rows_response_order == ReadRowsResponseOrder::ReverseRequestOrder
@@ -699,12 +972,14 @@ impl Bigtable for MockBigtableServer {
             requested_keys.reverse();
         }
 
-        let mut chunks = Vec::new();
+        let row_latency = state.read_rows_latency;
+        let interruption = state.read_rows_interruptions.pop_front();
+        let mut rows: Vec<Vec<CellChunk>> = Vec::new();
         for row_key in requested_keys {
             let Some(row) = state.rows.get(&(table.clone(), row_key.clone())) else {
                 continue;
             };
-            let start = chunks.len();
+            let mut row_chunks = Vec::new();
             for ((family, qualifier), cell) in row {
                 if allowed_qualifiers
                     .as_ref()
@@ -712,7 +987,7 @@ impl Bigtable for MockBigtableServer {
                 {
                     continue;
                 }
-                chunks.push(CellChunk {
+                row_chunks.push(CellChunk {
                     row_key: row_key.clone(),
                     family_name: Some(family.clone()),
                     qualifier: Some(qualifier.to_vec()),
@@ -725,19 +1000,56 @@ impl Bigtable for MockBigtableServer {
             }
             // Emit CommitRow on this row's last emitted chunk. Skip rows that
             // produced no matching cells so we don't tag a prior row's chunk.
-            if chunks.len() > start
-                && let Some(last) = chunks.last_mut()
-            {
-                last.row_status = Some(RowStatus::CommitRow(true));
-            }
+            let Some(last) = row_chunks.last_mut() else {
+                continue;
+            };
+            last.row_status = Some(RowStatus::CommitRow(true));
+            rows.push(row_chunks);
         }
 
-        let response = ReadRowsResponse {
-            chunks,
-            last_scanned_row_key: Bytes::new(),
-            request_stats: None,
+        // An interruption cuts the response after its complete rows, sending
+        // the first chunk of the next row uncommitted before the fault.
+        let interruption = interruption.map(|ReadRowsInterruption { after_rows, fault }| {
+            let partial_row = rows.get(after_rows).map(|chunks| CellChunk {
+                row_status: None,
+                ..chunks[0].clone()
+            });
+            rows.truncate(after_rows);
+            (partial_row, fault)
+        });
+        // One message per row when the test models row latency, else one
+        // message for the whole response.
+        let messages: Vec<Vec<CellChunk>> = if row_latency.is_zero() {
+            vec![rows.into_iter().flatten().collect()]
+        } else {
+            rows
         };
-        let stream = tokio_stream::once(Ok(response));
+
+        let stream = async_stream::stream! {
+            for chunks in messages {
+                if !row_latency.is_zero() {
+                    tokio::time::sleep(row_latency).await;
+                }
+                yield Ok(ReadRowsResponse {
+                    chunks,
+                    last_scanned_row_key: Bytes::new(),
+                    request_stats: None,
+                });
+            }
+            if let Some((partial_row, fault)) = interruption {
+                if let Some(chunk) = partial_row {
+                    yield Ok(ReadRowsResponse {
+                        chunks: vec![chunk],
+                        last_scanned_row_key: Bytes::new(),
+                        request_stats: None,
+                    });
+                }
+                match fault {
+                    ReadRowsFault::Stall => std::future::pending::<()>().await,
+                    ReadRowsFault::Fail(status) => yield Err(status),
+                }
+            }
+        };
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -789,45 +1101,12 @@ impl Bigtable for MockBigtableServer {
             Some(Filter::Chain(chain)) => {
                 // The CAS helpers in this crate always build a Chain with at least a
                 // FamilyNameRegex + ColumnQualifierRegex, optionally followed by a
-                // ValueRangeFilter. Parse those components (ignoring a no-op
-                // CellsPerColumnLimitFilter if present) and check whether any cell in
-                // the row satisfies all of them. Anything else is unsupported.
-                let mut family: Option<&str> = None;
-                let mut column: Option<&Bytes> = None;
-                let mut value_range: Option<&crate::bigtable::proto::bigtable::v2::ValueRange> =
-                    None;
-                for f in &chain.filters {
-                    match &f.filter {
-                        Some(Filter::FamilyNameRegexFilter(s)) => family = Some(s.as_str()),
-                        Some(Filter::ColumnQualifierRegexFilter(q)) => column = Some(q),
-                        Some(Filter::ValueRangeFilter(vr)) => value_range = Some(vr),
-                        Some(Filter::CellsPerColumnLimitFilter(1)) => {}
-                        Some(Filter::CellsPerColumnLimitFilter(_)) => {
-                            return Err(Status::unimplemented(
-                                "mock CAS predicate only supports CellsPerColumnLimitFilter(1)",
-                            ));
-                        }
-                        _ => {
-                            return Err(Status::unimplemented(
-                                "mock only supports Chain of Family/ColumnQualifier/ValueRange",
-                            ));
-                        }
-                    }
-                }
-                let Some(column) = column else {
-                    return Err(Status::unimplemented(
-                        "mock CAS predicate chain requires a ColumnQualifierRegex",
-                    ));
-                };
-                // The production helpers emit `^<literal>$`; strip anchors for exact match.
-                let column_literal = strip_regex_anchors(column);
+                // ValueRangeFilter. Check whether any cell in the row satisfies all
+                // of the parsed components. Anything else is unsupported.
+                let predicate = parse_predicate_chain(chain)?;
                 match row {
                     None => false,
-                    Some(row) => row.iter().any(|((fam, col), cell)| {
-                        family.is_none_or(|f| fam == f)
-                            && col.as_ref() == column_literal
-                            && value_range.is_none_or(|vr| value_in_range(&cell.value, vr))
-                    }),
+                    Some(row) => row_satisfies(row, &predicate),
                 }
             }
             None => false,
@@ -864,9 +1143,16 @@ impl Bigtable for MockBigtableServer {
 
     async fn ping_and_warm(
         &self,
-        _request: Request<PingAndWarmRequest>,
+        request: Request<PingAndWarmRequest>,
     ) -> Result<Response<PingAndWarmResponse>, Status> {
         self.request_count.fetch_add(1, Ordering::Relaxed);
+        if let Some(peer) = request.remote_addr() {
+            self.state.lock().await.ping_peers.push(peer);
+        }
+        self.apply_peer_faults(&request).await?;
+        if self.ping_should_stall.load(Ordering::Relaxed) {
+            std::future::pending::<()>().await;
+        }
         if self.ping_should_fail.load(Ordering::Relaxed) {
             return Err(Status::unavailable("injected ping failure"));
         }

@@ -385,8 +385,12 @@ impl Network {
                     .build(&mut OsRng)
             })
             .collect();
-        let config =
-            configure(ConfigBuilder::new_with_temp_dir().with_validators(validators)).build();
+        let config = configure(
+            ConfigBuilder::new_with_temp_dir()
+                .with_validators(validators)
+                .with_protocol_version(anchovy_max()),
+        )
+        .build();
         let (sui_configs, [anchovy_config]) = config.validator_configs.split_at(2) else {
             unreachable!("three validators");
         };
@@ -1384,12 +1388,18 @@ fn a_commit_past_the_checkpoint_limit_splits_alike() {
     drop(network.runtime);
 }
 
+/// The highest protocol version anchovy implements.
+fn anchovy_max() -> ProtocolVersion {
+    ProtocolVersion::new(execution::upgrade::MAX_PROTOCOL_VERSION)
+}
+
 /// Gives the version below the highest the highest's gas model, the only
 /// one anchovy's executor runs, alike for sui and anchovy (one process, one
 /// override): before any config is read, held for the test.
 fn runnable_below_max() -> OverrideGuard {
-    let below = ProtocolVersion::MAX.prev();
-    let gas_model = ProtocolConfig::get_for_max_version_UNSAFE().gas_model_version();
+    let below = anchovy_max().prev();
+    let gas_model =
+        ProtocolConfig::get_for_version(anchovy_max(), Chain::Unknown).gas_model_version();
     ProtocolConfig::apply_overrides_for_testing(move |version, mut config| {
         if version == below {
             config.set_gas_model_version_for_testing(gas_model);
@@ -1405,7 +1415,7 @@ fn runnable_below_max() -> OverrideGuard {
 #[test]
 fn the_network_upgrades_with_anchovy_s_support() {
     let _runnable = runnable_below_max();
-    let max = ProtocolVersion::MAX;
+    let max = anchovy_max();
     let mut network = Network::configured(|builder| {
         builder
             .with_epoch_duration(5_000)
@@ -1430,7 +1440,7 @@ fn the_network_upgrades_with_anchovy_s_support() {
 #[test]
 fn a_split_vote_keeps_the_version() {
     let _runnable = runnable_below_max();
-    let max = ProtocolVersion::MAX;
+    let max = anchovy_max();
     let mut network = Network::configured(|builder| {
         builder
             .with_epoch_duration(5_000)
@@ -1771,6 +1781,67 @@ fn a_lagging_consensus_follows_certified_checkpoints_alike() {
     drop(network.runtime);
 }
 
+/// Whether `effects` record the Clock as read but not declared.
+fn reads_the_clock_implicitly(effects: &TransactionEffects) -> bool {
+    effects
+        .unchanged_consensus_objects()
+        .iter()
+        .any(|(id, kind)| {
+            *id == sui_types::SUI_CLOCK_OBJECT_ID
+                && matches!(
+                    kind,
+                    sui_types::effects::UnchangedConsensusKind::ReadOnlyRoot(_)
+                )
+        })
+}
+
+/// Transactions borrowing the Clock without its being an input read it at
+/// the version their commit's prologue writes, alike, commit after commit.
+#[test]
+fn the_clock_borrowed_without_an_input_reads_alike() {
+    let mut network = Network::new();
+    let package = network.object_basics(0);
+    let sender = network.sender;
+    for i in 1..3 {
+        let create = network.call(
+            i,
+            package,
+            "object_basics",
+            "create_with_clock_timestamp",
+            vec![CallArg::Pure(bcs::to_bytes(&sender).unwrap())],
+        );
+        let effects = network.execute(&create);
+        assert!(reads_the_clock_implicitly(&effects), "{effects:?}");
+    }
+    drop(network.runtime);
+}
+
+/// While anchovy's consensus lags, a transaction borrowing the Clock runs
+/// from its certificate at the Clock version its effects record, alike.
+#[test]
+fn a_lagging_consensus_borrows_the_clock_alike() {
+    let mut network = Network::new();
+    let package = network.object_basics(0);
+    let sender = network.sender;
+    network.anchovy.runner.held.store(true, Ordering::SeqCst);
+    let create = network.call(
+        1,
+        package,
+        "object_basics",
+        "create_with_clock_timestamp",
+        vec![CallArg::Pure(bcs::to_bytes(&sender).unwrap())],
+    );
+    network.submit_through_sui(&[&create]);
+    let effects = network.committed(&create);
+    assert!(effects.status().is_ok(), "{:?}", effects.status());
+    assert!(reads_the_clock_implicitly(&effects), "{effects:?}");
+
+    network.anchovy.runner.held.store(false, Ordering::SeqCst);
+    let later = network.transfer(2);
+    network.execute(&later);
+    drop(network.runtime);
+}
+
 /// Anchovy's consensus is held while sui's validators pass the epoch's end:
 /// it finishes the epoch on certified checkpoints alone, the last with its
 /// change-epoch transaction, then follows consensus in the next.
@@ -1901,6 +1972,7 @@ fn the_composite_workload_runs_alike() {
     use sui_benchmark::workloads::adversarial::AdversarialPayloadCfg;
     use sui_benchmark::workloads::composite::*;
     use sui_benchmark::workloads::expected_failure::ExpectedFailurePayloadCfg;
+    use sui_benchmark::workloads::gas_double_spend::GasDoubleSpendSubmission;
     use sui_benchmark::workloads::workload::ExpectedFailureType;
     use sui_benchmark::workloads::workload_configuration::{
         WorkloadConfig, WorkloadConfiguration, WorkloadWeights,
@@ -2000,9 +2072,9 @@ fn the_composite_workload_runs_alike() {
                 randomness: 0,
                 randomized_transaction: 0,
                 slow: 0,
-                party: 0,
                 conflicting_transfer: 0,
                 composite: 1,
+                gas_double_spend: 0,
             },
             adversarial_cfg: AdversarialPayloadCfg::from_str("0-1.0").unwrap(),
             large_transaction_size_bytes: 100_000,
@@ -2016,6 +2088,8 @@ fn the_composite_workload_runs_alike() {
             shared_counter_gas_price_multiplier: 1.0,
             num_contested_objects: 2,
             randomized_transaction_concurrency: 4,
+            gas_double_spend_copies: 2,
+            gas_double_spend_submission: GasDoubleSpendSubmission::default(),
             target_qps: 20,
             in_flight_ratio: 2,
             duration: Interval::from_str("unbounded").unwrap(),

@@ -127,6 +127,7 @@ async fn the_stage_records_each_committed_transaction_s_status() {
             authenticator_initial_shared_version: None,
             randomness_initial_shared_version: None,
             accumulator_root_version: 1,
+            clock_version: 1,
             epoch_start_timestamp_ms: 0,
             epoch_duration_ms: u64::MAX,
         },
@@ -321,6 +322,7 @@ fn a_deferred_transaction_outlives_a_restart() {
         next_seq: 2,
         last_built_timestamp: 0,
         root_version: 1,
+        clock_version: 1,
         closed: false,
         certs_closed: false,
     };
@@ -332,6 +334,117 @@ fn a_deferred_transaction_outlives_a_restart() {
     let mut handler = CommitHandler::new(output, 1, vec![([0; 96], 10_000)], &epoch.config, None);
     let decided = handler.handle(&epoch, commit(2, &[]), &bump).unwrap();
     assert_eq!(scheduled(&decided), vec![digest(&first)]);
+}
+
+/// A transaction using randomness, paying with `gas` and taking `inputs`
+/// as owned objects.
+fn using_randomness(sender: &Sender, gas: ObjectRef, inputs: &[ObjectRef]) -> Tx {
+    let mut args: Vec<CallArg> = inputs
+        .iter()
+        .map(|r| CallArg::Object(ObjectArg::ImmOrOwnedObject(*r)))
+        .collect();
+    args.push(CallArg::Object(ObjectArg::SharedObject {
+        id: sui_types::SUI_RANDOMNESS_STATE_OBJECT_ID,
+        initial_shared_version: SequenceNumber::from_u64(1),
+        mutability: sui_types::transaction::SharedObjectMutability::Immutable,
+    }));
+    let pt = ProgrammableTransaction {
+        inputs: args,
+        commands: vec![],
+    };
+    let data = TransactionData::new(
+        TransactionKind::ProgrammableTransaction(pt),
+        sender.address,
+        gas,
+        1_000_000,
+        1000,
+    );
+    let bytes = bcs::to_bytes(&Transaction::from_data_and_signer(data, vec![&sender.key])).unwrap();
+    let digest = digest_of(&parse(bytes.clone()));
+    Tx { bytes, digest }
+}
+
+/// A transaction using randomness, deferred a round as a double spend's
+/// winner while DKG is pending, comes back to the randomness deferrals of
+/// the round it was first deferred from, and joins them.
+#[test]
+fn a_double_spend_using_randomness_joins_the_randomness_deferrals_of_its_round() {
+    use fastcrypto::traits::{KeyPair as _, ToFromBytes as _};
+    use validator::consensus::deferral::{DeferralKey, decode_deferred};
+    let bump = containers::Bump::default();
+    let epoch = epoch();
+    assert!(epoch.config.merge_colliding_deferrals());
+    assert!(epoch.config.defer_owned_object_double_spend());
+    let key = fastcrypto::bls12381::min_sig::BLS12381KeyPair::generate(
+        &mut <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(1),
+    );
+    let committee = vec![(
+        <[u8; 96]>::try_from(key.public().as_bytes()).unwrap(),
+        10_000,
+    )];
+    let setup = Arc::new(validator::consensus::dkg::DkgSetup::new(
+        &committee,
+        &epoch.config,
+        &[0; 32],
+        0,
+    ));
+    let sender = Sender::new();
+    let object = random_object_ref();
+    let waiting = using_randomness(&sender, random_object_ref(), &[]);
+    let winner = using_randomness(&sender, random_object_ref(), &[object]);
+    let loser = sender.transaction(random_object_ref(), &[object]);
+    let dir = tempfile::tempdir().unwrap();
+    let (_, output, _) = EpochStore::open(dir.path(), 0);
+    let commits = output.output_commits();
+    let mut handler = CommitHandler::new(output, 0, committee.clone(), &epoch.config, None)
+        .with_randomness(1, setup.clone());
+    let record = |index: u32| validator::consensus::commit::CommitRecord {
+        commit_index: index,
+        leader_round: index,
+        height: u64::from(index),
+        next_seq: u64::from(index) + 1,
+        last_built_timestamp: 0,
+        root_version: 1,
+        clock_version: 1,
+        closed: false,
+        certs_closed: false,
+    };
+    // Round 1: `waiting` waits for randomness, `winner` a round.
+    let decided = handler
+        .handle(
+            &epoch,
+            commit(1, &[(&waiting, &[]), (&winner, &[]), (&loser, &[])]),
+            &bump,
+        )
+        .unwrap();
+    let mut deferred_1 = deferred(&decided);
+    deferred_1.sort_unstable();
+    let mut expected = vec![digest(&waiting), digest(&winner)];
+    expected.sort_unstable();
+    assert_eq!(deferred_1, expected);
+    commits.write_through(handler.finish(&record(1)));
+    // Round 2, still without randomness: `winner` waits for it too, under
+    // round 1's randomness key.
+    let decided = handler.handle(&epoch, commit(2, &[]), &bump).unwrap();
+    assert_eq!(deferred(&decided), vec![digest(&winner)]);
+    commits.write_through(handler.finish(&record(2)));
+    drop((handler, commits));
+
+    let (_, mut output, _) = EpochStore::open(dir.path(), 0);
+    let waiting_for_randomness: Vec<(DeferralKey, Vec<[u8; 32]>)> = output
+        .take_deferred(DeferralKey::randomness())
+        .into_iter()
+        .map(|(key, bytes)| (key, decode_deferred(&bytes).map(|d| d.digest()).collect()))
+        .collect();
+    assert_eq!(
+        waiting_for_randomness,
+        vec![(
+            DeferralKey::Randomness {
+                deferred_from_round: 1
+            },
+            vec![digest(&waiting).bytes, digest(&winner).bytes]
+        )]
+    );
 }
 
 /// The keys a commit's authenticator state update adds.
@@ -401,6 +514,7 @@ fn a_key_a_quorum_voted_for_is_added_by_the_next_commit_across_a_restart() {
         next_seq: 2,
         last_built_timestamp: 0,
         root_version: 1,
+        clock_version: 1,
         closed: false,
         certs_closed: false,
     };
@@ -658,6 +772,7 @@ fn the_stage_leaves_dropped_transactions_out_of_its_chunks() {
             authenticator_initial_shared_version: None,
             randomness_initial_shared_version: None,
             accumulator_root_version: 1,
+            clock_version: 1,
             epoch_start_timestamp_ms: 0,
             epoch_duration_ms: u64::MAX,
         },

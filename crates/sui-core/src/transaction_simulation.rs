@@ -207,7 +207,10 @@ pub fn simulate_transaction(
     let cloned_gas = gas_data.clone();
     let cloned_kind = kind.clone();
     let tx_digest = transaction_digest;
-    let system_object_versions = SystemObjectVersions::from_latest_in_store(backing_store);
+    let system_object_versions = SystemObjectVersions::from_inputs_or_latest_in_store(
+        checked_input_objects.inner(),
+        backing_store,
+    );
     let (inner_temp_store, _, effects, execution_result) = executor.dev_inspect_transaction(
         &tracking_store,
         protocol_config,
@@ -217,7 +220,7 @@ pub fn simulate_transaction(
         &execution_epoch_id,
         epoch_timestamp_ms,
         checked_input_objects,
-        system_object_versions,
+        system_object_versions.clone(),
         gas_data,
         gas_status,
         kind,

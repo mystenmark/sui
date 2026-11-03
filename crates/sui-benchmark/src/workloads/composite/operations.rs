@@ -1,6 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use move_core_types::u256::U256;
 use mysten_common::random::get_rng;
 use rand::Rng;
 use sui_types::TypeTag;
@@ -16,8 +17,8 @@ use sui_types::transaction::{
     Argument, CallArg, Command, FundsWithdrawalArg, ObjectArg, SharedObjectMutability,
 };
 use sui_types::{
-    Identifier, SUI_ACCUMULATOR_ROOT_OBJECT_ID, SUI_FRAMEWORK_PACKAGE_ID,
-    SUI_RANDOMNESS_STATE_OBJECT_ID,
+    Identifier, MOVE_STDLIB_PACKAGE_ID, SUI_ACCUMULATOR_ROOT_OBJECT_ID, SUI_CLOCK_OBJECT_ID,
+    SUI_CLOCK_OBJECT_SHARED_VERSION, SUI_FRAMEWORK_PACKAGE_ID, SUI_RANDOMNESS_STATE_OBJECT_ID,
 };
 
 use super::AccountState;
@@ -31,12 +32,73 @@ pub enum InitRequirement {
     SeedTestCoinAddressBalance,
     EnableAddressAlias,
     CreateImmutableObject,
+    IssueAllowances,
+}
+
+/// (allowance id, initial shared version, funder) of an init-issued allowance.
+pub type AllowanceInfo = (ObjectID, SequenceNumber, SuiAddress);
+
+/// The init-issued allowances a payload's sender spends from.
+#[derive(Debug, Clone, Copy)]
+pub struct PayloadAllowances {
+    /// Funded by the previous payload, so sender and funder differ.
+    pub neighbor: AllowanceInfo,
+    /// Funded by the sender itself.
+    pub own: AllowanceInfo,
 }
 
 pub const ALIAS_TX: &str = "alias_tx";
 pub const ALIAS_REMOVE: &str = "alias_remove";
 pub const ALIAS_ADD: &str = "alias_add";
 pub const INVALID_ALIAS_TX: &str = "invalid_alias_tx";
+
+pub const PARTY_CREATE: &str = "party_create";
+pub const PARTY_MUTATE: &str = "party_mutate";
+pub const PARTY_END_STREAM: &str = "party_end_stream";
+pub const PARTY_OLD_STREAM: &str = "party_old_stream";
+pub const PARTY_OWNED_MUTATE: &str = "party_owned_mutate";
+pub const PARTY_RACING_MUTATE: &str = "party_racing_mutate";
+pub const PARTY_RESTART_STREAM: &str = "party_restart_stream";
+pub const PARTY_RETRANSFER: &str = "party_retransfer";
+pub const PARTY_HAND_OFF: &str = "party_hand_off";
+pub const PARTY_WRAP: &str = "party_wrap";
+pub const PARTY_UNWRAP: &str = "party_unwrap";
+pub const PARTY_HOLDER_READ: &str = "party_holder_read";
+
+pub const SHARED_DELETE_CREATE: &str = "shared_delete_create";
+pub const SHARED_DELETE_INCREMENT: &str = "shared_delete_increment";
+pub const SHARED_DELETE: &str = "shared_delete";
+pub const SHARED_DELETE_RACING: &str = "shared_delete_racing";
+pub const SHARED_DELETE_STALE: &str = "shared_delete_stale";
+
+pub const RECEIVE_CREATE_PARENT: &str = "receive_create_parent";
+pub const RECEIVE_CREATE_CHILD: &str = "receive_create_child";
+pub const RECEIVE_SEND_CHILD: &str = "receive_send_child";
+pub const RECEIVE_CHILD: &str = "receive_child";
+pub const RECEIVE_TOUCH_PARENT: &str = "receive_touch_parent";
+
+pub const PACKAGE_UPGRADE: &str = "package_upgrade";
+
+pub const OWNED_CREATE: &str = "owned_create";
+pub const OWNED_MUTATE: &str = "owned_mutate";
+pub const OWNED_FREEZE: &str = "owned_freeze";
+pub const OWNED_DELETE: &str = "owned_delete";
+pub const OWNED_CONFLICTING_MUTATE: &str = "owned_conflicting_mutate";
+pub const OWNED_FROZEN_READ: &str = "owned_frozen_read";
+pub const OWNED_STALE_MUTATE: &str = "owned_stale_mutate";
+
+pub const COIN_MINT: &str = "coin_mint";
+pub const COIN_MERGE: &str = "coin_merge";
+pub const COIN_STALE_MERGE: &str = "coin_stale_merge";
+
+pub const GASLESS_TRANSFER: &str = "gasless_transfer";
+
+pub const SPONSORED_TX: &str = "sponsored_tx";
+
+pub const TEST_COIN_DENY: &str = "test_coin_deny";
+pub const TEST_COIN_UNDENY: &str = "test_coin_undeny";
+
+pub const MULTISIG_TX: &str = "multisig_tx";
 
 pub struct OperationDescriptor {
     pub name: &'static str,
@@ -61,6 +123,8 @@ pub const ALL_OPERATIONS: &[OperationDescriptor] = &[
     AuthenticatedEventEmit::DESCRIPTOR,
     ImmutableObjectRead::DESCRIPTOR,
     CoinReservationWithdraw::DESCRIPTOR,
+    AllowanceWithdraw::DESCRIPTOR,
+    AllowanceSelfWithdraw::DESCRIPTOR,
 ];
 
 #[derive(Debug, Clone)]
@@ -73,11 +137,15 @@ pub enum ResourceRequest {
     AccumulatorRoot,
     ImmutableObject,
     CoinReservation,
+    Allowances,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct OperationConstraints {
     pub must_be_last_shared_access: bool,
+    /// The op is meant to fail validity, input, or funds checks. A failed op makes the rest of
+    /// its tx irrelevant, so an isolated op never shares a tx with ops that are not isolated.
+    pub isolated: bool,
 }
 
 pub struct OperationResources {
@@ -92,6 +160,7 @@ pub struct OperationResources {
     pub immutable_object: Option<ObjectRef>,
     pub chain_identifier: Option<ChainIdentifier>,
     pub current_epoch: Option<EpochId>,
+    pub allowances: Option<PayloadAllowances>,
 }
 
 pub trait Operation: Send + Sync {
@@ -219,6 +288,7 @@ impl Operation for RandomnessRead {
     fn constraints(&self) -> OperationConstraints {
         OperationConstraints {
             must_be_last_shared_access: true,
+            ..Default::default()
         }
     }
 
@@ -827,6 +897,13 @@ impl Operation for AddressBalanceOverdraw {
         Self::NAME
     }
 
+    fn constraints(&self) -> OperationConstraints {
+        OperationConstraints {
+            isolated: true,
+            ..Default::default()
+        }
+    }
+
     fn resource_requests(&self) -> Vec<ResourceRequest> {
         vec![ResourceRequest::AddressBalance]
     }
@@ -939,6 +1016,13 @@ impl ObjectBalanceOverdraw {
 impl Operation for ObjectBalanceOverdraw {
     fn name(&self) -> &'static str {
         Self::NAME
+    }
+
+    fn constraints(&self) -> OperationConstraints {
+        OperationConstraints {
+            isolated: true,
+            ..Default::default()
+        }
     }
 
     fn resource_requests(&self) -> Vec<ResourceRequest> {
@@ -1172,6 +1256,185 @@ impl Operation for ImmutableObjectRead {
             Identifier::new("value").unwrap(),
             vec![],
             vec![obj_arg],
+        );
+    }
+}
+
+/// Spends `amount` through the allowance and returns it to the funder, keeping its balance level.
+fn add_allowance_spend_commands(
+    builder: &mut ProgrammableTransactionBuilder,
+    allowance_id: ObjectID,
+    initial_shared_version: SequenceNumber,
+    funder: SuiAddress,
+    amount: u64,
+) {
+    let allowance_arg = builder
+        .obj(ObjectArg::SharedObject {
+            id: allowance_id,
+            initial_shared_version,
+            mutability: SharedObjectMutability::Mutable,
+        })
+        .unwrap();
+    let withdraw_arg = builder
+        .funds_withdrawal(FundsWithdrawalArg::balance_from_allowance(
+            amount,
+            GAS::type_tag(),
+            funder,
+            allowance_id,
+        ))
+        .unwrap();
+    let clock_arg = builder
+        .obj(ObjectArg::SharedObject {
+            id: SUI_CLOCK_OBJECT_ID,
+            initial_shared_version: SUI_CLOCK_OBJECT_SHARED_VERSION,
+            mutability: SharedObjectMutability::Immutable,
+        })
+        .unwrap();
+
+    let spent_balance = builder.programmable_move_call(
+        SUI_FRAMEWORK_PACKAGE_ID,
+        Identifier::new("allowance").unwrap(),
+        Identifier::new("balance_spend").unwrap(),
+        vec![GAS::type_tag()],
+        vec![allowance_arg, withdraw_arg, clock_arg],
+    );
+
+    let funder_arg = builder.pure(funder).unwrap();
+    builder.programmable_move_call(
+        SUI_FRAMEWORK_PACKAGE_ID,
+        Identifier::new("balance").unwrap(),
+        Identifier::new("send_funds").unwrap(),
+        vec![GAS::type_tag()],
+        vec![spent_balance, funder_arg],
+    );
+}
+
+fn allowance_spend_amount(address_balance_amount: u64) -> u64 {
+    if address_balance_amount > 0 {
+        address_balance_amount
+    } else {
+        get_rng().gen_range(100..1000)
+    }
+}
+
+/// Issues an `Allowance<Balance<SUI>>` funded by the tx sender for `spender`.
+/// The cap and expiration are effectively unlimited so spends never trip them.
+pub fn add_allowance_issue_commands(
+    builder: &mut ProgrammableTransactionBuilder,
+    spender: SuiAddress,
+) {
+    let no_rate_limit = builder.programmable_move_call(
+        MOVE_STDLIB_PACKAGE_ID,
+        Identifier::new("option").unwrap(),
+        Identifier::new("none").unwrap(),
+        vec!["0x2::allowance::RateLimit".parse().unwrap()],
+        vec![],
+    );
+    let args = vec![
+        builder.pure("".to_string()).unwrap(),
+        builder.pure(spender).unwrap(),
+        builder.pure(Some(U256::from(u64::MAX))).unwrap(),
+        builder.pure(None::<u64>).unwrap(),
+        builder.pure(Some(u64::MAX)).unwrap(),
+        no_rate_limit,
+    ];
+    builder.programmable_move_call(
+        SUI_FRAMEWORK_PACKAGE_ID,
+        Identifier::new("allowance").unwrap(),
+        Identifier::new("new").unwrap(),
+        vec![Balance::type_tag(GAS::type_tag())],
+        args,
+    );
+}
+
+/// Spends from the neighbor's balance: sender and funder differ.
+pub struct AllowanceWithdraw;
+
+impl AllowanceWithdraw {
+    pub const NAME: &'static str = "allowance_withdraw";
+    pub const DESCRIPTOR: OperationDescriptor = OperationDescriptor {
+        name: Self::NAME,
+        factory: || Box::new(AllowanceWithdraw),
+    };
+}
+
+impl Operation for AllowanceWithdraw {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn resource_requests(&self) -> Vec<ResourceRequest> {
+        vec![ResourceRequest::Allowances]
+    }
+
+    fn init_requirements(&self) -> Vec<InitRequirement> {
+        vec![
+            InitRequirement::SeedAddressBalance,
+            InitRequirement::IssueAllowances,
+        ]
+    }
+
+    fn apply(
+        &self,
+        builder: &mut ProgrammableTransactionBuilder,
+        resources: &OperationResources,
+        _account_state: &AccountState,
+    ) {
+        let (allowance_id, initial_shared_version, funder) = resources
+            .allowances
+            .expect("Allowances not resolved")
+            .neighbor;
+        add_allowance_spend_commands(
+            builder,
+            allowance_id,
+            initial_shared_version,
+            funder,
+            allowance_spend_amount(resources.address_balance_amount),
+        );
+    }
+}
+
+/// Spends from the sender's own balance through a self-issued allowance.
+pub struct AllowanceSelfWithdraw;
+
+impl AllowanceSelfWithdraw {
+    pub const NAME: &'static str = "allowance_self_withdraw";
+    pub const DESCRIPTOR: OperationDescriptor = OperationDescriptor {
+        name: Self::NAME,
+        factory: || Box::new(AllowanceSelfWithdraw),
+    };
+}
+
+impl Operation for AllowanceSelfWithdraw {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn resource_requests(&self) -> Vec<ResourceRequest> {
+        vec![ResourceRequest::Allowances]
+    }
+
+    fn init_requirements(&self) -> Vec<InitRequirement> {
+        vec![
+            InitRequirement::SeedAddressBalance,
+            InitRequirement::IssueAllowances,
+        ]
+    }
+
+    fn apply(
+        &self,
+        builder: &mut ProgrammableTransactionBuilder,
+        resources: &OperationResources,
+        _account_state: &AccountState,
+    ) {
+        let (allowance_id, initial_shared_version, funder) =
+            resources.allowances.expect("Allowances not resolved").own;
+        add_allowance_spend_commands(
+            builder,
+            allowance_id,
+            initial_shared_version,
+            funder,
+            allowance_spend_amount(resources.address_balance_amount),
         );
     }
 }

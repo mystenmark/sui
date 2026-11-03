@@ -79,6 +79,7 @@ pub(crate) struct ConsensusCommitOutput {
     dkg_confirmations: BTreeMap<PartyId, VersionedDkgConfirmation>,
     dkg_processed_messages: BTreeMap<PartyId, VersionedProcessedMessage>,
     dkg_used_message: Option<VersionedUsedProcessedMessages>,
+    dkg_own_confirmation: Option<VersionedDkgConfirmation>,
     dkg_output: Option<Option<dkg_v1::Output<PkG, EncG>>>,
 
     // jwk state
@@ -241,6 +242,10 @@ impl ConsensusCommitOutput {
         self.dkg_used_message = Some(used_messages);
     }
 
+    pub fn set_dkg_own_confirmation(&mut self, conf: VersionedDkgConfirmation) {
+        self.dkg_own_confirmation = Some(conf);
+    }
+
     pub fn set_dkg_output(&mut self, output: Option<dkg_v1::Output<PkG, EncG>>) {
         self.dkg_output = Some(output);
     }
@@ -278,7 +283,7 @@ impl ConsensusCommitOutput {
         epoch_store: &AuthorityPerEpochStore,
         batch: &mut DBBatch,
     ) -> SuiResult {
-        let tables = epoch_store.tables()?;
+        let tables = epoch_store.tables();
         batch.insert_batch(
             &tables.consensus_message_processed,
             self.consensus_messages_processed
@@ -360,6 +365,13 @@ impl ConsensusCommitOutput {
             self.dkg_used_message
                 .into_iter()
                 .map(|used_msgs| (SINGLETON_KEY, used_msgs)),
+        )?;
+        batch.insert_batch(
+            &tables.dkg_own_confirmation,
+            // using Option as iter
+            self.dkg_own_confirmation
+                .into_iter()
+                .map(|conf| (SINGLETON_KEY, conf)),
         )?;
         if let Some(output) = self.dkg_output {
             batch.insert_batch(&tables.dkg_output_v2, [(SINGLETON_KEY, output)])?;
@@ -585,7 +597,7 @@ impl ConsensusOutputQuarantine {
     }
 
     pub(super) fn commit(&mut self, epoch_store: &AuthorityPerEpochStore) -> SuiResult {
-        let mut batch = epoch_store.db_batch()?;
+        let mut batch = epoch_store.db_batch();
         self.commit_with_batch(epoch_store, &mut batch)?;
         batch.write()?;
         Ok(())
@@ -603,7 +615,7 @@ impl ConsensusOutputQuarantine {
         //    checkpoint.
         // 3. Commit all consensus output at that height or below.
 
-        let tables = epoch_store.tables()?;
+        let tables = epoch_store.tables();
 
         let mut highest_committed_height = None;
 
@@ -781,8 +793,8 @@ impl ConsensusOutputQuarantine {
         &self,
         tables: &AuthorityEpochTables,
         objects_to_init: &[ConsensusObjectSequenceKey],
-    ) -> SuiResult<Vec<Option<SequenceNumber>>> {
-        Ok(do_fallback_lookup(
+    ) -> Vec<Option<SequenceNumber>> {
+        do_fallback_lookup(
             objects_to_init,
             |object_key| {
                 if let Some(next_version) = self.shared_object_next_versions.get(object_key) {
@@ -797,7 +809,7 @@ impl ConsensusOutputQuarantine {
                     .multi_get(object_keys)
                     .expect("db error")
             },
-        ))
+        )
     }
 
     /// Gets owned object locks, checking quarantine first then falling back to DB.
@@ -806,8 +818,8 @@ impl ConsensusOutputQuarantine {
         &self,
         tables: &AuthorityEpochTables,
         obj_refs: &[ObjectRef],
-    ) -> SuiResult<Vec<Option<LockDetails>>> {
-        Ok(do_fallback_lookup(
+    ) -> Vec<Option<LockDetails>> {
+        do_fallback_lookup(
             obj_refs,
             |obj_ref| {
                 if let Some(lock) = self.owned_object_locks.get(obj_ref) {
@@ -821,7 +833,7 @@ impl ConsensusOutputQuarantine {
                     .multi_get_locked_transactions(obj_refs)
                     .expect("db error")
             },
-        ))
+        )
     }
 
     pub(super) fn get_highest_pending_checkpoint_height(&self) -> Option<CheckpointHeight> {
@@ -898,7 +910,7 @@ impl ConsensusOutputQuarantine {
         let end = (round + 1, (empty_jwk_id, empty_jwk));
 
         Ok(epoch_store
-            .tables()?
+            .tables()
             .active_jwks
             .safe_iter_with_bounds(Some(start), Some(end))
             .map_ok(|((r, (jwk_id, jwk)), _)| {
@@ -922,9 +934,9 @@ impl ConsensusOutputQuarantine {
         current_round: Round,
         for_randomness: bool,
         transactions: &[VerifiedExecutableTransactionWithAliases],
-    ) -> SuiResult<impl IntoIterator<Item = (ObjectID, u64)>> {
+    ) -> impl IntoIterator<Item = (ObjectID, u64)> {
         let protocol_config = epoch_store.protocol_config();
-        let tables = epoch_store.tables()?;
+        let tables = epoch_store.tables();
         let default_per_commit_budget = protocol_config
             .max_accumulated_txn_cost_per_object_in_mysticeti_commit_as_option()
             .unwrap_or(0);
@@ -969,7 +981,7 @@ impl ConsensusOutputQuarantine {
             },
         );
 
-        Ok(results
+        results
             .into_iter()
             .zip_debug_eq(shared_input_object_ids)
             .filter_map(|(debt, object_id)| debt.map(|debt| (debt, object_id)))
@@ -981,7 +993,7 @@ impl ConsensusOutputQuarantine {
                 let num_rounds = current_round - round - 1;
                 let debt = debt.saturating_sub(per_commit_budget * num_rounds);
                 (object_id, debt)
-            }))
+            })
     }
 }
 
@@ -1059,6 +1071,7 @@ impl ConsensusOutputQuarantine {
 mod tests {
     use super::*;
     use crate::authority::test_authority_builder::TestAuthorityBuilder;
+    use sui_macros::sim_test;
     use sui_types::base_types::ExecutionDigests;
     use sui_types::gas::GasCostSummary;
     use sui_types::messages_checkpoint::CheckpointContents;
@@ -1100,7 +1113,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[sim_test]
     async fn test_drain_boundary_prevents_premature_commit() {
         let state = TestAuthorityBuilder::new().build().await;
         let epoch_store = state.epoch_store_for_testing();
@@ -1138,7 +1151,7 @@ mod tests {
         assert_eq!(quarantine.output_queue_len_for_testing(), 2);
     }
 
-    #[tokio::test]
+    #[sim_test]
     async fn test_drain_boundary_commits_at_safe_point() {
         let state = TestAuthorityBuilder::new().build().await;
         let epoch_store = state.epoch_store_for_testing();

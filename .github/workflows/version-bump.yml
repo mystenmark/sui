@@ -118,9 +118,7 @@ jobs:
           git checkout -b "$BRANCH"
           git add \
             Cargo.toml \
-            Cargo.lock \
-            crates/sui-open-rpc/spec/openrpc.json \
-            crates/sui-open-rpc/tests/snapshots/generate_spec__openrpc.snap.json
+            Cargo.lock
           BODY="Sui v${NEW_VERSION} Version Bump"
           git commit -m "$BODY"
           # Push using the app token URL so the push is attributed to the GitHub App,
@@ -133,7 +131,7 @@ jobs:
             --base "$REF_NAME" \
             --head "$BRANCH" \
             --title "$BODY" \
-            --reviewer "ebmifa,pei-mysten,tharbert" \
+            --reviewer "ebmifa,tharbert" \
             --body "$BODY"
 
           if [[ "$AUTO_MERGE" == "true" ]]; then
@@ -150,8 +148,6 @@ jobs:
 
           git add \
             Cargo.toml \
-            Cargo.lock \
-            crates/sui-open-rpc/spec/openrpc.json \
-            crates/sui-open-rpc/tests/snapshots/generate_spec__openrpc.snap.json
+            Cargo.lock
           git commit -m "$BODY"
           git push origin HEAD:"$REF_NAME"

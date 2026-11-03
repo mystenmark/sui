@@ -25,5 +25,6 @@ pub(crate) fn protocol_config(config: &ProtocolConfig) -> ConsensusProtocolConfi
         /* enable_v3 */ false,
         /* leader_schedule_window_size */ 300,
         /* leader_schedule_update_interval */ 12,
+        config.shuffle_consensus_commit_blocks(),
     )
 }

@@ -745,9 +745,6 @@ pub enum SuiErrorKind {
     #[error("Missing committee information for epoch {0}")]
     MissingCommitteeAtEpoch(EpochId),
 
-    #[error("Index store not available on this Fullnode.")]
-    IndexStoreNotAvailable,
-
     #[error("Failed to read dynamic field from table in the object store: {0}")]
     DynamicFieldReadError(String),
 
@@ -844,6 +841,13 @@ pub enum SuiErrorKind {
 
     #[error("Transaction {digest} has been recently submitted to this validator.")]
     TransactionSubmitted { digest: TransactionDigest },
+
+    // Appended last: errors travel BCS-encoded in RPC status details, and older clients
+    // must keep decoding every earlier variant.
+    #[error(
+        "This validator is outside the transaction's staggered-submission proposer set; submit to one of its proposers."
+    )]
+    StaggeredSubmissionNotProposer,
 }
 
 #[repr(u64)]
@@ -1069,6 +1073,9 @@ impl SuiErrorKind {
             SuiErrorKind::TransactionRejectedDueToOutbiddingDuringCongestion { .. } => true,
             SuiErrorKind::ValidatorOverloadedRetryAfter { .. } => true,
 
+            // Retriable at another validator: one of the transaction's proposers.
+            SuiErrorKind::StaggeredSubmissionNotProposer => true,
+
             // The transaction is already being processed by consensus, so a fresh
             // submission is pointless. The client should retry by waiting for effects
             // rather than resubmitting.
@@ -1171,6 +1178,10 @@ impl SuiErrorKind {
             }
 
             SuiErrorKind::TimeoutError => ErrorCategory::Unavailable,
+
+            // Not a fault of the validator: the client simply asked a non-proposer. It
+            // retries at the next target without backoff, like any aborted submission.
+            SuiErrorKind::StaggeredSubmissionNotProposer => ErrorCategory::Aborted,
 
             // Other variants are assumed to be retriable with new transaction submissions.
             _ => ErrorCategory::Aborted,

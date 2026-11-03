@@ -27,6 +27,7 @@ use messages::transaction::{
     WithdrawalTypeArg,
 };
 use messages::type_tag::TypeTag;
+use sui_protocol_config::ProtocolConfig;
 
 use crate::{Context, Error, ErrorKind, transaction_data};
 
@@ -317,7 +318,7 @@ pub fn check(
     let received = load_receiving(&receiving, objects, bump)?;
 
     check_gas(data, ctx, &inputs, bump)?;
-    check_objects(data, &inputs, bump)?;
+    check_objects(data, ctx.config, &inputs, bump)?;
     check_replay_protection(data, &inputs)?;
     check_receiving_objects(&inputs, &receiving, &received, bump)?;
     check_owned_objects_live(&inputs)?;
@@ -566,6 +567,7 @@ fn check_gas(
 /// object is what its input says.
 fn check_objects(
     data: &TransactionData<'_, impl TxState>,
+    config: &ProtocolConfig,
     inputs: &[Input<'_>],
     bump: &Bump,
 ) -> Result<(), Error> {
@@ -591,13 +593,17 @@ fn check_objects(
         } else {
             data.sender()
         };
-        check_one_object(owner, input)?;
+        check_one_object(config, owner, input)?;
     }
     Ok(())
 }
 
 /// `check_one_object`.
-fn check_one_object(owner: &SuiAddress, input: &Input<'_>) -> Result<(), Error> {
+fn check_one_object(
+    config: &ProtocolConfig,
+    owner: &SuiAddress,
+    input: &Input<'_>,
+) -> Result<(), Error> {
     let object = input.object();
     let id = input.kind.id();
     if matches!(object.owner, Owner::Party(_)) {
@@ -653,12 +659,13 @@ fn check_one_object(owner: &SuiAddress, input: &Input<'_>) -> Result<(), Error> 
                 }
             }
         }
-        InputKind::Shared(s) => check_shared(owner, id, object, &s)?,
+        InputKind::Shared(s) => check_shared(config, owner, id, object, &s)?,
     }
     Ok(())
 }
 
 fn check_shared(
+    config: &ProtocolConfig,
     owner: &SuiAddress,
     id: &ObjectId,
     object: &Object<'_>,
@@ -667,7 +674,7 @@ fn check_shared(
     if object.version() == u64::MAX {
         return Err(error(ErrorKind::InvalidSequenceNumber, "version u64::MAX"));
     }
-    if is_system_object(id) && !system_object_usable(id, s.mutability()) {
+    if is_system_object(id) && !system_object_usable(config, id, s.mutability()) {
         return Err(error(
             ErrorKind::ImmutableParameterExpectedError,
             format!("system object {id:?} cannot be used so"),
@@ -723,7 +730,11 @@ fn is_system_object(id: &ObjectId) -> bool {
 
 /// Which system objects a user transaction may take as a shared input, and
 /// how.
-fn system_object_usable(id: &ObjectId, mutability: SharedObjectMutability) -> bool {
+fn system_object_usable(
+    config: &ProtocolConfig,
+    id: &ObjectId,
+    mutability: SharedObjectMutability,
+) -> bool {
     const SYSTEM_STATE: u16 = 0x5;
     const CLOCK: u16 = 0x6;
     const RANDOMNESS: u16 = 0x8;
@@ -733,6 +744,7 @@ fn system_object_usable(id: &ObjectId, mutability: SharedObjectMutability) -> bo
     const ADDRESS_ALIAS_STATE: u16 = 0xa;
     const DENY_LIST: u16 = 0x403;
     const ACCUMULATOR_ROOT: u16 = 0xacc;
+    const FORWARDING_ADDRESS_REGISTRY: u16 = 0xfa;
     let is = |n: u16| *id == ObjectId::from_u16(n);
     let immutable = mutability == SharedObjectMutability::Immutable;
     [
@@ -746,6 +758,7 @@ fn system_object_usable(id: &ObjectId, mutability: SharedObjectMutability) -> bo
     .into_iter()
     .any(is)
         || (immutable && [CLOCK, RANDOMNESS, ACCUMULATOR_ROOT].into_iter().any(is))
+        || (config.enable_forwarding_addresses() && is(FORWARDING_ADDRESS_REGISTRY))
 }
 
 /// `check_replay_protection`: a transaction must not be replayable, which

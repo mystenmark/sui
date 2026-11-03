@@ -18,7 +18,7 @@
 //! CheckpointExecutor enforces the invariant that if `run` returns successfully, we have reached the
 //! end of epoch. This allows us to use it as a signal for reconfig.
 
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use mysten_common::{ZipDebugEqIteratorExt, debug_fatal, fatal, izip_debug_eq};
 use parking_lot::Mutex;
 use std::{sync::Arc, time::Instant};
@@ -30,6 +30,7 @@ use sui_types::{
     SUI_ACCUMULATOR_ROOT_OBJECT_ID,
     node_role::{FullNodeSyncMode, NodeRole},
 };
+use tokio::task::JoinError;
 
 use sui_config::node::{CheckpointExecutorConfig, RunWithRange};
 use sui_macros::fail_point;
@@ -72,6 +73,8 @@ const CHECKPOINT_PROGRESS_LOG_COUNT_INTERVAL: u64 = 5000;
 pub enum StopReason {
     EpochComplete,
     RunWithRangeCondition,
+    /// The tokio runtime is shutting down and cancelled checkpoint execution work.
+    RuntimeShutdown,
 }
 
 pub(crate) struct CheckpointExecutionData {
@@ -329,24 +332,29 @@ impl CheckpointExecutor {
                 let pipeline_handle = pipeline_handle.await;
                 tokio::spawn(this.execute_checkpoint(checkpoint, pipeline_handle))
                     .await
-                    .unwrap()
+                    .and_then(|result| result)
             }
         })
         .buffered(concurrency)
         // Take the last value from the stream to determine if we completed the epoch
-        .fold(false, |state, is_final_checkpoint| async move {
+        .try_fold(false, |state, is_final_checkpoint| async move {
             assert!(
                 !state,
                 "fold can't be called again after the final checkpoint"
             );
-            is_final_checkpoint
+            Ok(is_final_checkpoint)
         })
         .await;
 
-        if final_checkpoint_executed {
-            StopReason::EpochComplete
-        } else {
-            StopReason::RunWithRangeCondition
+        match final_checkpoint_executed {
+            Ok(true) => StopReason::EpochComplete,
+            Ok(false) => StopReason::RunWithRangeCondition,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            // Tasks are only cancelled when the runtime shuts down.
+            Err(e) => {
+                info!("Checkpoint execution cancelled by runtime shutdown: {e}");
+                StopReason::RuntimeShutdown
+            }
         }
     }
 }
@@ -358,7 +366,7 @@ impl CheckpointExecutor {
         self: Arc<Self>,
         checkpoint: VerifiedCheckpoint,
         mut pipeline_handle: PipelineHandle,
-    ) -> bool /* is final checkpoint */ {
+    ) -> Result<bool /* is final checkpoint */, JoinError> {
         info!("executing checkpoint");
         let sequence_number = checkpoint.sequence_number;
 
@@ -462,8 +470,7 @@ impl CheckpointExecutor {
                 ckpt_state
             }
         })
-        .await
-        .unwrap();
+        .await?;
 
         finish_stage!(pipeline_handle, CommitTransactionOutputs);
 
@@ -526,7 +533,7 @@ impl CheckpointExecutor {
 
         // Important: code after the last pipeline stage is finished can run out of checkpoint order.
 
-        ckpt_state.data.checkpoint.is_last_checkpoint_of_epoch()
+        Ok(ckpt_state.data.checkpoint.is_last_checkpoint_of_epoch())
     }
 
     // On validators, checkpoints have often already been constructed locally, in which
@@ -577,7 +584,6 @@ impl CheckpointExecutor {
             self.epoch_store
                 .notify_read_checkpoint_state_hasher(&[sequence_number])
                 .await
-                .unwrap()
                 .pop()
                 .unwrap()
         };
@@ -672,9 +678,6 @@ impl CheckpointExecutor {
     ) -> CheckpointExecutionState {
         let sequence_number = ckpt_state.data.checkpoint.sequence_number;
 
-        self.commit_post_processing_index_batches(&ckpt_state.data.tx_digests)
-            .await;
-
         let _scope = mysten_metrics::monitored_scope("CheckpointExecutor::finalize_checkpoint");
 
         if self.state.is_fullnode(&self.epoch_store) {
@@ -691,11 +694,11 @@ impl CheckpointExecutor {
         // state, so we must wait until all transactions have been executed
         // before accumulating the checkpoint.
         if ckpt_state.state_hasher.is_none() {
-            ckpt_state.state_hasher = Some(
-                self.global_state_hasher
-                    .accumulate_checkpoint(&tx_data.effects, sequence_number, &self.epoch_store)
-                    .expect("epoch cannot have ended"),
-            );
+            ckpt_state.state_hasher = Some(self.global_state_hasher.accumulate_checkpoint(
+                &tx_data.effects,
+                sequence_number,
+                &self.epoch_store,
+            ));
         }
 
         finish_stage!(pipeline_handle, FinalizeTransactions);
@@ -705,32 +708,6 @@ impl CheckpointExecutor {
         finish_stage!(pipeline_handle, ProcessCheckpointData);
 
         ckpt_state
-    }
-
-    // Collect index batches from post-processing and commit atomically.
-    // This must happen AFTER all transactions have completed execution and BEFORE
-    // insert_finalized_transactions (so that index data is available when
-    // transactions_executed_in_checkpoint_notify fires).
-    async fn commit_post_processing_index_batches(&self, tx_digests: &[TransactionDigest]) {
-        let mut raw_batches = Vec::new();
-        let mut cache_updates = Vec::new();
-        for tx_digest in tx_digests {
-            if let Some((raw_batch, cu)) = self.state.await_post_processing(tx_digest).await {
-                raw_batches.push(raw_batch);
-                cache_updates.push(cu);
-            }
-        }
-        if !raw_batches.is_empty()
-            && let Some(indexes) = &self.state.indexes
-        {
-            let mut db_batch = indexes.new_db_batch();
-            db_batch
-                .concat(raw_batches)
-                .expect("failed to build index batch");
-            indexes
-                .commit_index_batch(db_batch, cache_updates)
-                .expect("failed to commit index batch");
-        }
     }
 
     fn checkpoint_data_enabled(&self) -> bool {
@@ -958,8 +935,7 @@ impl CheckpointExecutor {
                                 effects,
                                 *accumulator_version,
                                 &*self.object_cache_reader,
-                            )
-                            .expect("failed to acquire shared version assignments");
+                            );
 
                         let mut env = ExecutionEnv::new()
                             .with_assigned_versions(assigned_versions)
@@ -983,6 +959,15 @@ impl CheckpointExecutor {
                 },
             ),
         );
+
+        // When a randomness update arrives via checkpoint rather than being constructed
+        // locally from the round's signature, nothing else resolves its transaction key,
+        // and the keyed placeholder enqueued by consensus would wait forever.
+        for (txn, _) in &unexecuted_txns {
+            if let Some(key) = txn.non_digest_key() {
+                self.epoch_store.insert_tx_key(key, *txn.digest());
+            }
+        }
 
         // Enqueue unexecuted transactions with their expected effects digests
         self.execution_scheduler
@@ -1033,8 +1018,7 @@ impl CheckpointExecutor {
                 change_epoch_fx,
                 None,
                 self.object_cache_reader.as_ref(),
-            )
-            .expect("Acquiring shared version assignments for change_epoch tx cannot fail");
+            );
 
         info!(
             "scheduling change epoch txn with digest: {:?}, expected effects digest: {:?}, assigned versions: {:?}",

@@ -149,14 +149,18 @@ pub fn system_package_bytes(
     Some(packages)
 }
 
+/// The highest protocol version anchovy implements; the reference's may be
+/// higher.
+pub const MAX_PROTOCOL_VERSION: u64 = 141;
+
 /// The versions this binary supports on `chain`: those from the first its
-/// executor runs to the highest. Announcing more would vote for upgrades it
+/// executor runs to `MAX_PROTOCOL_VERSION`. Announcing more would vote for upgrades it
 /// cannot run.
 ///
 /// # Panics
 /// If the executor runs not even the highest version.
 pub fn supported_protocol_versions(chain: Chain) -> SupportedProtocolVersions {
-    let max = ProtocolVersion::MAX;
+    let max = ProtocolVersion::new(MAX_PROTOCOL_VERSION);
     let runs = |v: u64| {
         executor::runs(&ProtocolConfig::get_for_version(
             ProtocolVersion::new(v),
