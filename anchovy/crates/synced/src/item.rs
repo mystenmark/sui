@@ -54,9 +54,17 @@ pub fn executable(
     };
 
     keys.clear();
-    // A system transaction's gas payment is a placeholder, not an input.
-    if let TransactionKind::ProgrammableTransaction(_) = data.kind() {
-        resolver::object_keys(data, keys, packages);
+    // A system transaction's gas payment is a placeholder, not an input. A
+    // settlement reads the root at the version its chunk's transactions
+    // read, so only its package keys order it after a publish among them.
+    match data.kind() {
+        TransactionKind::ProgrammableTransaction(_) => {
+            resolver::object_keys(data, keys, packages);
+        }
+        TransactionKind::ProgrammableSystemTransaction(pt) => {
+            resolver::package_keys(pt.commands, keys, packages);
+        }
+        _ => {}
     }
     let mut writes = Vec::new();
     for change in effects.changed_objects {
