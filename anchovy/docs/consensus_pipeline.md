@@ -276,6 +276,11 @@ The costs:
 
     This is the resolver's only state: each stream's last scheduled
     generation, in memory, rebuildable from the store.
+  - A user transaction may borrow the Clock without its being an input.
+    Only prologues write the Clock, one version each, so the commit
+    handler knows the version its prologue writes, and the transaction
+    waits on `ObjectVersion(Clock, version)` instead of execution blocking
+    on it. A certified transaction waits on the version its effects record.
   - A transaction that withdraws funds also waits on `Reserved(digest)`.
     The resolver queues that wait, then sends the reservations to
     `FundsReserver` (see "Funds reservation"), which resolves the key to
