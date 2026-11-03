@@ -39,4 +39,6 @@ The user's list after phase 23:
   item is enqueued, dispatched and finished; every waiter logs when a wait
   is registered and when it is satisfied. Items log through a trait of
   their own, a short summary (a transaction's digest, not its full `Debug`),
-  rather than `Debug`.
+  rather than `Debug`: `trait Brief: Debug` with a default `brief` that
+  formats with `Debug`, so most types opt in with an empty impl and big
+  ones override it (a blanket impl over `Debug` would need specialization).
