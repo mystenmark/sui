@@ -575,12 +575,16 @@ impl ConsensusOutput {
     }
 
     /// Defers transactions, `transactions` encoded, by `key`, once per
-    /// commit. They replace any an earlier commit deferred by `key`, as the
-    /// reference's cache insert does: a randomness key keeps the round a
-    /// transaction was first deferred from, which another commit's
-    /// randomness deferrals may have taken.
-    pub fn defer(&mut self, key: DeferralKey, transactions: Vec<u8>) {
+    /// commit. A randomness key keeps the round a transaction was first
+    /// deferred from, which another commit's randomness deferrals may have
+    /// taken: `merge` puts them after those (`merge_colliding_deferrals`),
+    /// else they replace them, as the reference's cache insert did.
+    pub fn defer(&mut self, key: DeferralKey, mut transactions: Vec<u8>, merge: bool) {
         let mut q = lock_quarantine(&self.quarantine);
+        if merge && let Some(mut earlier) = q.deferred.remove(&key) {
+            earlier.append(&mut transactions);
+            transactions = earlier;
+        }
         q.deferred.insert(key, transactions.clone());
         q.open.deferred.push((key, Some(transactions)));
     }

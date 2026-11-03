@@ -690,7 +690,11 @@ impl CommitHandler {
             )
         });
         for (key, transactions) in deferred {
-            self.output.defer(key, encode_deferred(&transactions));
+            self.output.defer(
+                key,
+                encode_deferred(&transactions),
+                config.merge_colliding_deferrals(),
+            );
         }
 
         // 8. The schedule: the prologue, the update, then the transactions,
