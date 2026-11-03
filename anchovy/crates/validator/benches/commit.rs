@@ -200,6 +200,7 @@ fn main() {
                 randomness_initial_shared_version: None,
                 accumulator_root_version: 1,
                 clock_version: 1,
+                forwarding_registry: None,
                 epoch_start_timestamp_ms: 0,
                 epoch_duration_ms: u64::MAX,
             };

@@ -505,11 +505,17 @@ fn struct_tag(object: &Object<'_>) -> Option<move_tags::StructTag> {
 
 /// `Object::get_total_sui`: the SUI in the object's storage rebate and in its Move value. The
 /// balance traversal's map is in `bump`.
+///
+/// Resolving a layout builds package linkage, so the settlement layouts known to hold no SUI
+/// contribute only their storage rebates.
 fn get_total_sui(
     object: &Object<'_>,
     bump: &Bump,
     layout_resolver: &mut dyn LayoutResolver,
 ) -> Result<u64, SuiError> {
+    if crate::accumulator_settlement::has_no_sui(object) {
+        return Ok(object.storage_rebate());
+    }
     Ok(object.storage_rebate()
         + match object.data() {
             Data::Move(m) => move_object_get_total_sui(m, bump, layout_resolver)?,

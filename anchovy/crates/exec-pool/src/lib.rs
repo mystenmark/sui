@@ -26,8 +26,8 @@ use validator::epoch::EpochState;
 use validator::epoch_store::EpochStore;
 use validator::pipeline::items::{
     AdmissionInput, EffectsWaitItem, EpochCloserInput, Executable, ExecutableTransaction,
-    FundsCommand, InputCommand, InputValue, ReservationStatus, ScheduledEntry, Settle,
-    SettlementInput, Synced, SystemKind, SystemTransaction,
+    FundsCommand, InputCommand, InputValue, RegistryRead, ReservationStatus, ScheduledEntry,
+    Settle, SettlementInput, Synced, SystemKind, SystemTransaction,
 };
 use validator::pipeline::keys::{AccumulatorVersion, EffectsKey, InputKey, StreamId, TxDigest};
 use validator::pipeline::tables::{
@@ -297,6 +297,7 @@ impl Executor {
                 funds,
                 executable.root_version,
                 entry.clock_version,
+                entry.forwarding_registry,
                 bump,
             ),
         };
@@ -416,6 +417,7 @@ impl Executor {
                 funds,
                 executable.root_version,
                 executable.entry.clock_version,
+                executable.entry.forwarding_registry,
                 bump,
             )
         };
@@ -539,8 +541,13 @@ impl Executor {
         funds: Funds,
         root_version: u64,
         clock_version: Option<u64>,
+        forwarding_registry: Option<RegistryRead>,
         bump: &'b Bump,
     ) -> (Message<TransactionEffects<'static>>, WrittenObjects<'b>) {
+        let forwarding_registry = forwarding_registry.map(|read| RegistryVersion {
+            read,
+            generations: &self.generations,
+        });
         let outcome = self
             .epoch
             .execution
@@ -552,6 +559,9 @@ impl Executor {
                 execution::Implicit {
                     accumulator: Some(root_version),
                     clock: clock_version,
+                    forwarding_registry: forwarding_registry
+                        .as_ref()
+                        .map(|r| r as &dyn execution::LazyVersion),
                 },
                 &*self.unsettled,
                 match &self.roots {
@@ -632,6 +642,31 @@ impl Executor {
             InputValue::Generation(generation, Some(object)),
         ));
         generation
+    }
+}
+
+/// The forwarding address registry's version a transaction reads, found when
+/// execution reads it.
+struct RegistryVersion<'g> {
+    read: RegistryRead,
+    generations: &'g GenerationTable,
+}
+
+impl execution::LazyVersion for RegistryVersion<'_> {
+    fn version(&self) -> u64 {
+        match self.read {
+            RegistryRead::At(version) => version,
+            RegistryRead::Generation {
+                stream,
+                round,
+                generation,
+            } => match self.generations.wait(stream, round, generation) {
+                Generation::Version { version, .. } => version,
+                Generation::Ended { .. } => {
+                    unreachable!("the forwarding address registry's stream never ends")
+                }
+            },
+        }
     }
 }
 
@@ -1019,6 +1054,7 @@ mod tests {
                 aliases: None,
                 cancelled: Vec::new(),
                 clock_version: None,
+                forwarding_registry: None,
             },
             inputs: vec![],
             synced: None,

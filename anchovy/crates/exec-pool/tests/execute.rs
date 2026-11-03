@@ -297,3 +297,29 @@ fn a_reader_of_generation_zero_reads_it_after_the_writer_ran() {
     assert_eq!(read_at(&written, shared.id), initial);
     assert_eq!(read_at(&node.effects(reader).unwrap(), shared.id), initial);
 }
+
+/// A transaction that does not read the forwarding address registry waits
+/// for nothing, though the generation it would read is not recorded.
+#[test]
+fn a_transaction_not_reading_the_registry_does_not_wait_for_it() {
+    let mut node = Node::new(1);
+    let transfer = node.transfer(node.coin(0));
+    let digest = digest(&transfer);
+    let mut executable = node.executable(transfer, vec![], vec![]);
+    executable.entry.forwarding_registry =
+        Some(validator::pipeline::items::RegistryRead::Generation {
+            stream: validator::pipeline::keys::StreamId {
+                id: messages::base::ObjectId::from_u16(0xfa),
+                initial_shared_version: 1,
+            },
+            round: 9,
+            generation: 1,
+        });
+    node.executor
+        .process(vec![executable], &mut workqueue::Bump::default());
+    node.drain_checked();
+    assert_eq!(
+        node.effects(digest).unwrap().status(),
+        &ExecutionStatus::Success
+    );
+}
