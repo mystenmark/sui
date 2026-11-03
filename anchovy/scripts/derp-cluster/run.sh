@@ -58,12 +58,20 @@ if grep -l "panicked at" "$scratch"/stderr.* 2>/dev/null; then
     echo "a node panicked" >&2
     status=1
 fi
+# Anchovy may have been crashed shortly before the end: it must have
+# certified what sui had checkpointed a minute before.
 last() { grep -ahoE "$1" "$scratch"/stderr.* "$scratch"/stdout.* 2>/dev/null |
     grep -oE '[0-9]+$' | sort -n | tail -1; }
 sui=$(last 'Made new checkpoint seq=[0-9]+')
 anchovy=$(last 'anchovy certified checkpoint [0-9]+')
-echo "sui checkpointed through ${sui:-none}, anchovy certified through ${anchovy:-none}"
-if [[ -z ${anchovy:-} || -z ${sui:-} || $anchovy -lt $((sui - 10)) ]]; then
+sui_before=$(sed 's/\x1b\[[0-9;]*m//g' "$scratch"/stderr.0 |
+    grep -aoE '^[0-9T:.-]+Z .*Made new checkpoint seq=[0-9]+' |
+    awk '{ split($1, t, /[T:Z]/); s = t[2] * 3600 + t[3] * 60 + t[4];
+           match($0, /seq=[0-9]+/); seq[++n] = substr($0, RSTART + 4, RLENGTH - 4); at[n] = s }
+         END { for (i = n; i > 0; i--) if (at[i] <= at[n] - 60) { print seq[i]; exit } print 0 }')
+echo "sui checkpointed through ${sui:-none} (${sui_before} a minute before the end)," \
+    "anchovy certified through ${anchovy:-none}"
+if [[ -z ${anchovy:-} || $anchovy -lt $sui_before ]]; then
     echo "anchovy fell behind" >&2
     status=1
 fi
