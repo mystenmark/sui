@@ -34,11 +34,11 @@ retriable (`ObjectNotFound`, overload) or invalid. Anchovy sent none.
 - Anchovy's `wait_for_effects` takes a raw 32-byte digest, but sui's clients
   send its BCS (33 bytes, length-prefixed): seed 9's log has 141 "a 32-byte
   transaction digest is required" answers. Hidden by sui's quorum; the
-  compat test's own request sends raw bytes.
+  compat test's own request sent raw bytes. Fixed: the request's fields are
+  decoded as the reference's, with its errors
+  (`waits_are_decoded_as_the_reference_s_client_encodes_them`).
 
 ## Remaining
-- Decode `wait_for_effects`'s digest as sui's BCS, and make the compat
-  request send what sui's client sends.
 - Stateful rejections (`inputs.rs`) are checked against the reference at
   kind level only; `inputs.vectors` would need full reasons from the oracle.
 - Signature-failure texts (`InvalidSignature`) are anchovy's, not
