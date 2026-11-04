@@ -23,12 +23,22 @@ retriable (`ObjectNotFound`, overload) or invalid. Anchovy sent none.
   derp, 47 pass.
 
 ## Found
-- Seed 9 of the full mix through stalls panics in exec-pool's
-  `live_generation`: `StreamId { 0xa611f9…, initial_shared_version: 1 }`,
-  "which voting found live", has no live object. Not yet diagnosed.
+- Seed 9 of the full mix through stalls panicked in exec-pool's
+  `live_generation`: a shared access with no earlier generation found no
+  object. Its `StreamLive` key resolved at once, so it could run before its
+  object's creator (a transaction with no input objects, hence the stream's
+  start version 1) executed here. Fixed: `StreamLive` waits for the stream's
+  start, as the reference waits for the object at its initial version
+  (`a_first_access_waits_for_its_object_to_be_created`). Seed 9 did not
+  replay under derp (neither binary), so the test reproduces it instead.
+- Anchovy's `wait_for_effects` takes a raw 32-byte digest, but sui's clients
+  send its BCS (33 bytes, length-prefixed): seed 9's log has 141 "a 32-byte
+  transaction digest is required" answers. Hidden by sui's quorum; the
+  compat test's own request sends raw bytes.
 
 ## Remaining
-- Diagnose and fix seed 9.
+- Decode `wait_for_effects`'s digest as sui's BCS, and make the compat
+  request send what sui's client sends.
 - Stateful rejections (`inputs.rs`) are checked against the reference at
   kind level only; `inputs.vectors` would need full reasons from the oracle.
 - Signature-failure texts (`InvalidSignature`) are anchovy's, not
