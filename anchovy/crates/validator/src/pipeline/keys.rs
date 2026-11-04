@@ -36,7 +36,11 @@ pub enum InputKey {
         generation: u32,
     },
     /// The stream as the object store holds it: a generation 0 the resolver
-    /// has no earlier generation for. Always available.
+    /// has no earlier generation for. Available once the epoch recorded the
+    /// stream's start, or the object store holds its object live in it;
+    /// `Executor` notifies it for each stream a transaction starts. The
+    /// quorum that accepted the access had executed the object's creator,
+    /// but this validator need not have.
     StreamLive(StreamId),
     /// Every funds reservation of the transaction has resolved. Available
     /// once the reservation table holds how; `FundsReserver` notifies it.

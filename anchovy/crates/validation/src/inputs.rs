@@ -466,7 +466,7 @@ fn load<'a, 'b>(
             // names (same id and start version).
             InputKind::Shared(s) => match objects.live(&s.id) {
                 Some(object)
-                    if start_version(&object.get().owner)
+                    if object.get().owner.start_version()
                         == Some(s.initial_shared_version.get()) =>
                 {
                     object
@@ -506,18 +506,6 @@ fn load<'a, 'b>(
     let mut inputs = containers::Vec::with_capacity_in(kinds.len(), bump);
     inputs.extend(loaded.into_iter().map(|i| i.expect("every input loaded")));
     Ok(inputs)
-}
-
-/// The version a consensus object's stream starts at; none for other owners.
-fn start_version(owner: &Owner<'_>) -> Option<u64> {
-    match owner {
-        Owner::Shared {
-            initial_shared_version,
-        } => Some(*initial_shared_version),
-        Owner::ConsensusAddressOwner { start_version, .. } => Some(*start_version),
-        Owner::Party(party) => Some(party.start_version),
-        _ => None,
-    }
 }
 
 /// `read_receiving_objects_for_signing`: each live object, or none.

@@ -52,9 +52,10 @@ use workqueue::{Processor, Queue, Sink};
 ///   gives a stream `StreamLive` only in the round that first touches it,
 ///   and later rounds wait for that round's generation 0.
 ///
-///   A stream the resolver had no base for is always live: voting accepts
-///   only live shared inputs, and a deletion since the epoch began reaches
-///   later rounds as a base, recorded `Ended`.
+///   A stream the resolver had no base for is live once its `StreamLive`
+///   key is available: voting accepts only live shared inputs, and a
+///   deletion since the epoch began reaches later rounds as a base,
+///   recorded `Ended`.
 /// - **Recording.** Each stream it writes exclusively gets generation
 ///   `k + 1`: the version its effects give, or `Ended` if it deleted or
 ///   wrapped the object or took it out of consensus. A stream its effects do
@@ -468,7 +469,7 @@ impl Executor {
     ) {
         for change in effects.changed_objects {
             match change.output_state {
-                ObjectOut::ObjectWrite(..) => {
+                ObjectOut::ObjectWrite(_, owner) => {
                     let version = effects.lamport_version;
                     resolved_keys.push((
                         InputKey::ObjectVersion {
@@ -477,6 +478,17 @@ impl Executor {
                         },
                         InputValue::Object(self.object_at(written, change.id, version)),
                     ));
+                    // A stream starts at the version of the transaction that
+                    // shares the object or moves it into consensus.
+                    if owner.start_version() == Some(version) {
+                        resolved_keys.push((
+                            InputKey::StreamLive(StreamId {
+                                id: *change.id,
+                                initial_shared_version: version,
+                            }),
+                            InputValue::Live,
+                        ));
+                    }
                 }
                 ObjectOut::PackageWrite(version, _) => {
                     let package = self.object_at(written, change.id, version);
