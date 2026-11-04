@@ -1065,7 +1065,7 @@ async fn wait(
     position: Option<ConsensusPosition>,
 ) -> RawValidatorTransactionStatus {
     let request = RawWaitForEffectsRequest {
-        transaction_digest: Some(transaction.digest().into_inner().to_vec().into()),
+        transaction_digest: Some(bcs::to_bytes(transaction.digest()).unwrap().into()),
         consensus_position: position.map(|p| p.to_bcs().into()),
         include_details: false,
         ping_type: None,

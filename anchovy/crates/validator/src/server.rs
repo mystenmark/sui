@@ -43,10 +43,10 @@ use crate::pipeline::items::EffectsWaitItem;
 use crate::pipeline::keys::EffectsKey;
 use crate::processors::{self, Outcome, Rejected};
 use crate::proto::{
-    RawExecutedData, RawExecutedStatus, RawExpiredStatus, RawRejectedStatus, RawSubmitTxRequest,
-    RawSubmitTxResponse, RawSubmitTxResult, RawValidatorHealthRequest, RawValidatorHealthResponse,
-    RawValidatorSubmitStatus, RawValidatorTransactionStatus, RawWaitForEffectsRequest,
-    RawWaitForEffectsResponse, SubmitTxType,
+    PingType, RawExecutedData, RawExecutedStatus, RawExpiredStatus, RawRejectedStatus,
+    RawSubmitTxRequest, RawSubmitTxResponse, RawSubmitTxResult, RawValidatorHealthRequest,
+    RawValidatorHealthResponse, RawValidatorSubmitStatus, RawValidatorTransactionStatus,
+    RawWaitForEffectsRequest, RawWaitForEffectsResponse, SubmitTxType,
 };
 use crate::service::validator_server::{self, ValidatorServer};
 
@@ -226,14 +226,14 @@ impl Validator {
     /// reference does.
     async fn ping(
         &self,
-        request: &RawWaitForEffectsRequest,
+        position: Option<ConsensusPosition>,
+        include_details: bool,
     ) -> Result<Response<RawWaitForEffectsResponse>, Status> {
-        let position = request
-            .consensus_position
-            .as_deref()
-            .ok_or_else(|| Status::invalid_argument("a ping needs a consensus position"))?;
-        let position = ConsensusPosition::from_bcs(position)
-            .ok_or_else(|| Status::invalid_argument("not a consensus position"))?;
+        let position = position.ok_or_else(|| {
+            failed(&SuiErrorKind::InvalidRequest(
+                "Consensus position is required for Ping requests".to_owned(),
+            ))
+        })?;
         let epoch = self.current.get().await;
         if position.epoch < epoch.epoch.params.epoch {
             return Err(epoch_ended());
@@ -242,7 +242,7 @@ impl Validator {
         if statuses.too_far_ahead(&position) {
             return Err(Status::unavailable("ValidatorConsensusLagging"));
         }
-        let pinged = Self::pinged(&epoch.epoch, statuses, position, request.include_details);
+        let pinged = Self::pinged(&epoch.epoch, statuses, position, include_details);
         let status = tokio::select! {
             status = tokio::time::timeout(PING_TIMEOUT, pinged) => {
                 status.map_err(|_| Status::deadline_exceeded("TimeoutError"))?
@@ -501,21 +501,42 @@ impl validator_server::Validator for Validator {
         request: Request<RawWaitForEffectsRequest>,
     ) -> Result<Response<RawWaitForEffectsResponse>, Status> {
         let request = request.into_inner();
-        if request.ping_type.is_some() {
-            return self.ping(&request).await;
-        }
-        let digest: [u8; 32] = request
+        // Decoded as the reference's client encodes them, in its order.
+        let undecodable = |type_info: &str, error: String| {
+            failed(&SuiErrorKind::GrpcMessageDeserializeError {
+                type_info: type_info.to_owned(),
+                error,
+            })
+        };
+        let digest = request
             .transaction_digest
             .as_deref()
-            .and_then(|d| d.try_into().ok())
-            .ok_or_else(|| Status::invalid_argument("a 32-byte transaction digest is required"))?;
-        let position = match &request.consensus_position {
-            Some(bytes) => Some(
-                ConsensusPosition::from_bcs(bytes)
-                    .ok_or_else(|| Status::invalid_argument("not a consensus position"))?,
-            ),
-            None => None,
-        };
+            .map(|d| {
+                bcs::from_bytes::<sui_types::digests::TransactionDigest>(d)
+                    .map(sui_types::digests::TransactionDigest::into_inner)
+                    .map_err(|e| {
+                        undecodable("RawWaitForEffectsRequest.transaction_digest", e.to_string())
+                    })
+            })
+            .transpose()?;
+        let position = request
+            .consensus_position
+            .as_deref()
+            .map(|p| {
+                ConsensusPosition::from_bcs(p)
+                    .map_err(|e| undecodable("ConsensusPosition", e.to_string()))
+            })
+            .transpose()?;
+        if let Some(ping) = request.ping_type {
+            PingType::try_from(ping)
+                .map_err(|e| undecodable("RawWaitForEffectsRequest.ping_type", e.to_string()))?;
+            return self.ping(position, request.include_details).await;
+        }
+        let digest = digest.ok_or_else(|| {
+            failed(&SuiErrorKind::InvalidRequest(
+                "Transaction digest is required for wait for effects requests".to_owned(),
+            ))
+        })?;
         loop {
             let epoch = self.current.get().await;
             let consensus = &epoch.consensus;
