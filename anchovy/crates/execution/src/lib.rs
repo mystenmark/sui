@@ -389,6 +389,11 @@ impl Reference {
         let inputs = load_at(&view, data.input_objects()?, provided)?;
         let gas_status = if data.kind().is_system_tx() {
             SuiGasStatus::new_unmetered(&self.config)
+        } else if self.config.enable_gasless() && data.is_gasless_transaction() {
+            // As sui-core's `check_gas`.
+            let rgp = self.rgp.max(1);
+            let compute_cap = self.config.gasless_max_computation_units() * rgp;
+            SuiGasStatus::new(compute_cap, rgp, self.rgp, &self.config)?
         } else {
             SuiGasStatus::new(data.gas_budget(), data.gas_price(), self.rgp, &self.config)?
         };
