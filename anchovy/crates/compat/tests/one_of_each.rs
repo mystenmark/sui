@@ -767,7 +767,7 @@ impl Network {
                 }
             };
             let request = RawWaitForEffectsRequest {
-                transaction_digest: Some(transaction.digest().into_inner().to_vec().into()),
+                transaction_digest: Some(bcs::to_bytes(transaction.digest()).unwrap().into()),
                 consensus_position: position,
                 include_details: false,
                 ping_type: None,
@@ -2037,6 +2037,13 @@ fn the_full_composite_workload_runs_alike() {
 #[test]
 fn the_composite_workload_runs_alike_through_stalls() {
     composite_workload(true, false);
+}
+
+/// `the_full_composite_workload_runs_alike`, with anchovy stalled as in
+/// `the_composite_workload_runs_alike_through_stalls`.
+#[test]
+fn the_full_composite_workload_runs_alike_through_stalls() {
+    composite_workload(true, true);
 }
 
 fn composite_workload(stalls: bool, full: bool) {

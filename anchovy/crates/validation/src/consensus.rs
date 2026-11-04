@@ -12,13 +12,15 @@ use messages::checkpoint::AuthorityQuorumSignInfo;
 use messages::consensus::{ConsensusTransaction, ConsensusTransactionKind, TransactionClaim};
 
 use crate::sender_signed::deserialization_checks;
-use crate::{Error, ErrorKind};
+use crate::{Error, SuiErrorKind};
 
 /// `MAX_VALIDATOR_COUNT`, which bounds a quorum signature's signers.
 const MAX_VALIDATOR_COUNT: u64 = 150;
 
 fn malformed(what: &str) -> Error {
-    Error::new(ErrorKind::TransactionDeserializationError, what)
+    Error::new(SuiErrorKind::TransactionDeserializationError {
+        error: what.to_owned(),
+    })
 }
 
 /// Passes if sui decodes the transaction: its embedded transactions pass

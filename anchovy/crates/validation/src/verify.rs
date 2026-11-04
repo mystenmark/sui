@@ -28,7 +28,7 @@ use messages::transaction::{SenderSignedData, TransactionKind, TxState};
 use sui_protocol_config::{Chain, ProtocolConfig};
 
 use crate::signature::{MLDSA65_SIG_LEN, ParsedSignature, Passkey, ZkLoginAuthenticator, zklogin};
-use crate::{Error, ErrorKind};
+use crate::{Error, SuiErrorKind};
 
 /// What verification needs from the epoch, as the reference's
 /// `SignatureVerifier` holds it: the active JWKs and the verification
@@ -88,7 +88,7 @@ impl Verifier {
 }
 
 fn invalid(what: impl Into<String>) -> Error {
-    Error::new(ErrorKind::InvalidSignature, what)
+    Error::new(SuiErrorKind::InvalidSignature { error: what.into() })
 }
 
 fn blake2b(parts: &[&[u8]]) -> [u8; 32] {
@@ -312,13 +312,10 @@ fn signer_mapping<'b>(
     let required = required_signers(tx);
     let required_count = required.iter().flatten().count();
     if signatures.len() != required_count {
-        return Err(Error::new(
-            ErrorKind::SignerSignatureNumberMismatch,
-            format!(
-                "{} signatures for {required_count} signers",
-                signatures.len()
-            ),
-        ));
+        return Err(Error::new(SuiErrorKind::SignerSignatureNumberMismatch {
+            expected: required_count,
+            actual: signatures.len(),
+        }));
     }
     // User transactions were checked not to be system transactions.
     if !matches!(
@@ -349,14 +346,22 @@ fn signer_mapping<'b>(
     by_signer.sort_unstable_by_key(|(address, _, _)| address.0);
 
     for signer in required.iter().flatten() {
-        if !accepted_signers(signer, aliases)
+        let accepted = accepted_signers(signer, aliases);
+        if !accepted
             .iter()
             .any(|a| by_signer.iter().any(|(s, _, _)| s == a))
         {
-            return Err(Error::new(
-                ErrorKind::SignerSignatureAbsent,
-                "no signature from a required signer",
-            ));
+            let mut expected = String::new();
+            for (i, a) in accepted.iter().enumerate() {
+                if i > 0 {
+                    expected.push_str(" or ");
+                }
+                expected.push_str(&a.to_string());
+            }
+            return Err(Error::new(SuiErrorKind::SignerSignatureAbsent {
+                expected,
+                actual: by_signer.iter().map(|(s, _, _)| s.to_string()).collect(),
+            }));
         }
     }
     Ok(Some(by_signer))
@@ -530,7 +535,11 @@ fn verify_simple(
     parsed: Option<&SimpleKey>,
 ) -> Result<(), Error> {
     let (flag, sig, pk) = simple_parts(bytes);
-    let key_error = || Error::new(ErrorKind::KeyConversionError, "invalid public key");
+    let key_error = || {
+        Error::new(SuiErrorKind::KeyConversionError(
+            "Invalid public key".to_owned(),
+        ))
+    };
     let sig_error = || invalid("cannot parse signature");
     macro_rules! check {
         ($variant:ident, $pk:ty, $sig:ty) => {{
@@ -553,9 +562,12 @@ fn verify_simple(
             let pk = $pk;
             let sig = <$sig>::from_bytes(sig).map_err(|_| sig_error())?;
             if let Some(author) = author
-                && SuiAddress(blake2b(&[&[flag], pk.as_bytes()])) != *author
+                && let address = SuiAddress(blake2b(&[&[flag], pk.as_bytes()]))
+                && address != *author
             {
-                return Err(Error::new(ErrorKind::IncorrectSigner, "incorrect signer"));
+                return Err(Error::new(SuiErrorKind::IncorrectSigner {
+                    error: format!("Incorrect signer, expected {author}, got {address}"),
+                }));
             }
             pk.verify(digest, &sig)
                 .map_err(|e| invalid(format!("signature does not verify: {e}")))
@@ -745,10 +757,7 @@ fn verify_zklogin(
         && (!verifier.verify_legacy_zklogin_address
             || zklogin_padded_address(&zk.inputs) != *author)
     {
-        return Err(Error::new(
-            ErrorKind::InvalidAddress,
-            "zkLogin address mismatch",
-        ));
+        return Err(Error::new(SuiErrorKind::InvalidAddress));
     }
     if !verifier.supported_providers.is_empty() {
         let provider =

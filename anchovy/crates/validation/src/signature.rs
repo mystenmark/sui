@@ -11,7 +11,7 @@ use messages::arena::BumpAlloc;
 use messages::reader::Reader;
 use messages::signature::{CompressedSignature, MultiSig, MultiSigPublicKey, PublicKey};
 
-use crate::{Error, ErrorKind};
+use crate::{Error, SuiErrorKind};
 
 /// `MAX_SIGNER_IN_MULTISIG`.
 const MAX_SIGNERS: usize = 10;
@@ -75,7 +75,9 @@ impl ParsedSignature<'_> {
 }
 
 fn malformed(what: &str) -> Error {
-    Error::new(ErrorKind::TransactionDeserializationError, what)
+    Error::new(SuiErrorKind::TransactionDeserializationError {
+        error: what.to_owned(),
+    })
 }
 
 /// Parses a `GenericSignature`, returning it with the length the reference

@@ -27,7 +27,8 @@ use messages::grpc::{
     CheckpointRequest, CheckpointRequestV2, ObjectInfoRequest, SystemStateRequest,
     TransactionInfoRequest,
 };
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
+use validation::SuiErrorKind;
 
 use ::consensus::{PING_TRANSACTION_INDEX, Priority, TransactionClient};
 use waiter::{Command, WaitBatch};
@@ -42,10 +43,10 @@ use crate::pipeline::items::EffectsWaitItem;
 use crate::pipeline::keys::EffectsKey;
 use crate::processors::{self, Outcome, Rejected};
 use crate::proto::{
-    RawExecutedData, RawExecutedStatus, RawExpiredStatus, RawRejectedStatus, RawSubmitTxRequest,
-    RawSubmitTxResponse, RawSubmitTxResult, RawValidatorHealthRequest, RawValidatorHealthResponse,
-    RawValidatorSubmitStatus, RawValidatorTransactionStatus, RawWaitForEffectsRequest,
-    RawWaitForEffectsResponse, SubmitTxType,
+    PingType, RawExecutedData, RawExecutedStatus, RawExpiredStatus, RawRejectedStatus,
+    RawSubmitTxRequest, RawSubmitTxResponse, RawSubmitTxResult, RawValidatorHealthRequest,
+    RawValidatorHealthResponse, RawValidatorSubmitStatus, RawValidatorTransactionStatus,
+    RawWaitForEffectsRequest, RawWaitForEffectsResponse, SubmitTxType,
 };
 use crate::service::validator_server::{self, ValidatorServer};
 
@@ -225,14 +226,14 @@ impl Validator {
     /// reference does.
     async fn ping(
         &self,
-        request: &RawWaitForEffectsRequest,
+        position: Option<ConsensusPosition>,
+        include_details: bool,
     ) -> Result<Response<RawWaitForEffectsResponse>, Status> {
-        let position = request
-            .consensus_position
-            .as_deref()
-            .ok_or_else(|| Status::invalid_argument("a ping needs a consensus position"))?;
-        let position = ConsensusPosition::from_bcs(position)
-            .ok_or_else(|| Status::invalid_argument("not a consensus position"))?;
+        let position = position.ok_or_else(|| {
+            failed(&SuiErrorKind::InvalidRequest(
+                "Consensus position is required for Ping requests".to_owned(),
+            ))
+        })?;
         let epoch = self.current.get().await;
         if position.epoch < epoch.epoch.params.epoch {
             return Err(epoch_ended());
@@ -241,7 +242,7 @@ impl Validator {
         if statuses.too_far_ahead(&position) {
             return Err(Status::unavailable("ValidatorConsensusLagging"));
         }
-        let pinged = Self::pinged(&epoch.epoch, statuses, position, request.include_details);
+        let pinged = Self::pinged(&epoch.epoch, statuses, position, include_details);
         let status = tokio::select! {
             status = tokio::time::timeout(PING_TIMEOUT, pinged) => {
                 status.map_err(|_| Status::deadline_exceeded("TimeoutError"))?
@@ -331,15 +332,24 @@ impl Validator {
         epoch: &EpochState,
         request: &RawSubmitTxRequest,
     ) -> Result<SubmitTxType, Status> {
-        let submit_type = SubmitTxType::try_from(request.submit_type)
-            .map_err(|_| Status::invalid_argument("unknown submit type"))?;
+        let submit_type = SubmitTxType::try_from(request.submit_type).map_err(|e| {
+            failed(&SuiErrorKind::GrpcMessageDeserializeError {
+                type_info: "RawSubmitTxRequest.submit_type".to_owned(),
+                error: e.to_string(),
+            })
+        })?;
+        let invalid = |message: String| failed(&SuiErrorKind::InvalidRequest(message));
         let count = request.transactions.len();
         match submit_type {
             SubmitTxType::Ping if count > 0 => {
-                return Err(Status::invalid_argument("a ping carries no transactions"));
+                return Err(invalid(format!(
+                    "Ping request cannot contain {count} transactions"
+                )));
             }
             SubmitTxType::Default | SubmitTxType::SoftBundle if count == 0 => {
-                return Err(Status::invalid_argument("no transactions"));
+                return Err(invalid(
+                    "At least one transaction needs to be submitted".to_owned(),
+                ));
             }
             _ => {}
         }
@@ -350,8 +360,8 @@ impl Validator {
             config.max_num_transactions_in_block()
         };
         if count as u64 > max {
-            return Err(Status::invalid_argument(format!(
-                "{count} transactions, at most {max}"
+            return Err(invalid(format!(
+                "Too many transactions in request: {count} vs {max}"
             )));
         }
         Ok(submit_type)
@@ -365,10 +375,12 @@ impl Validator {
         request: &RawSubmitTxRequest,
     ) -> Result<oneshot::Receiver<Result<Vec<Outcome>, Rejected>>, Failure> {
         let mut transactions = Vec::with_capacity(request.transactions.len());
-        for bytes in &request.transactions {
+        for (i, bytes) in request.transactions.iter().enumerate() {
             let transaction = Message::<Transaction<DigestPending>>::parse(bytes.to_vec())
                 .map_err(|(e, _)| {
-                    Status::invalid_argument(format!("TransactionDeserializationError: {e:?}"))
+                    failed(&SuiErrorKind::TransactionDeserializationError {
+                        error: format!("Failed to deserialize transaction at index {i}: {e:?}"),
+                    })
                 })?;
             transactions.push(transaction);
         }
@@ -410,11 +422,12 @@ fn result(outcome: Outcome) -> RawSubmitTxResult {
         Outcome::Executed(executed) => {
             RawValidatorSubmitStatus::Executed(executed_status(*executed))
         }
-        // Without the reason: it would be BCS of the reference's `SuiError`,
-        // which anchovy's errors do not map to yet.
-        Outcome::Rejected(_) | Outcome::Failed(_) => {
-            RawValidatorSubmitStatus::Rejected(RawRejectedStatus { error: None })
-        }
+        Outcome::Rejected(e) => RawValidatorSubmitStatus::Rejected(RawRejectedStatus {
+            error: Some(reason_bcs(&e.reason).into()),
+        }),
+        Outcome::Failed(e) => RawValidatorSubmitStatus::Rejected(RawRejectedStatus {
+            error: Some(reason_bcs(&SuiErrorKind::Storage(e)).into()),
+        }),
         Outcome::Submit(_) => unreachable!("submitted, then answered with its position"),
     };
     RawSubmitTxResult {
@@ -427,9 +440,24 @@ fn epoch_ended() -> Status {
     Status::unavailable("EpochEnded")
 }
 
+/// BCS of the reference's `SuiError`, which encodes as its kind.
+fn reason_bcs(reason: &SuiErrorKind) -> Vec<u8> {
+    bcs::to_bytes(reason).expect("an error's strings and lists fit BCS's bounds")
+}
+
+/// A failed request as the reference fails one: clients decode its
+/// `SuiError` from the status's details.
+fn failed(reason: &SuiErrorKind) -> Status {
+    Status::with_details(
+        Code::Internal,
+        format!("{reason:?}"),
+        reason_bcs(reason).into(),
+    )
+}
+
 fn rejection(rejected: &Rejected) -> Status {
     match rejected {
-        Rejected::Invalid(e) => Status::invalid_argument(format!("{:?}: {}", e.kind, e.detail)),
+        Rejected::Invalid(e) => failed(&e.reason),
         Rejected::Overloaded => Status::resource_exhausted("signature verification queue full"),
         Rejected::ShuttingDown => Status::unavailable("shutting down"),
     }
@@ -473,21 +501,42 @@ impl validator_server::Validator for Validator {
         request: Request<RawWaitForEffectsRequest>,
     ) -> Result<Response<RawWaitForEffectsResponse>, Status> {
         let request = request.into_inner();
-        if request.ping_type.is_some() {
-            return self.ping(&request).await;
-        }
-        let digest: [u8; 32] = request
+        // Decoded as the reference's client encodes them, in its order.
+        let undecodable = |type_info: &str, error: String| {
+            failed(&SuiErrorKind::GrpcMessageDeserializeError {
+                type_info: type_info.to_owned(),
+                error,
+            })
+        };
+        let digest = request
             .transaction_digest
             .as_deref()
-            .and_then(|d| d.try_into().ok())
-            .ok_or_else(|| Status::invalid_argument("a 32-byte transaction digest is required"))?;
-        let position = match &request.consensus_position {
-            Some(bytes) => Some(
-                ConsensusPosition::from_bcs(bytes)
-                    .ok_or_else(|| Status::invalid_argument("not a consensus position"))?,
-            ),
-            None => None,
-        };
+            .map(|d| {
+                bcs::from_bytes::<sui_types::digests::TransactionDigest>(d)
+                    .map(sui_types::digests::TransactionDigest::into_inner)
+                    .map_err(|e| {
+                        undecodable("RawWaitForEffectsRequest.transaction_digest", e.to_string())
+                    })
+            })
+            .transpose()?;
+        let position = request
+            .consensus_position
+            .as_deref()
+            .map(|p| {
+                ConsensusPosition::from_bcs(p)
+                    .map_err(|e| undecodable("ConsensusPosition", e.to_string()))
+            })
+            .transpose()?;
+        if let Some(ping) = request.ping_type {
+            PingType::try_from(ping)
+                .map_err(|e| undecodable("RawWaitForEffectsRequest.ping_type", e.to_string()))?;
+            return self.ping(position, request.include_details).await;
+        }
+        let digest = digest.ok_or_else(|| {
+            failed(&SuiErrorKind::InvalidRequest(
+                "Transaction digest is required for wait for effects requests".to_owned(),
+            ))
+        })?;
         loop {
             let epoch = self.current.get().await;
             let consensus = &epoch.consensus;

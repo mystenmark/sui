@@ -322,6 +322,37 @@ impl fmt::Debug for Digest {
     }
 }
 
+/// As the reference displays digests: base58, Bitcoin's alphabet.
+impl fmt::Display for Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+        // 32 bytes take at most 44 base58 digits, least significant first.
+        let mut digits = [0u8; 44];
+        let mut len = 0;
+        for &byte in &self.bytes {
+            let mut carry = u32::from(byte);
+            for digit in &mut digits[..len] {
+                carry += u32::from(*digit) << 8;
+                *digit = (carry % 58) as u8;
+                carry /= 58;
+            }
+            while carry > 0 {
+                digits[len] = (carry % 58) as u8;
+                len += 1;
+                carry /= 58;
+            }
+        }
+        // Each leading zero byte is a leading '1'.
+        for _ in self.bytes.iter().take_while(|b| **b == 0) {
+            f.write_str("1")?;
+        }
+        for digit in digits[..len].iter().rev() {
+            write!(f, "{}", char::from(ALPHABET[usize::from(*digit)]))?;
+        }
+        Ok(())
+    }
+}
+
 pub type ObjectDigest = Digest;
 pub type TransactionDigest = Digest;
 pub type TransactionEffectsDigest = Digest;

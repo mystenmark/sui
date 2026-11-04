@@ -15,6 +15,7 @@ pub mod base;
 pub mod checkpoint;
 pub mod consensus;
 pub mod effects;
+pub mod error;
 pub mod execution_status;
 pub mod object;
 pub mod signature;

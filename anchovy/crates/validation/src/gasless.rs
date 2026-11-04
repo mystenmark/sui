@@ -15,10 +15,10 @@ use sui_protocol_config::ProtocolConfig;
 
 use crate::kind::is_valid_identifier;
 use crate::transaction_data::command_arguments;
-use crate::{Error, ErrorKind};
+use crate::{Error, UserInputError};
 
 fn unsupported(what: impl Into<String>) -> Error {
-    Error::new(ErrorKind::Unsupported, what)
+    Error::new(UserInputError::Unsupported(what.into()))
 }
 
 /// What a whitelisted function's type argument names.
@@ -55,14 +55,18 @@ pub fn validate(
     bump: &Bump,
 ) -> Result<(), Error> {
     if pt.commands.is_empty() {
-        return Err(unsupported("gasless transactions need a command"));
+        return Err(unsupported(
+            "Gasless transactions must have at least one command",
+        ));
     }
     if pt
         .inputs
         .iter()
         .any(|i| matches!(i, CallArg::Object(ObjectArg::Receiving(_))))
     {
-        return Err(unsupported("gasless transactions cannot receive objects"));
+        return Err(unsupported(
+            "Gasless transactions do not support Receiving object inputs",
+        ));
     }
     for command in pt.commands {
         match command {
@@ -70,7 +74,7 @@ pub fn validate(
             Command::MergeCoins(..) | Command::SplitCoins(..) => {}
             _ => {
                 return Err(unsupported(
-                    "gasless transactions allow only MoveCall, MergeCoins and SplitCoins",
+                    "Gasless transactions only support MoveCall, MergeCoins, and SplitCoins commands",
                 ));
             }
         }
@@ -81,8 +85,8 @@ pub fn validate(
 fn move_call(call: &ProgrammableMoveCall<'_>, config: &ProtocolConfig) -> Result<(), Error> {
     let not_allowed = || {
         unsupported(format!(
-            "{}::{} is not allowed in gasless transactions",
-            call.module, call.function
+            "Function {}::{}::{} is not supported in gasless transactions",
+            call.package, call.module, call.function
         ))
     };
     if call.package.0 != framework().0 {
@@ -95,34 +99,53 @@ fn move_call(call: &ProgrammableMoveCall<'_>, config: &ProtocolConfig) -> Result
         return Err(not_allowed());
     };
     let [type_arg] = call.type_arguments else {
-        return Err(unsupported("gasless functions take one type argument"));
+        return Err(unsupported(format!(
+            "Function {}::{}::{} requires 1 type arguments, but {} were provided",
+            call.package,
+            call.module,
+            call.function,
+            call.type_arguments.len()
+        )));
     };
     // The reference converts the argument to a type tag, which checks
     // identifiers.
-    if !identifiers_valid(type_arg) {
-        return Err(unsupported("type argument is not a valid type tag"));
+    if let Some(invalid) = invalid_identifier(type_arg) {
+        return Err(unsupported(format!(
+            "Failed to parse type argument {type_arg} as a type tag: \
+             Invalid identifier '{invalid}'"
+        )));
     }
     let fund = match constraint {
         TypeArg::Fund => type_arg,
         TypeArg::Balance => balance_param(type_arg)
-            .ok_or_else(|| unsupported("expected Balance<_> as the type argument"))?,
+            .ok_or_else(|| unsupported(format!("Expected a type Balance<_> but got {type_arg}")))?,
     };
     if !is_allowed_token(fund, config) {
-        return Err(unsupported("fund type not allowed in gasless transactions"));
+        return Err(unsupported(format!(
+            "Fund type {fund} is not currently allowed in gasless transactions"
+        )));
     }
     Ok(())
 }
 
-fn identifiers_valid(ty: &TypeTag<'_>) -> bool {
+/// The first invalid identifier in `ty`, in the order the reference's
+/// `TypeInput::to_type_tag` checks them: a struct's type parameters, then its
+/// module and name.
+fn invalid_identifier<'t>(ty: &TypeTag<'t>) -> Option<&'t str> {
     match ty {
-        TypeTag::Vector(inner) => identifiers_valid(inner.get()),
+        TypeTag::Vector(inner) => invalid_identifier(inner.get()),
         TypeTag::Struct(s) => {
             let s = s.get();
-            is_valid_identifier(s.module)
-                && is_valid_identifier(s.name)
-                && s.type_params.iter().all(identifiers_valid)
+            s.type_params
+                .iter()
+                .find_map(invalid_identifier)
+                .or_else(|| {
+                    [s.module, s.name]
+                        .into_iter()
+                        .find(|i| !is_valid_identifier(i))
+                })
         }
-        _ => true,
+        _ => None,
     }
 }
 
@@ -207,15 +230,24 @@ fn inputs(
             CallArg::Pure(bytes) => {
                 if bytes.len() as u64 > max_pure_bytes {
                     return Err(unsupported(format!(
-                        "pure input {i} over {max_pure_bytes} bytes"
+                        "Input {i} has size {} bytes, but gasless transactions \
+                         allow at most {max_pure_bytes} bytes per Pure input",
+                        bytes.len()
                     )));
                 }
                 if !used[i] {
                     unused_pure += 1;
                 }
             }
-            CallArg::Object(_) | CallArg::FundsWithdrawal(_) if !used[i] => {
-                return Err(unsupported(format!("input {i} is unused")));
+            CallArg::Object(_) if !used[i] => {
+                return Err(unsupported(format!(
+                    "Gasless transactions do not allow unused Object inputs (input {i})"
+                )));
+            }
+            CallArg::FundsWithdrawal(_) if !used[i] => {
+                return Err(unsupported(format!(
+                    "Gasless transactions do not allow unused FundsWithdrawal inputs (input {i})"
+                )));
             }
             CallArg::Object(_) | CallArg::FundsWithdrawal(_) => {}
         }
@@ -223,7 +255,7 @@ fn inputs(
     let max_unused = config.get_gasless_max_unused_inputs();
     if unused_pure > max_unused {
         return Err(unsupported(format!(
-            "{unused_pure} unused pure inputs, at most {max_unused}"
+            "Gasless transactions allow at most {max_unused} unused Pure inputs, but found {unused_pure}"
         )));
     }
     Ok(())
