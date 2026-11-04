@@ -13,14 +13,10 @@ use super::base::{
 };
 use super::object::Owner;
 
-/// The reference's `SuiError`, a newtype over its boxed kind: BCS encodes
-/// it as the kind alone.
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
-pub struct SuiError(pub SuiErrorKind);
-
 /// The variants of the reference's `SuiErrorKind` that anchovy sends. Each
 /// serializes at its index in the reference's enum; the others carry types
-/// anchovy has no mirror for.
+/// anchovy has no mirror for. The reference's `SuiError` is a newtype over
+/// a boxed kind, so BCS encodes it as the kind alone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SuiErrorKind {
     UserInputError {
@@ -47,6 +43,11 @@ pub enum SuiErrorKind {
     KeyConversionError(String),
     TransactionExpired,
     Storage(String),
+    GrpcMessageDeserializeError {
+        type_info: String,
+        error: String,
+    },
+    InvalidRequest(String),
 }
 
 impl Serialize for SuiErrorKind {
@@ -93,6 +94,16 @@ impl Serialize for SuiErrorKind {
                 let mut v = s.serialize_tuple_variant(NAME, 97, "Storage", 1)?;
                 v.serialize_field(e)?;
                 v.end()
+            }
+            SuiErrorKind::GrpcMessageDeserializeError { type_info, error } => {
+                let mut v =
+                    s.serialize_struct_variant(NAME, 103, "GrpcMessageDeserializeError", 2)?;
+                v.serialize_field("type_info", type_info)?;
+                v.serialize_field("error", error)?;
+                v.end()
+            }
+            SuiErrorKind::InvalidRequest(e) => {
+                s.serialize_newtype_variant(NAME, 106, "InvalidRequest", e)
             }
         }
     }

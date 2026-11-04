@@ -161,7 +161,7 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
     for m in &decoded {
         bump.reset();
         let verdict = validation::check(&m.get().0, &epoch.context(), &epoch.verifier, &[], &bump)
-            .map_or_else(|e| format!("{:?}", e.kind), |_| "ok".to_owned());
+            .map_or_else(|e| format!("{:?}", e.kind()), |_| "ok".to_owned());
         *verdicts.entry(verdict).or_default() += 1;
     }
     println!(

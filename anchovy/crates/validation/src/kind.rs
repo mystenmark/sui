@@ -14,20 +14,26 @@ use messages::transaction::{
 use messages::type_tag::{TypeInput, TypeTag};
 use sui_protocol_config::{PerObjectCongestionControlMode, ProtocolConfig};
 
-use crate::{Error, ErrorKind};
+use crate::{Error, UserInputError};
 
 /// The randomness state object, `0x8`.
 const RANDOMNESS_STATE: ObjectId = ObjectId::from_u16(8);
 
-fn unsupported(what: &str) -> Error {
-    Error::new(ErrorKind::Unsupported, what)
+fn unsupported(what: impl Into<String>) -> Error {
+    Error::new(UserInputError::Unsupported(what.into()))
 }
 
-fn size_limit(what: &str, limit: impl std::fmt::Display) -> Error {
-    Error::new(
-        ErrorKind::SizeLimitExceeded,
-        format!("{what}: limit {limit}"),
-    )
+fn size_limit(limit: &str, value: impl std::fmt::Display) -> Error {
+    Error::new(UserInputError::SizeLimitExceeded {
+        limit: limit.to_owned(),
+        value: value.to_string(),
+    })
+}
+
+fn invalid_identifier(error: &str) -> Error {
+    Error::new(UserInputError::InvalidIdentifier {
+        error: error.to_owned(),
+    })
 }
 
 pub fn validity_check(
@@ -51,33 +57,34 @@ pub fn validity_check(
         | TransactionKind::ConsensusCommitPrologue(_) => Ok(()),
         TransactionKind::ConsensusCommitPrologueV2(_) => require(
             config.include_consensus_digest_in_prologue(),
-            "ConsensusCommitPrologueV2",
+            "ConsensusCommitPrologueV2 is not supported",
         ),
         TransactionKind::ConsensusCommitPrologueV3(_) => require(
             config.record_consensus_determined_version_assignments_in_prologue(),
-            "ConsensusCommitPrologueV3",
+            "ConsensusCommitPrologueV3 is not supported",
         ),
         TransactionKind::ConsensusCommitPrologueV4(_) => require(
             config.record_additional_state_digest_in_prologue(),
-            "ConsensusCommitPrologueV4",
+            "ConsensusCommitPrologueV4 is not supported",
         ),
         TransactionKind::EndOfEpochTransaction(txs) => {
             require(
                 config.end_of_epoch_transaction_supported(),
-                "EndOfEpochTransaction",
+                "EndOfEpochTransaction is not supported",
             )?;
             txs.iter()
                 .try_for_each(|t| end_of_epoch_transaction(t, config))
         }
         TransactionKind::AuthenticatorStateUpdate(_) => require(
             config.enable_jwk_consensus_updates(),
-            "authenticator state updates",
+            "authenticator state updates not enabled",
         ),
-        TransactionKind::RandomnessStateUpdate(_) => {
-            require(config.random_beacon(), "randomness state updates")
-        }
+        TransactionKind::RandomnessStateUpdate(_) => require(
+            config.random_beacon(),
+            "randomness state updates not enabled",
+        ),
         TransactionKind::ProgrammableSystemTransaction(_) => {
-            require(config.enable_accumulators(), "accumulators")
+            require(config.enable_accumulators(), "accumulators not enabled")
         }
     }
 }
@@ -91,18 +98,18 @@ fn end_of_epoch_transaction(
         K::ChangeEpoch(_) => return Ok(()),
         K::AuthenticatorStateCreate | K::AuthenticatorStateExpire { .. } => (
             config.enable_jwk_consensus_updates(),
-            "authenticator state updates",
+            "authenticator state updates not enabled",
         ),
-        K::RandomnessStateCreate => (config.random_beacon(), "random beacon"),
-        K::DenyListStateCreate => (config.enable_coin_deny_list(), "coin deny list"),
-        K::BridgeStateCreate(_) => (config.bridge(), "bridge"),
+        K::RandomnessStateCreate => (config.random_beacon(), "random beacon not enabled"),
+        K::DenyListStateCreate => (config.enable_coin_deny_list(), "coin deny list not enabled"),
+        K::BridgeStateCreate(_) => (config.bridge(), "bridge not enabled"),
         K::BridgeCommitteeInit(_) => {
             if !config.bridge() {
-                return Err(unsupported("bridge"));
+                return Err(unsupported("bridge not enabled"));
             }
             (
                 config.should_try_to_finalize_bridge_committee(),
-                "finalizing the bridge committee",
+                "should not try to finalize committee yet",
             )
         }
         K::StoreExecutionTimeObservations(_) => (
@@ -110,16 +117,24 @@ fn end_of_epoch_transaction(
                 config.per_object_congestion_control_mode(),
                 PerObjectCongestionControlMode::ExecutionTimeEstimate(_)
             ),
-            "execution time estimation",
+            "execution time estimation not enabled",
         ),
-        K::AccumulatorRootCreate => (config.create_root_accumulator_object(), "accumulators"),
-        K::CoinRegistryCreate => (config.enable_coin_registry(), "coin registry"),
-        K::DisplayRegistryCreate => (config.enable_display_registry(), "display registry"),
-        K::AddressAliasStateCreate => (config.address_aliases(), "address aliases"),
-        K::WriteAccumulatorStorageCost { .. } => (config.enable_accumulators(), "accumulators"),
+        K::AccumulatorRootCreate => (
+            config.create_root_accumulator_object(),
+            "accumulators not enabled",
+        ),
+        K::CoinRegistryCreate => (config.enable_coin_registry(), "coin registry not enabled"),
+        K::DisplayRegistryCreate => (
+            config.enable_display_registry(),
+            "display registry not enabled",
+        ),
+        K::AddressAliasStateCreate => (config.address_aliases(), "address aliases not enabled"),
+        K::WriteAccumulatorStorageCost { .. } => {
+            (config.enable_accumulators(), "accumulators not enabled")
+        }
         K::ForwardingAddressRegistryCreate => (
             config.create_forwarding_address_registry(),
-            "forwarding address registry",
+            "forwarding address registry not enabled",
         ),
     };
     if enabled {
@@ -137,7 +152,7 @@ fn programmable_transaction(
 ) -> Result<(), Error> {
     if pt.commands.len() >= config.max_programmable_tx_commands() as usize {
         return Err(size_limit(
-            "commands in a programmable transaction",
+            "maximum commands in a programmable transaction",
             config.max_programmable_tx_commands(),
         ));
     }
@@ -148,7 +163,7 @@ fn programmable_transaction(
     let total = input_objects + tx.index().packages.len() + tx.index().receiving.len();
     if total > config.max_input_objects() as usize {
         return Err(size_limit(
-            "input and receiving objects",
+            "maximum input + receiving objects in a transaction",
             config.max_input_objects(),
         ));
     }
@@ -164,10 +179,10 @@ fn programmable_transaction(
             .filter(|c| matches!(c, Command::Publish(..) | Command::Upgrade(..)))
             .count() as u64;
         if publishes > max {
-            return Err(Error::new(
-                ErrorKind::MaxPublishCountExceeded,
-                format!("{publishes} publishes or upgrades, at most {max}"),
-            ));
+            return Err(Error::new(UserInputError::MaxPublishCountExceeded {
+                max_publish_commands: max,
+                publish_count: publishes,
+            }));
         }
     }
 
@@ -185,7 +200,7 @@ fn programmable_transaction(
         matches!(arg, CallArg::Object(ObjectArg::SharedObject(s)) if s.id == RANDOMNESS_STATE)
     }) {
         if !config.random_beacon() {
-            return Err(unsupported("randomness"));
+            return Err(unsupported("randomness is not enabled on this network"));
         }
         // Positions are u16 on the wire; the size limit keeps inputs below
         // 65536.
@@ -195,10 +210,7 @@ fn programmable_transaction(
             if !used {
                 used = crate::transaction_data::command_arguments(command).any(|a| a == random);
             } else if !matches!(command, Command::TransferObjects(..) | Command::MergeCoins(..)) {
-                return Err(Error::new(
-                    ErrorKind::PostRandomCommandRestrictions,
-                    "only TransferObjects and MergeCoins may follow a use of randomness",
-                ));
+                return Err(Error::new(UserInputError::PostRandomCommandRestrictions));
             }
         }
     }
@@ -220,10 +232,7 @@ fn distinct_input_objects(pt: &ProgrammableTransaction<'_>, bump: &Bump) -> Resu
     let count = ids.len();
     ids.sort_unstable();
     if ids.windows(2).any(|w| w[0] == w[1]) {
-        return Err(Error::new(
-            ErrorKind::DuplicateObjectRefInput,
-            "an object is an input more than once",
-        ));
+        return Err(Error::new(UserInputError::DuplicateObjectRefInput));
     }
     Ok(count)
 }
@@ -233,26 +242,33 @@ fn call_arg(arg: &CallArg<'_>, config: &ProtocolConfig) -> Result<(), Error> {
         CallArg::Pure(bytes) => {
             if bytes.len() >= config.max_pure_argument_size() as usize {
                 return Err(size_limit(
-                    "pure argument size",
+                    "maximum pure argument size",
                     config.max_pure_argument_size(),
                 ));
             }
         }
         CallArg::Object(ObjectArg::ImmOrOwnedObject(r)) => {
             if r.is_coin_reservation() && !config.enable_coin_reservation_obj_refs() {
-                return Err(unsupported("coin reservations"));
+                return Err(unsupported(
+                    "coin reservation backward compatibility layer is not enabled",
+                ));
             }
         }
         CallArg::Object(ObjectArg::SharedObject(s)) => {
             if s.mutability() == SharedObjectMutability::NonExclusiveWrite
                 && !config.enable_non_exclusive_writes()
             {
-                return Err(unsupported("non-exclusive writes"));
+                return Err(unsupported(
+                    "User transactions cannot use SharedObjectMutability::NonExclusiveWrite",
+                ));
             }
         }
         CallArg::Object(ObjectArg::Receiving(_)) => {
             if !config.receive_objects() {
-                return Err(unsupported("receiving objects"));
+                return Err(unsupported(format!(
+                    "receiving objects is not supported at {:?}",
+                    config.version
+                )));
             }
         }
         CallArg::FundsWithdrawal(w) => {
@@ -260,7 +276,10 @@ fn call_arg(arg: &CallArg<'_>, config: &ProtocolConfig) -> Result<(), Error> {
             if let Some(max) = config.max_accumulator_type_nodes_as_option() {
                 // The type is `Balance<ty>`: one node more than `ty`.
                 if node_count(&ty).saturating_add(1) > max {
-                    return Err(size_limit("type nodes in a funds accumulator type", max));
+                    return Err(size_limit(
+                        "maximum type nodes in a funds accumulator type",
+                        max,
+                    ));
                 }
             }
         }
@@ -281,7 +300,7 @@ fn node_count(ty: &TypeTag<'_>) -> u64 {
 }
 
 fn command_check(command: &Command<'_>, config: &ProtocolConfig) -> Result<(), Error> {
-    let empty = || Error::new(ErrorKind::EmptyCommandInput, "a command has no inputs");
+    let empty = || Error::new(UserInputError::EmptyCommandInput);
     let max_arguments = config.max_arguments() as usize;
     match command {
         Command::MoveCall(call) => move_call(call, config),
@@ -292,7 +311,10 @@ fn command_check(command: &Command<'_>, config: &ProtocolConfig) -> Result<(), E
                 return Err(empty());
             }
             if args.len() >= max_arguments {
-                return Err(size_limit("arguments in a command", max_arguments));
+                return Err(size_limit(
+                    "maximum arguments in a programmable transaction command",
+                    max_arguments,
+                ));
             }
             Ok(())
         }
@@ -304,7 +326,10 @@ fn command_check(command: &Command<'_>, config: &ProtocolConfig) -> Result<(), E
                 type_input(ty, config, &mut 0, 1)?;
             }
             if args.len() >= max_arguments {
-                return Err(size_limit("arguments in a command", max_arguments));
+                return Err(size_limit(
+                    "maximum arguments in a programmable transaction command",
+                    max_arguments,
+                ));
             }
             Ok(())
         }
@@ -314,14 +339,14 @@ fn command_check(command: &Command<'_>, config: &ProtocolConfig) -> Result<(), E
             }
             if modules.len() >= config.max_modules_in_publish() as usize {
                 return Err(size_limit(
-                    "modules in a publish or upgrade",
+                    "maximum modules in a programmable transaction upgrade command",
                     config.max_modules_in_publish(),
                 ));
             }
             if let Some(max) = config.max_package_dependencies_as_option()
                 && deps.len() >= max as usize
             {
-                return Err(size_limit("package dependencies", max));
+                return Err(size_limit("maximum package dependencies", max));
             }
             Ok(())
         }
@@ -336,14 +361,15 @@ fn move_call(call: &ProgrammableMoveCall<'_>, config: &ProtocolConfig) -> Result
     }
     if call.arguments.len() >= config.max_arguments() as usize {
         return Err(size_limit(
-            "arguments in a move call",
+            "maximum arguments in a move call",
             config.max_arguments(),
         ));
     }
     if config.validate_identifier_inputs()
         && (!is_valid_identifier(call.module) || !is_valid_identifier(call.function))
     {
-        return Err(Error::new(ErrorKind::InvalidIdentifier, call.module));
+        // The reference names the module even when the function is invalid.
+        return Err(invalid_identifier(call.module));
     }
     Ok(())
 }
@@ -360,13 +386,13 @@ fn type_input(
     *count += 1;
     if *count >= config.max_type_arguments() as usize {
         return Err(size_limit(
-            "type arguments in a call",
+            "maximum type arguments in a call transaction",
             config.max_type_arguments(),
         ));
     }
     if depth >= config.max_type_argument_depth() {
         return Err(size_limit(
-            "type argument depth",
+            "maximum type argument depth in a call transaction",
             config.max_type_argument_depth(),
         ));
     }
@@ -376,10 +402,10 @@ fn type_input(
             let s = s.get();
             if config.validate_identifier_inputs() {
                 if !is_valid_identifier(s.module) {
-                    return Err(Error::new(ErrorKind::InvalidIdentifier, s.module));
+                    return Err(invalid_identifier(s.module));
                 }
                 if !is_valid_identifier(s.name) {
-                    return Err(Error::new(ErrorKind::InvalidIdentifier, s.name));
+                    return Err(invalid_identifier(s.name));
                 }
             }
             s.type_params
@@ -410,18 +436,17 @@ pub fn is_valid_identifier(s: &str) -> bool {
 /// command.
 fn argument_indices(pt: &ProgrammableTransaction<'_>) -> Result<(), Error> {
     for (i, command) in pt.commands.iter().enumerate() {
-        for argument in crate::transaction_data::command_arguments(command) {
-            let bad = match argument {
-                Argument::Input(n) => n as usize >= pt.inputs.len(),
-                Argument::Result(n) | Argument::NestedResult(n, _) => n as usize >= i,
-                Argument::GasCoin => false,
+        for (j, argument) in crate::transaction_data::command_arguments(command).enumerate() {
+            let index = match argument {
+                Argument::Input(n) if n as usize >= pt.inputs.len() => n,
+                Argument::Result(n) | Argument::NestedResult(n, _) if n as usize >= i => n,
+                _ => continue,
             };
-            if bad {
-                return Err(Error::new(
-                    ErrorKind::InvalidArgumentIndex,
-                    format!("command {i} uses {argument:?}"),
-                ));
-            }
+            return Err(Error::new(UserInputError::InvalidArgumentIndex {
+                command_idx: i,
+                argument_idx: j,
+                index,
+            }));
         }
     }
     Ok(())

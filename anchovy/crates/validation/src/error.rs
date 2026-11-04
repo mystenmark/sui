@@ -3,6 +3,8 @@
 
 use std::fmt;
 
+pub use messages::build::error::{SuiErrorKind, UserInputError};
+
 /// The reference's error variant: `SuiErrorKind`'s, or `UserInputError`'s
 /// when the reference wraps one. Tests compare these names with the
 /// reference's verdicts.
@@ -158,25 +160,109 @@ impl ErrorKind {
     }
 }
 
+/// A rejection: the reference's error, as it sends it to clients.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Error {
-    pub kind: ErrorKind,
-    /// What failed, for people; not compared.
-    pub detail: String,
+    pub reason: SuiErrorKind,
 }
 
 impl Error {
-    pub fn new(kind: ErrorKind, detail: impl Into<String>) -> Error {
+    pub fn new(reason: impl Into<SuiErrorKind>) -> Error {
         Error {
-            kind,
-            detail: detail.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// The reason's variant.
+    ///
+    /// # Panics
+    ///
+    /// For a reason validation never gives.
+    pub fn kind(&self) -> ErrorKind {
+        match &self.reason {
+            SuiErrorKind::TransactionExpired => ErrorKind::TransactionExpired,
+            SuiErrorKind::InvalidSignature { .. } => ErrorKind::InvalidSignature,
+            SuiErrorKind::SignerSignatureAbsent { .. } => ErrorKind::SignerSignatureAbsent,
+            SuiErrorKind::SignerSignatureNumberMismatch { .. } => {
+                ErrorKind::SignerSignatureNumberMismatch
+            }
+            SuiErrorKind::IncorrectSigner { .. } => ErrorKind::IncorrectSigner,
+            SuiErrorKind::InvalidAddress => ErrorKind::InvalidAddress,
+            SuiErrorKind::TransactionDeserializationError { .. } => {
+                ErrorKind::TransactionDeserializationError
+            }
+            SuiErrorKind::KeyConversionError(_) => ErrorKind::KeyConversionError,
+            SuiErrorKind::UserInputError { error } => match error {
+                UserInputError::Unsupported(_) => ErrorKind::Unsupported,
+                UserInputError::InvalidExpiration { .. } => ErrorKind::InvalidExpiration,
+                UserInputError::InvalidChainId { .. } => ErrorKind::InvalidChainId,
+                UserInputError::MissingGasPayment => ErrorKind::MissingGasPayment,
+                UserInputError::InvalidWithdrawReservation { .. } => {
+                    ErrorKind::InvalidWithdrawReservation
+                }
+                UserInputError::GasPriceUnderRGP { .. } => ErrorKind::GasPriceUnderRGP,
+                UserInputError::SizeLimitExceeded { .. } => ErrorKind::SizeLimitExceeded,
+                UserInputError::GasObjectNotOwnedObject { .. } => {
+                    ErrorKind::GasObjectNotOwnedObject
+                }
+                UserInputError::GasPriceTooHigh { .. } => ErrorKind::GasPriceTooHigh,
+                UserInputError::GasBudgetTooHigh { .. } => ErrorKind::GasBudgetTooHigh,
+                UserInputError::GasBudgetTooLow { .. } => ErrorKind::GasBudgetTooLow,
+                UserInputError::UnsupportedSponsoredTransactionKind => {
+                    ErrorKind::UnsupportedSponsoredTransactionKind
+                }
+                UserInputError::DuplicateObjectRefInput => ErrorKind::DuplicateObjectRefInput,
+                UserInputError::MaxPublishCountExceeded { .. } => {
+                    ErrorKind::MaxPublishCountExceeded
+                }
+                UserInputError::EmptyCommandInput => ErrorKind::EmptyCommandInput,
+                UserInputError::InvalidIdentifier { .. } => ErrorKind::InvalidIdentifier,
+                UserInputError::InvalidArgumentIndex { .. } => ErrorKind::InvalidArgumentIndex,
+                UserInputError::PostRandomCommandRestrictions => {
+                    ErrorKind::PostRandomCommandRestrictions
+                }
+                UserInputError::ObjectNotFound { .. } => ErrorKind::ObjectNotFound,
+                UserInputError::DependentPackageNotFound { .. } => {
+                    ErrorKind::DependentPackageNotFound
+                }
+                UserInputError::MoveObjectAsPackage { .. } => ErrorKind::MoveObjectAsPackage,
+                UserInputError::MovePackageAsObject { .. } => ErrorKind::MovePackageAsObject,
+                UserInputError::ObjectVersionUnavailableForConsumption { .. } => {
+                    ErrorKind::ObjectVersionUnavailableForConsumption
+                }
+                UserInputError::InvalidGasObject { .. } => ErrorKind::InvalidGasObject,
+                UserInputError::GasBalanceTooLow { .. } => ErrorKind::GasBalanceTooLow,
+                UserInputError::MutableObjectUsedMoreThanOnce { .. } => {
+                    ErrorKind::MutableObjectUsedMoreThanOnce
+                }
+                UserInputError::ObjectInputArityViolation => ErrorKind::ObjectInputArityViolation,
+                UserInputError::InvalidSequenceNumber => ErrorKind::InvalidSequenceNumber,
+                UserInputError::InvalidObjectDigest { .. } => ErrorKind::InvalidObjectDigest,
+                UserInputError::InvalidChildObjectArgument { .. } => {
+                    ErrorKind::InvalidChildObjectArgument
+                }
+                UserInputError::NotOwnedObjectError => ErrorKind::NotOwnedObjectError,
+                UserInputError::NotSharedObjectError => ErrorKind::NotSharedObjectError,
+                UserInputError::ImmutableParameterExpectedError { .. } => {
+                    ErrorKind::ImmutableParameterExpectedError
+                }
+                UserInputError::SharedObjectStartingVersionMismatch => {
+                    ErrorKind::SharedObjectStartingVersionMismatch
+                }
+                UserInputError::IncorrectUserSignature { .. } => ErrorKind::IncorrectUserSignature,
+                UserInputError::MutableParameterExpected { .. } => {
+                    ErrorKind::MutableParameterExpected
+                }
+                error => unreachable!("validation does not reject with {error:?}"),
+            },
+            reason => unreachable!("validation does not reject with {reason:?}"),
         }
     }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}: {}", self.kind, self.detail)
+        write!(f, "{:?}", self.reason)
     }
 }
 

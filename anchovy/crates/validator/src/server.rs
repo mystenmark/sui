@@ -27,7 +27,8 @@ use messages::grpc::{
     CheckpointRequest, CheckpointRequestV2, ObjectInfoRequest, SystemStateRequest,
     TransactionInfoRequest,
 };
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
+use validation::SuiErrorKind;
 
 use ::consensus::{PING_TRANSACTION_INDEX, Priority, TransactionClient};
 use waiter::{Command, WaitBatch};
@@ -331,15 +332,24 @@ impl Validator {
         epoch: &EpochState,
         request: &RawSubmitTxRequest,
     ) -> Result<SubmitTxType, Status> {
-        let submit_type = SubmitTxType::try_from(request.submit_type)
-            .map_err(|_| Status::invalid_argument("unknown submit type"))?;
+        let submit_type = SubmitTxType::try_from(request.submit_type).map_err(|e| {
+            failed(&SuiErrorKind::GrpcMessageDeserializeError {
+                type_info: "RawSubmitTxRequest.submit_type".to_owned(),
+                error: e.to_string(),
+            })
+        })?;
+        let invalid = |message: String| failed(&SuiErrorKind::InvalidRequest(message));
         let count = request.transactions.len();
         match submit_type {
             SubmitTxType::Ping if count > 0 => {
-                return Err(Status::invalid_argument("a ping carries no transactions"));
+                return Err(invalid(format!(
+                    "Ping request cannot contain {count} transactions"
+                )));
             }
             SubmitTxType::Default | SubmitTxType::SoftBundle if count == 0 => {
-                return Err(Status::invalid_argument("no transactions"));
+                return Err(invalid(
+                    "At least one transaction needs to be submitted".to_owned(),
+                ));
             }
             _ => {}
         }
@@ -350,8 +360,8 @@ impl Validator {
             config.max_num_transactions_in_block()
         };
         if count as u64 > max {
-            return Err(Status::invalid_argument(format!(
-                "{count} transactions, at most {max}"
+            return Err(invalid(format!(
+                "Too many transactions in request: {count} vs {max}"
             )));
         }
         Ok(submit_type)
@@ -365,10 +375,12 @@ impl Validator {
         request: &RawSubmitTxRequest,
     ) -> Result<oneshot::Receiver<Result<Vec<Outcome>, Rejected>>, Failure> {
         let mut transactions = Vec::with_capacity(request.transactions.len());
-        for bytes in &request.transactions {
+        for (i, bytes) in request.transactions.iter().enumerate() {
             let transaction = Message::<Transaction<DigestPending>>::parse(bytes.to_vec())
                 .map_err(|(e, _)| {
-                    Status::invalid_argument(format!("TransactionDeserializationError: {e:?}"))
+                    failed(&SuiErrorKind::TransactionDeserializationError {
+                        error: format!("Failed to deserialize transaction at index {i}: {e:?}"),
+                    })
                 })?;
             transactions.push(transaction);
         }
@@ -410,11 +422,12 @@ fn result(outcome: Outcome) -> RawSubmitTxResult {
         Outcome::Executed(executed) => {
             RawValidatorSubmitStatus::Executed(executed_status(*executed))
         }
-        // Without the reason: it would be BCS of the reference's `SuiError`,
-        // which anchovy's errors do not map to yet.
-        Outcome::Rejected(_) | Outcome::Failed(_) => {
-            RawValidatorSubmitStatus::Rejected(RawRejectedStatus { error: None })
-        }
+        Outcome::Rejected(e) => RawValidatorSubmitStatus::Rejected(RawRejectedStatus {
+            error: Some(reason_bcs(&e.reason).into()),
+        }),
+        Outcome::Failed(e) => RawValidatorSubmitStatus::Rejected(RawRejectedStatus {
+            error: Some(reason_bcs(&SuiErrorKind::Storage(e)).into()),
+        }),
         Outcome::Submit(_) => unreachable!("submitted, then answered with its position"),
     };
     RawSubmitTxResult {
@@ -427,9 +440,24 @@ fn epoch_ended() -> Status {
     Status::unavailable("EpochEnded")
 }
 
+/// BCS of the reference's `SuiError`, which encodes as its kind.
+fn reason_bcs(reason: &SuiErrorKind) -> Vec<u8> {
+    bcs::to_bytes(reason).expect("an error's strings and lists fit BCS's bounds")
+}
+
+/// A failed request as the reference fails one: clients decode its
+/// `SuiError` from the status's details.
+fn failed(reason: &SuiErrorKind) -> Status {
+    Status::with_details(
+        Code::Internal,
+        format!("{reason:?}"),
+        reason_bcs(reason).into(),
+    )
+}
+
 fn rejection(rejected: &Rejected) -> Status {
     match rejected {
-        Rejected::Invalid(e) => Status::invalid_argument(format!("{:?}: {}", e.kind, e.detail)),
+        Rejected::Invalid(e) => failed(&e.reason),
         Rejected::Overloaded => Status::resource_exhausted("signature verification queue full"),
         Rejected::ShuttingDown => Status::unavailable("shutting down"),
     }

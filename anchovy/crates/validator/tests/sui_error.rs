@@ -9,32 +9,23 @@ use messages::build::base::{
     AccountAddress, CheckpointContentsDigest, Digest, ObjectDigest, ObjectId, SequenceNumber,
     SuiAddress, TransactionDigest,
 };
-use messages::build::error::{SuiError, SuiErrorKind, UserInputError as U};
+use messages::build::error::{SuiErrorKind, UserInputError as U};
 use messages::build::object::Owner;
 
-fn name(debug: String) -> String {
-    debug.split([' ', '(', '{']).next().unwrap().to_owned()
-}
-
-fn check(kind: SuiErrorKind) {
-    let bytes = bcs::to_bytes(&SuiError(kind.clone())).unwrap();
+fn check(kind: &SuiErrorKind) {
+    let bytes = bcs::to_bytes(kind).unwrap();
     let reference: sui_types::error::SuiError = bcs::from_bytes(&bytes)
         .unwrap_or_else(|e| panic!("{kind:?} does not decode as the reference's: {e}"));
     assert_eq!(bcs::to_bytes(&reference).unwrap(), bytes, "{kind:?}");
-    let (mirror, reference) = match (&kind, reference.as_inner()) {
-        (
-            SuiErrorKind::UserInputError { error },
-            sui_types::error::SuiErrorKind::UserInputError { error: reference },
-        ) => (
-            name(format!("{error:?}")),
-            <&'static str>::from(reference).to_owned(),
-        ),
-        (_, reference) => (
-            name(format!("{kind:?}")),
-            <&'static str>::from(reference).to_owned(),
-        ),
+    let mirror = match kind {
+        SuiErrorKind::UserInputError { error } => format!("{error:?}"),
+        kind => format!("{kind:?}"),
     };
-    assert_eq!(mirror, reference);
+    let reference: &str = match reference.as_inner() {
+        sui_types::error::SuiErrorKind::UserInputError { error } => error.into(),
+        kind => kind.into(),
+    };
+    assert_eq!(mirror.split([' ', '(', '{']).next().unwrap(), reference);
 }
 
 #[test]
@@ -167,7 +158,7 @@ fn every_variant_encodes_as_the_reference_s() {
         U::ProposerNotAllowed { proposer: 3 },
     ];
     for error in user {
-        check(error.into());
+        check(&error.into());
     }
     for kind in [
         SuiErrorKind::InvalidSignature { error: s() },
@@ -185,7 +176,35 @@ fn every_variant_encodes_as_the_reference_s() {
         SuiErrorKind::KeyConversionError(s()),
         SuiErrorKind::TransactionExpired,
         SuiErrorKind::Storage(s()),
+        SuiErrorKind::GrpcMessageDeserializeError {
+            type_info: s(),
+            error: s(),
+        },
+        SuiErrorKind::InvalidRequest(s()),
     ] {
-        check(kind);
+        check(&kind);
+    }
+}
+
+/// Digests display in base58, as the reference's do, for the reasons that
+/// carry them as text.
+#[test]
+fn a_digest_displays_as_the_reference_s() {
+    use rand::RngCore as _;
+    let mut rng = rand::thread_rng();
+    let mut cases = vec![[0; 32], [0xff; 32]];
+    let mut leading_zeros = [0; 32];
+    leading_zeros[3] = 1;
+    cases.push(leading_zeros);
+    for _ in 0..100 {
+        let mut bytes = [0; 32];
+        rng.fill_bytes(&mut bytes);
+        cases.push(bytes);
+    }
+    for bytes in cases {
+        assert_eq!(
+            messages::base::Digest::new(bytes).to_string(),
+            sui_types::digests::Digest::new(bytes).to_string(),
+        );
     }
 }

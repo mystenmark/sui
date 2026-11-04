@@ -52,7 +52,7 @@ async fn compare(epoch: &Arc<EpochState>, requests: &[Vec<&Case>]) -> (usize, us
                 passed += 1;
             }
             (Err(Rejected::Invalid(e)), Err(kind)) => {
-                assert_eq!(e.kind, kind, "{labels:?}: {e:?}");
+                assert_eq!(e.kind(), kind, "{labels:?}: {e:?}");
                 failed += 1;
             }
             (ours, expected) => panic!(
@@ -117,7 +117,7 @@ async fn a_bad_signature_comes_before_a_later_invalid_transaction() {
     let store = common::store(&epoch);
     let (processors, _processors) = common::submission(&epoch, &store.store, 16);
     match submit(&processors, &[bad_signature, invalid]).await {
-        Err(Rejected::Invalid(e)) => assert_eq!(e.kind, ErrorKind::InvalidSignature),
+        Err(Rejected::Invalid(e)) => assert_eq!(e.kind(), ErrorKind::InvalidSignature),
         other => panic!("{:?}", other.map(|_| ())),
     }
 }

@@ -10,7 +10,10 @@ use messages::transaction::{
     TransactionKind, TxState, WithdrawFrom,
 };
 
-use crate::{Context, Error, ErrorKind, accumulator, gasless, kind};
+use messages::build::base::SuiAddress;
+use messages::build::object::Owner;
+
+use crate::{Context, Error, SuiErrorKind, UserInputError, accumulator, gasless, kind};
 
 /// A transaction may name this many allowed proposers without paying for the
 /// amplification; beyond it, SIP-45 caps the set at gas price / RGP.
@@ -54,23 +57,40 @@ pub fn validity_check(
 /// reference gas price, and under the cap.
 pub fn check_gas_price(gas_price: u64, ctx: &Context<'_>) -> Result<(), Error> {
     if gas_price < ctx.reference_gas_price {
-        return Err(Error::new(
-            ErrorKind::GasPriceUnderRGP,
-            format!("gas price {gas_price} under {}", ctx.reference_gas_price),
-        ));
+        return Err(Error::new(UserInputError::GasPriceUnderRGP {
+            gas_price,
+            reference_gas_price: ctx.reference_gas_price,
+        }));
     }
     if ctx.config.gas_model_version() >= GAS_PRICE_CAP_FROM_GAS_MODEL
         && gas_price >= ctx.config.max_gas_price()
     {
-        return Err(Error::new(
-            ErrorKind::GasPriceTooHigh,
-            format!(
-                "gas price {gas_price} at or over {}",
-                ctx.config.max_gas_price()
-            ),
-        ));
+        return Err(Error::new(UserInputError::GasPriceTooHigh {
+            max_gas_price: ctx.config.max_gas_price(),
+        }));
     }
     Ok(())
+}
+
+fn unsupported(what: impl Into<String>) -> Error {
+    Error::new(UserInputError::Unsupported(what.into()))
+}
+
+fn invalid_reservation(error: impl Into<String>) -> Error {
+    Error::new(UserInputError::InvalidWithdrawReservation {
+        error: error.into(),
+    })
+}
+
+fn invalid_expiration(error: impl Into<String>) -> Error {
+    Error::new(UserInputError::InvalidExpiration {
+        error: error.into(),
+    })
+}
+
+/// A chain identifier as the reference debug-prints one.
+fn chain_debug(chain: &messages::base::ChainIdentifier) -> String {
+    format!("ChainIdentifier(CheckpointDigest({chain}))")
 }
 
 fn is_system_tx(tx: &TransactionData<'_, impl TxState>) -> bool {
@@ -123,13 +143,10 @@ fn check_funds_withdrawals(
 ) -> Result<(), Error> {
     let config = ctx.config;
     if tx.gas_data().payment.is_empty() && !config.enable_address_balance_gas_payments() {
-        return Err(Error::new(ErrorKind::MissingGasPayment, "no gas payment"));
+        return Err(Error::new(UserInputError::MissingGasPayment));
     }
     if !config.enable_accumulators() {
-        return Err(Error::new(
-            ErrorKind::Unsupported,
-            "address balance withdrawals are not enabled",
-        ));
+        return Err(unsupported("Address balance withdraw is not enabled"));
     }
 
     for withdrawal in tx.index().funds_withdrawals {
@@ -137,26 +154,21 @@ fn check_funds_withdrawals(
         match withdrawal.withdraw_from {
             WithdrawFrom::Sender => {}
             WithdrawFrom::Sponsor => {
-                return Err(Error::new(
-                    ErrorKind::InvalidWithdrawReservation,
-                    "sponsor withdrawals are not supported",
+                return Err(invalid_reservation(
+                    "Explicit sponsor withdrawals are not yet supported",
                 ));
             }
             // The allowance itself is checked once inputs are loaded.
             WithdrawFrom::SenderAllowance { .. } => {
                 if !config.enable_allowances() {
-                    return Err(Error::new(
-                        ErrorKind::Unsupported,
-                        "allowance withdrawals are not enabled",
-                    ));
+                    return Err(unsupported("Allowance withdrawals are not enabled"));
                 }
             }
         }
         let Reservation::MaxAmountU64(amount) = withdrawal.reservation;
         if amount == 0 {
-            return Err(Error::new(
-                ErrorKind::InvalidWithdrawReservation,
-                "withdrawal amount must be non-zero",
+            return Err(invalid_reservation(
+                "Balance withdraw reservation amount must be non-zero",
             ));
         }
     }
@@ -166,15 +178,11 @@ fn check_funds_withdrawals(
     for reservation in tx.index().coin_reservations {
         let (amount, epoch) = reservation_amount_and_epoch(reservation);
         if epoch != ctx.epoch && epoch + 1 != ctx.epoch {
-            return Err(Error::new(
-                ErrorKind::TransactionExpired,
-                format!("coin reservation for epoch {epoch}"),
-            ));
+            return Err(Error::new(SuiErrorKind::TransactionExpired));
         }
         if amount == 0 {
-            return Err(Error::new(
-                ErrorKind::InvalidWithdrawReservation,
-                "coin reservation amount must be non-zero",
+            return Err(invalid_reservation(
+                "Balance withdraw reservation amount must be non-zero",
             ));
         }
     }
@@ -185,10 +193,9 @@ fn check_funds_withdrawals(
     let count =
         tx.index().funds_withdrawals.len() + tx.index().coin_reservations.len() + implicit_gas;
     if count > MAX_WITHDRAWALS {
-        return Err(Error::new(
-            ErrorKind::InvalidWithdrawReservation,
-            format!("{count} withdrawals, at most {MAX_WITHDRAWALS}"),
-        ));
+        return Err(invalid_reservation(format!(
+            "Maximum number of balance withdraw reservations is {MAX_WITHDRAWALS}"
+        )));
     }
     Ok(())
 }
@@ -205,7 +212,7 @@ fn check_gas_payment(
         && is_gas_paid_from_address_balance(tx))
     {
         if tx.gas_data().payment.is_empty() {
-            return Err(Error::new(ErrorKind::MissingGasPayment, "no gas payment"));
+            return Err(Error::new(UserInputError::MissingGasPayment));
         }
         return Ok(());
     }
@@ -217,9 +224,8 @@ fn check_gas_payment(
             .iter()
             .any(|c| command_arguments(c).any(|a| a == Argument::GasCoin))
     {
-        return Err(Error::new(
-            ErrorKind::Unsupported,
-            "the gas coin is not an argument when gas comes from an address balance",
+        return Err(unsupported(
+            "Argument::GasCoin is not supported with address balance gas payments",
         ));
     }
 
@@ -227,14 +233,10 @@ fn check_gas_payment(
         && !is_gasless(tx, ctx)
         && tx.gas_data().price < ctx.reference_gas_price
     {
-        return Err(Error::new(
-            ErrorKind::GasPriceUnderRGP,
-            format!(
-                "gas price {} under {}",
-                tx.gas_data().price,
-                ctx.reference_gas_price
-            ),
-        ));
+        return Err(Error::new(UserInputError::GasPriceUnderRGP {
+            gas_price: tx.gas_data().price,
+            reference_gas_price: ctx.reference_gas_price,
+        }));
     }
 
     // Legacy rule: address-balance gas needs a replay-protecting window even
@@ -242,15 +244,11 @@ fn check_gas_payment(
     if !config.relax_valid_during_for_owned_inputs() {
         if matches!(tx.expiration(), TransactionExpiration::None) {
             // The reference's error, kept for compatibility.
-            return Err(Error::new(
-                ErrorKind::MissingGasPayment,
-                "address balance gas needs an expiration",
-            ));
+            return Err(Error::new(UserInputError::MissingGasPayment));
         }
         if !is_replay_protected(tx.expiration()) {
-            return Err(Error::new(
-                ErrorKind::InvalidExpiration,
-                "address balance gas needs a one- or two-epoch ValidDuring",
+            return Err(invalid_expiration(
+                "Address balance gas payments require ValidDuring expiration",
             ));
         }
     }
@@ -270,10 +268,10 @@ fn check_gas_object_count(
         len < max
     };
     if !within {
-        return Err(Error::new(
-            ErrorKind::SizeLimitExceeded,
-            format!("{len} gas payment objects, limit {max}"),
-        ));
+        return Err(Error::new(UserInputError::SizeLimitExceeded {
+            limit: "maximum number of gas payment objects".to_owned(),
+            value: max.to_string(),
+        }));
     }
     Ok(())
 }
@@ -284,10 +282,9 @@ fn check_coin_reservations_as_gas(
     ctx: &Context<'_>,
 ) -> Result<(), Error> {
     let not_owned = || {
-        Error::new(
-            ErrorKind::GasObjectNotOwnedObject,
-            "coin reservation gas must be the sender's SUI balance",
-        )
+        Error::new(UserInputError::GasObjectNotOwnedObject {
+            owner: Owner::AddressOwner(SuiAddress::from(tx.sender())),
+        })
     };
     let mut reservations = tx
         .gas_data()
@@ -328,30 +325,22 @@ fn check_gas_price_and_budget(
     if config.gas_model_version() >= GAS_PRICE_CAP_FROM_GAS_MODEL
         && gas.price >= config.max_gas_price()
     {
-        return Err(Error::new(
-            ErrorKind::GasPriceTooHigh,
-            format!(
-                "gas price {} at or over {}",
-                gas.price,
-                config.max_gas_price()
-            ),
-        ));
+        return Err(Error::new(UserInputError::GasPriceTooHigh {
+            max_gas_price: config.max_gas_price(),
+        }));
     }
 
     let max_budget = config.max_tx_gas();
     if gas.budget > max_budget {
-        return Err(Error::new(
-            ErrorKind::GasBudgetTooHigh,
-            format!("gas budget {} over {max_budget}", gas.budget),
-        ));
+        return Err(Error::new(UserInputError::GasBudgetTooHigh {
+            gas_budget: gas.budget,
+            max_budget,
+        }));
     }
 
     if is_gasless(tx, ctx) {
         if gas.budget != 0 {
-            return Err(Error::new(
-                ErrorKind::Unsupported,
-                "gas budget must be 0 for gasless transactions",
-            ));
+            return Err(unsupported("gas_budget must be 0 for gasless transactions"));
         }
         return Ok(());
     }
@@ -364,10 +353,10 @@ fn check_gas_price_and_budget(
         config.base_tx_cost_fixed()
     };
     if gas.budget < min_budget {
-        return Err(Error::new(
-            ErrorKind::GasBudgetTooLow,
-            format!("gas budget {} under {min_budget}", gas.budget),
-        ));
+        return Err(Error::new(UserInputError::GasBudgetTooLow {
+            gas_budget: gas.budget,
+            min_budget,
+        }));
     }
     Ok(())
 }
@@ -376,27 +365,27 @@ fn check_gas_price_and_budget(
 fn check_sponsorship(tx: &TransactionData<'_, impl TxState>) -> Result<(), Error> {
     if tx.gas_data().owner != tx.sender() && is_system_tx(tx) {
         return Err(Error::new(
-            ErrorKind::UnsupportedSponsoredTransactionKind,
-            "only programmable transactions may be sponsored",
+            UserInputError::UnsupportedSponsoredTransactionKind,
         ));
     }
     Ok(())
 }
 
-/// A command's arguments; order does not matter to the callers.
+/// A command's arguments in the reference's `Command::arguments` order,
+/// which numbers them in `InvalidArgumentIndex`.
 pub(crate) fn command_arguments<'c>(
     command: &'c Command<'_>,
 ) -> impl Iterator<Item = Argument> + 'c {
-    let (single, many): (Option<Argument>, &[Argument]) = match command {
-        Command::MoveCall(call) => (None, call.arguments),
-        Command::TransferObjects(objects, recipient) => (Some(*recipient), objects),
-        Command::SplitCoins(coin, amounts) => (Some(*coin), amounts),
-        Command::MergeCoins(target, sources) => (Some(*target), sources),
-        Command::Publish(..) => (None, &[]),
-        Command::MakeMoveVec(_, elements) => (None, elements),
-        Command::Upgrade(_, _, _, ticket) => (Some(*ticket), &[]),
+    let (first, many, last): (Option<Argument>, &[Argument], Option<Argument>) = match command {
+        Command::MoveCall(call) => (None, call.arguments, None),
+        Command::TransferObjects(objects, recipient) => (None, objects, Some(*recipient)),
+        Command::SplitCoins(coin, amounts) => (Some(*coin), amounts, None),
+        Command::MergeCoins(target, sources) => (Some(*target), sources, None),
+        Command::Publish(..) => (None, &[], None),
+        Command::MakeMoveVec(_, elements) => (None, elements, None),
+        Command::Upgrade(_, _, _, ticket) => (Some(*ticket), &[], None),
     };
-    single.into_iter().chain(many.iter().copied())
+    first.into_iter().chain(many.iter().copied()).chain(last)
 }
 
 fn check_expiration(
@@ -407,7 +396,7 @@ fn check_expiration(
         TransactionExpiration::None => return Ok(()),
         TransactionExpiration::Epoch(max_epoch) => {
             if ctx.epoch > max_epoch {
-                return Err(Error::new(ErrorKind::TransactionExpired, "past max epoch"));
+                return Err(Error::new(SuiErrorKind::TransactionExpired));
             }
             return Ok(());
         }
@@ -416,9 +405,8 @@ fn check_expiration(
             // Gated even when the proposer set is unusable, so that a transaction
             // accepted after the upgrade cannot be accepted before it.
             if !ctx.config.allowed_proposers() {
-                return Err(Error::new(
-                    ErrorKind::Unsupported,
-                    "restricting the proposers of a transaction is not supported",
+                return Err(unsupported(
+                    "Restricting the proposers of a transaction is not supported",
                 ));
             }
             (window, allowed_proposers)
@@ -431,9 +419,8 @@ fn check_expiration(
     }
 
     if window.min_timestamp.is_some() || window.max_timestamp.is_some() {
-        return Err(Error::new(
-            ErrorKind::Unsupported,
-            "timestamp-based expiration is not supported",
+        return Err(unsupported(
+            "Timestamp-based transaction expiration is not yet supported",
         ));
     }
 
@@ -442,37 +429,30 @@ fn check_expiration(
     // protection to the stateful checks.
     if !ctx.config.relax_valid_during_for_owned_inputs() {
         let (Some(min), Some(max)) = (window.min_epoch, window.max_epoch) else {
-            return Err(Error::new(
-                ErrorKind::Unsupported,
-                "both min_epoch and max_epoch must be specified",
+            return Err(unsupported(
+                "Both min_epoch and max_epoch must be specified",
             ));
         };
         if ctx.config.enable_multi_epoch_transaction_expiration() {
             if max != min && max != min.saturating_add(1) {
-                return Err(Error::new(
-                    ErrorKind::Unsupported,
-                    "max_epoch must be at most min_epoch + 1",
-                ));
+                return Err(unsupported("max_epoch must be at most min_epoch + 1"));
             }
         } else if min != max {
-            return Err(Error::new(
-                ErrorKind::Unsupported,
-                "min_epoch must equal max_epoch",
-            ));
+            return Err(unsupported("min_epoch must equal max_epoch"));
         }
     }
 
     if *window.chain != ctx.chain_identifier {
-        return Err(Error::new(ErrorKind::InvalidChainId, "wrong chain"));
+        return Err(Error::new(UserInputError::InvalidChainId {
+            provided: chain_debug(window.chain),
+            expected: chain_debug(&ctx.chain_identifier),
+        }));
     }
 
     if window.min_epoch.is_some_and(|min| ctx.epoch < min)
         || window.max_epoch.is_some_and(|max| ctx.epoch > max)
     {
-        return Err(Error::new(
-            ErrorKind::TransactionExpired,
-            "outside the validity window",
-        ));
+        return Err(Error::new(SuiErrorKind::TransactionExpired));
     }
     Ok(())
 }
@@ -491,31 +471,29 @@ fn check_allowed_proposers(
         .max(tx.gas_data().price / ctx.reference_gas_price.max(1))
         .min(u64::from(ctx.committee_size));
     if proposers.len() as u64 > max_proposers {
-        return Err(Error::new(
-            ErrorKind::InvalidExpiration,
-            format!(
-                "{} allowed proposers, at most {max_proposers} permitted",
-                proposers.len()
-            ),
-        ));
+        return Err(invalid_expiration(format!(
+            "allowed_proposers has {} entries, but at most {max_proposers} \
+             are permitted with gas price {}, reference gas price {}, and a \
+             committee of {}",
+            proposers.len(),
+            tx.gas_data().price,
+            ctx.reference_gas_price,
+            ctx.committee_size,
+        )));
     }
 
     if !proposers.is_sorted_by(|a, b| a.get() < b.get()) {
-        return Err(Error::new(
-            ErrorKind::InvalidExpiration,
-            "allowed proposers must be strictly increasing",
+        return Err(invalid_expiration(
+            "allowed_proposers must be strictly increasing",
         ));
     }
 
     if let Some(i) = proposers.iter().find(|i| i.get() >= ctx.committee_size) {
-        return Err(Error::new(
-            ErrorKind::InvalidExpiration,
-            format!(
-                "allowed proposer {} is outside a committee of {}",
-                i.get(),
-                ctx.committee_size
-            ),
-        ));
+        return Err(invalid_expiration(format!(
+            "allowed_proposers contains index {}, but the committee has {} members",
+            i.get(),
+            ctx.committee_size,
+        )));
     }
     Ok(())
 }
