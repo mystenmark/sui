@@ -19,6 +19,7 @@ use executor::gas::SuiGasStatus;
 use executor::inputs::{ExecutionInputs, InputObjectKind, InputState, LoadedInput};
 use executor::static_programmable_transactions::type_cache::TypeCache;
 use executor::storage::UnsettledObjectFundsRead;
+use executor::transaction::is_gasless_transaction;
 use messages::arena::Ref;
 use messages::base::{ObjectId, SuiAddress, TransactionDigest};
 use messages::object::MoveObjectType;
@@ -255,6 +256,13 @@ impl NativeExecution {
         let gas_data = *data.gas_data();
         let gas_status = if is_system_tx(data.kind()) {
             SuiGasStatus::new_unmetered()
+        } else if self.config.enable_gasless() && is_gasless_transaction(&gas_data, data.kind()) {
+            // As the reference's `check_gas`: metered at the reference gas price, up to the
+            // gasless computation cap, as its price of zero would be refused.
+            let rgp = self.reference_gas_price.max(1);
+            let compute_cap = self.config.gasless_max_computation_units() * rgp;
+            SuiGasStatus::new(compute_cap, rgp, self.reference_gas_price, &self.config)
+                .map_err(|e| Error::Native(format!("{e:?}")))?
         } else {
             SuiGasStatus::new(
                 gas_data.budget,

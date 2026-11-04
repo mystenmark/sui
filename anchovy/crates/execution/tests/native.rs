@@ -141,6 +141,31 @@ fn a_shared_clock_read_matches() {
     assert!(effects.status().is_ok(), "{effects:?}");
 }
 
+/// A gasless transaction, priced at zero with no payment, runs metered at the reference gas price
+/// in both.
+#[test]
+fn a_gasless_transaction_matches() {
+    let node = Node::new();
+    let mut builder = ProgrammableTransactionBuilder::new();
+    builder
+        .move_call(
+            sui_types::SUI_FRAMEWORK_ADDRESS.into(),
+            ident_str!("clock").to_owned(),
+            ident_str!("timestamp_ms").to_owned(),
+            vec![],
+            vec![CallArg::CLOCK_IMM],
+        )
+        .unwrap();
+    let effects = node.execute_both_and_commit(TransactionData::new_programmable(
+        node.sender,
+        vec![],
+        builder.finish(),
+        0,
+        0,
+    ));
+    assert!(effects.status().is_ok(), "{effects:?}");
+}
+
 #[test]
 fn split_and_merge_match() {
     let node = Node::new();
