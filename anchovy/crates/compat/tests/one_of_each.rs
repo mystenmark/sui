@@ -88,6 +88,8 @@ struct Anchovy {
     /// Its p2p endpoint, through which sui validators push it the random
     /// beacon's signatures.
     _p2p: node::p2p::P2p,
+    /// Its validator API at its network address, where sui's clients submit.
+    _rpc: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
     runner: Lagging,
     certified_inbox: Inbox<CertifiedCheckpoint>,
     certified: BTreeSet<u64>,
@@ -1018,9 +1020,11 @@ impl Anchovy {
         });
         node.start_epoch(&mut runner);
         let p2p = Anchovy::p2p(&node, config.p2p_config.listen_address);
+        let rpc = Anchovy::rpc(&node, config);
         let anchovy = Anchovy {
             node: Some(node),
             _p2p: p2p,
+            _rpc: rpc,
             runner,
             certified_inbox,
             certified: BTreeSet::new(),
@@ -1064,6 +1068,30 @@ impl Anchovy {
             perpetual.current.clone(),
         )
         .expect("the p2p address binds")
+    }
+
+    /// `node`'s validator API, served as anchovy-node serves it, at the
+    /// network address `config` gives. Like the p2p endpoint, it serves
+    /// whichever epoch runs, across restarts.
+    fn rpc(
+        node: &Node,
+        config: &NodeConfig,
+    ) -> tokio::task::JoinHandle<Result<(), tonic::transport::Error>> {
+        let address = config
+            .network_address
+            .to_socket_addr()
+            .or_else(|_| config.network_address.with_zero_ip().to_socket_addr())
+            .unwrap();
+        let listener = std::net::TcpListener::bind(address).expect("the RPC address binds");
+        listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let perpetual = &node.perpetual;
+        tokio::spawn(validator::serve(
+            listener,
+            validator::tls::NetworkKey::from_bytes(perpetual.keys.network.secret()),
+            perpetual.current.clone(),
+            std::future::pending(),
+        ))
     }
 
     /// Stops anchovy wherever it is, as a crash would, and starts it again
@@ -2275,6 +2303,32 @@ fn composite_workload(stalls: bool, full: bool) {
     let metrics = metrics.lock().unwrap();
     let sum = metrics.sum_all();
     tracing::info!(?sum, "composite metrics");
+    for (op_set, stats) in metrics.iter_stats() {
+        tracing::info!(op_set = op_set.describe(), ?stats, "composite op set");
+    }
+    if full {
+        // Each part of the full mix ran here, alike, at least once. Package upgrades and the deny
+        // list are left out: the workload tries them too rarely to count on.
+        for op in [
+            "gasless_transfer",
+            "sponsored_tx",
+            "multisig_tx",
+            "allowed_proposers_tx",
+            "party_create",
+            "owned_create",
+            "receive_create_parent",
+            "shared_delete_create",
+            "allowance_withdraw",
+            "allowance_self_withdraw",
+        ] {
+            let succeeded: u64 = metrics
+                .iter_stats()
+                .filter(|(op_set, _)| op_set.contains(op))
+                .map(|(_, stats)| stats.success_count)
+                .sum();
+            assert!(succeeded > 0, "no {op} succeeded");
+        }
+    }
     assert!(sum.success_count > 200, "{sum:?}");
     assert!(sum.permanent_failure_count > 0, "{sum:?}");
     assert!(sum.insufficient_funds_count > 0, "{sum:?}");
