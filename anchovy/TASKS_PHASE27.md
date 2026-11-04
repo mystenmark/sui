@@ -25,9 +25,10 @@ transactions, the deny list, allowed proposers and allowances.
   clients got transport errors from it and submitted only to sui's
   validators, so anchovy saw the workload through consensus alone. It now
   serves it, as anchovy-node does.
+- With anchovy taking submissions, the full, plain and stalled composite
+  tests pass seeds 1-12 each.
 
 ## Remaining
-- Sweeps of the three composite tests with anchovy taking submissions.
 - Anchovy's submit rejections carry no reason (`RawRejectedStatus { error:
   None }`), which sui's client decodes as a deserialization error: its
   validation errors don't map to the reference's `SuiError` yet. Clients
