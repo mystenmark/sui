@@ -1986,12 +1986,21 @@ fn a_certificate_that_consensus_contradicts_aborts() {
     network.wait_for("the abort", |_| None::<()>);
 }
 
-/// The reference's composite workload, mixed as its simtest mixes it,
-/// submitted through a sui full node for a minute: anchovy certifies every
-/// checkpoint the quorum does, alike.
+/// The reference's composite workload, mixed as its simtest mixed it at
+/// phase 21, submitted through a sui full node for two minutes: anchovy
+/// certifies every checkpoint the quorum does, alike.
 #[test]
 fn the_composite_workload_runs_alike() {
-    composite_workload(false);
+    composite_workload(false, false);
+}
+
+/// `the_composite_workload_runs_alike`, mixed as the reference's
+/// `test_composite_workload` mixes it now: object lifecycles, upgrades,
+/// gasless, sponsored and multisig transactions, the deny list, allowed
+/// proposers and allowances too.
+#[test]
+fn the_full_composite_workload_runs_alike() {
+    composite_workload(false, true);
 }
 
 /// `the_composite_workload_runs_alike`, with anchovy stalled: it starts
@@ -1999,10 +2008,10 @@ fn the_composite_workload_runs_alike() {
 /// consensus sometimes lags mid-epoch.
 #[test]
 fn the_composite_workload_runs_alike_through_stalls() {
-    composite_workload(true);
+    composite_workload(true, false);
 }
 
-fn composite_workload(stalls: bool) {
+fn composite_workload(stalls: bool, full: bool) {
     use rand::Rng as _;
     use std::str::FromStr as _;
     use sui_benchmark::bank::BenchmarkBank;
@@ -2022,6 +2031,17 @@ fn composite_workload(stalls: bool) {
         BenchmarkProxyMetrics, FullNodeProxy, LocalValidatorAggregatorProxy, ValidatorProxy,
     };
 
+    // Gasless transactions in the full mix send SUI, which no chain allows
+    // by default. Set before genesis reads the config, for every node here.
+    let _gasless = full.then(|| {
+        ProtocolConfig::apply_overrides_for_testing(|_, mut config| {
+            config.set_gasless_allowed_token_types_for_testing(vec![(
+                "0x2::sui::SUI".to_string(),
+                0,
+            )]);
+            config
+        })
+    });
     // Two epochs end under load. The workload's transactions are valid for
     // the epoch its observer last read and the next, and it reads every 60 s.
     let mut network = Network::with_epoch_duration(Some(61_000));
@@ -2040,31 +2060,72 @@ fn composite_workload(stalls: bool) {
     });
 
     let metrics = Arc::new(Mutex::new(CompositionMetrics::new()));
-    let composite = CompositeWorkloadConfig {
-        num_shared_counters: 2,
-        shared_counter_hotness: 0.95,
-        address_balance_amount: 1000,
-        address_balance_gas_probability: 0.2,
-        conflicting_transaction_probability: 0.1,
-        alias_tx_probability: 0.3,
-        metrics: Some(metrics.clone()),
-        ..Default::default()
-    }
-    .with_probability(SharedCounterIncrement::NAME, 0.2)
-    .with_probability(SharedCounterRead::NAME, 0.1)
-    .with_probability(RandomnessRead::NAME, 0.1)
-    .with_probability(AddressBalanceDeposit::NAME, 0.1)
-    .with_probability(AddressBalanceWithdraw::NAME, 0.1)
-    .with_probability(ObjectBalanceDeposit::NAME, 0.1)
-    .with_probability(ObjectBalanceWithdraw::NAME, 0.1)
-    .with_probability(TestCoinMint::NAME, 0.1)
-    .with_probability(TestCoinAddressDeposit::NAME, 0.1)
-    .with_probability(TestCoinAddressWithdraw::NAME, 0.05)
-    .with_probability(TestCoinObjectWithdraw::NAME, 0.05)
-    .with_probability(AddressBalanceOverdraw::NAME, 0.3)
-    .with_probability(AccumulatorBalanceRead::NAME, 0.3)
-    .with_probability(AuthenticatedEventEmit::NAME, 0.1)
-    .with_probability(CoinReservationWithdraw::NAME, 0.3);
+    let composite = if full {
+        // As the reference's `test_composite_workload`.
+        CompositeWorkloadConfig {
+            num_shared_counters: 2,
+            shared_counter_hotness: 0.95,
+            address_balance_amount: 1000,
+            address_balance_gas_probability: 0.2,
+            conflicting_transaction_probability: 0.1,
+            alias_tx_probability: 0.5,
+            party_object_probability: 0.8,
+            shared_deletion_probability: 0.3,
+            receive_probability: 0.3,
+            upgrade_probability: 0.3,
+            owned_object_probability: 0.3,
+            gasless_probability: 0.2,
+            sponsored_probability: 0.15,
+            deny_probability: 0.2,
+            multisig_probability: 0.2,
+            allowed_proposers_probability: 0.2,
+            metrics: Some(metrics.clone()),
+            ..Default::default()
+        }
+        .with_probability(SharedCounterIncrement::NAME, 0.35)
+        .with_probability(SharedCounterRead::NAME, 0.1)
+        .with_probability(RandomnessRead::NAME, 0.1)
+        .with_probability(AddressBalanceDeposit::NAME, 0.1)
+        .with_probability(AddressBalanceWithdraw::NAME, 0.1)
+        .with_probability(ObjectBalanceDeposit::NAME, 0.1)
+        .with_probability(ObjectBalanceWithdraw::NAME, 0.1)
+        .with_probability(TestCoinMint::NAME, 0.1)
+        .with_probability(TestCoinAddressDeposit::NAME, 0.1)
+        .with_probability(TestCoinAddressWithdraw::NAME, 0.05)
+        .with_probability(TestCoinObjectWithdraw::NAME, 0.05)
+        .with_probability(AddressBalanceOverdraw::NAME, 0.3)
+        .with_probability(AccumulatorBalanceRead::NAME, 0.3)
+        .with_probability(AuthenticatedEventEmit::NAME, 0.1)
+        .with_probability(CoinReservationWithdraw::NAME, 0.1)
+        .with_probability(AllowanceWithdraw::NAME, 0.1)
+        .with_probability(AllowanceSelfWithdraw::NAME, 0.1)
+    } else {
+        CompositeWorkloadConfig {
+            num_shared_counters: 2,
+            shared_counter_hotness: 0.95,
+            address_balance_amount: 1000,
+            address_balance_gas_probability: 0.2,
+            conflicting_transaction_probability: 0.1,
+            alias_tx_probability: 0.3,
+            metrics: Some(metrics.clone()),
+            ..Default::default()
+        }
+        .with_probability(SharedCounterIncrement::NAME, 0.2)
+        .with_probability(SharedCounterRead::NAME, 0.1)
+        .with_probability(RandomnessRead::NAME, 0.1)
+        .with_probability(AddressBalanceDeposit::NAME, 0.1)
+        .with_probability(AddressBalanceWithdraw::NAME, 0.1)
+        .with_probability(ObjectBalanceDeposit::NAME, 0.1)
+        .with_probability(ObjectBalanceWithdraw::NAME, 0.1)
+        .with_probability(TestCoinMint::NAME, 0.1)
+        .with_probability(TestCoinAddressDeposit::NAME, 0.1)
+        .with_probability(TestCoinAddressWithdraw::NAME, 0.05)
+        .with_probability(TestCoinObjectWithdraw::NAME, 0.05)
+        .with_probability(AddressBalanceOverdraw::NAME, 0.3)
+        .with_probability(AccumulatorBalanceRead::NAME, 0.3)
+        .with_probability(AuthenticatedEventEmit::NAME, 0.1)
+        .with_probability(CoinReservationWithdraw::NAME, 0.3)
+    };
 
     let primary = (
         network.coin(network.coins.len() - 1),
