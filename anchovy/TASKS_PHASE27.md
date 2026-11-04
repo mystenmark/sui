@@ -15,7 +15,22 @@ transactions, the deny list, allowed proposers and allowances.
   gas price with the gasless computation cap as budget; both executors now
   do.
 
+- With the fix, the full mix passes seeds 1-6. Its op sets show successes
+  for every part of the mix; it now asserts them, but for package upgrades
+  and the deny list, which the workload tries only a few times a run.
+- Every permanent rejection in the full mix came from a sui validator, as
+  the workload intends (overdraws, sponsor signatures, expiry, stale
+  objects, allowed proposers).
+- Compat never served anchovy's validator API at its network address: sui's
+  clients got transport errors from it and submitted only to sui's
+  validators, so anchovy saw the workload through consensus alone. It now
+  serves it, as anchovy-node does.
+
 ## Remaining
-- The full composite test under derp, until seeds pass.
+- Sweeps of the three composite tests with anchovy taking submissions.
+- Anchovy's submit rejections carry no reason (`RawRejectedStatus { error:
+  None }`), which sui's client decodes as a deserialization error: its
+  validation errors don't map to the reference's `SuiError` yet. Clients
+  can't tell a retriable rejection from an invalid transaction. Not a fork.
 - Then longer sweeps: the full mix, and every compat test past seed 6.
 - #28520 (consensus-pool owned-version validation) for anchovy admission.
