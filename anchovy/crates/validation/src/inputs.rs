@@ -29,7 +29,9 @@ use messages::transaction::{
 use messages::type_tag::TypeTag;
 use sui_protocol_config::ProtocolConfig;
 
-use crate::{Context, Error, ErrorKind, transaction_data};
+use messages::build;
+
+use crate::{Context, Error, UserInputError, transaction_data};
 
 /// Where the checks read objects. Reads cannot fail: a store that cannot
 /// read has nothing a check could do about it, so it panics.
@@ -64,15 +66,45 @@ impl InputKind<'_> {
     }
 }
 
-fn error(kind: ErrorKind, detail: impl Into<String>) -> Error {
-    Error::new(kind, detail)
+fn error(error: UserInputError) -> Error {
+    Error::new(error)
 }
 
-fn not_found(id: &ObjectId, version: Option<u64>) -> Error {
-    error(
-        ErrorKind::ObjectNotFound,
-        format!("{id:?} at {version:?} not found"),
+fn id(id: &ObjectId) -> build::base::ObjectId {
+    build::base::ObjectId::from(id)
+}
+
+fn object_ref(r: &ObjectRef) -> build::base::ObjectRef {
+    (
+        id(&r.id),
+        build::base::SequenceNumber(r.version.get()),
+        build::base::ObjectDigest::from(&r.digest),
     )
+}
+
+fn not_found(object: &ObjectId, version: Option<u64>) -> Error {
+    error(UserInputError::ObjectNotFound {
+        object_id: id(object),
+        version: version.map(build::base::SequenceNumber),
+    })
+}
+
+fn unavailable(r: &ObjectRef, current: u64) -> Error {
+    error(UserInputError::ObjectVersionUnavailableForConsumption {
+        provided_obj_ref: object_ref(r),
+        current_version: build::base::SequenceNumber(current),
+    })
+}
+
+fn invalid_digest(object: &ObjectId, expected: &ObjectDigest) -> Error {
+    error(UserInputError::InvalidObjectDigest {
+        object_id: id(object),
+        expected_digest: build::base::ObjectDigest::from(expected),
+    })
+}
+
+fn unsupported(what: impl Into<String>) -> Error {
+    error(UserInputError::Unsupported(what.into()))
 }
 
 /// The reference's `TransactionData::input_objects`: the inputs' objects, in
@@ -120,10 +152,7 @@ pub fn input_objects<'a, 'b>(
                 }
             }
             if !distinct(&inputs, bump) {
-                return Err(error(
-                    ErrorKind::DuplicateObjectRefInput,
-                    "an object is input twice",
-                ));
+                return Err(error(UserInputError::DuplicateObjectRefInput));
             }
             return Ok(inputs);
         }
@@ -138,10 +167,7 @@ pub fn input_objects<'a, 'b>(
         }
     }
     if !distinct(&inputs, bump) {
-        return Err(error(
-            ErrorKind::DuplicateObjectRefInput,
-            "an object is input twice",
-        ));
+        return Err(error(UserInputError::DuplicateObjectRefInput));
     }
     let mut packages = containers::Vec::new_in(bump);
     for command in pt.commands {
@@ -332,7 +358,11 @@ fn check_funds_withdrawals(data: &TransactionData<'_, impl TxState>) -> Result<(
     let TransactionKind::ProgrammableTransaction(pt) = data.kind() else {
         return Ok(());
     };
-    let invalid = |message: &str| Err(error(ErrorKind::InvalidWithdrawReservation, message));
+    let invalid = |message: &str| {
+        Err(error(UserInputError::InvalidWithdrawReservation {
+            error: message.to_owned(),
+        }))
+    };
     // Each withdrawal's balance (its owner and type) and amount.
     let withdrawals = || {
         pt.inputs.iter().filter_map(|arg| {
@@ -374,10 +404,9 @@ fn refuse_address_balances(
     ctx: &Context<'_>,
 ) -> Result<(), Error> {
     let unsupported = |what: &str| {
-        Err(error(
-            ErrorKind::Unsupported,
-            format!("{what}: address balances are not supported yet"),
-        ))
+        Err(unsupported(format!(
+            "{what}: address balances are not supported yet"
+        )))
     };
     if transaction_data::is_gasless(data, ctx) {
         return unsupported("a gasless transaction");
@@ -422,16 +451,14 @@ fn load<'a, 'b>(
         let object = match kind {
             InputKind::Package(id) => {
                 let Some(object) = objects.live(id) else {
-                    return Err(error(
-                        ErrorKind::DependentPackageNotFound,
-                        format!("package {id:?} not found"),
-                    ));
+                    return Err(error(UserInputError::DependentPackageNotFound {
+                        package_id: self::id(id),
+                    }));
                 };
                 if !matches!(object.get().data, Data::Package(_)) {
-                    return Err(error(
-                        ErrorKind::MoveObjectAsPackage,
-                        format!("{id:?} is not a package"),
-                    ));
+                    return Err(error(UserInputError::MoveObjectAsPackage {
+                        object_id: self::id(id),
+                    }));
                 }
                 object
             }
@@ -439,7 +466,7 @@ fn load<'a, 'b>(
             // names (same id and start version).
             InputKind::Shared(s) => match objects.live(&s.id) {
                 Some(object)
-                    if start_version(&object.get().owner)
+                    if object.get().owner.start_version()
                         == Some(s.initial_shared_version.get()) =>
                 {
                     object
@@ -465,10 +492,7 @@ fn load<'a, 'b>(
                 return Err(not_found(&r.id, None));
             };
             return Err(if current >= version {
-                error(
-                    ErrorKind::ObjectVersionUnavailableForConsumption,
-                    format!("{:?} at {version}: current version {current}", r.id),
-                )
+                unavailable(r, current)
             } else {
                 not_found(&r.id, Some(version))
             });
@@ -482,18 +506,6 @@ fn load<'a, 'b>(
     let mut inputs = containers::Vec::with_capacity_in(kinds.len(), bump);
     inputs.extend(loaded.into_iter().map(|i| i.expect("every input loaded")));
     Ok(inputs)
-}
-
-/// The version a consensus object's stream starts at; none for other owners.
-fn start_version(owner: &Owner<'_>) -> Option<u64> {
-    match owner {
-        Owner::Shared {
-            initial_shared_version,
-        } => Some(*initial_shared_version),
-        Owner::ConsensusAddressOwner { start_version, .. } => Some(*start_version),
-        Owner::Party(party) => Some(party.start_version),
-        _ => None,
-    }
 }
 
 /// `read_receiving_objects_for_signing`: each live object, or none.
@@ -532,10 +544,9 @@ fn check_gas(
     // `check_gas_objects`, which `check_gas_balance` repeats.
     for coin in &coins {
         if !matches!(coin.object().owner, Owner::AddressOwner(_)) {
-            return Err(error(
-                ErrorKind::GasObjectNotOwnedObject,
-                format!("gas coin {:?} is not address-owned", coin.kind.id()),
-            ));
+            return Err(error(UserInputError::GasObjectNotOwnedObject {
+                owner: build::object::Owner::from(&coin.object().owner),
+            }));
         }
     }
     let mut balance: u128 = 0;
@@ -546,19 +557,18 @@ fn check_gas(
                 u64::from_le_bytes(m.contents[32..40].try_into().expect("eight bytes"))
             }
             _ => {
-                return Err(error(
-                    ErrorKind::InvalidGasObject,
-                    format!("{:?} is not a SUI coin", coin.kind.id()),
-                ));
+                return Err(error(UserInputError::InvalidGasObject {
+                    object_id: id(coin.kind.id()),
+                }));
             }
         };
         balance += u128::from(value);
     }
     if balance < u128::from(gas.budget) {
-        return Err(error(
-            ErrorKind::GasBalanceTooLow,
-            format!("gas balance {balance} under budget {}", gas.budget),
-        ));
+        return Err(error(UserInputError::GasBalanceTooLow {
+            gas_balance: balance,
+            needed_gas_amount: u128::from(gas.budget),
+        }));
     }
     Ok(())
 }
@@ -574,17 +584,13 @@ fn check_objects(
     let mut mutable = containers::hash_set(bump, inputs.len());
     for input in inputs {
         if input.is_mutable() && !mutable.insert(input.kind.id().0) {
-            return Err(error(
-                ErrorKind::MutableObjectUsedMoreThanOnce,
-                format!("{:?} is used mutably twice", input.kind.id()),
-            ));
+            return Err(error(UserInputError::MutableObjectUsedMoreThanOnce {
+                object_id: id(input.kind.id()),
+            }));
         }
     }
     if inputs.is_empty() {
-        return Err(error(
-            ErrorKind::ObjectInputArityViolation,
-            "no input objects",
-        ));
+        return Err(error(UserInputError::ObjectInputArityViolation));
     }
     let gas = data.gas_data();
     for input in inputs {
@@ -607,36 +613,28 @@ fn check_one_object(
     let object = input.object();
     let id = input.kind.id();
     if matches!(object.owner, Owner::Party(_)) {
-        return Err(error(
-            ErrorKind::Unsupported,
-            "party objects are not supported yet",
-        ));
+        return Err(unsupported("Party-owned objects are not yet supported"));
     }
     let is_package = matches!(object.data, Data::Package(_));
     match input.kind {
         InputKind::Package(_) => {
             if !is_package {
-                return Err(error(
-                    ErrorKind::MoveObjectAsPackage,
-                    format!("{id:?} is not a package"),
-                ));
+                return Err(error(UserInputError::MoveObjectAsPackage {
+                    object_id: self::id(id),
+                }));
             }
         }
         InputKind::ImmOrOwned(r) => {
             if is_package {
-                return Err(error(
-                    ErrorKind::MovePackageAsObject,
-                    format!("{id:?} is a package"),
-                ));
+                return Err(error(UserInputError::MovePackageAsObject {
+                    object_id: self::id(id),
+                }));
             }
             if r.version.get() == u64::MAX {
-                return Err(error(ErrorKind::InvalidSequenceNumber, "version u64::MAX"));
+                return Err(error(UserInputError::InvalidSequenceNumber));
             }
             if input.digest() != r.digest {
-                return Err(error(
-                    ErrorKind::InvalidObjectDigest,
-                    format!("{id:?}: digest mismatch"),
-                ));
+                return Err(invalid_digest(id, &input.digest()));
             }
             match object.owner {
                 Owner::Immutable => {}
@@ -646,16 +644,13 @@ fn check_one_object(
                     }
                 }
                 Owner::ObjectOwner(parent) => {
-                    return Err(error(
-                        ErrorKind::InvalidChildObjectArgument,
-                        format!("{id:?} is a child of {parent:?}"),
-                    ));
+                    return Err(error(UserInputError::InvalidChildObjectArgument {
+                        child_id: self::id(id),
+                        parent_id: build::base::ObjectId(build::base::AccountAddress(parent.0)),
+                    }));
                 }
                 Owner::Shared { .. } | Owner::ConsensusAddressOwner { .. } | Owner::Party(_) => {
-                    return Err(error(
-                        ErrorKind::NotOwnedObjectError,
-                        format!("{id:?} is a consensus object"),
-                    ));
+                    return Err(error(UserInputError::NotOwnedObjectError));
                 }
             }
         }
@@ -672,29 +667,22 @@ fn check_shared(
     s: &SharedObjectArg,
 ) -> Result<(), Error> {
     if object.version() == u64::MAX {
-        return Err(error(ErrorKind::InvalidSequenceNumber, "version u64::MAX"));
+        return Err(error(UserInputError::InvalidSequenceNumber));
     }
     if is_system_object(id) && !system_object_usable(config, id, s.mutability()) {
-        return Err(error(
-            ErrorKind::ImmutableParameterExpectedError,
-            format!("system object {id:?} cannot be used so"),
-        ));
+        return Err(error(UserInputError::ImmutableParameterExpectedError {
+            object_id: self::id(id),
+        }));
     }
     match object.owner {
         Owner::AddressOwner(_) | Owner::ObjectOwner(_) | Owner::Immutable => {
-            return Err(error(
-                ErrorKind::NotSharedObjectError,
-                format!("{id:?} is not shared"),
-            ));
+            return Err(error(UserInputError::NotSharedObjectError));
         }
         Owner::Shared {
             initial_shared_version,
         } => {
             if initial_shared_version != s.initial_shared_version.get() {
-                return Err(error(
-                    ErrorKind::SharedObjectStartingVersionMismatch,
-                    format!("{id:?}"),
-                ));
+                return Err(error(UserInputError::SharedObjectStartingVersionMismatch));
             }
         }
         Owner::ConsensusAddressOwner {
@@ -702,10 +690,7 @@ fn check_shared(
             owner: actual,
         } => {
             if start_version != s.initial_shared_version.get() {
-                return Err(error(
-                    ErrorKind::SharedObjectStartingVersionMismatch,
-                    format!("{id:?}"),
-                ));
+                return Err(error(UserInputError::SharedObjectStartingVersionMismatch));
             }
             if actual != owner {
                 return Err(incorrect_signer(id, actual, owner));
@@ -717,10 +702,11 @@ fn check_shared(
 }
 
 fn incorrect_signer(id: &ObjectId, actual: &SuiAddress, given: &SuiAddress) -> Error {
-    error(
-        ErrorKind::IncorrectUserSignature,
-        format!("{id:?} is owned by {actual:?}, not {given:?}"),
-    )
+    error(UserInputError::IncorrectUserSignature {
+        error: format!(
+            "Object {id:?} is owned by account address {actual:?}, but given owner/signer address is {given:?}"
+        ),
+    })
 }
 
 /// The reference's `ObjectID::is_system_object`: the first 24 bytes are zero.
@@ -774,10 +760,11 @@ fn check_replay_protection(
     {
         Ok(())
     } else {
-        Err(error(
-            ErrorKind::InvalidExpiration,
-            "no owned inputs and no ValidDuring expiration of at most two epochs",
-        ))
+        Err(error(UserInputError::InvalidExpiration {
+            error: "Transactions must either have address-owned inputs, or a ValidDuring \
+                    expiration with at most two epochs of validity"
+                .to_owned(),
+        }))
     }
 }
 
@@ -794,7 +781,7 @@ fn check_receiving_objects(
     for (i, r) in receiving.iter().enumerate() {
         let version = r.version.get();
         if version == u64::MAX {
-            return Err(error(ErrorKind::InvalidSequenceNumber, "version u64::MAX"));
+            return Err(error(UserInputError::InvalidSequenceNumber));
         }
         let object = received[i].get();
         let fine = matches!(object.owner, Owner::AddressOwner(_))
@@ -802,50 +789,32 @@ fn check_receiving_objects(
             && object.digest() == r.digest;
         if !fine {
             if object.version() != version {
-                return Err(error(
-                    ErrorKind::ObjectVersionUnavailableForConsumption,
-                    format!(
-                        "{:?} at {version}: current version {}",
-                        r.id,
-                        object.version()
-                    ),
-                ));
+                return Err(unavailable(r, object.version()));
             }
             if matches!(object.data, Data::Package(_)) {
-                return Err(error(
-                    ErrorKind::MovePackageAsObject,
-                    format!("{:?} is a package", r.id),
-                ));
+                return Err(error(UserInputError::MovePackageAsObject {
+                    object_id: id(&r.id),
+                }));
             }
             if object.digest() != r.digest {
-                return Err(error(
-                    ErrorKind::InvalidObjectDigest,
-                    format!("{:?}: digest mismatch", r.id),
-                ));
+                return Err(invalid_digest(&r.id, &object.digest()));
             }
             return Err(match object.owner {
                 Owner::AddressOwner(_) => unreachable!("fine, then"),
-                Owner::ObjectOwner(parent) => error(
-                    ErrorKind::InvalidChildObjectArgument,
-                    format!("{:?} is a child of {parent:?}", r.id),
-                ),
+                Owner::ObjectOwner(parent) => error(UserInputError::InvalidChildObjectArgument {
+                    child_id: id(&r.id),
+                    parent_id: build::base::ObjectId(build::base::AccountAddress(parent.0)),
+                }),
                 Owner::Shared { .. } | Owner::ConsensusAddressOwner { .. } | Owner::Party(_) => {
-                    error(
-                        ErrorKind::NotSharedObjectError,
-                        format!("{:?} is a consensus object", r.id),
-                    )
+                    error(UserInputError::NotSharedObjectError)
                 }
-                Owner::Immutable => error(
-                    ErrorKind::MutableParameterExpected,
-                    format!("{:?} is immutable", r.id),
-                ),
+                Owner::Immutable => error(UserInputError::MutableParameterExpected {
+                    object_id: id(&r.id),
+                }),
             });
         }
         if !seen.insert(r.id.0) {
-            return Err(error(
-                ErrorKind::DuplicateObjectRefInput,
-                format!("{:?} is input twice", r.id),
-            ));
+            return Err(error(UserInputError::DuplicateObjectRefInput));
         }
     }
     Ok(())
@@ -866,20 +835,10 @@ fn check_owned_objects_live(inputs: &[Input<'_>]) -> Result<(), Error> {
     for (r, live) in owned() {
         let (version, digest) = live.expect("checked above");
         if version != r.version.get() {
-            return Err(error(
-                ErrorKind::ObjectVersionUnavailableForConsumption,
-                format!(
-                    "{:?} at {}: current version {version}",
-                    r.id,
-                    r.version.get(),
-                ),
-            ));
+            return Err(unavailable(r, version));
         }
         if digest != r.digest {
-            return Err(error(
-                ErrorKind::InvalidObjectDigest,
-                format!("{:?}: digest mismatch", r.id),
-            ));
+            return Err(invalid_digest(&r.id, &digest));
         }
     }
     Ok(())

@@ -304,7 +304,8 @@ impl Processor for VersionResolver {
 /// The input waiter's lookup of keys resolved before their wait: an
 /// `ObjectVersion` the object store holds, a `Package` it holds live, and a
 /// `Generation` the generation table holds (with its object, unless the
-/// stream ended), each as its value; any `StreamLive` at once. `Reserved` is
+/// stream ended), each as its value; a `StreamLive` once the epoch recorded
+/// the stream's start or the object store holds it live. `Reserved` is
 /// never found: `FundsReserver` resolves it only after the resolver queued
 /// its wait, through the same queue.
 pub struct InputAvailability {
@@ -351,7 +352,16 @@ impl Availability<InputKey, InputValue> for InputAvailability {
                         ),
                         Generation::Ended { .. } => InputValue::Generation(g, None),
                     }),
-                InputKey::StreamLive(_) => Some(InputValue::Live),
+                InputKey::StreamLive(stream) => (self.generations.started(stream)
+                    || self
+                        .store
+                        .live_object(&stream.id)
+                        .expect("the store reads")
+                        .is_some_and(|object| {
+                            object.get().owner.start_version()
+                                == Some(stream.initial_shared_version)
+                        }))
+                .then_some(InputValue::Live),
                 InputKey::Reserved(_) => None,
             }
         }));

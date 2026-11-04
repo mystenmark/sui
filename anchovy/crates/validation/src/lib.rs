@@ -20,7 +20,7 @@ pub mod verify;
 use messages::base::ChainIdentifier;
 use sui_protocol_config::ProtocolConfig;
 
-pub use error::{Error, ErrorKind};
+pub use error::{Error, ErrorKind, SuiErrorKind, UserInputError};
 
 /// The epoch-level inputs, as the reference's `TxValidityCheckContext`.
 #[derive(Clone, Copy, Debug)]

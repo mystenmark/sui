@@ -241,8 +241,9 @@ mod tests {
         for _ in 0..2 {
             let refused = cache.verify(&transactions[0], |_| {
                 Err(validation::Error::new(
-                    validation::ErrorKind::InvalidSignature,
-                    "refused",
+                    validation::SuiErrorKind::InvalidSignature {
+                        error: "refused".to_owned(),
+                    },
                 ))
             });
             assert!(refused.is_err());

@@ -323,3 +323,42 @@ fn a_transaction_not_reading_the_registry_does_not_wait_for_it() {
         &ExecutionStatus::Success
     );
 }
+
+/// The first access to a stream waits for the transaction that creates its
+/// object: the quorum that accepted the access had executed the creator, but
+/// this validator need not have.
+#[test]
+fn a_first_access_waits_for_its_object_to_be_created() {
+    let mut node = Node::new(2);
+    let gas = node.coin(0);
+    let share = node.share(gas);
+    let creator = digest(&share);
+    let shared = common::Shared {
+        id: sui_types::base_types::ObjectID::derive_id(
+            sui_types::digests::TransactionDigest::new(creator.bytes),
+            0,
+        ),
+        initial_shared_version: gas.1.value() + 1,
+    };
+    let write = node.increment(node.coin(1), shared);
+    let writer = digest(&write);
+    let write = node.executable(write, vec![shared.access(true, 4, 0)], vec![]);
+    let share = node.executable(share, vec![], vec![]);
+
+    let mut waiter = common::InputWaiter::new(&node);
+    assert_eq!(waiter.run(&mut node, vec![write]), 0);
+    assert_eq!(waiter.waiting(), 1, "the access waits for the object");
+    waiter.run(&mut node, vec![share]);
+    assert_eq!(waiter.waiting(), 0, "everything executed");
+
+    let created = node.effects(creator).unwrap();
+    assert!(
+        created.created().iter().any(|(r, owner)| r.0 == shared.id
+            && matches!(owner, sui_types::object::Owner::Shared { initial_shared_version }
+                if initial_shared_version.value() == shared.initial_shared_version)),
+        "{created:?}"
+    );
+    let written = node.effects(writer).unwrap();
+    assert_eq!(written.status(), &ExecutionStatus::Success, "{written:?}");
+    assert_eq!(read_at(&written, shared.id), shared.initial_shared_version);
+}

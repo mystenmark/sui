@@ -56,7 +56,7 @@ fn check(chk: &Path, verdicts: &Path, mismatches: &mut Vec<String>) -> usize {
         let signed = &tx.transaction;
         let validity = match validation::sender_signed::validity_check(signed, &ctx, &bump) {
             Ok(checked) => format!("ok:{}", checked.tx_size),
-            Err(e) => format!("{:?}", e.kind),
+            Err(e) => format!("{:?}", e.kind()),
         };
         let verification = validation::sender_signed::deserialization_checks(signed, &bump)
             .and_then(|(signatures, _)| {
@@ -69,7 +69,7 @@ fn check(chk: &Path, verdicts: &Path, mismatches: &mut Vec<String>) -> usize {
                     &bump,
                 )
             })
-            .map_or_else(|e| format!("{:?}", e.kind), |_| "ok".to_owned());
+            .map_or_else(|e| format!("{:?}", e.kind()), |_| "ok".to_owned());
         let ours = format!("{i} {validity} {verification}");
         if ours != line {
             mismatches.push(format!(

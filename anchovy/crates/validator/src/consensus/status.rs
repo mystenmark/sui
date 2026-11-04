@@ -39,9 +39,9 @@ impl ConsensusPosition {
         .expect("a position encodes")
     }
 
-    pub fn from_bcs(bytes: &[u8]) -> Option<ConsensusPosition> {
-        let (epoch, round, author, digest, index) = bcs::from_bytes(bytes).ok()?;
-        Some(ConsensusPosition {
+    pub fn from_bcs(bytes: &[u8]) -> Result<ConsensusPosition, bcs::Error> {
+        let (epoch, round, author, digest, index) = bcs::from_bytes(bytes)?;
+        Ok(ConsensusPosition {
             epoch,
             block: BlockRef {
                 round,

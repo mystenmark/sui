@@ -756,7 +756,7 @@ fn a_transaction_with_invalid_inputs_is_dropped_and_locks_nothing() {
         panic!("{:?}", decided.dropped);
     };
     assert_eq!(*dropped, digest(&twice));
-    assert_eq!(e.kind, validation::ErrorKind::DuplicateObjectRefInput);
+    assert_eq!(e.kind(), validation::ErrorKind::DuplicateObjectRefInput);
 }
 
 /// Everything a handler decided about a commit, as comparable text.

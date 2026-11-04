@@ -92,7 +92,10 @@ async fn every_route_is_served() {
         })
         .await
         .unwrap_err();
-    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+    assert_eq!(
+        common::reference_error_name(&sui_types::error::SuiError::from(status)),
+        "GrpcMessageDeserializeError"
+    );
     assert_unimplemented(
         client
             .object_info(ObjectInfoRequest {
@@ -149,4 +152,94 @@ async fn malformed_bcs_is_rejected_before_the_handler() {
         .await
         .unwrap_err();
     assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+}
+
+/// A wait as the reference's client encodes it is answered, and one it
+/// cannot decode or that lacks what it needs fails as the reference's does.
+#[tokio::test]
+async fn waits_are_decoded_as_the_reference_s_client_encodes_them() {
+    use sui_types::digests::TransactionDigest;
+    use sui_types::messages_consensus::ConsensusPosition;
+    use sui_types::messages_grpc::{PingType as ReferencePing, WaitForEffectsRequest};
+
+    let addr = serve().await;
+    let mut client = ValidatorClient::new(channel(addr).await);
+    let reference = |transaction_digest, ping_type, epoch| {
+        let raw =
+            sui_types::messages_grpc::RawWaitForEffectsRequest::try_from(WaitForEffectsRequest {
+                transaction_digest,
+                // The reference's position, from anchovy's encoding of it.
+                consensus_position: Some(
+                    bcs::from_bytes::<ConsensusPosition>(
+                        &validator::consensus::status::ConsensusPosition {
+                            epoch,
+                            block: ::consensus::BlockRef {
+                                round: 1,
+                                author: 0,
+                                digest: [0; 32],
+                            },
+                            index: 0,
+                        }
+                        .to_bcs(),
+                    )
+                    .unwrap(),
+                ),
+                include_details: false,
+                ping_type,
+            })
+            .unwrap();
+        RawWaitForEffectsRequest {
+            transaction_digest: raw.transaction_digest,
+            consensus_position: raw.consensus_position,
+            include_details: raw.include_details,
+            ping_type: raw.ping_type,
+        }
+    };
+    let error = |status: tonic::Status| {
+        let error = sui_types::error::SuiError::from(status);
+        (common::reference_error_name(&error), error.to_string())
+    };
+
+    // A position in an epoch past is answered as the epoch's end, for a
+    // transaction and for a ping alike.
+    let digest = Some(TransactionDigest::new([7; 32]));
+    for ping in [None, Some(ReferencePing::Consensus)] {
+        let status = client
+            .wait_for_effects(reference(digest, ping, 4))
+            .await
+            .unwrap_err();
+        assert_eq!(status.message(), "EpochEnded", "{status:?}");
+    }
+
+    let mut truncated = reference(digest, None, 5);
+    truncated.transaction_digest = Some(Bytes::from_static(&[32; 32]));
+    let mut no_position = reference(None, Some(ReferencePing::Consensus), 5);
+    no_position.consensus_position = None;
+    let mut unknown_ping = reference(None, None, 5);
+    unknown_ping.ping_type = Some(99);
+    for (request, expected) in [
+        (
+            truncated,
+            ("GrpcMessageDeserializeError", "unexpected end of input"),
+        ),
+        (
+            reference(None, None, 5),
+            (
+                "InvalidRequest",
+                "Transaction digest is required for wait for effects requests",
+            ),
+        ),
+        (
+            no_position,
+            (
+                "InvalidRequest",
+                "Consensus position is required for Ping requests",
+            ),
+        ),
+        (unknown_ping, ("GrpcMessageDeserializeError", "ping_type")),
+    ] {
+        let (name, text) = error(client.wait_for_effects(request).await.unwrap_err());
+        assert_eq!(name, expected.0);
+        assert!(text.contains(expected.1), "{text}");
+    }
 }

@@ -115,6 +115,20 @@ impl EpochStore {
         Some(live)
     }
 
+    /// Whether a start is recorded for shared object `id`'s stream from
+    /// `initial_shared_version` (see `start_version`).
+    ///
+    /// # Panics
+    /// If the database cannot be read.
+    pub fn has_start_version(&self, id: &ObjectId, initial_shared_version: u64) -> bool {
+        self.db
+            .exists(
+                Space::StartVersions,
+                &stream_key(id, initial_shared_version),
+            )
+            .expect("the epoch's database reads")
+    }
+
     /// Records `start` as where version assignment starts shared object
     /// `id` in the epoch, unless a start is recorded already: a certified
     /// transaction writing it, executed before anything in the epoch

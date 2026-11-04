@@ -13,13 +13,16 @@ use std::sync::Arc;
 use bytes::Bytes;
 use common::Case;
 use messages::transaction::DigestPending;
+use sui_types::error::SuiError;
 use tonic::Code;
 use tonic::transport::Channel;
 use tonic::transport::server::TcpIncoming;
 use validator::Validator;
 use validator::epoch::EpochState;
 use validator::processors::Request;
-use validator::proto::{RawSubmitTxRequest, RawValidatorSubmitStatus, SubmitTxType};
+use validator::proto::{
+    RawRejectedStatus, RawSubmitTxRequest, RawValidatorSubmitStatus, SubmitTxType,
+};
 use validator::service::validator_client::ValidatorClient;
 use workqueue::Queue;
 
@@ -95,27 +98,28 @@ async fn verdicts_come_back_over_grpc() {
                 // Genesis has none of its objects.
                 let results = response.unwrap().into_inner().results;
                 assert_eq!(results.len(), 1, "{}", case.label);
-                assert!(
-                    matches!(
-                        results[0].inner,
-                        Some(RawValidatorSubmitStatus::Rejected(_))
-                    ),
-                    "{}: {results:?}",
+                let Some(RawValidatorSubmitStatus::Rejected(RawRejectedStatus {
+                    error: Some(error),
+                })) = &results[0].inner
+                else {
+                    panic!("{}: {results:?}", case.label);
+                };
+                let error: SuiError = bcs::from_bytes(error).unwrap();
+                assert_eq!(
+                    common::reference_error_name(&error),
+                    "ObjectNotFound",
+                    "{}: {error:?}",
                     case.label
                 );
                 passed += 1;
             }
             Err(kind) => {
-                let status = response.unwrap_err();
+                // As a client reads it.
+                let error = SuiError::from(response.unwrap_err());
                 assert_eq!(
-                    status.code(),
-                    Code::InvalidArgument,
-                    "{}: {status:?}",
-                    case.label
-                );
-                assert!(
-                    status.message().starts_with(&format!("{kind:?}:")),
-                    "{}: expected {kind:?}, got {status:?}",
+                    common::reference_error_name(&error),
+                    format!("{kind:?}"),
+                    "{}: {error:?}",
                     case.label
                 );
                 failed += 1;
@@ -132,35 +136,37 @@ async fn verdicts_come_back_over_grpc() {
 async fn malformed_requests_are_refused() {
     let (cases, epoch) = cases();
     let (valid, invalid) = valid_and_invalid(&cases, &epoch);
+    let invalid_kind = common::expected(&epoch, &[invalid]).unwrap_err();
     let mut client = serve(epoch).await;
     let garbage = RawSubmitTxRequest {
         transactions: vec![Bytes::from_static(&[1, 2, 3])],
         submit_type: SubmitTxType::Default as i32,
     };
     let requests = [
-        ("garbage", garbage),
-        ("empty", submit(&[], SubmitTxType::Default)),
+        ("TransactionDeserializationError", garbage),
+        ("InvalidRequest", submit(&[], SubmitTxType::Default)),
+        ("InvalidRequest", submit(&[valid], SubmitTxType::Ping)),
         (
-            "ping with a transaction",
-            submit(&[valid], SubmitTxType::Ping),
-        ),
-        (
-            "unknown type",
+            "GrpcMessageDeserializeError",
             RawSubmitTxRequest {
                 submit_type: 9,
                 ..submit(&[valid], SubmitTxType::Default)
             },
         ),
-        ("too many", submit(&[valid; 513], SubmitTxType::Default)),
+        (
+            "InvalidRequest",
+            submit(&[valid; 513], SubmitTxType::Default),
+        ),
         // One invalid transaction fails the whole request.
         (
-            "one invalid",
+            &format!("{invalid_kind:?}"),
             submit(&[valid, invalid], SubmitTxType::Default),
         ),
     ];
-    for (label, request) in requests {
-        let status = client.submit_transaction(request).await.unwrap_err();
-        assert_eq!(status.code(), Code::InvalidArgument, "{label}: {status:?}");
+    for (expected, request) in requests {
+        // Decoded as a client decodes it.
+        let error = SuiError::from(client.submit_transaction(request).await.unwrap_err());
+        assert_eq!(common::reference_error_name(&error), expected, "{error:?}");
     }
 }
 
@@ -202,5 +208,8 @@ async fn a_full_queue_between_processors_refuses_work() {
         .submit_transaction(submit(&[invalid], SubmitTxType::Default))
         .await
         .unwrap_err();
-    assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+    assert_eq!(
+        common::reference_error_name(&SuiError::from(status)),
+        "Unsupported"
+    );
 }

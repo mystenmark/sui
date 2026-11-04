@@ -139,7 +139,7 @@ pub fn expected(epoch: &EpochState, cases: &[&Case]) -> Result<(), ErrorKind> {
         let transaction = case.parse().unwrap();
         let bump = Bump::with_capacity(1 << 16);
         validation::check(&transaction.get().0, &context, &epoch.verifier, &[], &bump)
-            .map_err(|e| e.kind)?;
+            .map_err(|e| e.kind())?;
     }
     Ok(())
 }
@@ -183,7 +183,7 @@ impl Pipeline {
             })
         else {
             return match verdict.try_recv().unwrap() {
-                Err(Rejected::Invalid(e)) => Err(e.kind),
+                Err(Rejected::Invalid(e)) => Err(e.kind()),
                 other => panic!("{:?}", other.map(|_| ())),
             };
         };
@@ -279,4 +279,12 @@ pub fn current(
             sync_inbox,
         ),
     )
+}
+
+/// The variant of a reference error, or of the `UserInputError` it wraps.
+pub fn reference_error_name(error: &sui_types::error::SuiError) -> &'static str {
+    match error.as_inner() {
+        sui_types::error::SuiErrorKind::UserInputError { error } => error.into(),
+        kind => kind.into(),
+    }
 }

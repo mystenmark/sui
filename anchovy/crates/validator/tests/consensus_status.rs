@@ -143,5 +143,5 @@ fn a_position_encodes_as_the_reference_s() {
     assert_eq!(reference.block.round, 77);
     assert_eq!(reference.index, 9);
     assert_eq!(bcs::to_bytes(&reference).unwrap(), bytes);
-    assert_eq!(ConsensusPosition::from_bcs(&bytes), Some(p));
+    assert_eq!(ConsensusPosition::from_bcs(&bytes).ok(), Some(p));
 }

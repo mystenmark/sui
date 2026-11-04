@@ -154,6 +154,13 @@ impl GenerationTable {
         self.store.generation(&stream, round, generation)
     }
 
+    /// Whether the epoch recorded where `stream`'s version assignment
+    /// starts.
+    pub fn started(&self, stream: StreamId) -> bool {
+        self.store
+            .has_start_version(&stream.id, stream.initial_shared_version)
+    }
+
     /// Writes the generations `transactions`, which have committed,
     /// produced.
     pub fn commit(&self, transactions: &[TxDigest], bump: &containers::Bump) {

@@ -107,7 +107,7 @@ fn allocations_per_transaction() {
             let (result, n) = count(|| {
                 validation::sender_signed::validity_check(signed, &ctx, &bump).map(|_| ())
             });
-            let outcome = result.map_or_else(|e| format!("{:?}", e.kind), |()| "ok".into());
+            let outcome = result.map_or_else(|e| format!("{:?}", e.kind()), |()| "ok".into());
             if n > 0 && outcome == "ok" && scheme != "zklogin" {
                 eprintln!(
                     "{n} allocations: arena chunks {} bytes {}, price {}",
@@ -123,7 +123,7 @@ fn allocations_per_transaction() {
             let bump = Bump::with_capacity(1 << 16);
             let (result, n) =
                 count(|| validation::check(signed, &ctx, &verifier, &[], &bump).map(|_| ()));
-            let outcome = result.map_or_else(|e| format!("{:?}", e.kind), |()| "ok".into());
+            let outcome = result.map_or_else(|e| format!("{:?}", e.kind()), |()| "ok".into());
             seen.entry(("check", outcome, scheme)).or_default().push(n);
         }
     }
@@ -196,7 +196,7 @@ fn measure_vectors(seen: &mut Seen) {
         let bump = Bump::with_capacity(1 << 16);
         let (result, n) =
             count(|| validation::check(message.get(), &ctx, &verifier, &[], &bump).map(|_| ()));
-        let outcome = result.map_or_else(|e| format!("{:?}", e.kind), |()| "ok".into());
+        let outcome = result.map_or_else(|e| format!("{:?}", e.kind()), |()| "ok".into());
         let scheme = label
             .trim_start_matches("verify_")
             .split('_')

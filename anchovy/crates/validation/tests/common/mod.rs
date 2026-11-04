@@ -93,7 +93,7 @@ fn run(tx: &Tx, ctx: &Context<'_>, verifier: &Verifier) -> String {
             let bump = containers::Bump::with_capacity(4096);
             return match validation::sender_signed::validity_check(signed, ctx, &bump) {
                 Ok(checked) => format!("ok:{}", checked.tx_size),
-                Err(e) => format!("{:?}", e.kind),
+                Err(e) => format!("{:?}", e.kind()),
             };
         }
         "verify" => {
@@ -120,14 +120,14 @@ fn run(tx: &Tx, ctx: &Context<'_>, verifier: &Verifier) -> String {
             let bump = containers::Bump::with_capacity(1 << 16);
             return match validation::check(signed, ctx, verifier, &[], &bump) {
                 Ok(checked) => format!("ok:{}", checked.tx_size),
-                Err(e) => format!("{:?}", e.kind),
+                Err(e) => format!("{:?}", e.kind()),
             };
         }
         check => panic!("unknown check {check}"),
     };
     match result {
         Ok(()) => "ok".to_owned(),
-        Err(e) => format!("{:?}", e.kind),
+        Err(e) => format!("{:?}", e.kind()),
     }
 }
 

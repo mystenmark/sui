@@ -102,7 +102,7 @@ fn matches_the_reference() {
                     &containers::Bump::default(),
                 ) {
                     Ok(()) => "ok".to_owned(),
-                    Err(e) => format!("{:?}", e.kind),
+                    Err(e) => format!("{:?}", e.kind()),
                 };
                 if ours != *verdict {
                     mismatches.push(format!("{label}: reference {verdict}, ours {ours}"));

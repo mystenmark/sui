@@ -14,7 +14,7 @@ use messages::type_tag::TypeTag;
 
 use crate::kind::is_valid_identifier;
 use crate::signature::{self, ParsedSignature, uleb_len};
-use crate::{Context, Error, ErrorKind, transaction_data};
+use crate::{Context, Error, SuiErrorKind, UserInputError, transaction_data};
 
 /// A transaction that passed: its signatures parsed, and the size the
 /// reference counts against per-block byte limits.
@@ -25,7 +25,9 @@ pub struct Checked<'a> {
 }
 
 fn malformed(what: &str) -> Error {
-    Error::new(ErrorKind::TransactionDeserializationError, what)
+    Error::new(SuiErrorKind::TransactionDeserializationError {
+        error: what.to_owned(),
+    })
 }
 
 pub fn validity_check<'a>(
@@ -40,22 +42,32 @@ pub fn validity_check<'a>(
         // Only ML-DSA-65 is gated among the simple schemes. An ML-DSA-65
         // multisig member, signing or not, is a BCS variant older binaries
         // cannot decode.
-        let enabled = match sig {
-            ParsedSignature::MultiSig(m) => {
-                config.upgraded_multisig_supported() && (config.mldsa65_auth() || !uses_mldsa65(m))
+        const MLDSA65_MULTISIG: &str = "ML-DSA-65 multisig members are not enabled on this network";
+        let unsupported = match sig {
+            ParsedSignature::MultiSig(_) if !config.upgraded_multisig_supported() => {
+                Some("upgraded multisig format not enabled on this network")
             }
-            ParsedSignature::MultiSigLegacy { multisig, .. } => {
-                config.mldsa65_auth() || !uses_mldsa65(multisig)
+            ParsedSignature::MultiSig(m) if uses_mldsa65(m) && !config.mldsa65_auth() => {
+                Some(MLDSA65_MULTISIG)
             }
-            ParsedSignature::ZkLogin(_) => config.zklogin_auth(),
-            ParsedSignature::Passkey(_) => config.passkey_auth(),
-            ParsedSignature::Simple(bytes) => bytes[0] != 7 || config.mldsa65_auth(),
+            ParsedSignature::MultiSigLegacy { multisig, .. }
+                if uses_mldsa65(multisig) && !config.mldsa65_auth() =>
+            {
+                Some(MLDSA65_MULTISIG)
+            }
+            ParsedSignature::ZkLogin(_) if !config.zklogin_auth() => {
+                Some("zklogin is not enabled on this network")
+            }
+            ParsedSignature::Passkey(_) if !config.passkey_auth() => {
+                Some("passkey is not enabled on this network")
+            }
+            ParsedSignature::Simple(bytes) if bytes[0] == 7 && !config.mldsa65_auth() => {
+                Some("ML-DSA-65 signatures are not enabled on this network")
+            }
+            _ => None,
         };
-        if !enabled {
-            return Err(Error::new(
-                ErrorKind::Unsupported,
-                format!("{} signatures are not enabled", sig.variant()),
-            ));
+        if let Some(what) = unsupported {
+            return Err(Error::new(UserInputError::Unsupported(what.to_owned())));
         }
     }
 
@@ -64,26 +76,25 @@ pub fn validity_check<'a>(
         tx.data().kind(),
         TransactionKind::ProgrammableTransaction(_)
     ) {
-        return Err(Error::new(
-            ErrorKind::Unsupported,
-            "a user transaction cannot be a system transaction",
-        ));
+        return Err(Error::new(UserInputError::Unsupported(
+            "SenderSignedData must not contain system transaction".to_owned(),
+        )));
     }
 
     let max = config.max_tx_size_bytes();
     if tx_size as u64 > max {
-        return Err(Error::new(
-            ErrorKind::SizeLimitExceeded,
-            format!("transaction of {tx_size} bytes, limit {max}"),
-        ));
+        return Err(Error::new(UserInputError::SizeLimitExceeded {
+            limit: format!("serialized transaction size exceeded maximum of {max}"),
+            value: tx_size.to_string(),
+        }));
     }
     if transaction_data::is_gasless(tx.data(), ctx) {
         let max = config.get_gasless_max_tx_size_bytes();
         if tx_size as u64 > max {
-            return Err(Error::new(
-                ErrorKind::SizeLimitExceeded,
-                format!("gasless transaction of {tx_size} bytes, limit {max}"),
-            ));
+            return Err(Error::new(UserInputError::SizeLimitExceeded {
+                limit: format!("serialized gasless transaction size exceeded maximum of {max}"),
+                value: tx_size.to_string(),
+            }));
         }
     }
 

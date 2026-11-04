@@ -465,16 +465,35 @@ fn coin(id: ObjectID, version: u64) -> Object {
     )
 }
 
+/// `stream`'s object, shared, at `version`.
+fn shared(stream: StreamId, version: u64) -> Object {
+    Object::with_id_owner_version_for_testing(
+        ObjectID::new(stream.id.0),
+        SequenceNumber::from_u64(version),
+        Owner::Shared {
+            initial_shared_version: SequenceNumber::from_u64(stream.initial_shared_version),
+        },
+    )
+}
+
 #[test]
 fn availability_reads_the_store_and_the_generation_table() {
     let package = id(0x50);
     let s = stream(9);
+    let reshared = StreamId {
+        initial_shared_version: 2,
+        ..stream(4)
+    };
     let (store, _dir) = store(&[
         coin(id(1), 5),
         coin(package, 1),
         coin(ObjectID::new(s.id.0), 4),
+        shared(stream(3), 2),
+        shared(reshared, 3),
     ]);
-    let (generations, _generations_dir) = generation_table();
+    let generations_dir = tempfile::tempdir().unwrap();
+    let (epoch_store, _, _) = validator::epoch_store::EpochStore::open(generations_dir.path(), 0);
+    let generations = Arc::new(GenerationTable::new(epoch_store.clone()));
     generations.record(
         s,
         1,
@@ -509,14 +528,17 @@ fn availability_reads_the_store_and_the_generation_table() {
         generation(s, 1, 2),
         generation(s, 1, 3),
         generation(s, 2, 1),
+        // A stream is live once its object is, from the stream's start.
         InputKey::StreamLive(stream(3)),
+        InputKey::StreamLive(stream(4)),
+        InputKey::StreamLive(stream(5)),
     ];
     let mut found = Vec::new();
     availability.check(&keys, &mut found);
     assert_eq!(
         found.iter().map(Option::is_some).collect::<Vec<_>>(),
         [
-            true, false, false, true, false, true, true, false, false, true
+            true, false, false, true, false, true, true, false, false, true, false, false
         ]
     );
     // Each found key resolves to what it names.
@@ -532,6 +554,19 @@ fn availability_reads_the_store_and_the_generation_table() {
         Some(InputValue::Generation(Generation::Ended { .. }, None))
     ));
     assert!(matches!(&found[9], Some(InputValue::Live)));
+    // Or once the epoch recorded where the stream starts, though its object
+    // is gone.
+    let unshared = stream(5);
+    epoch_store.seed_start_version(
+        &unshared.id,
+        1,
+        store::Live {
+            version: 1,
+            digest: Digest::new([0; 32]),
+        },
+    );
+    availability.check(&[InputKey::StreamLive(unshared)], &mut found);
+    assert!(matches!(&found[0], Some(InputValue::Live)));
     // `Reserved` resolves only when `FundsReserver` resolves it.
     availability.check(&[InputKey::Reserved(hashed(1))], &mut found);
     assert!(found[0].is_none());
@@ -540,7 +575,8 @@ fn availability_reads_the_store_and_the_generation_table() {
 #[test]
 fn a_resolved_chunk_waits_in_the_input_waiter_until_its_keys_are_available() {
     let gas = coin(id(3), 1);
-    let (store, _dir) = store(std::slice::from_ref(&gas));
+    let clock = stream(6);
+    let (store, _dir) = store(&[gas.clone(), shared(clock, 1)]);
     let (generations, _generations_dir) = generation_table();
     let mut waiter = Waiter::new(InputAvailability {
         store: store.clone(),
@@ -554,7 +590,6 @@ fn a_resolved_chunk_waits_in_the_input_waiter_until_its_keys_are_available() {
         }
         chunk
     };
-    let clock = stream(6);
     let owned = (id(1), SequenceNumber::from_u64(5), random_object_ref().2);
     let mut spend = user(
         vec![CallArg::Object(ObjectArg::ImmOrOwnedObject(owned))],

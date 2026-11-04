@@ -235,8 +235,9 @@ impl SignatureChecks {
                                 || deferred[checks].iter().all(verify::verify_ed25519);
                             if !verified {
                                 return Err(validation::Error::new(
-                                    validation::ErrorKind::InvalidSignature,
-                                    "signature does not verify",
+                                    validation::SuiErrorKind::InvalidSignature {
+                                        error: "signature does not verify".to_owned(),
+                                    },
                                 ));
                             }
                             self.cache.insert(key, indices);

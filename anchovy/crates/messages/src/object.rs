@@ -45,6 +45,19 @@ unsafe impl WireRecord for PartyMember {}
 impl<'a> Owner<'a> {
     pub const MIN_WIRE_SIZE: usize = 1;
 
+    /// The version a consensus object's stream starts at; none for other
+    /// owners.
+    pub fn start_version(&self) -> Option<SequenceNumber> {
+        match self {
+            Owner::Shared {
+                initial_shared_version,
+            } => Some(*initial_shared_version),
+            Owner::ConsensusAddressOwner { start_version, .. } => Some(*start_version),
+            Owner::Party(party) => Some(party.start_version),
+            Owner::AddressOwner(_) | Owner::ObjectOwner(_) | Owner::Immutable => None,
+        }
+    }
+
     pub fn parse<A: Alloc<'a>>(r: &mut Reader<'a>, a: &mut A) -> Result<Owner<'a>> {
         r.enter()?;
         let owner = match r.variant()? {

@@ -37,6 +37,7 @@ waiter.workspace = true
 workqueue.workspace = true
 
 [dev-dependencies]
+flate2 = "1"
 rand.workspace = true
 execution = { workspace = true, features = ["testing"] }
 base64.workspace = true
