@@ -2039,6 +2039,13 @@ fn the_composite_workload_runs_alike_through_stalls() {
     composite_workload(true, false);
 }
 
+/// `the_full_composite_workload_runs_alike`, with anchovy stalled as in
+/// `the_composite_workload_runs_alike_through_stalls`.
+#[test]
+fn the_full_composite_workload_runs_alike_through_stalls() {
+    composite_workload(true, true);
+}
+
 fn composite_workload(stalls: bool, full: bool) {
     use rand::Rng as _;
     use std::str::FromStr as _;
