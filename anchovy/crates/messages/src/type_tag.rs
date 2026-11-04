@@ -32,6 +32,52 @@ pub struct StructTag<'a> {
     pub type_params: &'a [TypeTag<'a>],
 }
 
+/// As the reference displays a `TypeTag` (or a `TypeInput`, the same way).
+impl std::fmt::Display for TypeTag<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TypeTag::Bool => f.write_str("bool"),
+            TypeTag::U8 => f.write_str("u8"),
+            TypeTag::U16 => f.write_str("u16"),
+            TypeTag::U32 => f.write_str("u32"),
+            TypeTag::U64 => f.write_str("u64"),
+            TypeTag::U128 => f.write_str("u128"),
+            TypeTag::U256 => f.write_str("u256"),
+            TypeTag::Address => f.write_str("address"),
+            TypeTag::Signer => f.write_str("signer"),
+            TypeTag::Vector(inner) => write!(f, "vector<{}>", inner.get()),
+            TypeTag::Struct(s) => write!(f, "{}", s.get()),
+        }
+    }
+}
+
+/// As the reference displays a `StructTag`: the address in hex without
+/// leading zeros.
+impl std::fmt::Display for StructTag<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("0x")?;
+        let mut digits = self.address.0.iter().flat_map(|b| [b >> 4, b & 0xf]);
+        let first = digits.by_ref().find(|d| *d != 0);
+        match first {
+            None => f.write_str("0")?,
+            Some(first) => {
+                for d in std::iter::once(first).chain(digits) {
+                    write!(f, "{d:x}")?;
+                }
+            }
+        }
+        write!(f, "::{}::{}", self.module, self.name)?;
+        for (i, param) in self.type_params.iter().enumerate() {
+            f.write_str(if i == 0 { "<" } else { ", " })?;
+            write!(f, "{param}")?;
+        }
+        if !self.type_params.is_empty() {
+            f.write_str(">")?;
+        }
+        Ok(())
+    }
+}
+
 /// On the wire `TypeInput` and `StructInput` are `TypeTag` and `StructTag`.
 /// The reference keeps them apart only because its `TypeTag` validates
 /// identifiers while deserializing, which this crate never does.
