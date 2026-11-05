@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use ::consensus::{BlockRef, TransactionIndex};
+use messages::build::error::SuiErrorKind;
 use tokio::sync::{oneshot, watch};
 
 /// How many rounds a status is kept past its block's: the reference's
@@ -87,6 +88,10 @@ struct Inner {
     /// Ordered by block, so by round: expiry pops from the front.
     statuses: BTreeMap<(BlockRef, TransactionIndex), ConsensusTxStatus>,
     waiters: HashMap<(BlockRef, TransactionIndex), Vec<oneshot::Sender<ConsensusTxStatus>>>,
+    /// Why this validator voted to reject, or every validator dropped, a
+    /// transaction: the reference's `TransactionRejectReasonCache`. Expires
+    /// with the statuses.
+    reasons: BTreeMap<(BlockRef, TransactionIndex), SuiErrorKind>,
     /// The last leader round passed to `update_leader_round`.
     last_leader_round: Option<u32>,
 }
@@ -146,6 +151,32 @@ impl ConsensusTxStatusCache {
         }
     }
 
+    /// Records why each transaction was rejected or dropped: the
+    /// reference's `set_rejection_vote_reason`. Set before the status, so
+    /// that a waiter woken by the status finds it.
+    pub fn set_reasons(
+        &self,
+        reasons: impl IntoIterator<Item = (BlockRef, TransactionIndex, SuiErrorKind)>,
+    ) {
+        let leader_round = *self.leader_round.borrow();
+        let mut inner = self.lock();
+        for (block, index, reason) in reasons {
+            if leader_round.is_some_and(|r| expired(block.round, r)) {
+                continue;
+            }
+            inner.reasons.insert((block, index), reason);
+        }
+    }
+
+    /// Why the transaction at `position` was rejected or dropped, if
+    /// recorded: the reference's `get_rejection_vote_reason`.
+    pub fn reason(&self, position: &ConsensusPosition) -> Option<SuiErrorKind> {
+        self.lock()
+            .reasons
+            .get(&(position.block, position.index))
+            .cloned()
+    }
+
     /// A commit with this leader round was handled. As the reference does,
     /// positions expire against the round before, so that the transactions
     /// of the commit just handled are not expired at once.
@@ -159,6 +190,12 @@ impl ConsensusTxStatusCache {
                 break;
             }
             inner.statuses.pop_first();
+        }
+        while let Some((&(block, _), _)) = inner.reasons.first_key_value() {
+            if !expired(block.round, previous) {
+                break;
+            }
+            inner.reasons.pop_first();
         }
         inner.waiters.retain(|(block, _), waiters| {
             waiters.retain(|w| !w.is_closed());

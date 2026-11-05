@@ -13,6 +13,8 @@ use ::consensus::{Block, BlockRef, TransactionIndex};
 use containers::Bump;
 use messages::Message;
 use messages::base::{ObjectId, SuiAddress};
+use messages::build;
+use messages::build::error::{SuiErrorKind, UserInputError};
 use messages::consensus::{
     ConsensusTransaction, ConsensusTransactionKind, PlainTransactionWithClaims, TransactionClaim,
     TransactionDenyRules,
@@ -29,6 +31,7 @@ use crate::checks::{self, SignatureChecks, VerifiedTransaction};
 use crate::consensus::cache::{BlockEntries, CachedTransaction, ConsensusTxCache};
 use crate::consensus::decode::{checkpoint_signature, claimed_immutable};
 use crate::consensus::execution_time::duration;
+use crate::consensus::status::ConsensusTxStatusCache;
 use crate::epoch::EpochState;
 use crate::pipeline::items::{AliasVersions, BuiltWaitItem, BuiltWaits};
 use crate::pipeline::keys::CheckpointBuilt;
@@ -64,27 +67,13 @@ impl Refuse for VoteRequest {
     fn refuse(self, _: Refusal) {}
 }
 
-/// Why this validator votes to reject a user transaction.
-#[derive(Debug)]
-pub enum RejectReason {
-    Invalid(validation::Error),
-    MissingAliasClaim,
-    AliasesChanged,
-    ImmutableClaim(String),
-}
-
-impl From<validation::Error> for RejectReason {
-    fn from(e: validation::Error) -> RejectReason {
-        RejectReason::Invalid(e)
-    }
-}
-
 /// Votes on blocks against the store, filling the cache of decoded
 /// transactions.
 ///
 /// Inward: consensus (black box): `VoteRequest`.
 /// Outward:
 /// - consensus: the verdict, through the request's reply;
+/// - the status cache: why each rejected transaction was, once wired;
 /// - built waiter, wait for: each checkpoint signature in a valid block,
 ///   keyed by `CheckpointBuilt(seq)`, once routed. Ahead of its commit, for
 ///   latency; the commit decoder routes it again, as a commit can arrive
@@ -97,6 +86,7 @@ pub struct BlockVoter {
     cache: Arc<ConsensusTxCache>,
     signatures: SignatureChecks,
     checkpoint_signatures: Option<BuiltWaits>,
+    statuses: Option<Arc<ConsensusTxStatusCache>>,
 }
 
 impl BlockVoter {
@@ -111,7 +101,15 @@ impl BlockVoter {
             store,
             cache,
             checkpoint_signatures: None,
+            statuses: None,
         }
+    }
+
+    /// Records why each rejected transaction was, for its submitter.
+    #[must_use]
+    pub fn with_statuses(mut self, statuses: Arc<ConsensusTxStatusCache>) -> BlockVoter {
+        self.statuses = Some(statuses);
+        self
     }
 
     /// Routes the checkpoint signatures of valid blocks to the summary
@@ -153,7 +151,7 @@ impl BlockVoter {
         // 3. A vote on each user transaction; other kinds are accepted.
         //    First the validity checks, then the signatures, the block's in
         //    one batch, then the rest of `vote_transaction`.
-        let mut rejects = Vec::new();
+        let mut rejects = containers::Vec::new_in(bump);
         let mut entries: BlockEntries = (0..decoded.len()).map(|_| None).collect();
         let mut valid = containers::Vec::new_in(bump);
         let mut pending = containers::Vec::new_in(bump);
@@ -170,7 +168,7 @@ impl BlockVoter {
                     valid.push(transaction);
                     pending.push((index, claims));
                 }
-                Err(_) => rejects.push(index as TransactionIndex),
+                Err(e) => rejects.push((index as TransactionIndex, e.reason)),
             }
         }
         let verified = self.signatures.verify_batch(valid, bump);
@@ -178,11 +176,10 @@ impl BlockVoter {
             let (index, claims) = &pending[i];
             match verified {
                 Ok((transaction, indices)) => {
-                    if self
-                        .vote_verified(epoch, &transaction, indices, claims, bump)
-                        .is_err()
+                    if let Err(reason) =
+                        self.vote_verified(epoch, &transaction, indices, claims, bump)
                     {
-                        rejects.push(*index as TransactionIndex);
+                        rejects.push((*index as TransactionIndex, reason));
                     }
                     entries[*index] = Some(CachedTransaction::new(
                         transaction,
@@ -191,14 +188,22 @@ impl BlockVoter {
                         bump,
                     ));
                 }
-                Err(_) => rejects.push(*index as TransactionIndex),
+                Err(e) => rejects.push((*index as TransactionIndex, e.reason)),
             }
         }
-        rejects.sort_unstable();
+        rejects.sort_unstable_by_key(|(index, _)| *index);
+        let indices = rejects.iter().map(|(index, _)| *index).collect();
+        if let Some(statuses) = &self.statuses {
+            statuses.set_reasons(
+                rejects
+                    .into_iter()
+                    .map(|(index, reason)| (reference, index, reason)),
+            );
+        }
 
         // 4. Keep the decoded transactions for the block's commit.
         self.cache.insert(reference, entries);
-        Ok(rejects)
+        Ok(indices)
     }
 
     fn route_signatures(&self, transactions: &[Message<ConsensusTransaction<'static>>]) {
@@ -225,22 +230,17 @@ impl BlockVoter {
         indices: SignerIndices,
         claims: &CopiedClaims<'_>,
         bump: &Bump,
-    ) -> Result<(), RejectReason> {
+    ) -> Result<(), SuiErrorKind> {
+        let missing_claim = || SuiErrorKind::InvalidRequest("missing address alias claim".into());
         if epoch.params.config.address_aliases() {
             let indices = indices.as_slice();
             // No signer has an alias: aliases are object state anchovy does
             // not read yet, so each signer's alias version is `None`.
             let matches = if epoch.params.config.fix_checkpoint_signature_mapping() {
-                let claimed = claims
-                    .aliases_v2
-                    .as_ref()
-                    .ok_or(RejectReason::MissingAliasClaim)?;
+                let claimed = claims.aliases_v2.as_ref().ok_or_else(missing_claim)?;
                 claimed.matches(indices.iter().map(|index| (*index, None)))
             } else {
-                let claimed = claims
-                    .aliases_v1
-                    .as_ref()
-                    .ok_or(RejectReason::MissingAliasClaim)?;
+                let claimed = claims.aliases_v1.as_ref().ok_or_else(missing_claim)?;
                 let data = transaction.get().0.data();
                 let sponsor =
                     (data.gas_data().owner != data.sender()).then_some(data.gas_data().owner);
@@ -252,7 +252,7 @@ impl BlockVoter {
                 )
             };
             if !matches {
-                return Err(RejectReason::AliasesChanged);
+                return Err(SuiErrorKind::AliasesChanged);
             }
         }
 
@@ -265,7 +265,7 @@ impl BlockVoter {
             .expect("the store reads")
             .is_none()
         {
-            checks::inputs_pass(epoch, &self.store, transaction, bump)?;
+            checks::inputs_pass(epoch, &self.store, transaction, bump).map_err(|e| e.reason)?;
         }
         if !claims.immutable.is_empty() {
             verify_immutable_object_claims(&self.store, transaction, &claims.immutable, bump)?;
@@ -549,8 +549,8 @@ fn verify_immutable_object_claims(
     transaction: &VerifiedTransaction,
     claimed_ids: &[ObjectId],
     bump: &Bump,
-) -> Result<(), RejectReason> {
-    let inputs = input_objects(transaction.get().0.data(), bump)?;
+) -> Result<(), SuiErrorKind> {
+    let inputs = input_objects(transaction.get().0.data(), bump).map_err(|e| e.reason)?;
     let mut owned: containers::Vec<'_, messages::base::ObjectRef> = containers::Vec::new_in(bump);
     owned.extend(inputs.iter().filter_map(|kind| match kind {
         InputKind::ImmOrOwned(r) => Some(*r),
@@ -560,24 +560,26 @@ fn verify_immutable_object_claims(
         .iter()
         .find(|id| !owned.iter().any(|r| r.id == **id))
     {
-        return Err(RejectReason::ImmutableClaim(format!(
-            "{id:?} is not an owned input"
-        )));
+        return Err(SuiErrorKind::ImmutableObjectClaimNotFoundInInput {
+            object_id: id.into(),
+        });
     }
     let mut immutable = containers::Vec::new_in(bump);
     for input in &owned {
         let Some(object) = store.live_object(&input.id).expect("the store reads") else {
-            return Err(RejectReason::ImmutableClaim(format!(
-                "{:?} not found",
-                input.id
-            )));
+            return Err(UserInputError::ObjectNotFound {
+                object_id: (&input.id).into(),
+                version: Some(build::base::SequenceNumber(input.version.get())),
+            }
+            .into());
         };
         let object = object.get();
         if object.version() != input.version.get() || object.digest() != input.digest {
-            return Err(RejectReason::ImmutableClaim(format!(
-                "{:?} is no longer at its given version",
-                input.id
-            )));
+            return Err(UserInputError::ObjectVersionUnavailableForConsumption {
+                provided_obj_ref: input.into(),
+                current_version: build::base::SequenceNumber(object.version()),
+            }
+            .into());
         }
         if matches!(object.owner, Owner::Immutable) {
             immutable.push(input.id);
@@ -589,10 +591,21 @@ fn verify_immutable_object_claims(
     claimed.dedup();
     immutable.sort_unstable();
     immutable.dedup();
-    if claimed != immutable {
-        return Err(RejectReason::ImmutableClaim(
-            "the claimed immutable objects are not the immutable inputs".to_owned(),
-        ));
+    // The first of each difference, in id order, as the reference's sets.
+    if let Some(id) = claimed.iter().find(|id| !immutable.contains(id)) {
+        let input = owned
+            .iter()
+            .find(|r| r.id == *id)
+            .expect("claims are inputs");
+        return Err(SuiErrorKind::InvalidImmutableObjectClaim {
+            claimed_object_id: id.into(),
+            found_object_ref: input.into(),
+        });
+    }
+    if let Some(id) = immutable.iter().find(|id| !claimed.contains(id)) {
+        return Err(SuiErrorKind::ImmutableObjectNotClaimed {
+            object_id: id.into(),
+        });
     }
     Ok(())
 }

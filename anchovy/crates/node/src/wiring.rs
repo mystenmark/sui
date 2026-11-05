@@ -229,6 +229,7 @@ impl Parts {
     fn voter(&self, built: BuiltWaits) -> BlockVoter {
         BlockVoter::new(self.epoch.clone(), self.store.clone(), self.cache.clone())
             .with_signatures(built)
+            .with_statuses(self.statuses.clone())
     }
 
     /// Whether the epoch has the random beacon: the reference's

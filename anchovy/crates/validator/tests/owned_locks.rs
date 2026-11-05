@@ -162,6 +162,29 @@ async fn the_stage_records_each_committed_transaction_s_status() {
         status(2).await,
         StatusResult::Status(ConsensusTxStatus::Rejected)
     );
+    // The drop's reason, as the reference's: the lock conflict, with its
+    // holder.
+    let reason = |index| {
+        statuses
+            .reason(&ConsensusPosition {
+                epoch: epoch.epoch,
+                block,
+                index,
+            })
+            .map(|r| {
+                bcs::from_bytes::<sui_types::error::SuiError>(&bcs::to_bytes(&r).unwrap())
+                    .unwrap()
+                    .into_inner()
+            })
+    };
+    assert_eq!(
+        reason(1),
+        Some(sui_types::error::SuiErrorKind::ObjectLockConflict {
+            obj_ref: object,
+            pending_transaction: sui_types::digests::TransactionDigest::new(digest(&first).bytes),
+        })
+    );
+    assert_eq!(reason(0), None);
 }
 
 fn digest(t: &Tx) -> Hashed {

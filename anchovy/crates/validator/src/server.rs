@@ -218,7 +218,7 @@ impl Validator {
                     }),
                 })
             }
-            status => Self::undecided(epoch, status),
+            status => Self::undecided(epoch, statuses, position, status),
         }
     }
 
@@ -301,15 +301,25 @@ impl Validator {
     ) -> RawValidatorTransactionStatus {
         match statuses.notify_read(position).await {
             StatusResult::Status(ConsensusTxStatus::Finalized) => std::future::pending().await,
-            status => Self::undecided(epoch, status),
+            status => Self::undecided(epoch, statuses, position, status),
         }
     }
 
-    /// A status other than finalized, as the reference answers it.
-    fn undecided(epoch: &EpochState, status: StatusResult) -> RawValidatorTransactionStatus {
+    /// A status other than finalized, as the reference answers it: a
+    /// rejection with the reason recorded for it, if any.
+    fn undecided(
+        epoch: &EpochState,
+        statuses: &ConsensusTxStatusCache,
+        position: ConsensusPosition,
+        status: StatusResult,
+    ) -> RawValidatorTransactionStatus {
         match status {
             StatusResult::Status(ConsensusTxStatus::Rejected | ConsensusTxStatus::Dropped) => {
-                RawValidatorTransactionStatus::Rejected(RawRejectedStatus { error: None })
+                RawValidatorTransactionStatus::Rejected(RawRejectedStatus {
+                    error: statuses
+                        .reason(&position)
+                        .map(|reason| reason_bcs(&reason).into()),
+                })
             }
             StatusResult::Status(ConsensusTxStatus::Finalized) => {
                 unreachable!("finalized is answered by the caller")
