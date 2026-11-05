@@ -234,16 +234,14 @@ impl SignatureChecks {
                             let verified = batch_verified
                                 || deferred[checks].iter().all(verify::verify_ed25519);
                             if !verified {
-                                return Err(validation::Error::new(
-                                    validation::SuiErrorKind::InvalidSignature {
-                                        error: "signature does not verify".to_owned(),
-                                    },
-                                ));
+                                return Err(reference_error(&epoch, &transaction, None, bump));
                             }
                             self.cache.insert(key, indices);
                             indices
                         }
-                        Prepared::Failed(e) => return Err(e),
+                        Prepared::Failed(e) => {
+                            return Err(reference_error(&epoch, &transaction, Some(e), bump));
+                        }
                     };
                     Ok((transaction.relabel(&Witness(PhantomData)), indices))
                 }),
@@ -279,6 +277,37 @@ impl SignatureChecks {
 /// handler may call this, and only for a transaction it took from a commit.
 pub fn sequenced_by_consensus(transaction: Unchecked) -> VerifiedTransaction {
     transaction.with_digest().relabel(&Witness(PhantomData))
+}
+
+/// The error `verify::verify_signatures` gives a transaction whose
+/// signatures failed when its Ed25519 checks were deferred: deferring
+/// checks them in another order, the reference's is this one. `deferred` is
+/// the deferred checks' error, if they gave one.
+fn reference_error(
+    epoch: &EpochState,
+    transaction: &ValidTransaction,
+    deferred: Option<validation::Error>,
+    bump: &Bump,
+) -> validation::Error {
+    let signed = &transaction.get().0;
+    let error = sender_signed::deserialization_checks(signed, bump)
+        .and_then(|(signatures, _)| {
+            verify::verify_signatures(
+                signed,
+                signatures,
+                epoch.params.epoch,
+                &epoch.verifier,
+                &[],
+                bump,
+            )
+        })
+        .err();
+    // Both fail alike; an error stands should they not.
+    error.or(deferred).unwrap_or_else(|| {
+        validation::Error::new(validation::SuiErrorKind::InvalidSignature {
+            error: "Fail to verify user sig Invalid signature was given to the function".to_owned(),
+        })
+    })
 }
 
 /// Checks a verified transaction's inputs against the store's live
