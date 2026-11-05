@@ -333,6 +333,74 @@ fn an_executed_transaction_s_immutable_claim_is_still_verified() {
     assert_eq!(node.voter().vote(block, &bump), Ok(vec![0]));
 }
 
+/// Each reject vote's reason is recorded at its position, as the
+/// reference's error.
+#[test]
+fn reject_votes_record_the_reference_s_reasons() {
+    use sui_types::error::{SuiError, SuiErrorKind, UserInputError};
+    use validator::consensus::status::{ConsensusPosition, ConsensusTxStatusCache};
+    let bump = containers::Bump::default();
+    let node = Node::new();
+    let statuses = Arc::new(ConsensusTxStatusCache::new());
+    let gas = node.gas();
+    let (_, other_key) = get_key_pair::<AccountKeyPair>();
+    let mut stale = gas;
+    stale.1 = stale.1.next();
+    let elsewhere = ObjectID::random();
+    let block = block(
+        11,
+        vec![
+            user_transaction(&node.signed_transfer(gas, &other_key), &[no_alias()]),
+            user_transaction(&node.transfer(stale), &[no_alias()]),
+            user_transaction(&node.transfer(gas), &[aliases(&[(0, Some(5))])]),
+            user_transaction(&node.transfer(gas), &[no_alias(), immutable(&[gas.0])]),
+            user_transaction(&node.transfer(gas), &[no_alias(), immutable(&[elsewhere])]),
+            user_transaction(&node.transfer(gas), &[no_alias()]),
+        ],
+    );
+    let reference = block.reference;
+    let mut voter = node.voter().with_statuses(statuses.clone());
+    assert_eq!(voter.vote(block, &bump), Ok(vec![0, 1, 2, 3, 4]));
+    let reason = |index| {
+        statuses
+            .reason(&ConsensusPosition {
+                epoch: 0,
+                block: reference,
+                index,
+            })
+            .map(|r| bcs::from_bytes::<SuiError>(&bcs::to_bytes(&r).unwrap()).unwrap())
+            .map(SuiError::into_inner)
+    };
+    assert!(matches!(
+        reason(0),
+        Some(SuiErrorKind::SignerSignatureAbsent { .. })
+    ));
+    assert_eq!(
+        reason(1),
+        Some(SuiErrorKind::UserInputError {
+            error: UserInputError::ObjectNotFound {
+                object_id: gas.0,
+                version: Some(stale.1),
+            }
+        })
+    );
+    assert_eq!(reason(2), Some(SuiErrorKind::AliasesChanged));
+    assert_eq!(
+        reason(3),
+        Some(SuiErrorKind::InvalidImmutableObjectClaim {
+            claimed_object_id: gas.0,
+            found_object_ref: gas,
+        })
+    );
+    assert_eq!(
+        reason(4),
+        Some(SuiErrorKind::ImmutableObjectClaimNotFoundInInput {
+            object_id: elsewhere,
+        })
+    );
+    assert_eq!(reason(5), None);
+}
+
 #[test]
 fn undecodable_and_deprecated_transactions_invalidate_the_block() {
     let bump = containers::Bump::default();

@@ -22,6 +22,7 @@ pub enum SuiErrorKind {
     UserInputError {
         error: UserInputError,
     },
+    TooManyTransactionsPendingConsensus,
     InvalidSignature {
         error: String,
     },
@@ -37,17 +38,42 @@ pub enum SuiErrorKind {
         error: String,
     },
     InvalidAddress,
+    ObjectLockConflict {
+        obj_ref: ObjectRef,
+        pending_transaction: TransactionDigest,
+    },
     TransactionDeserializationError {
         error: String,
     },
     KeyConversionError(String),
+    ValidatorHaltedAtEpochEnd,
+    EpochEnded(u64),
     TransactionExpired,
+    TimeoutError,
     Storage(String),
+    ValidatorOverloadedRetryAfter {
+        retry_after_secs: u64,
+    },
     GrpcMessageDeserializeError {
         type_info: String,
         error: String,
     },
+    ValidatorConsensusLagging {
+        round: u32,
+        last_committed_round: u32,
+    },
     InvalidRequest(String),
+    AliasesChanged,
+    ImmutableObjectClaimNotFoundInInput {
+        object_id: ObjectId,
+    },
+    ImmutableObjectNotClaimed {
+        object_id: ObjectId,
+    },
+    InvalidImmutableObjectClaim {
+        claimed_object_id: ObjectId,
+        found_object_ref: ObjectRef,
+    },
 }
 
 impl Serialize for SuiErrorKind {
@@ -65,6 +91,9 @@ impl Serialize for SuiErrorKind {
                 v.serialize_field("error", error)?;
                 v.end()
             }
+            SuiErrorKind::TooManyTransactionsPendingConsensus => {
+                s.serialize_unit_variant(NAME, 4, "TooManyTransactionsPendingConsensus")
+            }
             SuiErrorKind::InvalidSignature { error: e } => error(s, 8, "InvalidSignature", e),
             SuiErrorKind::SignerSignatureAbsent { expected, actual } => {
                 let mut v = s.serialize_struct_variant(NAME, 9, "SignerSignatureAbsent", 2)?;
@@ -81,18 +110,40 @@ impl Serialize for SuiErrorKind {
             }
             SuiErrorKind::IncorrectSigner { error: e } => error(s, 11, "IncorrectSigner", e),
             SuiErrorKind::InvalidAddress => s.serialize_unit_variant(NAME, 22, "InvalidAddress"),
+            SuiErrorKind::ObjectLockConflict {
+                obj_ref,
+                pending_transaction,
+            } => {
+                let mut v = s.serialize_struct_variant(NAME, 36, "ObjectLockConflict", 2)?;
+                v.serialize_field("obj_ref", obj_ref)?;
+                v.serialize_field("pending_transaction", pending_transaction)?;
+                v.end()
+            }
             SuiErrorKind::TransactionDeserializationError { error: e } => {
                 error(s, 60, "TransactionDeserializationError", e)
             }
             SuiErrorKind::KeyConversionError(e) => {
                 s.serialize_newtype_variant(NAME, 74, "KeyConversionError", e)
             }
+            SuiErrorKind::ValidatorHaltedAtEpochEnd => {
+                s.serialize_unit_variant(NAME, 77, "ValidatorHaltedAtEpochEnd")
+            }
+            SuiErrorKind::EpochEnded(epoch) => {
+                s.serialize_newtype_variant(NAME, 78, "EpochEnded", epoch)
+            }
             SuiErrorKind::TransactionExpired => {
                 s.serialize_unit_variant(NAME, 80, "TransactionExpired")
             }
+            SuiErrorKind::TimeoutError => s.serialize_unit_variant(NAME, 85, "TimeoutError"),
             SuiErrorKind::Storage(e) => {
                 let mut v = s.serialize_tuple_variant(NAME, 97, "Storage", 1)?;
                 v.serialize_field(e)?;
+                v.end()
+            }
+            SuiErrorKind::ValidatorOverloadedRetryAfter { retry_after_secs } => {
+                let mut v =
+                    s.serialize_struct_variant(NAME, 98, "ValidatorOverloadedRetryAfter", 1)?;
+                v.serialize_field("retry_after_secs", retry_after_secs)?;
                 v.end()
             }
             SuiErrorKind::GrpcMessageDeserializeError { type_info, error } => {
@@ -102,8 +153,45 @@ impl Serialize for SuiErrorKind {
                 v.serialize_field("error", error)?;
                 v.end()
             }
+            SuiErrorKind::ValidatorConsensusLagging {
+                round,
+                last_committed_round,
+            } => {
+                let mut v =
+                    s.serialize_struct_variant(NAME, 104, "ValidatorConsensusLagging", 2)?;
+                v.serialize_field("round", round)?;
+                v.serialize_field("last_committed_round", last_committed_round)?;
+                v.end()
+            }
             SuiErrorKind::InvalidRequest(e) => {
                 s.serialize_newtype_variant(NAME, 106, "InvalidRequest", e)
+            }
+            SuiErrorKind::AliasesChanged => s.serialize_unit_variant(NAME, 107, "AliasesChanged"),
+            SuiErrorKind::ImmutableObjectClaimNotFoundInInput { object_id } => {
+                let mut v = s.serialize_struct_variant(
+                    NAME,
+                    108,
+                    "ImmutableObjectClaimNotFoundInInput",
+                    1,
+                )?;
+                v.serialize_field("object_id", object_id)?;
+                v.end()
+            }
+            SuiErrorKind::ImmutableObjectNotClaimed { object_id } => {
+                let mut v =
+                    s.serialize_struct_variant(NAME, 109, "ImmutableObjectNotClaimed", 1)?;
+                v.serialize_field("object_id", object_id)?;
+                v.end()
+            }
+            SuiErrorKind::InvalidImmutableObjectClaim {
+                claimed_object_id,
+                found_object_ref,
+            } => {
+                let mut v =
+                    s.serialize_struct_variant(NAME, 110, "InvalidImmutableObjectClaim", 2)?;
+                v.serialize_field("claimed_object_id", claimed_object_id)?;
+                v.serialize_field("found_object_ref", found_object_ref)?;
+                v.end()
             }
         }
     }

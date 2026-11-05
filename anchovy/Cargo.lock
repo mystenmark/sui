@@ -12238,6 +12238,7 @@ dependencies = [
  "execution",
  "fastcrypto",
  "fastcrypto-tbls",
+ "fastcrypto-zkp",
  "flate2",
  "foldhash 0.2.0",
  "hashbrown 0.17.1",

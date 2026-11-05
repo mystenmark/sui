@@ -14,7 +14,6 @@ use bytes::Bytes;
 use common::Case;
 use messages::transaction::DigestPending;
 use sui_types::error::SuiError;
-use tonic::Code;
 use tonic::transport::Channel;
 use tonic::transport::server::TcpIncoming;
 use validator::Validator;
@@ -184,7 +183,10 @@ async fn a_full_queue_refuses_work() {
         r = b.submit_transaction(submit(&[valid], SubmitTxType::Default)) => r,
     }
     .unwrap_err();
-    assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+    assert_eq!(
+        common::reference_error_name(&SuiError::from(status)),
+        "TooManyTransactionsPendingConsensus"
+    );
 }
 
 #[tokio::test]
@@ -203,7 +205,10 @@ async fn a_full_queue_between_processors_refuses_work() {
         .submit_transaction(submit(&[valid], SubmitTxType::Default))
         .await
         .unwrap_err();
-    assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+    assert_eq!(
+        common::reference_error_name(&SuiError::from(status)),
+        "TooManyTransactionsPendingConsensus"
+    );
     let status = client
         .submit_transaction(submit(&[invalid], SubmitTxType::Default))
         .await

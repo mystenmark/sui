@@ -1259,11 +1259,23 @@ async fn a_transaction_dropped_after_consensus_is_answered_rejected() {
     let statuses = submitting.await.unwrap();
     let (at_first, at_second) = (submitted(&statuses[0]), submitted(&statuses[1]));
 
-    // The second lost its coin's lock to the first: dropped, never executed.
-    assert!(matches!(
-        wait(&service, &second, Some(at_second)).await,
-        RawValidatorTransactionStatus::Rejected(_)
-    ));
+    // The second lost its coin's lock to the first: dropped, never executed,
+    // with the reference's reason.
+    let RawValidatorTransactionStatus::Rejected(rejected) =
+        wait(&service, &second, Some(at_second)).await
+    else {
+        panic!("rejected");
+    };
+    let reason: sui_types::error::SuiError = bcs::from_bytes(&rejected.error.unwrap()).unwrap();
+    let sui_types::error::SuiErrorKind::ObjectLockConflict {
+        obj_ref,
+        pending_transaction,
+    } = reason.into_inner()
+    else {
+        panic!("a lock conflict");
+    };
+    assert_eq!(obj_ref, coin);
+    assert_eq!(pending_transaction, *first.digest());
     // The first, its lock contested, waits a round.
     assert!(seq > 0);
     let next = network.commit(vec![]);

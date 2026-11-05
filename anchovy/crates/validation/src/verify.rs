@@ -508,11 +508,19 @@ fn verify_authenticator(
             verify_simple(bytes, Some(author), digest, key)
         }
         ParsedSignature::MultiSig(m) | ParsedSignature::MultiSigLegacy { multisig: m, .. } => {
-            for s in m.sigs {
-                if let CompressedSignature::ZkLogin(z) = s {
-                    let zk = parse_nested_zklogin(z)?;
-                    zklogin_epoch(&zk, epoch, verifier)?;
-                }
+            // As the reference's `get_zklogin_sigs`, every one parses before
+            // any epoch is checked.
+            let zklogins = || {
+                m.sigs.iter().filter_map(|s| match s {
+                    CompressedSignature::ZkLogin(z) => Some(parse_nested_zklogin(z)),
+                    _ => None,
+                })
+            };
+            if let Some(Err(e)) = zklogins().find(Result::is_err) {
+                return Err(e);
+            }
+            for zk in zklogins() {
+                zklogin_epoch(&zk?, epoch, verifier)?;
             }
             verify_multisig(m, author, digest, verifier)
         }
@@ -540,7 +548,7 @@ fn verify_simple(
             "Invalid public key".to_owned(),
         ))
     };
-    let sig_error = || invalid("cannot parse signature");
+    let sig_error = || invalid("Fail to get pubkey and sig");
     macro_rules! check {
         ($variant:ident, $pk:ty, $sig:ty) => {{
             let owned;
@@ -570,7 +578,7 @@ fn verify_simple(
                 }));
             }
             pk.verify(digest, &sig)
-                .map_err(|e| invalid(format!("signature does not verify: {e}")))
+                .map_err(|e| invalid(format!("Fail to verify user sig {e}")))
         }};
     }
     match flag {
@@ -604,21 +612,21 @@ fn verify_multisig(
         }
     }
     if multisig_address(m) != *author {
-        return Err(invalid("address does not match the keys"));
+        return Err(invalid("Invalid address derived from pks"));
     }
     if !verifier.accept_zklogin_in_multisig
         && m.sigs
             .iter()
             .any(|s| matches!(s, CompressedSignature::ZkLogin(_)))
     {
-        return Err(invalid("zkLogin not accepted in multisig"));
+        return Err(invalid("zkLogin sig not supported inside multisig"));
     }
     if !verifier.accept_passkey_in_multisig
         && m.sigs
             .iter()
             .any(|s| matches!(s, CompressedSignature::Passkey(_)))
     {
-        return Err(invalid("passkey not accepted in multisig"));
+        return Err(invalid("Passkey sig not supported inside multisig"));
     }
     if !verifier.accept_mldsa65_in_multisig
         && m.multisig_pk
@@ -637,70 +645,107 @@ fn verify_multisig(
     // Truncating is the reference's behavior.
     for (sig, i) in m.sigs.iter().zip(indices) {
         let Some((pk, w)) = m.multisig_pk.pk_map.get(usize::from(i)) else {
-            return Err(invalid("bitmap names a missing key"));
+            return Err(invalid("Invalid public keys index"));
         };
         let (pk_flag, pk_bytes) = key_flag_and_bytes(pk);
         let scheme_matches = |flag| !verifier.additional_multisig_checks || pk_flag == flag;
         let sub_author = SuiAddress(blake2b(&[&[pk_flag], pk_bytes]));
-        let ok = match sig {
+        // The reference's `Invalid sig` text: the key as `flag || key` in
+        // base64, its address, and why.
+        let member = |why: &str| {
+            use base64ct::Encoding as _;
+            let mut key = Vec::with_capacity(1 + pk_bytes.len());
+            key.push(pk_flag);
+            key.extend_from_slice(pk_bytes);
+            let key = base64ct::Base64::encode_string(&key);
+            invalid(format!(
+                "Invalid sig for pk={key} address={sub_author} error={why}"
+            ))
+        };
+        let mismatch = || member("signature/pubkey type mismatch");
+        let failed = |why: String| member(&format!("{why:?}"));
+        let outcome = match sig {
             CompressedSignature::Ed25519(s) => {
                 if !scheme_matches(0) {
-                    return Err(invalid("signature and key schemes differ"));
+                    return Err(mismatch());
                 }
-                verify_raw::<Ed25519PublicKey>(pk_bytes, &s[..], digest)?
+                verify_raw::<Ed25519PublicKey>("ed25519", pk_bytes, &s[..], digest)?
             }
             CompressedSignature::Secp256k1(s) => {
                 if !scheme_matches(1) {
-                    return Err(invalid("signature and key schemes differ"));
+                    return Err(mismatch());
                 }
-                verify_raw::<Secp256k1PublicKey>(pk_bytes, &s[..], digest)?
+                verify_raw::<Secp256k1PublicKey>("k1", pk_bytes, &s[..], digest)?
             }
             CompressedSignature::Secp256r1(s) => {
                 if !scheme_matches(2) {
-                    return Err(invalid("signature and key schemes differ"));
+                    return Err(mismatch());
                 }
-                verify_raw::<Secp256r1PublicKey>(pk_bytes, &s[..], digest)?
+                verify_raw::<Secp256r1PublicKey>("r1", pk_bytes, &s[..], digest)?
             }
             CompressedSignature::ZkLogin(z) => {
                 if !scheme_matches(5) {
-                    return Err(invalid("signature and key schemes differ"));
+                    return Err(mismatch());
                 }
                 let zk = parse_nested_zklogin(z)?;
-                verify_zklogin(&zk, &sub_author, digest, verifier).is_ok()
+                verify_zklogin(&zk, &sub_author, digest, verifier).map_err(general)
             }
             CompressedSignature::MLDSA65(s) => {
                 if !scheme_matches(7) {
-                    return Err(invalid("signature and key schemes differ"));
+                    return Err(mismatch());
                 }
-                verify_raw::<MLDSA65PublicKey>(pk_bytes, &s[..], digest)?
+                verify_raw::<MLDSA65PublicKey>("mldsa65", pk_bytes, &s[..], digest)?
             }
             // The reference checks no scheme here.
             CompressedSignature::Passkey(p) => {
                 let p = parse_nested_passkey(p)?;
-                verify_passkey(&p, &sub_author, digest).is_ok()
+                verify_passkey(&p, &sub_author, digest).map_err(general)
             }
         };
-        if !ok {
-            return Err(invalid("a multisig member's signature does not verify"));
-        }
+        outcome.map_err(failed)?;
         weight += u16::from(*w);
     }
     if weight < m.multisig_pk.threshold {
-        return Err(invalid("insufficient weight"));
+        return Err(invalid(format!(
+            "Insufficient weight={weight} threshold={}",
+            m.multisig_pk.threshold
+        )));
     }
     Ok(())
 }
 
 /// A member signature: the key and signature must parse (else an error)
-/// and then verify (else `false`).
-fn verify_raw<P>(pk: &[u8], sig: &[u8], digest: &[u8; 32]) -> Result<bool, Error>
+/// and then verify (else why not, as fastcrypto says). `scheme` names it as
+/// the reference's texts do.
+fn verify_raw<P>(
+    scheme: &str,
+    pk: &[u8],
+    sig: &[u8],
+    digest: &[u8; 32],
+) -> Result<Result<(), String>, Error>
 where
     P: VerifyingKey + ToFromBytes,
     P::Sig: ToFromBytes,
 {
-    let pk = P::from_bytes(pk).map_err(|_| invalid("invalid member public key"))?;
-    let sig = P::Sig::from_bytes(sig).map_err(|_| invalid("invalid member signature"))?;
-    Ok(pk.verify(digest, &sig).is_ok())
+    let pk = P::from_bytes(pk).map_err(|_| invalid(format!("Invalid {scheme} pk bytes")))?;
+    let sig = P::Sig::from_bytes(sig)
+        .map_err(|_| invalid(format!("Invalid {scheme} signature bytes")))?;
+    Ok(pk.verify(digest, &sig).map_err(|e| e.to_string()))
+}
+
+/// A member authenticator's failure as the reference reports it: its error
+/// displayed, inside fastcrypto's `GeneralError`.
+fn general(e: Error) -> String {
+    let why = match e.reason {
+        SuiErrorKind::InvalidSignature { error } => format!("Signature is not valid: {error}"),
+        SuiErrorKind::InvalidAddress => "Invalid address".to_owned(),
+        SuiErrorKind::IncorrectSigner { error } => {
+            format!("Value was not signed by the correct sender: {error}")
+        }
+        SuiErrorKind::KeyConversionError(error) => format!("Key Conversion Error: {error}"),
+        reason => format!("{reason:?}"),
+    };
+    format!("General cryptographic error: {why}")
 }
 
 fn parse_nested_zklogin(bytes: &[u8]) -> Result<ZkLoginAuthenticator, Error> {
@@ -708,7 +753,7 @@ fn parse_nested_zklogin(bytes: &[u8]) -> Result<ZkLoginAuthenticator, Error> {
         Some((5, body)) => zklogin(body),
         _ => None,
     }
-    .ok_or_else(|| invalid("invalid zkLogin authenticator bytes"))
+    .ok_or_else(|| invalid("Invalid zklogin authenticator bytes"))
 }
 
 fn parse_nested_passkey(bytes: &[u8]) -> Result<Passkey<'_>, Error> {
@@ -716,18 +761,28 @@ fn parse_nested_passkey(bytes: &[u8]) -> Result<Passkey<'_>, Error> {
         Some((6, body)) => crate::signature::passkey(body),
         _ => None,
     }
-    .ok_or_else(|| invalid("invalid passkey authenticator bytes"))
+    .ok_or_else(|| invalid("Invalid passkey authenticator bytes"))
 }
 
 /// `ZkLoginPublicIdentifier::validate`: `iss_len || iss || seed`, the issuer
 /// UTF-8 and the seed at most 32 bytes.
 fn validate_zklogin_identifier(id: &[u8]) -> Result<(), Error> {
-    let bad = || invalid("invalid zkLogin public identifier");
-    let (&iss_len, rest) = id.split_first().ok_or_else(bad)?;
-    let iss = rest.get(..usize::from(iss_len)).ok_or_else(bad)?;
-    std::str::from_utf8(iss).map_err(|_| bad())?;
-    if rest.len() - usize::from(iss_len) > 32 {
-        return Err(bad());
+    // As the reference's `MultiSig::verify_claims` wraps the error's text.
+    let bad = |why: &str| {
+        invalid(format!(
+            "Invalid zkLogin pk in multisig: Signature is not valid: {why}"
+        ))
+    };
+    let (&iss_len, rest) = id.split_first().ok_or_else(|| bad("invalid zklogin pk"))?;
+    let iss = rest
+        .get(..usize::from(iss_len))
+        .ok_or_else(|| bad("invalid zklogin pk iss length"))?;
+    std::str::from_utf8(iss).map_err(|e| bad(&format!("zkLogin pk issuer is not valid: {e}")))?;
+    let seed = rest.len() - usize::from(iss_len);
+    if seed > 32 {
+        return Err(bad(&format!(
+            "address seed must be at most 32 bytes, got {seed}"
+        )));
     }
     Ok(())
 }
@@ -737,10 +792,17 @@ fn zklogin_epoch(zk: &ZkLoginAuthenticator, epoch: u64, verifier: &Verifier) -> 
     if let Some(delta) = verifier.zklogin_max_epoch_upper_bound_delta
         && zk.max_epoch > epoch + delta
     {
-        return Err(invalid("zkLogin max epoch too far ahead"));
+        return Err(invalid(format!(
+            "ZKLogin max epoch too large {}, current epoch {epoch}, max accepted: {}",
+            zk.max_epoch,
+            epoch + delta
+        )));
     }
     if epoch > zk.max_epoch {
-        return Err(invalid("zkLogin signature expired"));
+        return Err(invalid(format!(
+            "ZKLogin expired at epoch {}, current epoch {epoch}",
+            zk.max_epoch
+        )));
     }
     Ok(())
 }
@@ -761,14 +823,19 @@ fn verify_zklogin(
     }
     if !verifier.supported_providers.is_empty() {
         let provider =
-            OIDCProvider::from_iss(zk.inputs.get_iss()).map_err(|_| invalid("unknown provider"))?;
+            OIDCProvider::from_iss(zk.inputs.get_iss()).map_err(|_| invalid("Unknown provider"))?;
         if !verifier.supported_providers.contains(&provider) {
-            return Err(invalid("provider not supported"));
+            return Err(invalid(format!(
+                "OIDC provider not supported: {}",
+                zk.inputs.get_iss()
+            )));
         }
     }
     // zkLogin is classical, so its ephemeral key is too.
     if zk.user_signature[0] == 7 {
-        return Err(invalid("zkLogin ephemeral signature scheme not supported"));
+        return Err(invalid(
+            "zkLogin ephemeral signature scheme not supported: mldsa65",
+        ));
     }
     verify_simple(&zk.user_signature, None, digest, None)?;
 
@@ -783,16 +850,16 @@ fn verify_zklogin(
         &verifier.zk_login_env,
         verifier.circuit_mode,
     )
-    .map_err(|e| invalid(format!("zkLogin proof: {e}")))
+    .map_err(|e| invalid(format!("Signature is not valid: {e}")))
 }
 
 /// `PasskeyAuthenticator::verify_claims`.
 fn verify_passkey(p: &Passkey<'_>, author: &SuiAddress, digest: &[u8; 32]) -> Result<(), Error> {
     if passkey_address(p) != *author {
-        return Err(invalid("invalid author"));
+        return Err(invalid("Invalid author"));
     }
     if p.challenge != *digest {
-        return Err(invalid("invalid challenge"));
+        return Err(invalid("Invalid challenge"));
     }
     let client_data_hash = Sha256::digest(p.client_data_json.as_bytes()).digest;
     let mut message = Vec::with_capacity(p.authenticator_data.len() + 32);
@@ -801,5 +868,5 @@ fn verify_passkey(p: &Passkey<'_>, author: &SuiAddress, digest: &[u8; 32]) -> Re
     let pk = Secp256r1PublicKey::from_bytes(p.public_key).expect("checked when parsed");
     let sig = Secp256r1Signature::from_bytes(p.signature).expect("checked when parsed");
     pk.verify(&message, &sig)
-        .map_err(|_| invalid("fails to verify"))
+        .map_err(|_| invalid("Fails to verify"))
 }
