@@ -114,8 +114,14 @@ async fn statuses_are_kept_until_they_expire() {
         cache.notify_read(recent).await,
         StatusResult::Status(ConsensusTxStatus::Finalized)
     );
-    assert!(cache.too_far_ahead(&position(6 + 2 * RETENTION_ROUNDS, 0)));
-    assert!(!cache.too_far_ahead(&position(5 + 2 * RETENTION_ROUNDS, 0)));
+    assert_eq!(
+        cache.too_far_ahead(&position(6 + 2 * RETENTION_ROUNDS, 0)),
+        Some(5 + RETENTION_ROUNDS)
+    );
+    assert_eq!(
+        cache.too_far_ahead(&position(5 + 2 * RETENTION_ROUNDS, 0)),
+        None
+    );
 }
 
 #[test]

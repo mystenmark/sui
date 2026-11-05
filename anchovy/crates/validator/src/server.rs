@@ -236,18 +236,18 @@ impl Validator {
         })?;
         let epoch = self.current.get().await;
         if position.epoch < epoch.epoch.params.epoch {
-            return Err(epoch_ended());
+            return Err(epoch_ended(position.epoch));
         }
         let statuses = &epoch.consensus.statuses;
-        if statuses.too_far_ahead(&position) {
-            return Err(Status::unavailable("ValidatorConsensusLagging"));
+        if let Some(leader_round) = statuses.too_far_ahead(&position) {
+            return Err(lagging(&position, leader_round));
         }
         let pinged = Self::pinged(&epoch.epoch, statuses, position, include_details);
         let status = tokio::select! {
             status = tokio::time::timeout(PING_TIMEOUT, pinged) => {
-                status.map_err(|_| Status::deadline_exceeded("TimeoutError"))?
+                status.map_err(|_| failed(&SuiErrorKind::TimeoutError))?
             }
-            () = self.current.ended(&epoch) => return Err(epoch_ended()),
+            () = self.current.ended(&epoch) => return Err(epoch_ended(position.epoch)),
         };
         Ok(Response::new(RawWaitForEffectsResponse {
             inner: Some(status),
@@ -262,7 +262,7 @@ impl Validator {
     ) -> Result<RawValidatorTransactionStatus, Failure> {
         let read = || {
             execution::executed_named(&consensus.store, &messages::base::Digest::new(digest))
-                .map_err(|e| Status::internal(format!("{e:?}")))
+                .map_err(|e| failed(&SuiErrorKind::Storage(format!("{e:?}"))))
         };
         let executed = if let Some(executed) = read()? {
             executed
@@ -277,9 +277,7 @@ impl Validator {
                 .effects
                 .try_push(Command::Wait(batch))
                 .map_err(|e| match e {
-                    PushError::Full(_) => {
-                        Failure::Status(Status::resource_exhausted("effects waiter full"))
-                    }
+                    PushError::Full(_) => Failure::Status(failed(&OVERLOADED)),
                     PushError::Closed(_) => Failure::EpochEnded,
                 })?;
             done.await.map_err(|_| Failure::EpochEnded)?;
@@ -400,7 +398,7 @@ impl Validator {
             .try_push(processors::Request::new(transactions, reply))
             .map_err(|e| match e {
                 PushError::Full(_) => {
-                    Failure::Status(Status::resource_exhausted("validation queue full"))
+                    Failure::Status(failed(&SuiErrorKind::TooManyTransactionsPendingConsensus))
                 }
                 PushError::Closed(_) => Failure::EpochEnded,
             })?;
@@ -445,9 +443,23 @@ fn result(outcome: Outcome) -> RawSubmitTxResult {
     }
 }
 
-/// The reference's `SuiErrorKind::EpochEnded`.
-fn epoch_ended() -> Status {
-    Status::unavailable("EpochEnded")
+/// A full queue past submission: the reference's answer to a validator
+/// overloaded at execution.
+const OVERLOADED: SuiErrorKind = SuiErrorKind::ValidatorOverloadedRetryAfter {
+    retry_after_secs: 1,
+};
+
+/// The reference's answer to a wait in an epoch that has ended.
+fn epoch_ended(epoch: u64) -> Status {
+    failed(&SuiErrorKind::EpochEnded(epoch))
+}
+
+/// The reference's `check_position_too_ahead`.
+fn lagging(position: &ConsensusPosition, leader_round: u32) -> Status {
+    failed(&SuiErrorKind::ValidatorConsensusLagging {
+        round: position.block.round,
+        last_committed_round: leader_round,
+    })
 }
 
 /// BCS of the reference's `SuiError`, which encodes as its kind.
@@ -468,8 +480,8 @@ fn failed(reason: &SuiErrorKind) -> Status {
 fn rejection(rejected: &Rejected) -> Status {
     match rejected {
         Rejected::Invalid(e) => failed(&e.reason),
-        Rejected::Overloaded => Status::resource_exhausted("signature verification queue full"),
-        Rejected::ShuttingDown => Status::unavailable("shutting down"),
+        Rejected::Overloaded => failed(&SuiErrorKind::TooManyTransactionsPendingConsensus),
+        Rejected::ShuttingDown => failed(&SuiErrorKind::ValidatorHaltedAtEpochEnd),
     }
 }
 
@@ -550,13 +562,15 @@ impl validator_server::Validator for Validator {
         loop {
             let epoch = self.current.get().await;
             let consensus = &epoch.consensus;
-            if position.is_some_and(|p| p.epoch < epoch.epoch.params.epoch) {
-                return Err(epoch_ended());
+            if let Some(p) = position
+                && p.epoch < epoch.epoch.params.epoch
+            {
+                return Err(epoch_ended(p.epoch));
             }
             if let Some(position) = &position
-                && consensus.statuses.too_far_ahead(position)
+                && let Some(leader_round) = consensus.statuses.too_far_ahead(position)
             {
-                return Err(Status::unavailable("ValidatorConsensusLagging"));
+                return Err(lagging(position, leader_round));
             }
             let decided = async {
                 match position {
@@ -580,7 +594,7 @@ impl validator_server::Validator for Validator {
                     Err(failure) => failure,
                 },
                 () = self.current.ended(&epoch) => match position {
-                    Some(_) => return Err(epoch_ended()),
+                    Some(_) => return Err(epoch_ended(epoch.epoch.params.epoch)),
                     None => Failure::EpochEnded,
                 },
             };

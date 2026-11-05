@@ -243,11 +243,11 @@ impl ConsensusTxStatusCache {
         }
     }
 
-    /// Whether `position` is too far ahead of the committed leader round to
+    /// The committed leader round, if `position` is too far ahead of it to
     /// wait for: the reference's `check_position_too_ahead`.
-    pub fn too_far_ahead(&self, position: &ConsensusPosition) -> bool {
-        self.leader_round
-            .borrow()
-            .is_some_and(|r| position.block.round > r.saturating_add(RETENTION_ROUNDS))
+    pub fn too_far_ahead(&self, position: &ConsensusPosition) -> Option<u32> {
+        let leader_round = (*self.leader_round.borrow())?;
+        (position.block.round > leader_round.saturating_add(RETENTION_ROUNDS))
+            .then_some(leader_round)
     }
 }
