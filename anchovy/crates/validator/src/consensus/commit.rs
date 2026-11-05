@@ -23,6 +23,7 @@ use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest as _};
 use containers::Bump;
 use messages::base::{Hashed, ObjectRef};
+use messages::build::error::SuiErrorKind;
 use messages::build::system_transaction::{Jwk, JwkId};
 use sui_protocol_config::{PerObjectCongestionControlMode, ProtocolConfig};
 use workqueue::Processor;
@@ -68,6 +69,21 @@ pub enum DropReason {
     Inputs(validation::Error),
     /// It came after the epoch's certificates closed.
     EpochClosed,
+}
+
+impl DropReason {
+    /// The reason the reference records for its submitter: none after the
+    /// epoch closed, which a submitter retries in the next.
+    fn reference(&self) -> Option<SuiErrorKind> {
+        match self {
+            DropReason::LockConflict { object, holder } => Some(SuiErrorKind::ObjectLockConflict {
+                obj_ref: object.into(),
+                pending_transaction: holder.digest().into(),
+            }),
+            DropReason::Inputs(e) => Some(e.reason.clone()),
+            DropReason::EpochClosed => None,
+        }
+    }
 }
 
 /// A commit the handler decided: its schedule, where each scheduled
@@ -1755,6 +1771,12 @@ impl CommitStage {
         // finalized (scheduled, or a duplicate of one that was).
         let mut dropped = containers::hash_set(bump, decided.dropped.len());
         dropped.extend(decided.dropped.iter().map(|(b, i, ..)| (*b, *i)));
+        self.statuses.set_reasons(
+            decided
+                .dropped
+                .iter()
+                .filter_map(|(b, i, _, reason)| Some((*b, *i, reason.reference()?))),
+        );
         self.statuses.set_statuses(
             rejected
                 .into_iter()

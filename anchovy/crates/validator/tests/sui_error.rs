@@ -181,6 +181,28 @@ fn every_variant_encodes_as_the_reference_s() {
             error: s(),
         },
         SuiErrorKind::InvalidRequest(s()),
+        SuiErrorKind::TooManyTransactionsPendingConsensus,
+        SuiErrorKind::ObjectLockConflict {
+            obj_ref: object_ref,
+            pending_transaction: tx,
+        },
+        SuiErrorKind::ValidatorHaltedAtEpochEnd,
+        SuiErrorKind::EpochEnded(4),
+        SuiErrorKind::TimeoutError,
+        SuiErrorKind::ValidatorOverloadedRetryAfter {
+            retry_after_secs: 1,
+        },
+        SuiErrorKind::ValidatorConsensusLagging {
+            round: 1,
+            last_committed_round: 2,
+        },
+        SuiErrorKind::AliasesChanged,
+        SuiErrorKind::ImmutableObjectClaimNotFoundInInput { object_id: id },
+        SuiErrorKind::ImmutableObjectNotClaimed { object_id: id },
+        SuiErrorKind::InvalidImmutableObjectClaim {
+            claimed_object_id: id,
+            found_object_ref: object_ref,
+        },
     ] {
         check(&kind);
     }

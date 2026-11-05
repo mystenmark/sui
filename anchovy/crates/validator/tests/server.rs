@@ -208,7 +208,10 @@ async fn waits_are_decoded_as_the_reference_s_client_encodes_them() {
             .wait_for_effects(reference(digest, ping, 4))
             .await
             .unwrap_err();
-        assert_eq!(status.message(), "EpochEnded", "{status:?}");
+        assert_eq!(
+            error(status),
+            ("EpochEnded", "Operations for epoch 4 have ended".to_owned())
+        );
     }
 
     let mut truncated = reference(digest, None, 5);

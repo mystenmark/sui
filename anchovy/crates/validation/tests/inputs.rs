@@ -1,7 +1,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The stateful input checks against the reference's verdicts, from
+//! The stateful input checks against the reference's verdicts and errors,
+//! from
 //! `sui-oracle --input-vectors` (format in the oracle's `inputs.rs`).
 
 use std::collections::{BTreeMap, HashMap};
@@ -84,7 +85,7 @@ fn matches_the_reference() {
                     store.live.insert(id, version);
                 }
             }
-            ["case", label, hex, verdict] => {
+            ["case", label, hex, verdict, reason] => {
                 let ctx = Context {
                     config: config.as_ref().unwrap(),
                     epoch,
@@ -95,17 +96,23 @@ fn matches_the_reference() {
                 let signed = Message::<SenderSignedData>::parse(unsigned(&unhex(hex)))
                     .map_err(|(e, _)| e)
                     .unwrap();
-                let ours = match validation::inputs::check(
+                let (ours, our_reason) = match validation::inputs::check(
                     signed.get(),
                     &ctx,
                     &store,
                     &containers::Bump::default(),
                 ) {
-                    Ok(()) => "ok".to_owned(),
-                    Err(e) => format!("{:?}", e.kind()),
+                    Ok(()) => ("ok".to_owned(), None),
+                    Err(e) => (format!("{:?}", e.kind()), Some(e.reason)),
                 };
                 if ours != *verdict {
                     mismatches.push(format!("{label}: reference {verdict}, ours {ours}"));
+                } else if let Some(our_reason) = our_reason
+                    && bcs::to_bytes(&our_reason).unwrap() != unhex(reason)
+                {
+                    mismatches.push(format!(
+                        "{label}: the reference's {reason}, ours {our_reason:?}"
+                    ));
                 }
                 cases += 1;
             }

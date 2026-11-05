@@ -438,7 +438,7 @@ async fn submit_and_wait(service: &Validator, transaction: &Transaction) -> bool
         status @ RawValidatorSubmitStatus::Rejected(_) => panic!("not submitted: {status:?}"),
     };
     let request = RawWaitForEffectsRequest {
-        transaction_digest: Some(transaction.digest().into_inner().to_vec().into()),
+        transaction_digest: Some(bcs::to_bytes(transaction.digest()).unwrap().into()),
         consensus_position: position,
         include_details: false,
         ping_type: None,
@@ -451,7 +451,14 @@ async fn submit_and_wait(service: &Validator, transaction: &Transaction) -> bool
     .expect("answered in time");
     let status = match status {
         Ok(status) => status,
-        Err(status) if status.message() == "EpochEnded" => return false,
+        Err(status)
+            if matches!(
+                sui_types::error::SuiError::from(status.clone()).as_inner(),
+                sui_types::error::SuiErrorKind::EpochEnded(_)
+            ) =>
+        {
+            return false;
+        }
         Err(status) => panic!("{status:?}"),
     };
     match status.into_inner().inner.unwrap() {

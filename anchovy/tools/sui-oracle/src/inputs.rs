@@ -12,10 +12,11 @@
 //! ```text
 //! context <protocol version> <reference gas price> <epoch>
 //! object <live|stale> <Object BCS hex>
-//! case <label> <TransactionData BCS hex> <verdict>
+//! case <label> <TransactionData BCS hex> <verdict> <SuiError BCS hex | ->
 //! ```
 //!
-//! A verdict is `ok` or the `UserInputError` variant's name. Every
+//! A verdict is `ok` or the `UserInputError` variant's name, then the
+//! error itself (`-` if none). Every
 //! transaction passes the static validity checks; none draws on address
 //! balances or publishes a package (the checks anchovy refuses or skips).
 
@@ -184,7 +185,7 @@ fn validate_owned(store: &Store, owned: &[ObjectRef]) -> Result<(), SuiError> {
     Ok(())
 }
 
-fn verdict(store: &Store, config: &ProtocolConfig, tx: &TransactionData) -> String {
+fn verdict(store: &Store, config: &ProtocolConfig, tx: &TransactionData) -> (String, String) {
     let result = (|| -> Result<(), SuiError> {
         let kinds = tx.input_objects()?;
         let receiving = tx.receiving_objects();
@@ -202,8 +203,8 @@ fn verdict(store: &Store, config: &ProtocolConfig, tx: &TransactionData) -> Stri
         validate_owned(store, &checked.inner().filter_owned_objects())
     })();
     match result {
-        Ok(()) => "ok".to_owned(),
-        Err(e) => name(&e),
+        Ok(()) => ("ok".to_owned(), "-".to_owned()),
+        Err(e) => (name(&e), crate::hex(&bcs::to_bytes(&e).unwrap())),
     }
 }
 
@@ -697,10 +698,10 @@ pub fn vectors() -> Vec<u8> {
         }
     }
     for (label, tx) in cases(&w) {
-        let verdict = verdict(&store, &config, &tx);
+        let (verdict, reason) = verdict(&store, &config, &tx);
         writeln!(
             out,
-            "case {label} {} {verdict}",
+            "case {label} {} {verdict} {reason}",
             crate::hex(&bcs::to_bytes(&tx).unwrap())
         )
         .unwrap();

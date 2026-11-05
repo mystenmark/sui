@@ -114,8 +114,38 @@ async fn statuses_are_kept_until_they_expire() {
         cache.notify_read(recent).await,
         StatusResult::Status(ConsensusTxStatus::Finalized)
     );
-    assert!(cache.too_far_ahead(&position(6 + 2 * RETENTION_ROUNDS, 0)));
-    assert!(!cache.too_far_ahead(&position(5 + 2 * RETENTION_ROUNDS, 0)));
+    assert_eq!(
+        cache.too_far_ahead(&position(6 + 2 * RETENTION_ROUNDS, 0)),
+        Some(5 + RETENTION_ROUNDS)
+    );
+    assert_eq!(
+        cache.too_far_ahead(&position(5 + 2 * RETENTION_ROUNDS, 0)),
+        None
+    );
+}
+
+#[test]
+fn reasons_are_kept_until_their_positions_expire() {
+    use messages::build::error::SuiErrorKind;
+    let cache = ConsensusTxStatusCache::new();
+    let (old, recent) = (position(5, 0), position(500, 1));
+    cache.update_leader_round(1);
+    cache.set_reasons([
+        (old.block, old.index, SuiErrorKind::AliasesChanged),
+        (recent.block, recent.index, SuiErrorKind::TransactionExpired),
+    ]);
+    assert_eq!(cache.reason(&old), Some(SuiErrorKind::AliasesChanged));
+    assert_eq!(cache.reason(&position(500, 0)), None);
+    cache.update_leader_round(5 + RETENTION_ROUNDS);
+    cache.update_leader_round(6 + RETENTION_ROUNDS);
+    assert_eq!(cache.reason(&old), None);
+    assert_eq!(
+        cache.reason(&recent),
+        Some(SuiErrorKind::TransactionExpired)
+    );
+    // A reason for an expired position is not kept.
+    cache.set_reasons([(old.block, old.index, SuiErrorKind::AliasesChanged)]);
+    assert_eq!(cache.reason(&old), None);
 }
 
 #[test]

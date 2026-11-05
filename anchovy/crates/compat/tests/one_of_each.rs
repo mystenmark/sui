@@ -780,7 +780,14 @@ impl Network {
             .expect("answered in time");
             match answer {
                 Ok(_) => {}
-                Err(status) if status.message() == "EpochEnded" => return false,
+                Err(status)
+                    if matches!(
+                        sui_types::error::SuiError::from(status.clone()).as_inner(),
+                        sui_types::error::SuiErrorKind::EpochEnded(_)
+                    ) =>
+                {
+                    return false;
+                }
                 Err(status) => panic!("{status:?}"),
             }
         }

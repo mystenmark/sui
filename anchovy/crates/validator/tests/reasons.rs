@@ -255,3 +255,106 @@ fn mutated_transactions_are_rejected_with_the_reference_s_reasons() {
     .unwrap();
     assert_no_vector_differences(&vectors);
 }
+
+/// The signed vectors whose signatures the reference rejects are rejected
+/// with its reasons, verified alone and in one batch.
+#[test]
+fn signatures_are_rejected_with_the_reference_s_reasons() {
+    use fastcrypto_zkp::bn254::zk_login::OIDCProvider;
+    use fastcrypto_zkp::bn254::zk_login_api::ZkLoginEnv;
+    use std::sync::Arc;
+    use sui_types::signature::VerifyParams;
+    use sui_types::signature_verification::{
+        VerifiedDigestCache, verify_sender_signed_data_message_signatures,
+    };
+
+    let (cases, jwks) = common::signed_vectors();
+    let epoch = common::vectors_epoch(4, jwks.clone());
+    let config = &epoch.params.config;
+    let params = VerifyParams::new(
+        jwks.into_iter().collect(),
+        config
+            .zklogin_supported_providers()
+            .iter()
+            .map(|s| s.parse::<OIDCProvider>().unwrap())
+            .collect(),
+        ZkLoginEnv::Test,
+        config.zklogin_circuit_mode(),
+        config.verify_legacy_zklogin_address(),
+        config.accept_zklogin_in_multisig(),
+        config.accept_passkey_in_multisig(),
+        config.zklogin_max_epoch_upper_bound_delta(),
+        config.additional_multisig_checks(),
+        config.validate_zklogin_public_identifier(),
+    )
+    .with_mldsa65_in_multisig(config.mldsa65_auth());
+    let context = epoch.context();
+    let mut differences = vec![];
+    let mut compared = 0;
+    // Those the validity check passes, and the reference's error for each.
+    let mut batch = vec![];
+    for case in &cases {
+        let transaction = case.parse().unwrap();
+        let bump = Bump::with_capacity(1 << 16);
+        let signed = &transaction.get().0;
+        let Ok(checked) = validation::sender_signed::validity_check(signed, &context, &bump) else {
+            continue;
+        };
+        let ours = validation::verify::verify_signatures(
+            signed,
+            checked.signatures,
+            context.epoch,
+            &epoch.verifier,
+            &[],
+            &bump,
+        );
+        // Debug builds of the reference panic on some malformed multisigs
+        // (`zip_debug_eq`), which release builds reject; those are skipped.
+        let Ok(Some(reference)) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let tx = bcs::from_bytes::<Transaction>(&case.bytes).ok()?;
+            Some(verify_sender_signed_data_message_signatures(
+                tx.data(),
+                context.epoch,
+                &params,
+                Arc::new(VerifiedDigestCache::new_empty()),
+                vec![],
+            ))
+        })) else {
+            continue;
+        };
+        batch.push((case, reference.as_ref().err().cloned()));
+        let (Err(ours), Err(reference)) = (ours, reference) else {
+            continue;
+        };
+        compared += 1;
+        if bcs::to_bytes(&ours.reason).unwrap() != bcs::to_bytes(&reference).unwrap() {
+            differences.push(format!(
+                "{}: ours {:?}, the reference's {reference:?}",
+                case.label, ours.reason
+            ));
+        }
+    }
+    let bump = Bump::with_capacity(1 << 20);
+    let mut transactions = containers::Vec::new_in(&bump);
+    transactions.extend(batch.iter().map(|(case, _)| {
+        validator::checks::validate_one(case.parse().unwrap(), &context, &bump).unwrap()
+    }));
+    let mut checks = validator::checks::SignatureChecks::new(epoch.clone(), 1);
+    for ((case, reference), ours) in batch.iter().zip(checks.verify_batch(transactions, &bump)) {
+        let (Err(ours), Some(reference)) = (ours, reference) else {
+            continue;
+        };
+        if bcs::to_bytes(&ours.reason).unwrap() != bcs::to_bytes(reference).unwrap() {
+            differences.push(format!(
+                "{} in a batch: ours {:?}, the reference's {reference:?}",
+                case.label, ours.reason
+            ));
+        }
+    }
+    assert!(compared > 0);
+    assert!(
+        differences.is_empty(),
+        "{compared} compared:\n{}",
+        differences.join("\n")
+    );
+}
