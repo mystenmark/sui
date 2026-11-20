@@ -20,6 +20,11 @@ the PRD now asks for a rebase at least once a week.
 - API changes: `SuiGasStatus::for_execution` and `check_gas_price`, the
   expiration argument of early errors, consensus-core's `ConsumerMonitor`.
 - Tests that execute run at `MAX_PROTOCOL_VERSION`, not sui's highest.
+- Address aliases: signature checks read each required signer's live
+  `AddressAliases` object (its id derived without allocating); any listed
+  alias may sign, and the object's version is what a submission claims and
+  what a vote compares the claim with. The signature cache's key holds the
+  versions. Verification still allocates nothing.
 - The oracle follows the new APIs and writes vectors only up to anchovy's
   highest version (a validator test checks they agree). The regenerated
   validity, mutation, input and consensus vectors match at every version
@@ -28,8 +33,6 @@ the PRD now asks for a rebase at least once a week.
 ## Found
 - Validation differs from the reference only at protocol 144, whose
   timestamp expiration anchovy does not implement; hence the oracle's cap.
-- `aggregator::aggregate a_committee_of_a_hundred_certifies_at_two_thirds`
-  was reported leaky once by nextest (a crate this phase does not touch).
 - At the renumbered 141 the compat tests' packages fail to publish
   (`VMVerificationOrDeserializationError`): they use framework features that
   arrive in 142. They pass at 142.
@@ -41,12 +44,15 @@ the PRD now asks for a rebase at least once a week.
   objects), so once the workload enables a sender's aliases, sui's voters
   reject that sender's transactions anchovy submits with `AliasesChanged`;
   the client gives up after 15-19 attempts. Anchovy's voter likewise
-  rejects sui's `Some` claims. Every other run passed.
+  rejects sui's `Some` claims. Every other run passed. Fixed (address
+  aliases, above); seeds 1-48 of the four composite workloads then pass.
+- A derp seed replays identically only with the same `--scratch` path: the
+  host directory is in the guest's environment.
+- nextest reported a leak once each in two tests this phase does not touch
+  (`aggregator::aggregate`, `validator::consensus
+  an_executed_transaction_is_accepted_though_its_inputs_are_spent`).
 
 ## Remaining
-- Address aliases: read each required signer's `AddressAliases` object for
-  signature verification (any alias may sign), the submit claim and the
-  vote check; the signature cache must account for alias versions.
 - Execution v5 (protocol 143): a port of the new `latest` adapter, natives
   and verifier, plus the Move VM changes behind it.
 - Timestamp expiration (protocol 144, devnet): validity checks and the
@@ -60,4 +66,4 @@ the PRD now asks for a rebase at least once a week.
   accumulator events; the compat workloads cover them.
 - The mainnet validity corpus and signature vectors were not regenerated
   (they need checkpoint files).
-- Derp sweeps, with derp's latest main.
+- The consensus transaction pool and execution v5 are not planned yet.
