@@ -53,6 +53,10 @@ use sui_types::effects::TransactionEffectsAPI;
 use sui_types::full_checkpoint_content::CheckpointData;
 use sui_types::transaction::{InputObjectKind, SharedObjectMutability, TransactionDataAPI};
 
+/// anchovy's `execution::upgrade::MAX_PROTOCOL_VERSION`: vectors cover the versions anchovy runs.
+/// anchovy's validator tests check that the two agree.
+const MAX_PROTOCOL_VERSION: u64 = 142;
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

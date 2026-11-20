@@ -200,7 +200,7 @@ fn reload_gasless_tokens(vectors: &str, chain: &str) {
                 .then(|| fields[3].split_once('-').unwrap().1)
         })
         .map(|v| v.parse::<u64>().unwrap());
-    let config = (1..=ProtocolVersion::MAX.as_u64())
+    let config = (1..=execution::upgrade::MAX_PROTOCOL_VERSION)
         .rev()
         .filter(|v| Some(*v) != first)
         .map(|v| ProtocolConfig::get_for_version(ProtocolVersion::new(v), Chain::Unknown))
@@ -237,6 +237,21 @@ fn assert_no_vector_differences(vectors: &str) {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+/// The oracle writes vectors up to its own copy of anchovy's highest version.
+#[test]
+fn the_vectors_reach_anchovy_s_highest_protocol_version() {
+    let vectors = include_str!("../../validation/tests/data/validity.vectors");
+    let highest = vectors
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split(' ').collect();
+            (fields[0] == "case").then(|| fields[3].split_once('-').unwrap().1.parse::<u64>())
+        })
+        .map(Result::unwrap)
+        .max();
+    assert_eq!(highest, Some(execution::upgrade::MAX_PROTOCOL_VERSION));
 }
 
 #[test]

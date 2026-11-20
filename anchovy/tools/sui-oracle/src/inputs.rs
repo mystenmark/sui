@@ -191,7 +191,7 @@ fn verdict(store: &Store, config: &ProtocolConfig, tx: &TransactionData) -> (Str
         let receiving = tx.receiving_objects();
         let (inputs, received) = load(store, &kinds, &receiving)?;
         let metrics = Arc::new(BytecodeVerifierMetrics::new(&prometheus::Registry::new()));
-        let (_, checked) = sui_transaction_checks::check_transaction_input(
+        let checked = sui_transaction_checks::check_transaction_input(
             config,
             RGP,
             tx,
@@ -283,7 +283,10 @@ fn world(store: &mut Store) -> World {
     let clock = {
         let mut contents = SUI_CLOCK_OBJECT_ID.to_vec();
         contents.extend(0u64.to_le_bytes());
-        let config = ProtocolConfig::get_for_max_version_UNSAFE();
+        let config = ProtocolConfig::get_for_version(
+            ProtocolVersion::new(crate::MAX_PROTOCOL_VERSION),
+            Chain::Unknown,
+        );
         let object = unsafe {
             MoveObject::new_from_execution(
                 sui_types::clock::Clock::type_().into(),
@@ -677,7 +680,7 @@ fn cases(w: &World) -> Vec<(&'static str, TransactionData)> {
 }
 
 pub fn vectors() -> Vec<u8> {
-    let version = ProtocolVersion::MAX;
+    let version = ProtocolVersion::new(crate::MAX_PROTOCOL_VERSION);
     let config = ProtocolConfig::get_for_version(version, Chain::Unknown);
     let mut store = Store::default();
     let w = world(&mut store);

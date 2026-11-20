@@ -12,7 +12,7 @@
 //!
 //! `check` names the reference function: `tx_data` is
 //! `TransactionData::validity_check` on BCS `TransactionData`, `gas_price`
-//! the price checks of `SuiGasStatus::new`, `sender_signed` decoding
+//! the price checks of `check_gas_price`, `sender_signed` decoding
 //! `SenderSignedData` and its `validity_check` (see `validity_signed.rs`),
 //! `verify` its signatures (see `validity_verify.rs`). A first line
 //! `jwks <json>` holds the JWKs verification runs with. A `case` covers a run of consecutive
@@ -31,7 +31,7 @@ use sui_types::base_types::{ObjectDigest, ObjectID, ObjectRef, SequenceNumber, S
 use sui_types::coin_reservation::ParsedObjectRefWithdrawal;
 use sui_types::digests::{ChainIdentifier, CheckpointDigest};
 use sui_types::error::{SuiError, SuiErrorKind};
-use sui_types::gas::SuiGasStatus;
+use sui_types::gas::check_gas_price;
 use sui_types::gas_coin::GAS;
 use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
 use sui_types::transaction::{
@@ -606,29 +606,20 @@ fn sponsorship_cases() -> Vec<(String, TransactionData)> {
     ]
 }
 
-/// `SuiGasStatus::new`'s price checks, run on each transaction's gas price.
-/// `None` if the checks passed and the budget setup after them panicked: it
-/// asserts a non-zero price (which a zero reference gas price lets through)
-/// and overflows on huge prices where no price cap applies.
+/// `check_gas_price`, run on each transaction's gas price. Always `Some`: the
+/// reference's price checks no longer panic.
 fn gas_status(
     tx: &TransactionData,
     ctx: &TxValidityCheckContext<'_>,
 ) -> Option<Result<(), SuiError>> {
     let gas = tx.gas_data();
-    // The expected panic is a verdict, not printed; other panics still are.
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        SuiGasStatus::new(gas.budget, gas.price, ctx.reference_gas_price, ctx.config).map(|_| ())
-    }));
-    std::panic::set_hook(hook);
-    result.ok()
+    Some(check_gas_price(gas.price, ctx.reference_gas_price, ctx.config).map_err(Into::into))
 }
 
 /// Every case, run under every context, chain and protocol version.
 pub fn vectors() -> String {
     let chains = [Chain::Unknown, Chain::Mainnet, Chain::Testnet];
-    let max = ProtocolVersion::MAX.as_u64();
+    let max = crate::MAX_PROTOCOL_VERSION;
     let configs: Vec<Vec<ProtocolConfig>> = chains
         .iter()
         .map(|&chain| {

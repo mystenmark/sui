@@ -29,7 +29,10 @@ pub(crate) const RGP: u64 = 1;
 pub(crate) const COMMITTEE_SIZE: u32 = 100;
 
 pub(crate) fn verdicts(checkpoint: &CheckpointData) -> String {
-    let config = ProtocolConfig::get_for_version(ProtocolVersion::MAX, Chain::Mainnet);
+    let config = ProtocolConfig::get_for_version(
+        ProtocolVersion::new(crate::MAX_PROTOCOL_VERSION),
+        Chain::Mainnet,
+    );
     let epoch = checkpoint.checkpoint_summary.epoch;
     let ctx = TxValidityCheckContext {
         config: &config,

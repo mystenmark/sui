@@ -40,7 +40,7 @@ const COUNT: usize = 3000;
 /// The protocol versions each mutation runs under: every tenth, and the
 /// last few, where most flags change.
 fn versions() -> Vec<u64> {
-    let max = ProtocolVersion::MAX.as_u64();
+    let max = crate::MAX_PROTOCOL_VERSION;
     let mut v: Vec<u64> = (1..=max).step_by(10).collect();
     v.extend(max.saturating_sub(8)..=max);
     v.sort_unstable();
