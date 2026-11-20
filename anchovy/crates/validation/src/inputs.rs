@@ -238,7 +238,8 @@ fn end_of_epoch_inputs<'a>(kind: &EndOfEpochTransactionKind<'_>) -> [Option<Inpu
         | EndOfEpochTransactionKind::CoinRegistryCreate
         | EndOfEpochTransactionKind::DisplayRegistryCreate
         | EndOfEpochTransactionKind::AddressAliasStateCreate
-        | EndOfEpochTransactionKind::ForwardingAddressRegistryCreate => [None, None],
+        | EndOfEpochTransactionKind::ForwardingAddressRegistryCreate
+        | EndOfEpochTransactionKind::FreezeListCreate => [None, None],
     }
 }
 
@@ -374,6 +375,7 @@ fn check_funds_withdrawals(data: &TransactionData<'_, impl TxState>) -> Result<(
                 WithdrawFrom::Sender => data.sender(),
                 WithdrawFrom::Sponsor => data.gas_data().owner,
                 WithdrawFrom::SenderAllowance { funder, .. } => funder,
+                WithdrawFrom::FrozenAddress { seized_from, .. } => seized_from,
             };
             let WithdrawalTypeArg::Balance(ty) = w.type_arg;
             let Reservation::MaxAmountU64(amount) = w.reservation;

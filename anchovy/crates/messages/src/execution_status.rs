@@ -145,6 +145,7 @@ pub enum ExecutionErrorKind<'a> {
     NonExclusiveWriteInputObjectModified {
         id: &'a ObjectId,
     },
+    TransactionExpired,
 }
 
 impl<'a> ExecutionErrorKind<'a> {
@@ -242,6 +243,7 @@ impl<'a> ExecutionErrorKind<'a> {
             41 => E::NonExclusiveWriteInputObjectModified {
                 id: ObjectId::parse(r)?,
             },
+            42 => E::TransactionExpired,
             tag => {
                 return Err(ParseError::UnknownVariant {
                     ty: "ExecutionErrorKind",

@@ -158,6 +158,11 @@ fn check_funds_withdrawals(
                     "Explicit sponsor withdrawals are not yet supported",
                 ));
             }
+            WithdrawFrom::FrozenAddress { .. } => {
+                return Err(invalid_reservation(
+                    "Frozen address withdrawals are not yet supported",
+                ));
+            }
             // The allowance itself is checked once inputs are loaded.
             WithdrawFrom::SenderAllowance { .. } => {
                 if !config.enable_allowances() {

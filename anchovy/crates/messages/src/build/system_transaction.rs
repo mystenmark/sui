@@ -196,6 +196,7 @@ pub enum EndOfEpochTransactionKind {
     AddressAliasStateCreate,
     WriteAccumulatorStorageCost(WriteAccumulatorStorageCost),
     ForwardingAddressRegistryCreate,
+    FreezeListCreate,
 }
 
 impl From<&view::SystemPackage<'_>> for (SequenceNumber, Vec<Vec<u8>>, Vec<ObjectId>) {
@@ -463,6 +464,7 @@ impl From<&view::EndOfEpochTransactionKind<'_>> for EndOfEpochTransactionKind {
                 })
             }
             V::ForwardingAddressRegistryCreate => B::ForwardingAddressRegistryCreate,
+            V::FreezeListCreate => B::FreezeListCreate,
         }
     }
 }

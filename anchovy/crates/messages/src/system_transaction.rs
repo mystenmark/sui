@@ -443,6 +443,7 @@ pub enum EndOfEpochTransactionKind<'a> {
         storage_cost: u64,
     },
     ForwardingAddressRegistryCreate,
+    FreezeListCreate,
 }
 
 impl<'a> EndOfEpochTransactionKind<'a> {
@@ -478,6 +479,7 @@ impl<'a> EndOfEpochTransactionKind<'a> {
                 storage_cost: r.u64()?,
             },
             13 => EndOfEpochTransactionKind::ForwardingAddressRegistryCreate,
+            14 => EndOfEpochTransactionKind::FreezeListCreate,
             tag => {
                 return Err(ParseError::UnknownVariant {
                     ty: "EndOfEpochTransactionKind",

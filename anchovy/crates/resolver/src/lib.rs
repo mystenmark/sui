@@ -193,6 +193,7 @@ fn funds_withdrawals(
             WithdrawFrom::Sender => data.sender(),
             WithdrawFrom::Sponsor => gas.owner,
             WithdrawFrom::SenderAllowance { funder, .. } => funder,
+            WithdrawFrom::FrozenAddress { seized_from, .. } => seized_from,
         };
         let WithdrawalTypeArg::Balance(inner) = withdrawal.type_arg;
         let account =

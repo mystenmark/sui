@@ -1084,6 +1084,11 @@ fn execution_loop<'a, Mode: ExecutionMode>(
                         assert!(protocol_config.create_forwarding_address_registry());
                         builder = setup_forwarding_address_registry_create(builder);
                     }
+                    EndOfEpochTransactionKind::FreezeListCreate => {
+                        unreachable!(
+                            "EndOfEpochTransactionKind::FreezeListCreate is not supported by this execution version"
+                        )
+                    }
                 }
             }
             unreachable!(

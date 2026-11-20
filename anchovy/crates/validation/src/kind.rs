@@ -136,6 +136,9 @@ fn end_of_epoch_transaction(
             config.create_forwarding_address_registry(),
             "forwarding address registry not enabled",
         ),
+        K::FreezeListCreate => {
+            return Err(unsupported("freeze list creation is not supported yet"));
+        }
     };
     if enabled {
         Ok(())

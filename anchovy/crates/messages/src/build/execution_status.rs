@@ -124,6 +124,7 @@ pub enum ExecutionErrorKind {
     NonExclusiveWriteInputObjectModified {
         id: ObjectId,
     },
+    TransactionExpired,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -335,6 +336,7 @@ impl From<&view::ExecutionErrorKind<'_>> for ExecutionErrorKind {
                     id: ObjectId::from(id),
                 }
             }
+            V::TransactionExpired => B::TransactionExpired,
         }
     }
 }

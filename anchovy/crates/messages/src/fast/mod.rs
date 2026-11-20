@@ -471,6 +471,7 @@ impl<'a> Writer<'a> {
                 self.u8(41);
                 self.raw(&id.0);
             }
+            E::TransactionExpired => self.u8(42),
         }
     }
 
