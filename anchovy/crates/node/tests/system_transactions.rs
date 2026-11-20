@@ -42,10 +42,19 @@ impl Node {
         let dir = tempfile::tempdir().unwrap();
         let store = store::Store::open(dir.path()).unwrap();
         execution::genesis::commit(&store, &objects).unwrap();
-        let reference =
-            Reference::new(ProtocolVersion::MAX.as_u64(), Chain::Unknown, 0, 0, RGP).unwrap();
+        let reference = Reference::new(
+            execution::upgrade::MAX_PROTOCOL_VERSION,
+            Chain::Unknown,
+            0,
+            0,
+            RGP,
+        )
+        .unwrap();
         let native = NativeExecution::new(
-            ProtocolConfig::get_for_version(ProtocolVersion::MAX, Chain::Unknown),
+            ProtocolConfig::get_for_version(
+                ProtocolVersion::new(execution::upgrade::MAX_PROTOCOL_VERSION),
+                Chain::Unknown,
+            ),
             Arc::new(ExecutionMetrics::new(&prometheus::Registry::new())),
             0,
             0,
@@ -101,7 +110,7 @@ fn change_epoch(
 ) -> EndOfEpochTransactionKind {
     EndOfEpochTransactionKind::new_change_epoch(
         1,
-        ProtocolVersion::MAX,
+        ProtocolVersion::new(execution::upgrade::MAX_PROTOCOL_VERSION),
         1_000,
         2_000,
         500,
@@ -131,7 +140,7 @@ fn a_legacy_change_epoch_matches() {
     let node = Node::new(|_| false);
     node.execute(&VerifiedTransaction::new_change_epoch(
         1,
-        ProtocolVersion::MAX,
+        ProtocolVersion::new(execution::upgrade::MAX_PROTOCOL_VERSION),
         1_000,
         2_000,
         500,
@@ -191,7 +200,10 @@ fn end_of_epoch_writes_to_the_system_state_match() {
     use sui_types::transaction::StoredExecutionTimeObservations;
 
     let node = Node::new(|_| false);
-    let config = ProtocolConfig::get_for_version(ProtocolVersion::MAX, Chain::Unknown);
+    let config = ProtocolConfig::get_for_version(
+        ProtocolVersion::new(execution::upgrade::MAX_PROTOCOL_VERSION),
+        Chain::Unknown,
+    );
     let PerObjectCongestionControlMode::ExecutionTimeEstimate(params) =
         config.per_object_congestion_control_mode()
     else {

@@ -6,7 +6,7 @@
 
 use execution::{Outcome, Reference, genesis};
 use move_core_types::ident_str;
-use sui_protocol_config::{Chain, ProtocolVersion};
+use sui_protocol_config::Chain;
 use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
 use sui_types::crypto::{AccountKeyPair, get_key_pair};
 use sui_types::effects::{TransactionEffects, TransactionEffectsAPI};
@@ -31,8 +31,14 @@ struct Node {
 impl Node {
     fn new() -> Node {
         let (sender, key) = get_key_pair::<AccountKeyPair>();
-        let execution =
-            Reference::new(ProtocolVersion::MAX.as_u64(), Chain::Unknown, 0, 0, RGP).unwrap();
+        let execution = Reference::new(
+            execution::upgrade::MAX_PROTOCOL_VERSION,
+            Chain::Unknown,
+            0,
+            0,
+            RGP,
+        )
+        .unwrap();
         let dir = tempfile::tempdir().unwrap();
         let store = store::Store::open(dir.path()).unwrap();
         let objects = genesis::objects(&execution, &[(sender, 10 * SUI)]).unwrap();

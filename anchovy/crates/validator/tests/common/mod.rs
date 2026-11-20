@@ -16,7 +16,7 @@ use messages::Message;
 use messages::base::Digest;
 use messages::checkpoint::CheckpointData;
 use messages::transaction::{DigestPending, Transaction};
-use sui_protocol_config::{Chain, ProtocolVersion};
+use sui_protocol_config::Chain;
 use validation::ErrorKind;
 use validation::verify::{JWK, JwkId};
 use validator::epoch::EpochState;
@@ -71,7 +71,7 @@ pub fn signed_vectors() -> (Vec<Case>, Vec<(JwkId, JWK)>) {
 pub fn vectors_epoch(epoch: u64, jwks: Vec<(JwkId, JWK)>) -> Arc<EpochState> {
     Arc::new(EpochState::new(
         Chain::Unknown,
-        ProtocolVersion::MAX.as_u64(),
+        execution::upgrade::MAX_PROTOCOL_VERSION,
         epoch,
         Digest::new([0x11; 32]),
         1000,
@@ -117,7 +117,7 @@ pub fn mainnet() -> (Vec<Case>, u64) {
 pub fn mainnet_epoch(epoch: u64) -> Arc<EpochState> {
     Arc::new(EpochState::new(
         Chain::Mainnet,
-        ProtocolVersion::MAX.as_u64(),
+        execution::upgrade::MAX_PROTOCOL_VERSION,
         epoch,
         Digest::new(
             unhex("35834a8ac17ca48fb14ac8f99c17c98747e95dd07294ae41a46b382246a4499b")

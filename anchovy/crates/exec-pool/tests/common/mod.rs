@@ -15,7 +15,7 @@ use messages::base::{Hashed, ObjectId};
 use messages::transaction::SharedObjectMutability;
 use move_core_types::ident_str;
 use resolver::InputAvailability;
-use sui_protocol_config::{Chain, ProtocolVersion};
+use sui_protocol_config::Chain;
 use sui_types::base_types::{ObjectID, ObjectRef, SequenceNumber, SuiAddress};
 use sui_types::crypto::{AccountKeyPair, KeypairTraits, get_key_pair};
 use sui_types::digests::TransactionDigest;
@@ -118,7 +118,7 @@ impl Node {
     fn of(sender: SuiAddress, key: AccountKeyPair, coins: usize) -> Node {
         let epoch = Arc::new(EpochState::new(
             Chain::Unknown,
-            ProtocolVersion::MAX.as_u64(),
+            execution::upgrade::MAX_PROTOCOL_VERSION,
             0,
             messages::base::Digest::new([0; 32]),
             RGP,
