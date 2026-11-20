@@ -11,11 +11,11 @@ use fastcrypto::encoding::{Encoding, Hex};
 use fastcrypto::error::FastCryptoError;
 use fastcrypto::groups::bls12381::G2Element;
 use fastcrypto::serde_helpers::ToFromByteArray;
-use fastcrypto_tbls::dkg_v1::{Confirmation, Message, Observer};
-use fastcrypto_tbls::ecies_v1;
-use fastcrypto_tbls::nodes::{Node, Nodes};
-use fastcrypto_tbls::polynomial::Poly;
-use fastcrypto_tbls::random_oracle::RandomOracle;
+use fastcrypto_threshold::dkg_v1::{Confirmation, Message, Observer};
+use fastcrypto_threshold::ecies_v1;
+use fastcrypto_threshold::nodes::{Node, Nodes};
+use fastcrypto_threshold::polynomial::Poly;
+use fastcrypto_threshold::random_oracle::RandomOracle;
 use sui_protocol_config::ProtocolConfig;
 use sui_types::messages_consensus::{VersionedDkgConfirmation, VersionedDkgMessage};
 

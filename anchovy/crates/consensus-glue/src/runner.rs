@@ -5,9 +5,7 @@ use std::sync::Arc;
 
 use consensus::TransactionClient;
 use consensus_config::{NetworkKeyPair, Parameters, ProtocolKeyPair};
-use consensus_core::{
-    Clock, CommitConsumerArgs, CommitConsumerMonitor, ConsensusAuthority, NetworkType,
-};
+use consensus_core::{Clock, CommitConsumerArgs, ConsensusAuthority, ConsumerMonitor, NetworkType};
 use node::epoch::{Consensus, ConsensusStart, ValidatorKeys};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
@@ -37,7 +35,7 @@ pub struct Runner {
 struct Running {
     /// The authority once started, and the task submitting to it.
     authority: JoinHandle<(ConsensusAuthority, JoinHandle<()>)>,
-    monitor: Arc<CommitConsumerMonitor>,
+    monitor: Arc<ConsumerMonitor>,
     commits: JoinHandle<()>,
 }
 

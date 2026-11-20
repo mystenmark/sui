@@ -484,7 +484,7 @@ fn one_member_dkg(
 ) -> (
     Vec<([u8; 96], u64)>,
     Arc<validator::consensus::dkg::DkgSetup>,
-    fastcrypto_tbls::dkg_v1::Party<
+    fastcrypto_threshold::dkg_v1::Party<
         fastcrypto::groups::bls12381::G2Element,
         fastcrypto::groups::bls12381::G2Element,
     >,
@@ -507,8 +507,8 @@ fn one_member_dkg(
         key.copy().private().as_bytes().try_into().unwrap(),
     )
     .unwrap();
-    let party = fastcrypto_tbls::dkg_v1::Party::new(
-        fastcrypto_tbls::ecies_v1::PrivateKey::from(secret),
+    let party = fastcrypto_threshold::dkg_v1::Party::new(
+        fastcrypto_threshold::ecies_v1::PrivateKey::from(secret),
         setup.nodes().clone(),
         setup.threshold(),
         setup.random_oracle().clone(),

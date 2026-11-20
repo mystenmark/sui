@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use consensus::{Block, BlockRef, CommittedSubDag};
-use consensus_core::{BlockAPI, CommitConsumerMonitor};
+use consensus_core::{BlockAPI, ConsumerMonitor};
 use mysten_metrics::monitored_mpsc::UnboundedReceiver;
 use tokio::sync::oneshot;
 use validator::consensus::decode::CommitRequest;
@@ -17,7 +17,7 @@ use workqueue::{PushError, Queue};
 pub(crate) async fn forward(
     mut committed: UnboundedReceiver<consensus_core::CommittedSubDag>,
     commits: Queue<CommitRequest>,
-    monitor: Arc<CommitConsumerMonitor>,
+    monitor: Arc<ConsumerMonitor>,
 ) {
     while let Some(sub_dag) = committed.recv().await {
         let index = sub_dag.commit_ref.index;

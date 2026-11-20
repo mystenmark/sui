@@ -26,7 +26,6 @@ use sui_types::digests::TransactionDigest;
 use sui_types::effects::{TransactionEffects, TransactionEffectsAPI};
 use sui_types::error::SuiError;
 use sui_types::execution_params::ExecutionOrEarlyError;
-use sui_types::gas::SuiGasStatus;
 use sui_types::message_envelope::Message as _;
 use sui_types::metrics::ExecutionMetrics;
 use sui_types::object::Object;
@@ -387,16 +386,6 @@ impl Reference {
         let view = StoreView::new(store);
 
         let inputs = load_at(&view, data.input_objects()?, provided)?;
-        let gas_status = if data.kind().is_system_tx() {
-            SuiGasStatus::new_unmetered(&self.config)
-        } else if self.config.enable_gasless() && data.is_gasless_transaction() {
-            // As sui-core's `check_gas`.
-            let rgp = self.rgp.max(1);
-            let compute_cap = self.config.gasless_max_computation_units() * rgp;
-            SuiGasStatus::new(compute_cap, rgp, self.rgp, &self.config)?
-        } else {
-            SuiGasStatus::new(data.gas_budget(), data.gas_price(), self.rgp, &self.config)?
-        };
         let accumulator_version = if self.config.enable_accumulators() {
             accumulator_version(&view)?.map(|live| ConsensusObjectVersion {
                 version: implicit.accumulator.map_or(
@@ -419,11 +408,16 @@ impl Reference {
             }
             Funds::Insufficient => sui_types::execution_params::FundsWithdrawStatus::Insufficient,
         };
+        // Timestamp expiration is enabled only past `MAX_PROTOCOL_VERSION`, so no commit
+        // timestamp is passed.
+        assert!(!self.config.enable_timestamp_transaction_expiration());
         let early = match sui_types::execution_params::get_early_execution_error(
             &digest,
             &inputs,
             &std::collections::HashSet::new(),
             &funds,
+            data.expiration(),
+            None,
         ) {
             None => ExecutionOrEarlyError::ok(None),
             Some(errors) => ExecutionOrEarlyError::failed(errors, None),
@@ -471,7 +465,7 @@ impl Reference {
             ),
             &ReferenceUnsettled(unsettled),
             data.gas_data().clone(),
-            gas_status,
+            self.rgp,
             kind,
             rewritten,
             data.sender(),

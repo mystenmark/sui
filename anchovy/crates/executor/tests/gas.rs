@@ -8,7 +8,8 @@
 use executor::gas::{SuiGasStatus, SuiGasStatusAPI};
 use messages::base::ObjectId;
 use sui_protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
-use sui_types::gas::{SuiGasStatus as Reference, SuiGasStatusAPI as _};
+use sui_types::gas::{SuiGasStatus as Reference, SuiGasStatusAPI as _, check_gas_price};
+use sui_types::transaction::{GasData, ProgrammableTransaction, TransactionKind};
 
 /// xorshift64*: deterministic, no dependency.
 struct Rng(u64);
@@ -124,6 +125,23 @@ fn run(rng: &mut Rng, mut ours: SuiGasStatus, mut theirs: Reference, label: &str
     }
 }
 
+/// Gas paid from a coin, so neither unmetered nor gasless.
+fn gas_data(budget: u64, price: u64) -> GasData {
+    GasData {
+        payment: vec![sui_types::base_types::random_object_ref()],
+        owner: sui_types::base_types::SuiAddress::ZERO,
+        price,
+        budget,
+    }
+}
+
+fn user_kind() -> TransactionKind {
+    TransactionKind::ProgrammableTransaction(ProgrammableTransaction {
+        inputs: vec![],
+        commands: vec![],
+    })
+}
+
 #[test]
 fn gas_status_matches_sui_types() {
     let config = ProtocolConfig::get_for_version(ProtocolVersion::MAX, Chain::Unknown);
@@ -133,7 +151,7 @@ fn gas_status_matches_sui_types() {
         let price = rgp + rng.below(5) * rng.below(100_000);
         let budget = rng.below(5_000_000_000) + 2_000_000;
         let ours = SuiGasStatus::new(budget, price, rgp, &config).unwrap();
-        let theirs = Reference::new(budget, price, rgp, &config).unwrap();
+        let theirs = Reference::for_execution(&gas_data(budget, price), &user_kind(), rgp, &config);
         run(&mut rng, ours, theirs, &format!("metered {i}"));
     }
     for i in 0..50 {
@@ -153,7 +171,7 @@ fn gas_price_checks_match_sui_types() {
         config.max_gas_price(),
     ] {
         let ours = SuiGasStatus::new(1_000_000, price, 1000, &config).is_ok();
-        let theirs = Reference::new(1_000_000, price, 1000, &config).is_ok();
+        let theirs = check_gas_price(price, 1000, &config).is_ok();
         assert_eq!(ours, theirs, "price {price}");
     }
 }

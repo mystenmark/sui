@@ -61,19 +61,19 @@ sui-benchmark = { path = "../crates/sui-benchmark" }
 telemetry-subscribers = { path = "../crates/telemetry-subscribers" }
 move-core-types = { path = "../external-crates/move/crates/move-core-types" }
 move-binary-format = { path = "../external-crates/move/crates/move-binary-format" }
-move-vm-runtime = { path = "../external-crates/move/crates/move-vm-runtime" }
-move-bytecode-verifier = { path = "../external-crates/move/crates/move-bytecode-verifier" }
+move-vm-runtime = { path = "../external-crates/move/historical-versions/v4/crates/move-vm-runtime", package = "move-vm-runtime-v4" }
+move-bytecode-verifier = { path = "../external-crates/move/historical-versions/v4/crates/move-bytecode-verifier", package = "move-bytecode-verifier-v4" }
 move-bytecode-verifier-meter = { path = "../external-crates/move/crates/move-bytecode-verifier-meter" }
 move-vm-config = { path = "../external-crates/move/crates/move-vm-config" }
 move-regex-borrow-graph = { path = "../external-crates/move/crates/move-regex-borrow-graph" }
-sui-verifier = { path = "../sui-execution/latest/sui-verifier", package = "sui-verifier-latest" }
+sui-verifier = { path = "../sui-execution/historical-versions/v4/sui-verifier", package = "sui-verifier-v4" }
 # The reference adapter, a test oracle for what the executor ports.
-sui-adapter = { path = "../sui-execution/latest/sui-adapter", package = "sui-adapter-latest" }
+sui-adapter = { path = "../sui-execution/historical-versions/v4/sui-adapter", package = "sui-adapter-v4" }
 # Linked by `natives`, as sui-move-natives links them.
 better_any = "0.1.1"
 smallvec = "1.10.0"
 rand = "0.8.5"
-fastcrypto-vdf = { git = "https://github.com/MystenLabs/fastcrypto", rev = "0a263279c31a45ba4bcd986a82b7e99c63ed16c0", features = ["experimental"] }
+fastcrypto-vdf = { git = "https://github.com/MystenLabs/fastcrypto", rev = "a58b2984d6ac827b40c48fc0f2478a46569b5b17", features = ["experimental"] }
 prometheus = "0.14"
 aggregator = { path = "crates/aggregator" }
 arena = { path = "crates/arena" }
@@ -119,16 +119,16 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["a
 bs58 = "0.5"
 # Crypto is fastcrypto's (PRD), at sui's revision; base64ct and roaring at
 # the versions sui decodes signatures with.
-fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "0a263279c31a45ba4bcd986a82b7e99c63ed16c0" }
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "a58b2984d6ac827b40c48fc0f2478a46569b5b17" }
 # The Ed25519 fastcrypto wraps, at its version: batch verification with an RNG of
 # our choosing.
 ed25519-consensus = "=2.1.0"
 base64ct = { version = "=1.8.0", features = ["alloc"] }
 # The random beacon's DKG and threshold signatures.
-fastcrypto-tbls = { git = "https://github.com/MystenLabs/fastcrypto", rev = "0a263279c31a45ba4bcd986a82b7e99c63ed16c0" }
-fastcrypto-zkp = { git = "https://github.com/MystenLabs/fastcrypto", rev = "0a263279c31a45ba4bcd986a82b7e99c63ed16c0", package = "fastcrypto-zkp" }
+fastcrypto-threshold = { git = "https://github.com/MystenLabs/fastcrypto", rev = "a58b2984d6ac827b40c48fc0f2478a46569b5b17" }
+fastcrypto-zkp = { git = "https://github.com/MystenLabs/fastcrypto", rev = "a58b2984d6ac827b40c48fc0f2478a46569b5b17", package = "fastcrypto-zkp" }
 # ML-DSA-65 account signatures, with the assembly backends sui-types enables.
-fastcrypto-pq = { git = "https://github.com/MystenLabs/fastcrypto", rev = "0a263279c31a45ba4bcd986a82b7e99c63ed16c0", features = ["native"] }
+fastcrypto-pq = { git = "https://github.com/MystenLabs/fastcrypto", rev = "a58b2984d6ac827b40c48fc0f2478a46569b5b17", features = ["native"] }
 roaring = "=0.11.4"
 # The map type fastcrypto-zkp takes JWKs in.
 imbl = "7"

@@ -11,8 +11,8 @@ use fastcrypto::bls12381::min_sig::BLS12381KeyPair;
 use fastcrypto::groups::bls12381::{G2Element, Scalar};
 use fastcrypto::serde_helpers::ToFromByteArray;
 use fastcrypto::traits::{KeyPair as _, ToFromBytes};
-use fastcrypto_tbls::dkg_v1::Party;
-use fastcrypto_tbls::ecies_v1;
+use fastcrypto_threshold::dkg_v1::Party;
+use fastcrypto_threshold::ecies_v1;
 use rand::SeedableRng;
 use sui_protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
 use sui_types::messages_consensus::{VersionedDkgConfirmation, VersionedDkgMessage};
@@ -253,7 +253,7 @@ fn outputs(
     network: &Network,
     encoded: &[Vec<u8>],
     dealers: &[usize],
-) -> Vec<fastcrypto_tbls::dkg_v1::Output<G2Element, G2Element>> {
+) -> Vec<fastcrypto_threshold::dkg_v1::Output<G2Element, G2Element>> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(10);
     let merged: Vec<_> = network
         .parties
@@ -285,8 +285,8 @@ fn outputs(
 /// group's signature, and then pushes that instead of its partials.
 #[test]
 fn the_collector_signs_and_aggregates_with_its_shares() {
-    use fastcrypto_tbls::tbls::ThresholdBls;
-    use fastcrypto_tbls::types::ThresholdBls12381MinSig;
+    use fastcrypto_threshold::tbls::ThresholdBls;
+    use fastcrypto_threshold::types::ThresholdBls12381MinSig;
     use validator::pipeline::keys::GateKey;
     use validator::randomness::{
         BeaconInput, SendSignaturesRequest, SignatureCollector, signature_message,
