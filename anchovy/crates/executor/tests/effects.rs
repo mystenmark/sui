@@ -616,11 +616,31 @@ fn effects_match_reference() {
 
 #[test]
 fn size_estimate_matches_reference() {
+    let bump = Bump::default();
     for (w, m, d) in [(0, 0, 0), (1, 2, 3), (100, 50, 7), (2048, 1024, 1000)] {
-        assert_eq!(
-            port::estimate_effects_size_upperbound_v2(w, m, d),
-            TransactionEffects::estimate_effects_size_upperbound_v2(w, m, d)
-        );
+        for complete in [false, true] {
+            assert_eq!(
+                port::estimate_effects_size_upperbound_v2(
+                    &bump,
+                    w,
+                    m,
+                    d,
+                    w / 2,
+                    m / 3,
+                    &[],
+                    complete
+                ),
+                TransactionEffects::estimate_effects_size_upperbound_v2(
+                    w,
+                    m,
+                    d,
+                    w / 2,
+                    m / 3,
+                    &[],
+                    complete
+                )
+            );
+        }
     }
 }
 
