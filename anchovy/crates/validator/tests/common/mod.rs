@@ -152,13 +152,20 @@ pub struct Pipeline {
     pub verifier: validator::processors::SignatureVerifier,
 }
 
+/// A store with no objects, so that no signer has aliases. Its directory is
+/// removed when the process exits.
+pub fn empty_store() -> Arc<store::Store> {
+    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    Arc::new(store::Store::open(dir.path()).unwrap())
+}
+
 impl Pipeline {
     pub fn new(epoch: &Arc<EpochState>, generation: usize) -> Pipeline {
         use validator::processors::{SignatureVerifier, TransactionValidator};
         Pipeline {
             epoch: epoch.clone(),
             validator: TransactionValidator::new(epoch.clone()),
-            verifier: SignatureVerifier::with_cache(epoch.clone(), generation),
+            verifier: SignatureVerifier::with_cache(epoch.clone(), empty_store(), generation),
         }
     }
 
@@ -221,6 +228,7 @@ pub fn submission(
     let (to_check, checks) = workqueue::queue(1024);
     let (validating, verifying, checking) = (epoch.clone(), epoch.clone(), epoch.clone());
     let store = store.clone();
+    let verifying_store = store.clone();
     let worker = workqueue::Worker::new("submission")
         .run(
             validation,
@@ -229,7 +237,7 @@ pub fn submission(
         )
         .run(
             verification,
-            move || SignatureVerifier::new(verifying),
+            move || SignatureVerifier::new(verifying, verifying_store),
             to_check,
         )
         .run(checks, move || SubmitChecker::new(checking, store), |()| {})

@@ -21,7 +21,11 @@ use validation::verify::SignerIndices;
 pub const GENERATION: usize = 100_000;
 
 /// Versioned, and apart from every other use of the hash.
-const DOMAIN: &[u8] = b"anchovy verified signatures v1\0";
+const DOMAIN: &[u8] = b"anchovy verified signatures v2\0";
+
+/// Each required signer's `AddressAliases` version, in signer order: the
+/// aliases a verdict was reached with.
+pub(crate) type AliasVersions = [Option<u64>; 2];
 
 /// One epoch's: verification reads the epoch number, protocol config and
 /// JWKs, so a cache lives no longer than its epoch.
@@ -57,15 +61,16 @@ impl SignatureCache {
     /// and whose digest was computed from its own bytes, and `verify` is
     /// handed that same view: what is cached is what was verified. Only a
     /// `Valid` transaction gets here: verification does not repeat
-    /// validation. `verify` must depend on nothing but the view and the
-    /// epoch. In particular it takes no aliases: they would have to be in
-    /// the key.
+    /// validation. `verify` must depend on nothing but the view, the epoch
+    /// and the aliases at `aliases`, the versions of the objects they were
+    /// read from, which the key holds.
     pub(crate) fn verify(
         &mut self,
         transaction: &Message<Transaction<'static, Valid>>,
+        aliases: AliasVersions,
         verify: impl FnOnce(&SenderSignedData<'_, Valid>) -> Result<SignerIndices, validation::Error>,
     ) -> Result<SignerIndices, validation::Error> {
-        let (key, cached) = self.lookup(transaction);
+        let (key, cached) = self.lookup(transaction, aliases);
         if let Some(indices) = cached {
             return Ok(indices);
         }
@@ -80,8 +85,9 @@ impl SignatureCache {
     pub(crate) fn lookup(
         &mut self,
         transaction: &Message<Transaction<'static, Valid>>,
+        aliases: AliasVersions,
     ) -> (Hashed, Option<SignerIndices>) {
-        let key = key(self.epoch, &transaction.get().0);
+        let key = key(self.epoch, &transaction.get().0, aliases);
         let cached = self
             .current
             .get(&key)
@@ -112,16 +118,18 @@ impl SignatureCache {
     }
 }
 
-/// Every byte verification reads, and the epoch. The transaction digest
-/// commits to the data's bytes, from which the rest of the data view was
-/// parsed. Signatures are length-prefixed, so no two lists of them hash
-/// alike.
-fn key(epoch: u64, transaction: &SenderSignedData<'_, Valid>) -> Hashed {
+/// Every byte verification reads, the epoch, and the alias versions. The
+/// transaction digest commits to the data's bytes, from which the rest of
+/// the data view was parsed; an `AddressAliases` object's id is derived from
+/// its signer, so its version fixes its contents. Signatures are
+/// length-prefixed, so no two lists of them hash alike.
+fn key(epoch: u64, transaction: &SenderSignedData<'_, Valid>, aliases: AliasVersions) -> Hashed {
     key_of(
         epoch,
         transaction.digest(),
         *transaction.intent(),
         transaction.tx_signatures(),
+        aliases,
     )
 }
 
@@ -130,11 +138,21 @@ fn key_of(
     digest: &Digest,
     intent: Intent,
     signatures: &[GenericSignature<'_>],
+    aliases: AliasVersions,
 ) -> Hashed {
     use blake2::Digest as _;
     let mut hasher = Blake2b::<U32>::new();
     hasher.update(DOMAIN);
     hasher.update(epoch.to_le_bytes());
+    for version in aliases {
+        match version {
+            None => hasher.update([0]),
+            Some(version) => {
+                hasher.update([1]);
+                hasher.update(version.to_le_bytes());
+            }
+        }
+    }
     hasher.update(digest.bytes);
     hasher.update([intent.scope, intent.version, intent.app_id]);
     hasher.update((signatures.len() as u64).to_le_bytes());
@@ -187,7 +205,7 @@ mod tests {
     ) -> bool {
         let ran = Cell::new(false);
         cache
-            .verify(transaction, |_| {
+            .verify(transaction, [None, None], |_| {
                 ran.set(true);
                 Ok(SignerIndices::default())
             })
@@ -239,7 +257,7 @@ mod tests {
         let transactions = transactions();
         let mut cache = SignatureCache::new(5, 8);
         for _ in 0..2 {
-            let refused = cache.verify(&transactions[0], |_| {
+            let refused = cache.verify(&transactions[0], [None, None], |_| {
                 Err(validation::Error::new(
                     validation::SuiErrorKind::InvalidSignature {
                         error: "refused".to_owned(),
@@ -257,7 +275,13 @@ mod tests {
         let original = &transactions[0].get().0;
         let [a, b] = [&b"abc"[..], b"de"].map(GenericSignature);
         let key_with = |epoch: u64, signatures: &[GenericSignature<'_>]| {
-            key_of(epoch, original.digest(), *original.intent(), signatures)
+            key_of(
+                epoch,
+                original.digest(),
+                *original.intent(),
+                signatures,
+                [None, None],
+            )
         };
         let base = key_with(5, &[a, b]);
         assert_ne!(base, key_with(5, &[b, a]), "order");
@@ -267,5 +291,14 @@ mod tests {
         assert_ne!(base, key_with(5, &[c, d]), "boundaries");
         assert_ne!(base, key_with(6, &[a, b]), "epoch");
         assert_eq!(base, key_with(5, &[a, b]));
+        let key_aliased =
+            |aliases| key_of(5, original.digest(), *original.intent(), &[a, b], aliases);
+        assert_ne!(base, key_aliased([Some(0), None]), "an alias version");
+        assert_ne!(
+            key_aliased([Some(1), None]),
+            key_aliased([None, Some(1)]),
+            "whose alias"
+        );
+        assert_ne!(key_aliased([Some(1), None]), key_aliased([Some(2), None]));
     }
 }

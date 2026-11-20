@@ -36,7 +36,7 @@ impl Submission {
         Submission {
             checker: SubmitChecker::new(node.epoch.clone(), node.store.clone()),
             validator: TransactionValidator::new(node.epoch.clone()),
-            verifier: SignatureVerifier::new(node.epoch.clone()),
+            verifier: SignatureVerifier::new(node.epoch.clone(), node.store.clone()),
         }
     }
 

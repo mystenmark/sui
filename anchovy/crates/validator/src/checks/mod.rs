@@ -21,13 +21,15 @@ use std::sync::Arc;
 
 use containers::Bump;
 use messages::Message;
-use messages::base::{Hashed, ObjectId};
-use messages::object::Object;
-use messages::transaction::{Attested, DigestPending, HasDigest, Transaction, TxState};
+use messages::base::{Hashed, ObjectId, SuiAddress};
+use messages::object::{Data, Object};
+use messages::transaction::{
+    Attested, DigestPending, HasDigest, SenderSignedData, Transaction, TxState,
+};
 use validation::{sender_signed, verify};
 
 pub use signature_cache::GENERATION;
-use signature_cache::SignatureCache;
+use signature_cache::{AliasVersions, SignatureCache};
 use validation::verify::SignerIndices;
 
 use crate::epoch::EpochState;
@@ -111,18 +113,145 @@ pub fn certified(transaction: Unchecked) -> VerifiedTransaction {
     transaction.with_digest().relabel(&Witness(PhantomData))
 }
 
+/// Each required signer's signature index, and the version of the
+/// `AddressAliases` object its aliases were read from: what a consensus
+/// transaction's alias claim names.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Signers {
+    pub indices: SignerIndices,
+    /// In signer order, as `indices`.
+    pub alias_versions: AliasVersions,
+}
+
+impl Signers {
+    /// The V2 claim: each signer's signature index and alias version.
+    pub fn aliases_v2(&self) -> impl Iterator<Item = (u8, Option<u64>)> + '_ {
+        self.indices
+            .as_slice()
+            .iter()
+            .zip(self.alias_versions)
+            .map(|(index, version)| (*index, version))
+    }
+
+    /// The V1 claim: each signer and its alias version.
+    pub fn aliases_v1<S: TxState>(
+        &self,
+        transaction: &SenderSignedData<'_, S>,
+    ) -> impl Iterator<Item = (SuiAddress, Option<u64>)> + use<'_, S> {
+        verify::required_signers(transaction)
+            .into_iter()
+            .flatten()
+            .zip(self.alias_versions)
+    }
+}
+
+/// The addresses each required signer may sign as, from its live
+/// `AddressAliases` object, and that object's version: the reference's
+/// `verify_tx_with_current_aliases` lookup. Without address aliases, or
+/// without an object, a signer signs as itself.
+struct CurrentAliases<'b> {
+    by_signer: containers::Vec<'b, (SuiAddress, &'b [SuiAddress])>,
+    versions: AliasVersions,
+}
+
+fn current_aliases<'b>(
+    epoch: &EpochState,
+    store: &store::Store,
+    transaction: &SenderSignedData<'_, impl TxState>,
+    bump: &'b Bump,
+) -> CurrentAliases<'b> {
+    let mut aliases = CurrentAliases {
+        by_signer: containers::Vec::new_in(bump),
+        versions: [None, None],
+    };
+    if !epoch.params.config.address_aliases() {
+        return aliases;
+    }
+    let signers = verify::required_signers(transaction);
+    for (i, signer) in signers.iter().enumerate() {
+        let Some(signer) = signer else { continue };
+        let Some(object) = store
+            .live_object(&address_aliases_object_id(signer))
+            .expect("the store reads")
+        else {
+            continue;
+        };
+        let object = object.get();
+        let Data::Move(contents) = object.data else {
+            panic!("AddressAliases object must be a MoveObject");
+        };
+        // `AddressAliases { id: UID, aliases: VecSet<address> }`.
+        let mut r = messages::reader::Reader::new(contents.contents);
+        let listed = r
+            .record::<ObjectId>()
+            .and_then(|_| r.record_vec::<SuiAddress>())
+            .expect("failed to parse AddressAliases object");
+        let listed = if listed.is_empty() {
+            std::slice::from_ref(signer)
+        } else {
+            listed
+        };
+        aliases
+            .by_signer
+            .push((*signer, containers::alloc_slice_copy(bump, listed)));
+        aliases.versions[i] = Some(object.version());
+    }
+    aliases
+}
+
+/// The reference's `address_aliases_object_id`, without allocating: the
+/// derived object id of `signer`'s `AliasKey` under the address alias state,
+/// that is `derive_dynamic_field_id(0xa, DerivedObjectKey<AliasKey>, signer)`.
+pub fn address_aliases_object_id(signer: &SuiAddress) -> ObjectId {
+    use blake2::Digest as _;
+    // `HashingIntentScope::ChildObjectId`.
+    const CHILD_OBJECT_ID: u8 = 0xf0;
+    // `TypeTag::Struct`'s variant index.
+    const STRUCT: u8 = 7;
+    let mut framework = [0u8; 32];
+    framework[31] = 2;
+    let mut alias_state = [0u8; 32];
+    alias_state[31] = 0xa;
+    let mut hasher = blake2::Blake2b::<blake2::digest::consts::U32>::new();
+    hasher.update([CHILD_OBJECT_ID]);
+    hasher.update(alias_state);
+    hasher.update((signer.0.len() as u64).to_le_bytes());
+    hasher.update(signer.0);
+    // `0x2::derived_object::DerivedObjectKey<0x2::address_alias::AliasKey>`'s BCS.
+    for (module, name, type_params) in [
+        (&b"derived_object"[..], &b"DerivedObjectKey"[..], 1u8),
+        (b"address_alias", b"AliasKey", 0),
+    ] {
+        hasher.update([STRUCT]);
+        hasher.update(framework);
+        hasher.update([module.len() as u8]);
+        hasher.update(module);
+        hasher.update([name.len() as u8]);
+        hasher.update(name);
+        hasher.update([type_params]);
+    }
+    ObjectId(hasher.finalize().into())
+}
+
 /// Signature verification in one epoch, remembering what verified.
 pub struct SignatureChecks {
     epoch: Arc<EpochState>,
+    store: Arc<store::Store>,
     cache: SignatureCache,
 }
 
 impl SignatureChecks {
-    /// In `epoch`, with a cache of `2 * generation` entries.
-    pub fn new(epoch: Arc<EpochState>, generation: usize) -> SignatureChecks {
+    /// In `epoch`, reading aliases from `store`, with a cache of
+    /// `2 * generation` entries.
+    pub fn new(
+        epoch: Arc<EpochState>,
+        store: Arc<store::Store>,
+        generation: usize,
+    ) -> SignatureChecks {
         SignatureChecks {
             cache: SignatureCache::new(epoch.params.epoch, generation),
             epoch,
+            store,
         }
     }
 
@@ -132,29 +261,28 @@ impl SignatureChecks {
     }
 
     /// Verifies each transaction's signatures, unless they verified before:
-    /// all `Verified`, or the first failure. Each must have been validated
-    /// in the same epoch.
+    /// all `Verified`, each one's signers pushed onto `signers`, or the first
+    /// failure. Each must have been validated in the same epoch.
     pub fn verify(
         &mut self,
         transactions: Vec<ValidTransaction>,
+        signers: &mut Vec<Signers>,
         bump: &Bump,
     ) -> Result<Vec<VerifiedTransaction>, validation::Error> {
         for transaction in &transactions {
-            self.verify_signatures(transaction, bump)?;
+            signers.push(self.verify_signatures(transaction, bump)?);
         }
         Ok(Message::relabel_all(transactions, &Witness(PhantomData)))
     }
 
-    /// `verify` for one transaction, also giving each required signer's
-    /// signature index, with no aliases: what a consensus transaction's alias
-    /// claim must name.
+    /// `verify` for one transaction.
     pub fn verify_one(
         &mut self,
         transaction: ValidTransaction,
         bump: &Bump,
-    ) -> Result<(VerifiedTransaction, SignerIndices), validation::Error> {
-        let indices = self.verify_signatures(&transaction, bump)?;
-        Ok((transaction.relabel(&Witness(PhantomData)), indices))
+    ) -> Result<(VerifiedTransaction, Signers), validation::Error> {
+        let signers = self.verify_signatures(&transaction, bump)?;
+        Ok((transaction.relabel(&Witness(PhantomData)), signers))
     }
 
     /// `verify_one` for each transaction, verifying their simple Ed25519
@@ -165,7 +293,7 @@ impl SignatureChecks {
         &mut self,
         transactions: containers::Vec<'b, ValidTransaction>,
         bump: &'b Bump,
-    ) -> containers::Vec<'b, Result<(VerifiedTransaction, SignerIndices), validation::Error>> {
+    ) -> containers::Vec<'b, Result<(VerifiedTransaction, Signers), validation::Error>> {
         enum Prepared {
             Cached(SignerIndices),
             /// Verified but for its Ed25519 checks, `deferred[checks]`.
@@ -182,11 +310,12 @@ impl SignatureChecks {
         let mut deferred = containers::Vec::new_in(bump);
         let mut prepared = containers::Vec::with_capacity_in(transactions.len(), bump);
         prepared.extend(transactions.iter().map(|transaction| {
-            let (key, cached) = self.cache.lookup(transaction);
-            if let Some(indices) = cached {
-                return Prepared::Cached(indices);
-            }
             let signed = &transaction.get().0;
+            let aliases = current_aliases(&epoch, &self.store, signed, bump);
+            let (key, cached) = self.cache.lookup(transaction, aliases.versions);
+            if let Some(indices) = cached {
+                return (Prepared::Cached(indices), aliases);
+            }
             let start = deferred.len();
             let prepared =
                 sender_signed::deserialization_checks(signed, bump).and_then(|(signatures, _)| {
@@ -195,12 +324,12 @@ impl SignatureChecks {
                         signatures,
                         epoch.params.epoch,
                         &epoch.verifier,
-                        &[],
+                        &aliases.by_signer,
                         bump,
                         &mut deferred,
                     )
                 });
-            match prepared {
+            let prepared = match prepared {
                 Ok(indices) => Prepared::Pending {
                     key,
                     indices,
@@ -210,7 +339,8 @@ impl SignatureChecks {
                     deferred.truncate(start);
                     Prepared::Failed(e)
                 }
-            }
+            };
+            (prepared, aliases)
         }));
 
         // 2. One batch; if it fails, each transaction's checks alone.
@@ -219,33 +349,46 @@ impl SignatureChecks {
         // 3. The verified enter the cache. `prepared` has an entry per
         // transaction.
         let mut verified = containers::Vec::with_capacity_in(transactions.len(), bump);
-        verified.extend(
-            transactions
-                .into_iter()
-                .zip(prepared)
-                .map(|(transaction, prepared)| {
-                    let indices = match prepared {
-                        Prepared::Cached(indices) => indices,
-                        Prepared::Pending {
-                            key,
-                            indices,
-                            checks,
-                        } => {
-                            let verified = batch_verified
-                                || deferred[checks].iter().all(verify::verify_ed25519);
-                            if !verified {
-                                return Err(reference_error(&epoch, &transaction, None, bump));
-                            }
-                            self.cache.insert(key, indices);
-                            indices
+        verified.extend(transactions.into_iter().zip(prepared).map(
+            |(transaction, (prepared, aliases))| {
+                let indices = match prepared {
+                    Prepared::Cached(indices) => indices,
+                    Prepared::Pending {
+                        key,
+                        indices,
+                        checks,
+                    } => {
+                        let verified =
+                            batch_verified || deferred[checks].iter().all(verify::verify_ed25519);
+                        if !verified {
+                            return Err(reference_error(
+                                &epoch,
+                                &transaction,
+                                &aliases,
+                                None,
+                                bump,
+                            ));
                         }
-                        Prepared::Failed(e) => {
-                            return Err(reference_error(&epoch, &transaction, Some(e), bump));
-                        }
-                    };
-                    Ok((transaction.relabel(&Witness(PhantomData)), indices))
-                }),
-        );
+                        self.cache.insert(key, indices);
+                        indices
+                    }
+                    Prepared::Failed(e) => {
+                        return Err(reference_error(
+                            &epoch,
+                            &transaction,
+                            &aliases,
+                            Some(e),
+                            bump,
+                        ));
+                    }
+                };
+                let signers = Signers {
+                    indices,
+                    alias_versions: aliases.versions,
+                };
+                Ok((transaction.relabel(&Witness(PhantomData)), signers))
+            },
+        ));
         verified
     }
 
@@ -253,19 +396,23 @@ impl SignatureChecks {
         &mut self,
         transaction: &ValidTransaction,
         bump: &Bump,
-    ) -> Result<SignerIndices, validation::Error> {
+    ) -> Result<Signers, validation::Error> {
         let epoch = &self.epoch;
-        self.cache.verify(transaction, |signed| {
+        let aliases = current_aliases(epoch, &self.store, &transaction.get().0, bump);
+        let indices = self.cache.verify(transaction, aliases.versions, |signed| {
             let (signatures, _) = sender_signed::deserialization_checks(signed, bump)?;
-            // No aliases: they are object state, which does not exist yet.
             verify::verify_signatures(
                 signed,
                 signatures,
                 epoch.params.epoch,
                 &epoch.verifier,
-                &[],
+                &aliases.by_signer,
                 bump,
             )
+        })?;
+        Ok(Signers {
+            indices,
+            alias_versions: aliases.versions,
         })
     }
 }
@@ -286,6 +433,7 @@ pub fn sequenced_by_consensus(transaction: Unchecked) -> VerifiedTransaction {
 fn reference_error(
     epoch: &EpochState,
     transaction: &ValidTransaction,
+    aliases: &CurrentAliases<'_>,
     deferred: Option<validation::Error>,
     bump: &Bump,
 ) -> validation::Error {
@@ -297,7 +445,7 @@ fn reference_error(
                 signatures,
                 epoch.params.epoch,
                 &epoch.verifier,
-                &[],
+                &aliases.by_signer,
                 bump,
             )
         })
