@@ -2,6 +2,7 @@ we are building a ground-up rewrite of the sui validator and fullnode. because t
 
 Top level rules / design principles:
 - start the work in a new workspace
+- rebase onto upstream sui main at least once a week, so that anchovy tracks the reference implementation's changes.
 - do not take any dependencies on existing crates in the sui repo, (or in the MystenLabs org generally) until/unless explicitly instructed
   - exceptions:
     - fastcrypto, we will not re-implement any crypto routines
