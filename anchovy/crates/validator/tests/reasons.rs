@@ -354,8 +354,8 @@ fn signatures_are_rejected_with_the_reference_s_reasons() {
     transactions.extend(batch.iter().map(|(case, _)| {
         validator::checks::validate_one(case.parse().unwrap(), &context, &bump).unwrap()
     }));
-    let mut checks =
-        validator::checks::SignatureChecks::new(epoch.clone(), common::empty_store(), 1);
+    let (_dir, store) = common::empty_store();
+    let mut checks = validator::checks::SignatureChecks::new(epoch.clone(), store, 1);
     for ((case, reference), ours) in batch.iter().zip(checks.verify_batch(transactions, &bump)) {
         let (Err(ours), Some(reference)) = (ours, reference) else {
             continue;

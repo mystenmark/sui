@@ -312,7 +312,7 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
         }),
     );
     let mut validator = TransactionValidator::new(epoch.clone());
-    let store = common::empty_store();
+    let (_dir, store) = empty_store();
     let mut verifier = SignatureVerifier::new(epoch.clone(), store.clone());
     // As a worker's arena: reset after each item, never freed.
     let mut bump = workqueue::Bump::default();

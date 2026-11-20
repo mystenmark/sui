@@ -644,6 +644,52 @@ fn size_estimate_matches_reference() {
     }
 }
 
+/// The complete estimate's accumulator part: each accumulator object's
+/// write is counted once, with its type tag and event digests.
+#[test]
+fn accumulator_size_estimate_matches_reference() {
+    use sui_types::accumulator_event::AccumulatorEvent;
+    use sui_types::accumulator_root::AccumulatorObjId;
+    let mut rng = Rng(41);
+    let bump = Bump::default();
+    // A type with long names and nesting: its encoding needs multi-byte lengths.
+    let long = "a".repeat(200);
+    let wide = TypeTag::from_str(&format!(
+        "0x1234::{long}::{long}<vector<0x2::balance::Balance<0x2::sui::SUI>>, u64>"
+    ))
+    .unwrap();
+    for round in 0..20 {
+        let mut theirs = Vec::new();
+        for object in 0..=rng.below(5) {
+            let id = rng.id();
+            let mut writes = accumulator_writes(&mut rng, (round + object) % 3);
+            if object == 0 {
+                for w in &mut writes {
+                    w.address.ty = wide.clone();
+                }
+            }
+            theirs.extend(writes.into_iter().map(|write| AccumulatorEvent {
+                accumulator_obj: AccumulatorObjId::new_unchecked(id),
+                write,
+            }));
+        }
+        let ours: Vec<_> = theirs
+            .iter()
+            .map(|e| {
+                executor::accumulator_event::AccumulatorEvent::new(
+                    common::oid(*e.accumulator_obj.inner()),
+                    common::accumulator_write(&bump, &e.write),
+                )
+            })
+            .collect();
+        assert_eq!(
+            port::estimate_effects_size_upperbound_v2(&bump, 3, 2, 1, 0, 0, &ours, true),
+            TransactionEffects::estimate_effects_size_upperbound_v2(3, 2, 1, 0, 0, &theirs, true),
+            "round {round}"
+        );
+    }
+}
+
 #[test]
 #[should_panic(expected = "All writes must have the same accumulator address")]
 fn merge_rejects_mismatched_addresses() {

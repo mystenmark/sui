@@ -147,25 +147,29 @@ pub fn expected(epoch: &EpochState, cases: &[&Case]) -> Result<(), ErrorKind> {
 /// The processors, run by hand on the calling thread, each one's output the
 /// next one's input, so that tests can look at the verifier's cache.
 pub struct Pipeline {
+    _store_dir: tempfile::TempDir,
     epoch: Arc<EpochState>,
     pub validator: validator::processors::TransactionValidator,
     pub verifier: validator::processors::SignatureVerifier,
 }
 
-/// A store with no objects, so that no signer has aliases. Its directory is
-/// removed when the process exits.
-pub fn empty_store() -> Arc<store::Store> {
-    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
-    Arc::new(store::Store::open(dir.path()).unwrap())
+/// A store with no objects, so that no signer has aliases, and its
+/// directory, removed when dropped.
+pub fn empty_store() -> (tempfile::TempDir, Arc<store::Store>) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(store::Store::open(dir.path()).unwrap());
+    (dir, store)
 }
 
 impl Pipeline {
     pub fn new(epoch: &Arc<EpochState>, generation: usize) -> Pipeline {
         use validator::processors::{SignatureVerifier, TransactionValidator};
+        let (store_dir, store) = empty_store();
         Pipeline {
+            _store_dir: store_dir,
             epoch: epoch.clone(),
             validator: TransactionValidator::new(epoch.clone()),
-            verifier: SignatureVerifier::with_cache(epoch.clone(), empty_store(), generation),
+            verifier: SignatureVerifier::with_cache(epoch.clone(), store, generation),
         }
     }
 

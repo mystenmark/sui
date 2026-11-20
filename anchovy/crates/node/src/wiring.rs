@@ -70,9 +70,9 @@ pub(crate) fn spawn(
     let mut handles = vec![
         // Submission.
         w.thread("submission")
-            .run(i.transactions, |p, _| TransactionValidator::new(p.epoch.clone()),           into(&q.signatures, "signatures"))
-            .run(i.signatures,   |p, _| SignatureVerifier::new(p.epoch.clone(), p.store.clone()),              into(&q.submit, "submit"))
-            .run(i.submit,       |p, _| SubmitChecker::new(p.epoch.clone(), p.store.clone()), drop)
+            .run(i.transactions, |p, _| TransactionValidator::new(p.epoch.clone()),                    into(&q.signatures, "signatures"))
+            .run(i.signatures,   |p, _| SignatureVerifier::new(p.epoch.clone(), p.store.clone()), into(&q.submit, "submit"))
+            .run(i.submit,       |p, _| SubmitChecker::new(p.epoch.clone(), p.store.clone()),     drop)
             .spawn(),
         // Consensus.
         w.one("voting",            i.votes,            |p, q| p.voter(q.built_waits),                                  drop),

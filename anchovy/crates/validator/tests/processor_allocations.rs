@@ -75,7 +75,7 @@ fn plain_signatures(case: &common::Case) -> bool {
 fn verifying_allocates_nothing_once_warm() {
     let (cases, epoch) = common::mainnet();
     let epoch = common::mainnet_epoch(epoch);
-    let store = common::empty_store();
+    let (_dir, store) = common::empty_store();
     let mut validator = TransactionValidator::new(epoch.clone());
     let mut warm = SignatureVerifier::new(epoch.clone(), store.clone());
     let mut bump = Bump::default();
@@ -101,7 +101,7 @@ fn verifying_allocates_nothing_once_warm() {
 fn a_cache_hit_allocates_nothing() {
     let (cases, epoch) = common::mainnet();
     let epoch = common::mainnet_epoch(epoch);
-    let store = common::empty_store();
+    let (_dir, store) = common::empty_store();
     let mut validator = TransactionValidator::new(epoch.clone());
     let mut verifier = SignatureVerifier::new(epoch.clone(), store.clone());
     let mut bump = Bump::default();

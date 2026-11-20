@@ -41,9 +41,8 @@ pub struct Contents {
 /// are `effects`, and whose transactions, aligned with them, are
 /// `transactions`, with temporaries in `bump`.
 ///
-/// Each user signature is recorded with no alias version: aliases are
-/// object state anchovy does not read yet, so every signer signs as itself
-/// (see `consensus::vote`).
+/// Each user signature is recorded with the alias version its submitter's
+/// V2 claim names, and with none where there is no claim.
 ///
 /// # Panics
 /// On effects that do not parse or are V1, which this validator's executor
