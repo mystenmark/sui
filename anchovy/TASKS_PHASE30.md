@@ -34,7 +34,19 @@ the PRD now asks for a rebase at least once a week.
   (`VMVerificationOrDeserializationError`): they use framework features that
   arrive in 142. They pass at 142.
 
+- Derp sweep (derp main 333e342), seeds 1-24 of all 34 compat tests: three
+  composite runs fail (full composite seed 9, full through stalls seed 4,
+  composite through stalls seed 18), all the same way. Anchovy claims alias
+  version `None` for every signer (it does not read `AddressAliases`
+  objects), so once the workload enables a sender's aliases, sui's voters
+  reject that sender's transactions anchovy submits with `AliasesChanged`;
+  the client gives up after 15-19 attempts. Anchovy's voter likewise
+  rejects sui's `Some` claims. Every other run passed.
+
 ## Remaining
+- Address aliases: read each required signer's `AddressAliases` object for
+  signature verification (any alias may sign), the submit claim and the
+  vote check; the signature cache must account for alias versions.
 - Execution v5 (protocol 143): a port of the new `latest` adapter, natives
   and verifier, plus the Move VM changes behind it.
 - Timestamp expiration (protocol 144, devnet): validity checks and the
