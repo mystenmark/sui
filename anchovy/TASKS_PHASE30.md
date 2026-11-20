@@ -19,8 +19,17 @@ the PRD now asks for a rebase at least once a week.
   with the reference's errors; v4 execution treats them as unreachable.
 - API changes: `SuiGasStatus::for_execution` and `check_gas_price`, the
   expiration argument of early errors, consensus-core's `ConsumerMonitor`.
+- Tests that execute run at `MAX_PROTOCOL_VERSION`, not sui's highest.
+- The oracle follows the new APIs and writes vectors only up to anchovy's
+  highest version (a validator test checks they agree). The regenerated
+  validity, mutation, input and consensus vectors match at every version
+  anchovy runs.
 
 ## Found
+- Validation differs from the reference only at protocol 144, whose
+  timestamp expiration anchovy does not implement; hence the oracle's cap.
+- `aggregator::aggregate a_committee_of_a_hundred_certifies_at_two_thirds`
+  was reported leaky once by nextest (a crate this phase does not touch).
 - At the renumbered 141 the compat tests' packages fail to publish
   (`VMVerificationOrDeserializationError`): they use framework features that
   arrive in 142. They pass at 142.
@@ -37,4 +46,6 @@ the PRD now asks for a rebase at least once a week.
   consensus-core's channel.
 - The effects size estimate is compared with the reference without
   accumulator events; the compat workloads cover them.
+- The mainnet validity corpus and signature vectors were not regenerated
+  (they need checkpoint files).
 - Derp sweeps, with derp's latest main.
