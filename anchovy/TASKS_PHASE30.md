@@ -24,7 +24,10 @@ the PRD now asks for a rebase at least once a week.
   `AddressAliases` object (its id derived without allocating); any listed
   alias may sign, and the object's version is what a submission claims and
   what a vote compares the claim with. The signature cache's key holds the
-  versions. Verification still allocates nothing.
+  versions. Verification of a signer the store has looked up before
+  allocates nothing; a signer's first lookup fills the store's cache.
+- The complete effects size estimate is compared with the reference with
+  accumulator events (wide type tags, repeated objects, event digests).
 - The oracle follows the new APIs and writes vectors only up to anchovy's
   highest version (a validator test checks they agree). The regenerated
   validity, mutation, input and consensus vectors match at every version
@@ -62,8 +65,6 @@ the PRD now asks for a rebase at least once a week.
   with `OwnedObjectConflict` (#28519), pull-time owned-version checks
   (#28520), byte bounds and a time to live. Anchovy submits straight into
   consensus-core's channel.
-- The effects size estimate is compared with the reference without
-  accumulator events; the compat workloads cover them.
 - The mainnet validity corpus and signature vectors were not regenerated
   (they need checkpoint files).
 - The consensus transaction pool and execution v5 are not planned yet.
