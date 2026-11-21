@@ -312,7 +312,8 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
         }),
     );
     let mut validator = TransactionValidator::new(epoch.clone());
-    let mut verifier = SignatureVerifier::new(epoch.clone());
+    let (_dir, store) = empty_store();
+    let mut verifier = SignatureVerifier::new(epoch.clone(), store.clone());
     // As a worker's arena: reset after each item, never freed.
     let mut bump = workqueue::Bump::default();
     let mut both = |verifier: &mut SignatureVerifier, txs: &[Bytes]| {
@@ -332,7 +333,10 @@ fn single_thread(txs: &[Bytes], epoch: &Arc<EpochState>) {
         "decode + both processors, cache cold",
         per_tx(txs, 5, |txs| {
             // Its two tables' allocation is timed too: ~5 ns a transaction.
-            both(&mut SignatureVerifier::new(epoch.clone()), txs);
+            both(
+                &mut SignatureVerifier::new(epoch.clone(), store.clone()),
+                txs,
+            );
         }),
     );
     row(

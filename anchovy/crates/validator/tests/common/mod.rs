@@ -16,7 +16,7 @@ use messages::Message;
 use messages::base::Digest;
 use messages::checkpoint::CheckpointData;
 use messages::transaction::{DigestPending, Transaction};
-use sui_protocol_config::{Chain, ProtocolVersion};
+use sui_protocol_config::Chain;
 use validation::ErrorKind;
 use validation::verify::{JWK, JwkId};
 use validator::epoch::EpochState;
@@ -71,7 +71,7 @@ pub fn signed_vectors() -> (Vec<Case>, Vec<(JwkId, JWK)>) {
 pub fn vectors_epoch(epoch: u64, jwks: Vec<(JwkId, JWK)>) -> Arc<EpochState> {
     Arc::new(EpochState::new(
         Chain::Unknown,
-        ProtocolVersion::MAX.as_u64(),
+        execution::upgrade::MAX_PROTOCOL_VERSION,
         epoch,
         Digest::new([0x11; 32]),
         1000,
@@ -117,7 +117,7 @@ pub fn mainnet() -> (Vec<Case>, u64) {
 pub fn mainnet_epoch(epoch: u64) -> Arc<EpochState> {
     Arc::new(EpochState::new(
         Chain::Mainnet,
-        ProtocolVersion::MAX.as_u64(),
+        execution::upgrade::MAX_PROTOCOL_VERSION,
         epoch,
         Digest::new(
             unhex("35834a8ac17ca48fb14ac8f99c17c98747e95dd07294ae41a46b382246a4499b")
@@ -147,18 +147,29 @@ pub fn expected(epoch: &EpochState, cases: &[&Case]) -> Result<(), ErrorKind> {
 /// The processors, run by hand on the calling thread, each one's output the
 /// next one's input, so that tests can look at the verifier's cache.
 pub struct Pipeline {
+    _store_dir: tempfile::TempDir,
     epoch: Arc<EpochState>,
     pub validator: validator::processors::TransactionValidator,
     pub verifier: validator::processors::SignatureVerifier,
 }
 
+/// A store with no objects, so that no signer has aliases, and its
+/// directory, removed when dropped.
+pub fn empty_store() -> (tempfile::TempDir, Arc<store::Store>) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(store::Store::open(dir.path()).unwrap());
+    (dir, store)
+}
+
 impl Pipeline {
     pub fn new(epoch: &Arc<EpochState>, generation: usize) -> Pipeline {
         use validator::processors::{SignatureVerifier, TransactionValidator};
+        let (store_dir, store) = empty_store();
         Pipeline {
+            _store_dir: store_dir,
             epoch: epoch.clone(),
             validator: TransactionValidator::new(epoch.clone()),
-            verifier: SignatureVerifier::with_cache(epoch.clone(), generation),
+            verifier: SignatureVerifier::with_cache(epoch.clone(), store, generation),
         }
     }
 
@@ -221,6 +232,7 @@ pub fn submission(
     let (to_check, checks) = workqueue::queue(1024);
     let (validating, verifying, checking) = (epoch.clone(), epoch.clone(), epoch.clone());
     let store = store.clone();
+    let verifying_store = store.clone();
     let worker = workqueue::Worker::new("submission")
         .run(
             validation,
@@ -229,7 +241,7 @@ pub fn submission(
         )
         .run(
             verification,
-            move || SignatureVerifier::new(verifying),
+            move || SignatureVerifier::new(verifying, verifying_store),
             to_check,
         )
         .run(checks, move || SubmitChecker::new(checking, store), |()| {})

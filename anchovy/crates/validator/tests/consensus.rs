@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use consensus::{Block, BlockRef, CommittedSubDag, TransactionIndex};
 use messages::base::Digest;
-use sui_protocol_config::{Chain, ProtocolVersion};
+use sui_protocol_config::Chain;
 use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
 use sui_types::crypto::{AccountKeyPair, AuthorityPublicKeyBytes, get_key_pair};
 use sui_types::digests::TransactionDigest;
@@ -48,7 +48,7 @@ impl Node {
         let (sender, key) = get_key_pair::<AccountKeyPair>();
         let epoch = Arc::new(EpochState::new(
             Chain::Unknown,
-            ProtocolVersion::MAX.as_u64(),
+            execution::upgrade::MAX_PROTOCOL_VERSION,
             0,
             Digest::new([0; 32]),
             RGP,
@@ -84,6 +84,54 @@ impl Node {
         bcs::from_bytes::<Object>(object.wire_bytes())
             .unwrap()
             .compute_object_reference()
+    }
+
+    /// Writes `signer`'s `AddressAliases` object, listing `aliases`, at
+    /// `version`.
+    fn set_aliases(&self, signer: SuiAddress, aliases: &[SuiAddress], version: u64) {
+        use sui_types::address_alias::{AddressAliases, address_aliases_object_id};
+        use sui_types::base_types::{MoveObjectType, SequenceNumber};
+        use sui_types::collection_types::VecSet;
+        use sui_types::id::UID;
+        use sui_types::object::{MoveObject, Owner};
+        let id = address_aliases_object_id(signer).unwrap();
+        let contents = bcs::to_bytes(&AddressAliases {
+            id: UID::new(id),
+            aliases: VecSet {
+                contents: aliases.to_vec(),
+            },
+        })
+        .unwrap();
+        let ty = sui_types::parse_sui_struct_tag("0x2::address_alias::AddressAliases").unwrap();
+        let config = self.epoch.params.config.clone();
+        // Safety: the contents are an `AddressAliases`, the type they name.
+        let object = unsafe {
+            MoveObject::new_from_execution(
+                MoveObjectType::from(ty),
+                false,
+                SequenceNumber::from_u64(version),
+                contents,
+                &config,
+                false,
+            )
+        }
+        .unwrap();
+        let object = Object::new_move(
+            object,
+            Owner::AddressOwner(signer),
+            TransactionDigest::genesis_marker(),
+        );
+        self.store
+            .write_through(store::Commit {
+                written: vec![store::Written {
+                    id: messages::base::ObjectId(id.into_bytes()),
+                    version,
+                    digest: Digest::new(object.digest().into_inner()),
+                    bytes: bcs::to_bytes(&object).unwrap(),
+                }],
+                ..store::Commit::default()
+            })
+            .unwrap();
     }
 
     /// A signed transfer paid with `gas`, as `Transaction` BCS.
@@ -157,7 +205,7 @@ fn block(round: u32, transactions: Vec<Vec<u8>>) -> Block {
 /// A handler of a committee of one, that has handled no commit.
 fn new_handler(output: validator::epoch_store::ConsensusOutput) -> CommitHandler {
     let config = sui_protocol_config::ProtocolConfig::get_for_version(
-        sui_protocol_config::ProtocolVersion::MAX,
+        sui_protocol_config::ProtocolVersion::new(execution::upgrade::MAX_PROTOCOL_VERSION),
         sui_protocol_config::Chain::Unknown,
     );
     CommitHandler::new(output, 0, vec![([0; 96], 10_000)], &config, None, None)
@@ -399,6 +447,89 @@ fn reject_votes_record_the_reference_s_reasons() {
         })
     );
     assert_eq!(reason(5), None);
+}
+
+/// A signer's aliases are read from its `AddressAliases` object: the claim
+/// must name the object's version, and any listed alias may sign.
+#[test]
+fn votes_check_signers_aliases_as_the_reference_does() {
+    let bump = containers::Bump::default();
+    let node = Node::new();
+    let gas = node.gas();
+    let (alias, alias_key) = get_key_pair::<AccountKeyPair>();
+    // One voter throughout, and the sender's transfer in both blocks: its
+    // cached verdict must not outlive the aliases it was reached with.
+    let mut voter = node.voter();
+    let own = node.transfer(gas);
+    node.set_aliases(node.sender, &[node.sender], 3);
+    let first = block(
+        12,
+        vec![
+            user_transaction(&own, &[no_alias()]),
+            user_transaction(&own, &[aliases(&[(0, Some(3))])]),
+        ],
+    );
+    assert_eq!(voter.vote(first, &bump), Ok(vec![0]));
+
+    // Listing only another address: its key signs for the sender, and the
+    // sender's own does not.
+    node.set_aliases(node.sender, &[alias], 4);
+    let second = block(
+        13,
+        vec![
+            user_transaction(
+                &node.signed_transfer(gas, &alias_key),
+                &[aliases(&[(0, Some(4))])],
+            ),
+            user_transaction(&own, &[aliases(&[(0, Some(4))])]),
+            user_transaction(
+                &node.signed_transfer(gas, &alias_key),
+                &[aliases(&[(0, Some(3))])],
+            ),
+        ],
+    );
+    assert_eq!(voter.vote(second, &bump), Ok(vec![1, 2]));
+}
+
+/// A submission's alias claim names the aliases its signatures verified
+/// with, as the reference's decodes it, and the voters accept it.
+#[test]
+fn a_submission_claims_its_signers_aliases() {
+    use sui_types::messages_consensus::ConsensusTransactionKind;
+    use validator::processors::{Outcome, Request, SignatureVerifier, TransactionValidator};
+    use validator::submit::SubmitChecker;
+    use workqueue::Processor;
+    let node = Node::new();
+    let gas = node.gas();
+    let (alias, alias_key) = get_key_pair::<AccountKeyPair>();
+    node.set_aliases(node.sender, &[node.sender, alias], 5);
+    let mut validator = TransactionValidator::new(node.epoch.clone());
+    let mut verifier = SignatureVerifier::new(node.epoch.clone(), node.store.clone());
+    let mut checker = SubmitChecker::new(node.epoch.clone(), node.store.clone());
+    for transaction in [node.transfer(gas), node.signed_transfer(gas, &alias_key)] {
+        let (reply, mut answer) = tokio::sync::oneshot::channel();
+        let parsed = messages::Message::parse(transaction)
+            .map_err(|(e, _)| e)
+            .unwrap();
+        let mut bump = workqueue::Bump::default();
+        let ready = validator
+            .process(Request::new(vec![parsed], reply), &mut bump)
+            .and_then(|valid| verifier.process(valid, &mut bump))
+            .expect("valid and verified");
+        checker.process(ready, &mut bump);
+        let outcomes = answer.try_recv().unwrap().unwrap();
+        let [Outcome::Submit(bytes)] = &outcomes[..] else {
+            panic!("{outcomes:?}");
+        };
+        let decoded: ConsensusTransaction = bcs::from_bytes(bytes).unwrap();
+        let ConsensusTransactionKind::UserTransactionV2(user) = decoded.kind else {
+            panic!("{:?}", decoded.kind);
+        };
+        let claimed: Vec<_> = user.aliases().unwrap().into_iter().collect();
+        assert_eq!(claimed, vec![(0, Some(5.into()))]);
+        let accepted = block(14, vec![bytes.clone()]);
+        assert_eq!(node.voter().vote(accepted, &bump), Ok(vec![]));
+    }
 }
 
 #[test]
@@ -757,4 +888,16 @@ fn handlers_decide_alike_whatever_has_executed() {
     // The executed transaction is scheduled, not dropped as a duplicate:
     // the executor finds it executed.
     assert_eq!(first[0].0.len(), 2);
+}
+
+#[test]
+fn alias_object_ids_are_derived_as_the_reference_derives_them() {
+    for _ in 0..16 {
+        let signer = SuiAddress::random_for_testing_only();
+        let theirs = sui_types::address_alias::address_aliases_object_id(signer).unwrap();
+        let ours = validator::checks::address_aliases_object_id(&messages::base::SuiAddress(
+            signer.to_inner(),
+        ));
+        assert_eq!(ours.0, theirs.into_bytes());
+    }
 }

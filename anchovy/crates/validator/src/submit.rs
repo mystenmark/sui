@@ -9,7 +9,6 @@ use std::sync::Arc;
 use containers::Bump;
 use messages::object::Owner;
 use validation::inputs::{InputKind, input_objects};
-use validation::sender_signed;
 use workqueue::Processor;
 
 use crate::checks::{self, Verified, VerifiedTransaction};
@@ -44,6 +43,7 @@ impl SubmitChecker {
         &self,
         epoch: &EpochState,
         transaction: &VerifiedTransaction,
+        signers: &checks::Signers,
         bump: &Bump,
     ) -> Result<Vec<u8>, validation::Error> {
         let signed = &transaction.get().0;
@@ -72,34 +72,23 @@ impl SubmitChecker {
             }
         }
 
-        // No signer has an alias: aliases are object state anchovy does not
-        // read yet, so each alias version is `None`.
+        // The aliases the signatures verified with.
         let config = &epoch.params.config;
         if config.address_aliases() {
             claims += 1;
             if config.fix_checkpoint_signature_mapping() {
-                let (signatures, _) = sender_signed::deserialization_checks(signed, bump)?;
-                let indices = validation::verify::signer_signature_indices(
-                    signed,
-                    signatures,
-                    &epoch.verifier,
-                    &[],
-                    bump,
-                )?;
                 encoded.push(2);
-                uleb128(&mut encoded, indices.as_slice().len());
-                for index in indices.as_slice() {
-                    encoded.extend_from_slice(&[*index, 0]);
+                uleb128(&mut encoded, signers.indices.as_slice().len());
+                for (index, version) in signers.aliases_v2() {
+                    encoded.push(index);
+                    option_u64(&mut encoded, version);
                 }
             } else {
-                let sponsor =
-                    (data.gas_data().owner != data.sender()).then_some(data.gas_data().owner);
-                let signers = [Some(data.sender()), sponsor].into_iter().flatten();
                 encoded.push(0);
-                uleb128(&mut encoded, signers.clone().count());
-                for signer in signers {
+                uleb128(&mut encoded, signers.aliases_v1(signed).count());
+                for (signer, version) in signers.aliases_v1(signed) {
                     encoded.extend_from_slice(&signer.0);
-                    encoded.push(0);
+                    option_u64(&mut encoded, version);
                 }
             }
         }
@@ -120,6 +109,17 @@ impl SubmitChecker {
 /// `ConsensusTransactionKind::UserTransactionV2`'s variant index.
 const USER_TRANSACTION_V2: u8 = 12;
 
+/// An `Option<SequenceNumber>`'s BCS.
+fn option_u64(out: &mut containers::Vec<'_, u8>, version: Option<u64>) {
+    match version {
+        None => out.push(0),
+        Some(version) => {
+            out.push(1);
+            out.extend_from_slice(&version.to_le_bytes());
+        }
+    }
+}
+
 fn uleb128(out: &mut containers::Vec<'_, u8>, mut n: usize) {
     while n >= 0x80 {
         out.push((n as u8) | 0x80);
@@ -136,17 +136,18 @@ impl Processor for SubmitChecker {
         let Request {
             transactions,
             then: _,
+            signers,
             reply,
         } = request;
         let epoch = self.epoch.clone();
         let mut outcomes = Vec::with_capacity(transactions.len());
-        for transaction in &transactions {
+        for (transaction, signers) in transactions.iter().zip(&signers) {
             if let Some(outcome) = executed(&self.store, transaction.get().0.digest()) {
                 outcomes.push(outcome);
                 continue;
             }
             let submission = checks::inputs_pass(&epoch, &self.store, transaction, bump)
-                .and_then(|()| self.consensus_transaction(&epoch, transaction, bump));
+                .and_then(|()| self.consensus_transaction(&epoch, transaction, signers, bump));
             outcomes.push(match submission {
                 Ok(bytes) => Outcome::Submit(bytes),
                 Err(e) => Outcome::Rejected(e),

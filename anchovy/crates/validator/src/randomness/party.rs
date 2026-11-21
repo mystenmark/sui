@@ -7,8 +7,8 @@ use std::sync::Arc;
 use containers::Bump;
 use fastcrypto::groups::bls12381::{G2Element, Scalar};
 use fastcrypto::serde_helpers::ToFromByteArray;
-use fastcrypto_tbls::dkg_v1::{Party, ProcessedMessage, UsedProcessedMessages};
-use fastcrypto_tbls::ecies_v1;
+use fastcrypto_threshold::dkg_v1::{Party, ProcessedMessage, UsedProcessedMessages};
+use fastcrypto_threshold::ecies_v1;
 use sui_types::base_types::AuthorityName;
 use sui_types::messages_consensus::{
     ConsensusTransaction, VersionedDkgConfirmation, VersionedDkgMessage,

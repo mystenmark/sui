@@ -519,6 +519,8 @@ EndOfEpochTransactionKind:
           TYPENAME: WriteAccumulatorStorageCost
     13:
       ForwardingAddressRegistryCreate: UNIT
+    14:
+      FreezeListCreate: UNIT
 Event:
   STRUCT:
     - package_id:
@@ -681,6 +683,8 @@ ExecutionErrorKind:
         STRUCT:
           - id:
               TYPENAME: ObjectID
+    42:
+      TransactionExpired: UNIT
 ExecutionFailure:
   STRUCT:
     - error:
@@ -1496,6 +1500,13 @@ WithdrawFrom:
           - funder:
               TYPENAME: SuiAddress
           - allowance:
+              TYPENAME: ObjectID
+    3:
+      FrozenAddress:
+        STRUCT:
+          - seized_from:
+              TYPENAME: SuiAddress
+          - seize_auth:
               TYPENAME: ObjectID
 WithdrawalTypeArg:
   ENUM:

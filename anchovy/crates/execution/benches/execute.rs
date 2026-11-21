@@ -222,15 +222,24 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(2000);
 
-    let reference =
-        Reference::new(ProtocolVersion::MAX.as_u64(), Chain::Unknown, 0, 0, RGP).unwrap();
+    let reference = Reference::new(
+        execution::upgrade::MAX_PROTOCOL_VERSION,
+        Chain::Unknown,
+        0,
+        0,
+        RGP,
+    )
+    .unwrap();
     println!("executor   workload  txs    execute µs/tx  commit µs/tx  allocs/tx (execute)");
     for workload in &workloads {
         for name in &executors {
             let executor = match *name {
                 "native" => Executor::Native(
                     NativeExecution::new(
-                        ProtocolConfig::get_for_version(ProtocolVersion::MAX, Chain::Unknown),
+                        ProtocolConfig::get_for_version(
+                            ProtocolVersion::new(execution::upgrade::MAX_PROTOCOL_VERSION),
+                            Chain::Unknown,
+                        ),
                         Arc::new(ExecutionMetrics::new(&prometheus::Registry::new())),
                         0,
                         0,
@@ -240,8 +249,14 @@ fn main() {
                     .unwrap(),
                 ),
                 _ => Executor::Reference(
-                    Reference::new(ProtocolVersion::MAX.as_u64(), Chain::Unknown, 0, 0, RGP)
-                        .unwrap(),
+                    Reference::new(
+                        execution::upgrade::MAX_PROTOCOL_VERSION,
+                        Chain::Unknown,
+                        0,
+                        0,
+                        RGP,
+                    )
+                    .unwrap(),
                 ),
             };
             let mut setup = setup(&reference, n);

@@ -9,11 +9,20 @@ use sui_protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
 fn only_versions_the_executor_runs_are_supported() {
     for chain in [Chain::Unknown, Chain::Testnet, Chain::Mainnet] {
         let supported = execution::upgrade::supported_protocol_versions(chain);
-        assert_eq!(supported.max, ProtocolVersion::MAX);
+        assert_eq!(
+            supported.max,
+            ProtocolVersion::new(execution::upgrade::MAX_PROTOCOL_VERSION)
+        );
         for v in supported.as_range() {
             let config = ProtocolConfig::get_for_version(ProtocolVersion::new(v), chain);
             assert!(executor::runs(&config), "{chain:?} version {v}");
         }
+        let above = ProtocolConfig::get_for_version(supported.max + 1, chain);
+        assert!(
+            !executor::runs(&above),
+            "{chain:?} above {:?}",
+            supported.max
+        );
         let below = ProtocolConfig::get_for_version(supported.min.prev(), chain);
         assert!(
             !executor::runs(&below),

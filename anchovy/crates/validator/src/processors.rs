@@ -34,6 +34,10 @@ pub struct Request<S: TxState> {
     /// reference checks each transaction's signatures before validating the
     /// next, so a bad signature among these is the request's error first.
     pub(crate) then: Option<validation::Error>,
+    /// Each transaction's signers once its signatures verified; empty
+    /// before, with room for every transaction, so that no processor
+    /// allocates it.
+    pub(crate) signers: Vec<checks::Signers>,
     pub(crate) reply: Reply,
 }
 
@@ -44,6 +48,7 @@ impl Request<DigestPending> {
         reply: Reply,
     ) -> Request<DigestPending> {
         Request {
+            signers: Vec::with_capacity(transactions.len()),
             transactions,
             then: None,
             reply,
@@ -126,12 +131,14 @@ impl Processor for TransactionValidator {
         let Request {
             transactions,
             then: _,
+            signers,
             reply,
         } = request;
         let (valid, failure) = checks::validate(transactions, &self.epoch.context(), bump);
         let request = Request {
             transactions: valid,
             then: failure,
+            signers,
             reply,
         };
         if request.transactions.is_empty()
@@ -155,14 +162,19 @@ pub struct SignatureVerifier {
 }
 
 impl SignatureVerifier {
-    pub fn new(epoch: Arc<EpochState>) -> SignatureVerifier {
-        SignatureVerifier::with_cache(epoch, checks::GENERATION)
+    /// In `epoch`, reading signers' aliases from `store`.
+    pub fn new(epoch: Arc<EpochState>, store: Arc<store::Store>) -> SignatureVerifier {
+        SignatureVerifier::with_cache(epoch, store, checks::GENERATION)
     }
 
     /// With a signature cache of `2 * generation` entries.
-    pub fn with_cache(epoch: Arc<EpochState>, generation: usize) -> SignatureVerifier {
+    pub fn with_cache(
+        epoch: Arc<EpochState>,
+        store: Arc<store::Store>,
+        generation: usize,
+    ) -> SignatureVerifier {
         SignatureVerifier {
-            checks: SignatureChecks::new(epoch, generation),
+            checks: SignatureChecks::new(epoch, store, generation),
         }
     }
 
@@ -180,12 +192,14 @@ impl Processor for SignatureVerifier {
         let Request {
             transactions,
             then,
+            mut signers,
             reply,
         } = request;
-        match (self.checks.verify(transactions, bump), then) {
+        match (self.checks.verify(transactions, &mut signers, bump), then) {
             (Ok(verified), None) => Some(Request {
                 transactions: verified,
                 then: None,
+                signers,
                 reply,
             }),
             (Err(e), _) | (Ok(_), Some(e)) => {

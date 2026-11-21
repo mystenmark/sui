@@ -298,6 +298,11 @@ fn input<'a, Mode: ExecutionMode>(
                         id: *allowance,
                     }
                 }
+                P::WithdrawFrom::FrozenAddress { .. } => {
+                    unreachable!(
+                        "WithdrawFrom::FrozenAddress is not supported by this execution version"
+                    )
+                }
             };
             let ty = env.withdrawal_type_for_source(&source, funds_ty)?;
             (

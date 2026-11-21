@@ -39,10 +39,19 @@ impl Node {
     /// A node whose anchovy executor is `configure`d.
     fn with_native(configure: impl FnOnce(NativeExecution) -> NativeExecution) -> Node {
         let (sender, key) = get_key_pair::<AccountKeyPair>();
-        let reference =
-            Reference::new(ProtocolVersion::MAX.as_u64(), Chain::Unknown, 0, 0, RGP).unwrap();
+        let reference = Reference::new(
+            execution::upgrade::MAX_PROTOCOL_VERSION,
+            Chain::Unknown,
+            0,
+            0,
+            RGP,
+        )
+        .unwrap();
         let native = NativeExecution::new(
-            ProtocolConfig::get_for_version(ProtocolVersion::MAX, Chain::Unknown),
+            ProtocolConfig::get_for_version(
+                ProtocolVersion::new(execution::upgrade::MAX_PROTOCOL_VERSION),
+                Chain::Unknown,
+            ),
             Arc::new(ExecutionMetrics::new(&prometheus::Registry::new())),
             0,
             0,

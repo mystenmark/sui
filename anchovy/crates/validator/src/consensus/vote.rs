@@ -23,11 +23,10 @@ use messages::object::Owner;
 use messages::transaction::TransactionExpiration;
 use tokio::sync::oneshot;
 use validation::inputs::{InputKind, input_objects};
-use validation::verify::SignerIndices;
 use waiter::{Command, WaitBatch};
 use workqueue::{Processor, Refusal, Refuse};
 
-use crate::checks::{self, SignatureChecks, VerifiedTransaction};
+use crate::checks::{self, SignatureChecks, Signers, VerifiedTransaction};
 use crate::consensus::cache::{BlockEntries, CachedTransaction, ConsensusTxCache};
 use crate::consensus::decode::{checkpoint_signature, claimed_immutable};
 use crate::consensus::execution_time::duration;
@@ -96,7 +95,7 @@ impl BlockVoter {
         cache: Arc<ConsensusTxCache>,
     ) -> BlockVoter {
         BlockVoter {
-            signatures: SignatureChecks::new(epoch.clone(), checks::GENERATION),
+            signatures: SignatureChecks::new(epoch.clone(), store.clone(), checks::GENERATION),
             epoch,
             store,
             cache,
@@ -175,9 +174,9 @@ impl BlockVoter {
         for (i, verified) in verified.into_iter().enumerate() {
             let (index, claims) = &pending[i];
             match verified {
-                Ok((transaction, indices)) => {
+                Ok((transaction, signers)) => {
                     if let Err(reason) =
-                        self.vote_verified(epoch, &transaction, indices, claims, bump)
+                        self.vote_verified(epoch, &transaction, signers, claims, bump)
                     {
                         rejects.push((*index as TransactionIndex, reason));
                     }
@@ -227,29 +226,19 @@ impl BlockVoter {
         &mut self,
         epoch: &EpochState,
         transaction: &VerifiedTransaction,
-        indices: SignerIndices,
+        signers: Signers,
         claims: &CopiedClaims<'_>,
         bump: &Bump,
     ) -> Result<(), SuiErrorKind> {
         let missing_claim = || SuiErrorKind::InvalidRequest("missing address alias claim".into());
         if epoch.params.config.address_aliases() {
-            let indices = indices.as_slice();
-            // No signer has an alias: aliases are object state anchovy does
-            // not read yet, so each signer's alias version is `None`.
+            // The claim must name the aliases signatures verified with now.
             let matches = if epoch.params.config.fix_checkpoint_signature_mapping() {
                 let claimed = claims.aliases_v2.as_ref().ok_or_else(missing_claim)?;
-                claimed.matches(indices.iter().map(|index| (*index, None)))
+                claimed.matches(signers.aliases_v2())
             } else {
                 let claimed = claims.aliases_v1.as_ref().ok_or_else(missing_claim)?;
-                let data = transaction.get().0.data();
-                let sponsor =
-                    (data.gas_data().owner != data.sender()).then_some(data.gas_data().owner);
-                claimed.matches(
-                    [Some(data.sender()), sponsor]
-                        .into_iter()
-                        .flatten()
-                        .map(|signer| (*signer, None)),
-                )
+                claimed.matches(signers.aliases_v1(&transaction.get().0))
             };
             if !matches {
                 return Err(SuiErrorKind::AliasesChanged);

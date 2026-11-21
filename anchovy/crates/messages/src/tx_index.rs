@@ -117,7 +117,8 @@ impl IndexCounts {
             | EndOfEpochTransactionKind::CoinRegistryCreate
             | EndOfEpochTransactionKind::DisplayRegistryCreate
             | EndOfEpochTransactionKind::AddressAliasStateCreate
-            | EndOfEpochTransactionKind::ForwardingAddressRegistryCreate => 0,
+            | EndOfEpochTransactionKind::ForwardingAddressRegistryCreate
+            | EndOfEpochTransactionKind::FreezeListCreate => 0,
         };
     }
 }
@@ -156,7 +157,8 @@ fn push_end_of_epoch(
         | EndOfEpochTransactionKind::CoinRegistryCreate
         | EndOfEpochTransactionKind::DisplayRegistryCreate
         | EndOfEpochTransactionKind::AddressAliasStateCreate
-        | EndOfEpochTransactionKind::ForwardingAddressRegistryCreate => {}
+        | EndOfEpochTransactionKind::ForwardingAddressRegistryCreate
+        | EndOfEpochTransactionKind::FreezeListCreate => {}
     }
 }
 

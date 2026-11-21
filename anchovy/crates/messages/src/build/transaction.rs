@@ -58,6 +58,10 @@ pub enum WithdrawFrom {
         funder: SuiAddress,
         allowance: ObjectId,
     },
+    FrozenAddress {
+        seized_from: SuiAddress,
+        seize_auth: ObjectId,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -268,6 +272,13 @@ impl From<&view::WithdrawFrom<'_>> for WithdrawFrom {
                     allowance: ObjectId::from(*allowance),
                 }
             }
+            view::WithdrawFrom::FrozenAddress {
+                seized_from,
+                seize_auth,
+            } => WithdrawFrom::FrozenAddress {
+                seized_from: SuiAddress::from(*seized_from),
+                seize_auth: ObjectId::from(*seize_auth),
+            },
         }
     }
 }

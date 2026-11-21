@@ -6,9 +6,9 @@ use std::sync::Arc;
 
 use containers::Bump;
 use fastcrypto::groups::bls12381::{G1Element, Scalar};
-use fastcrypto_tbls::nodes::Nodes;
-use fastcrypto_tbls::tbls::{PartialSignature, Share, ThresholdBls};
-use fastcrypto_tbls::types::ThresholdBls12381MinSig;
+use fastcrypto_threshold::nodes::Nodes;
+use fastcrypto_threshold::tbls::{PartialSignature, Share, ThresholdBls};
+use fastcrypto_threshold::types::ThresholdBls12381MinSig;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 use workqueue::{Processor, Refusal, Refuse};

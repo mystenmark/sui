@@ -75,8 +75,9 @@ fn plain_signatures(case: &common::Case) -> bool {
 fn verifying_allocates_nothing_once_warm() {
     let (cases, epoch) = common::mainnet();
     let epoch = common::mainnet_epoch(epoch);
+    let (_dir, store) = common::empty_store();
     let mut validator = TransactionValidator::new(epoch.clone());
-    let mut warm = SignatureVerifier::new(epoch.clone());
+    let mut warm = SignatureVerifier::new(epoch.clone(), store.clone());
     let mut bump = Bump::default();
     for case in &cases {
         process(&mut validator, &mut warm, case, &mut bump);
@@ -84,7 +85,7 @@ fn verifying_allocates_nothing_once_warm() {
     let mut accepted = 0;
     for case in &cases {
         // A cache that has not seen it, made before counting: it is verified.
-        let mut verifier = SignatureVerifier::new(epoch.clone());
+        let mut verifier = SignatureVerifier::new(epoch.clone(), store.clone());
         let (ok, allocations) = process(&mut validator, &mut verifier, case, &mut bump);
         assert_eq!(verifier.cache_stats().0, 0);
         if ok && plain_signatures(case) {
@@ -100,8 +101,9 @@ fn verifying_allocates_nothing_once_warm() {
 fn a_cache_hit_allocates_nothing() {
     let (cases, epoch) = common::mainnet();
     let epoch = common::mainnet_epoch(epoch);
+    let (_dir, store) = common::empty_store();
     let mut validator = TransactionValidator::new(epoch.clone());
-    let mut verifier = SignatureVerifier::new(epoch.clone());
+    let mut verifier = SignatureVerifier::new(epoch.clone(), store.clone());
     let mut bump = Bump::default();
     let accepted: Vec<_> = cases
         .iter()

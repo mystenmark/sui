@@ -276,7 +276,7 @@ pub fn signer_signature_indices(
 
 /// The sender, then the gas owner if it differs: the reference's
 /// `required_signers`.
-fn required_signers(tx: &SenderSignedData<'_, impl TxState>) -> [Option<SuiAddress>; 2] {
+pub fn required_signers(tx: &SenderSignedData<'_, impl TxState>) -> [Option<SuiAddress>; 2] {
     let data = tx.data();
     let sponsor = (data.gas_data().owner != data.sender()).then_some(*data.gas_data().owner);
     [Some(*data.sender()), sponsor]

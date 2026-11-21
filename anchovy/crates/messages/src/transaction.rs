@@ -149,6 +149,11 @@ pub enum WithdrawFrom<'a> {
         funder: &'a SuiAddress,
         allowance: &'a ObjectId,
     },
+    /// Seize from frozen `seized_from`'s balance under a `SeizeAuth` owned by the sender.
+    FrozenAddress {
+        seized_from: &'a SuiAddress,
+        seize_auth: &'a ObjectId,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -193,6 +198,10 @@ impl<'a> FundsWithdrawalArg<'a> {
             2 => WithdrawFrom::SenderAllowance {
                 funder: SuiAddress::parse(r)?,
                 allowance: ObjectId::parse(r)?,
+            },
+            3 => WithdrawFrom::FrozenAddress {
+                seized_from: SuiAddress::parse(r)?,
+                seize_auth: ObjectId::parse(r)?,
             },
             tag => {
                 return Err(ParseError::UnknownVariant {
