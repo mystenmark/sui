@@ -457,15 +457,19 @@ fn votes_check_signers_aliases_as_the_reference_does() {
     let node = Node::new();
     let gas = node.gas();
     let (alias, alias_key) = get_key_pair::<AccountKeyPair>();
+    // One voter throughout, and the sender's transfer in both blocks: its
+    // cached verdict must not outlive the aliases it was reached with.
+    let mut voter = node.voter();
+    let own = node.transfer(gas);
     node.set_aliases(node.sender, &[node.sender], 3);
     let first = block(
         12,
         vec![
-            user_transaction(&node.transfer(gas), &[no_alias()]),
-            user_transaction(&node.transfer(gas), &[aliases(&[(0, Some(3))])]),
+            user_transaction(&own, &[no_alias()]),
+            user_transaction(&own, &[aliases(&[(0, Some(3))])]),
         ],
     );
-    assert_eq!(node.voter().vote(first, &bump), Ok(vec![0]));
+    assert_eq!(voter.vote(first, &bump), Ok(vec![0]));
 
     // Listing only another address: its key signs for the sender, and the
     // sender's own does not.
@@ -477,14 +481,14 @@ fn votes_check_signers_aliases_as_the_reference_does() {
                 &node.signed_transfer(gas, &alias_key),
                 &[aliases(&[(0, Some(4))])],
             ),
-            user_transaction(&node.transfer(gas), &[aliases(&[(0, Some(4))])]),
+            user_transaction(&own, &[aliases(&[(0, Some(4))])]),
             user_transaction(
                 &node.signed_transfer(gas, &alias_key),
                 &[aliases(&[(0, Some(3))])],
             ),
         ],
     );
-    assert_eq!(node.voter().vote(second, &bump), Ok(vec![1, 2]));
+    assert_eq!(voter.vote(second, &bump), Ok(vec![1, 2]));
 }
 
 /// A submission's alias claim names the aliases its signatures verified
